@@ -458,6 +458,10 @@ class Processor(QtCore.QObject):
             err = f"Error: {e}\n{traceback.format_exc()}"
             self.finished.emit(False, err)
 
+    def _init_status(self):
+        self._last_status_time = 0.0
+        self._last_status_text = None
+
     def _status(self, msg: str):
         now = time.time()
         if not hasattr(self, '_last_status_time'):
