@@ -1,3 +1,4 @@
+
 import math
 import os
 import cv2
@@ -14,74 +15,117 @@ def l2_normalize(x, eps=1e-10):
     n = np.linalg.norm(x) + eps
     return x / n
 
-def cosine_distance(a, b):
-    # a,b are 1D arrays
-    an = l2_normalize(a)
-    bn = l2_normalize(b)
-    sim = float(np.dot(an, bn))
-    # convert to distance in [0,2]
-    return 1.0 - sim  # smaller is better
-
-def clamp(v, lo, hi):
+def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
-def expand_box_to_ratio(x1, y1, x2, y2, ratio_w, ratio_h, frame_w, frame_h, anchor=None, head_bias=0.12):
-    # Expand a box to target aspect ratio while containing the original box.
-    bw = x2 - x1
-    bh = y2 - y1
-    cx = x1 + bw/2.0
-    cy = y1 + bh/2.0
+def expand_box_to_ratio(x1, y1, x2, y2, ratio_w, ratio_h, frame_w, frame_h, anchor=None, head_bias=0.0):
+    """
+    Expand a box to the exact ratio (ratio_w:ratio_h) while clamping to frame.
+    Optionally bias the crop upward (head_bias in [0..0.5]) and anchor around a point.
+    Returns integer (nx1, ny1, nx2, ny2).
+    """
+    x1, y1, x2, y2 = map(float, (x1, y1, x2, y2))
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    target = float(ratio_w) / float(ratio_h)
 
-    target = ratio_w / ratio_h
-    cur = bw / max(bh, 1e-6)
+    # center
+    if anchor is not None:
+        cx, cy = float(anchor[0]), float(anchor[1])
+    else:
+        cx = x1 + bw * 0.5
+        cy = y1 + bh * 0.5
 
+    # bias upward for heads
+    cy = cy - head_bias * bh
+
+    # compute new size that encloses the box at target ratio
+    cur = bw / bh
     if cur < target:
-        # widen
+        # need more width
         new_w = target * bh
         new_h = bh
     else:
-        # taller
         new_w = bw
         new_h = bw / target
 
-    # Optional anchor (e.g., face box center) and head bias for portraits
-    if anchor is not None:
-        acx, acy = anchor
-        cx = 0.7*cx + 0.3*acx  # pull center toward anchor
-        cy = 0.6*cy + 0.4*acy - head_bias*new_h  # bias upward to leave headroom
-    else:
-        cy -= head_bias*new_h
+    nx1 = cx - new_w * 0.5
+    ny1 = cy - new_h * 0.5
+    nx2 = cx + new_w * 0.5
+    ny2 = cy + new_h * 0.5
 
-    nx1 = cx - new_w/2.0
-    ny1 = cy - new_h/2.0
-    nx2 = cx + new_w/2.0
-    ny2 = cy + new_h/2.0
+    # clamp
+    nx1 = _clamp(nx1, 0, frame_w - 1)
+    ny1 = _clamp(ny1, 0, frame_h - 1)
+    nx2 = _clamp(nx2, 0, frame_w - 1)
+    ny2 = _clamp(ny2, 0, frame_h - 1)
 
-    # Clamp to frame
-    nx1 = clamp(nx1, 0, frame_w-1)
-    ny1 = clamp(ny1, 0, frame_h-1)
-    nx2 = clamp(nx2, 0, frame_w-1)
-    ny2 = clamp(ny2, 0, frame_h-1)
-
-    # If clamping shrank below target, re-center within frame
+    # ensure exact ratio after clamping by expanding towards inside if needed
     new_w = nx2 - nx1
     new_h = ny2 - ny1
-    cur = new_w / max(new_h, 1e-6)
-    if abs(cur - target) > 1e-3:
-        # Try to adjust width or height minimally
-        if cur < target:
-            # need more width
-            pad = (target*new_h - new_w)/2.0
-            nx1 = clamp(nx1 - pad, 0, frame_w-1)
-            nx2 = clamp(nx2 + pad, 0, frame_w-1)
-        else:
-            # need more height
-            pad = (new_w/target - new_h)/2.0
-            ny1 = clamp(ny1 - pad, 0, frame_h-1)
-            ny2 = clamp(ny2 + pad, 0, frame_h-1)
+    if new_w <= 1 or new_h <= 1:
+        return int(nx1), int(ny1), int(nx2), int(ny2)
 
-    return int(nx1), int(ny1), int(nx2), int(ny2)
+    cur = new_w / new_h
+    if abs(cur - target) > 1e-4:
+        if cur < target:
+            # grow width if possible
+            pad = (target * new_h - new_w) * 0.5
+            nx1 = _clamp(nx1 - pad, 0, frame_w - 1)
+            nx2 = _clamp(nx2 + pad, 0, frame_w - 1)
+        else:
+            pad = (new_w / target - new_h) * 0.5
+            ny1 = _clamp(ny1 - pad, 0, frame_h - 1)
+            ny2 = _clamp(ny2 + pad, 0, frame_h - 1)
+
+    return int(round(nx1)), int(round(ny1)), int(round(nx2)), int(round(ny2))
 
 def crop_img(frame, box):
     x1,y1,x2,y2 = [int(v) for v in box]
     return frame[y1:y2, x1:x2]
+
+def detect_black_borders(bgr, thr=10, max_scan=None):
+    """
+    Detect constant black borders and return ROI (x1,y1,x2,y2).
+    thr: pixel intensity threshold (0-255) below which we consider black.
+    max_scan: optional limit for scanning depth from edges.
+    """
+    if bgr is None or bgr.size == 0:
+        return (0,0,0,0)
+    H, W = bgr.shape[:2]
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    if max_scan is None:
+        max_scan = max(64, min(H, W) // 8)
+
+    # top
+    top = 0
+    for r in range(min(H, max_scan)):
+        if gray[r, :].mean() > thr:
+            break
+        top = r + 1
+    # bottom
+    bottom = H
+    for r in range(H - 1, max(H - max_scan - 1, -1), -1):
+        if gray[r, :].mean() > thr:
+            break
+        bottom = r
+    # left
+    left = 0
+    for c in range(min(W, max_scan)):
+        if gray[:, c].mean() > thr:
+            break
+        left = c + 1
+    # right
+    right = W
+    for c in range(W - 1, max(W - max_scan - 1, -1), -1):
+        if gray[:, c].mean() > thr:
+            break
+        right = c
+
+    # sanity
+    left = _clamp(left, 0, right - 1)
+    top = _clamp(top, 0, bottom - 1)
+    right = _clamp(right, left + 1, W)
+    bottom = _clamp(bottom, top + 1, H)
+
+    return int(left), int(top), int(right), int(bottom)

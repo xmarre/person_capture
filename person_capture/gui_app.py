@@ -53,9 +53,16 @@ class SessionConfig:
     ratio: str = "2:3"
     frame_stride: int = 2
     min_det_conf: float = 0.35
-    face_thresh: float = 0.32
-    reid_thresh: float = 0.38
+    face_thresh: float = 0.30
+    reid_thresh: float = 0.35
     combine: str = "min"            # min | avg | face_priority
+    match_mode: str = "either"      # either | both | face_only | reid_only
+    only_best: bool = True
+    min_sharpness: float = 120.0
+    min_gap_sec: float = 1.5
+    min_box_pixels: int = 5000
+    auto_crop_borders: bool = True
+    border_threshold: int = 10
     device: str = "cuda"            # cuda | cpu
     yolo_model: str = "yolov8n.pt"
     face_model: str = "yolov8n-face.pt"
@@ -78,6 +85,23 @@ class SessionConfig:
 # ---------------------- Worker Thread ----------------------
 
 class Processor(QtCore.QObject):
+    def _calc_sharpness(self, bgr):
+        if bgr is None or bgr.size == 0:
+            return 0.0
+        g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        return float(cv2.Laplacian(g, cv2.CV_64F).var())
+
+    def _autocrop_borders(self, frame, thr):
+        from utils import detect_black_borders
+        x1,y1,x2,y2 = detect_black_borders(frame, thr=int(thr))
+        return frame[y1:y2, x1:x2], (x1,y1)
+
+    def _expand_to_ratio(self, box, ratio_w, ratio_h, frame_w, frame_h, anchor=None):
+        from utils import expand_box_to_ratio
+        x1,y1,x2,y2 = box
+        ex1,ey1,ex2,ey2 = expand_box_to_ratio(x1,y1,x2,y2, ratio_w, ratio_h, frame_w, frame_h, anchor=anchor, head_bias=0.12)
+        return ex1,ey1,ex2,ey2
+
     # Signals for UI
     setup = QtCore.Signal(int, float)                # total_frames, fps
     progress = QtCore.Signal(int)                    # current frame idx
@@ -173,7 +197,7 @@ class Processor(QtCore.QObject):
             csv_path = os.path.join(cfg.out_dir, "index.csv")
             csv_f = open(csv_path, "w", newline="")
             writer = csv.writer(csv_f)
-            writer.writerow(["frame","time_secs","score","face_dist","reid_dist","x1","y1","x2","y2","crop_path"])
+            writer.writerow(["frame","time_secs","score","face_dist","reid_dist","x1","y1","x2","y2","crop_path","sharpness"])
 
             hit_count = 0
             frame_idx = 0
@@ -200,83 +224,138 @@ class Processor(QtCore.QObject):
                     break
                 H, W = frame.shape[:2]
 
-                persons = det.detect(frame, conf=float(cfg.min_det_conf))
+                
+                # Optional black border crop
+                frame_for_det = frame
+                off_x, off_y = 0, 0
+                if cfg.auto_crop_borders:
+                    frame_for_det, (off_x, off_y) = self._autocrop_borders(frame, cfg.border_threshold)
+                    H2, W2 = frame_for_det.shape[:2]
+                else:
+                    H2, W2 = H, W
+
+                persons = det.detect(frame_for_det, conf=float(cfg.min_det_conf))
+                candidates = []
                 crops = []
                 boxes = []
+                faces_local = {}
+
+                # Build candidate list
                 for p in persons:
                     x1,y1,x2,y2 = [int(v) for v in p["xyxy"]]
-                    x1 = max(0, x1); y1 = max(0, y1); x2 = min(W-1, x2); y2 = min(H-1, y2)
+                    x1 = max(0, x1); y1 = max(0, y1); x2 = min(W2-1, x2); y2 = min(H2-1, y2)
                     if x2 <= x1+2 or y2 <= y1+2:
                         continue
-                    crop = frame[y1:y2, x1:x2]
+                    if (x2-x1)*(y2-y1) < int(cfg.min_box_pixels):
+                        continue
+                    crop = frame_for_det[y1:y2, x1:x2]
                     crops.append(crop); boxes.append((x1,y1,x2,y2))
 
                 reid_feats = reid.extract(crops) if crops else []
 
                 # Face features per person
-                face_map = {}
                 for i, crop in enumerate(crops):
                     ffaces = face.extract(crop)
                     bestf = FaceEmbedder.best_face(ffaces)
-                    if bestf is not None and ref_face_feat is not None:
-                        fd = 1.0 - float(np.dot(bestf["feat"], ref_face_feat))
-                        face_map[i] = (bestf, fd)
+                    faces_local[i] = bestf
 
+                # Evaluate candidates
                 for i, feat in enumerate(reid_feats):
                     rd = None
                     if ref_reid_feat is not None:
-                        # cosine distance using L2-norm
                         f = feat / max(np.linalg.norm(feat), 1e-9)
                         r = ref_reid_feat / max(np.linalg.norm(ref_reid_feat), 1e-9)
-                        sim = float(np.dot(f, r))
-                        rd = 1.0 - sim
-                    fd = face_map.get(i, (None, None))[1]
-                    score = self._combine_scores(fd, rd, mode=cfg.combine)
+                        rd = 1.0 - float(np.dot(f, r))
 
-                    accept = False
-                    if score is not None:
-                        face_ok = (fd is not None and fd <= float(cfg.face_thresh))
-                        reid_ok = (rd is not None and rd <= float(cfg.reid_thresh))
+                    bf = faces_local.get(i, None)
+                    fd = None
+                    if bf is not None and ref_face_feat is not None:
+                        fd = 1.0 - float(np.dot(bf["feat"], ref_face_feat))
+
+                    # Match decision by mode
+                    face_ok = (fd is not None and fd <= float(cfg.face_thresh))
+                    reid_ok = (rd is not None and rd <= float(cfg.reid_thresh))
+                    if cfg.match_mode == "both":
+                        accept = face_ok and reid_ok
+                    elif cfg.match_mode == "face_only":
+                        accept = face_ok
+                    elif cfg.match_mode == "reid_only":
+                        accept = reid_ok
+                    else:
                         accept = face_ok or reid_ok
 
-                    if accept:
-                        x1,y1,x2,y2 = boxes[i]
-                        anchor = None
-                        bf = face_map.get(i, (None,None))[0]
-                        if bf is not None:
-                            fb = bf["bbox"]
-                            acx = x1 + (fb[0]+fb[2])/2.0
-                            acy = y1 + (fb[1]+fb[3])/2.0
-                            anchor = (acx, acy)
-                        ex1,ey1,ex2,ey2 = expand_box_to_ratio(x1,y1,x2,y2, ratio_w, ratio_h, W, H, anchor=anchor, head_bias=0.12)
-                        crop_img_path = os.path.join(crops_dir, f"f{frame_idx:08d}.jpg")
-                        crop_img = frame[ey1:ey2, ex1:ex2]
-                        cv2.imwrite(crop_img_path, crop_img)
-                        hit_count += 1
-                        self.hit.emit(crop_img_path)
+                    if not accept:
+                        continue
 
-                        if cfg.save_annot:
-                            vis = frame.copy()
-                            cv2.rectangle(vis, (x1,y1),(x2,y2),(0,255,0),2)
-                            cv2.rectangle(vis, (ex1,ey1),(ex2,ey2),(255,0,0),2)
-                            if bf is not None:
-                                fb = bf["bbox"]
-                                cv2.rectangle(vis, (x1+fb[0], y1+fb[1]), (x1+fb[2], y1+fb[3]), (0,0,255), 2)
-                            txt = f"score={score:.3f} fd={fd if fd is not None else -1:.3f} rd={rd if rd is not None else -1:.3f}"
-                            cv2.putText(vis, txt, (15,30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
-                            ann_path = os.path.join(ann_dir, f"f{frame_idx:08d}.jpg") if ann_dir else None
-                            if ann_path:
-                                cv2.imwrite(ann_path, vis)
+                    score = self._combine_scores(fd, rd, mode=cfg.combine)
+                    x1,y1,x2,y2 = boxes[i]
+                    # map anchor to frame_for_det coords
+                    anchor = None
+                    if bf is not None:
+                        fb = bf["bbox"]
+                        acx = x1 + (fb[0]+fb[2])/2.0
+                        acy = y1 + (fb[1]+fb[3])/2.0
+                        anchor = (acx, acy)
 
-                    # Preview
-                    if cfg.preview_every > 0 and (frame_idx - last_preview_emit) >= int(cfg.preview_every):
-                        last_preview_emit = frame_idx
-                        show = frame.copy()
-                        # draw boxes for visibility
-                        for (x1,y1,x2,y2) in boxes:
-                            cv2.rectangle(show, (x1,y1),(x2,y2),(0,255,0),1)
-                        qimg = self._cv_bgr_to_qimage(show)
-                        self.preview.emit(qimg)
+                    # expand to ratio within the DET frame
+                    ex1,ey1,ex2,ey2 = self._expand_to_ratio((x1,y1,x2,y2), ratio_w, ratio_h, W2, H2, anchor=anchor)
+
+                    # Compute sharpness on final crop
+                    crop_img = frame_for_det[ey1:ey2, ex1:ex2]
+                    sharp = self._calc_sharpness(crop_img)
+                    if sharp < float(cfg.min_sharpness):
+                        continue
+
+                    # Map to original frame coords for annotation
+                    ox1, oy1, ox2, oy2 = ex1+off_x, ey1+off_y, ex2+off_x, ey2+off_y
+                    area = (ox2-ox1)*(oy2-oy1)
+                    candidates.append(dict(score=score, fd=fd, rd=rd, sharp=sharp, box=(ox1,oy1,ox2,oy2), area=area, show_box=(x1+off_x,y1+off_y,x2+off_x,y2+off_y)))
+
+                # Choose best and save with cadence
+                def save_hit(c):
+                    nonlocal hit_count
+                    crop_img_path = os.path.join(crops_dir, f"f{frame_idx:08d}.jpg")
+                    cx1,cy1,cx2,cy2 = c["box"]
+                    crop_img2 = frame[cy1:cy2, cx1:cx2]
+                    cv2.imwrite(crop_img_path, crop_img2)
+                    writer.writerow([frame_idx, frame_idx/float(fps), c["score"], c["fd"], c["rd"], cx1, cy1, cx2, cy2, crop_img_path, c["sharp"]])
+                    self.hit.emit(crop_img_path)
+                    return True
+
+                # initialize cadence tracking
+                if not hasattr(self, "_last_hit_t"):
+                    self._last_hit_t = -1e9
+
+                if candidates:
+                    # sort by score asc then area desc
+                    candidates.sort(key=lambda d: (d["score"] if d["score"] is not None else 1e9, -d["area"]))
+                    now_t = frame_idx/float(fps)
+                    if cfg.only_best:
+                        c = candidates[0]
+                        if now_t - self._last_hit_t >= float(cfg.min_gap_sec):
+                            if save_hit(c):
+                                hit_count += 1
+                                self._last_hit_t = now_t
+                    else:
+                        for c in candidates:
+                            now_t = frame_idx/float(fps)
+                            if now_t - self._last_hit_t >= float(cfg.min_gap_sec):
+                                if save_hit(c):
+                                    hit_count += 1
+                                    self._last_hit_t = now_t
+
+                # Annotated preview
+                if cfg.save_annot or (cfg.preview_every > 0 and (frame_idx - last_preview_emit) >= int(cfg.preview_every)):
+                    show = frame.copy()
+                    # draw person boxes
+                    for c in candidates:
+                        x1,y1,x2,y2 = c["show_box"]
+                        cv2.rectangle(show, (x1,y1),(x2,y2),(0,255,0),1)
+                    if candidates:
+                        bx1,by1,bx2,by2 = candidates[0]["box"]
+                        cv2.rectangle(show, (bx1,by1),(bx2,by2),(255,0,0),2)
+                    qimg = self._cv_bgr_to_qimage(show)
+                    self.preview.emit(qimg)
 
                 frame_idx += 1
                 self.progress.emit(frame_idx)
@@ -353,7 +432,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.det_conf_spin = QtWidgets.QDoubleSpinBox(); self.det_conf_spin.setDecimals(3); self.det_conf_spin.setRange(0.0, 1.0); self.det_conf_spin.setSingleStep(0.01); self.det_conf_spin.setValue(0.35)
         self.face_thr_spin = QtWidgets.QDoubleSpinBox(); self.face_thr_spin.setDecimals(3); self.face_thr_spin.setRange(0.0, 2.0); self.face_thr_spin.setSingleStep(0.01); self.face_thr_spin.setValue(0.32)
         self.reid_thr_spin = QtWidgets.QDoubleSpinBox(); self.reid_thr_spin.setDecimals(3); self.reid_thr_spin.setRange(0.0, 2.0); self.reid_thr_spin.setSingleStep(0.01); self.reid_thr_spin.setValue(0.38)
-        self.combine_combo = QtWidgets.QComboBox(); self.combine_combo.addItems(["min","avg","face_priority"])
+        self.combine_combo = QtWidgets.QComboBox(); self.combine_combo.addItems(["min","avg","face_priority"]) 
+        self.match_mode_combo = QtWidgets.QComboBox(); self.match_mode_combo.addItems(["either","both","face_only","reid_only"]) 
+        self.only_best_check = QtWidgets.QCheckBox("Only best per frame")
+        self.only_best_check.setChecked(True)
+        self.min_sharp_spin = QtWidgets.QDoubleSpinBox(); self.min_sharp_spin.setRange(0.0, 5000.0); self.min_sharp_spin.setValue(120.0)
+        self.min_gap_spin = QtWidgets.QDoubleSpinBox(); self.min_gap_spin.setDecimals(2); self.min_gap_spin.setRange(0.0, 30.0); self.min_gap_spin.setValue(1.5)
+        self.min_box_pix_spin = QtWidgets.QSpinBox(); self.min_box_pix_spin.setRange(0, 5000000); self.min_box_pix_spin.setValue(5000)
+        self.auto_crop_check = QtWidgets.QCheckBox("Auto‑crop black borders")
+        self.auto_crop_check.setChecked(True)
+        self.border_thr_spin = QtWidgets.QSpinBox(); self.border_thr_spin.setRange(0, 50); self.border_thr_spin.setValue(10)
         self.device_combo = QtWidgets.QComboBox(); self.device_combo.addItems(["cuda","cpu"])
         self.yolo_edit = QtWidgets.QLineEdit("yolov8n.pt")
         self.face_yolo_edit = QtWidgets.QLineEdit("yolov8n-face.pt")
@@ -367,6 +455,13 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Face max dist", self.face_thr_spin),
             ("ReID max dist", self.reid_thr_spin),
             ("Combine", self.combine_combo),
+            ("Match mode", self.match_mode_combo),
+            ("Only best", self.only_best_check),
+            ("Min sharpness", self.min_sharp_spin),
+            ("Min seconds between hits", self.min_gap_spin),
+            ("Min box area (px)", self.min_box_pix_spin),
+            ("Auto‑crop black borders", self.auto_crop_check),
+            ("Border threshold", self.border_thr_spin),
             ("Device", self.device_combo),
             ("YOLO model", self.yolo_edit),
             ("Face YOLO model", self.face_yolo_edit),
@@ -525,6 +620,13 @@ class MainWindow(QtWidgets.QMainWindow):
             face_thresh=float(self.face_thr_spin.value()),
             reid_thresh=float(self.reid_thr_spin.value()),
             combine=self.combine_combo.currentText(),
+            match_mode=self.match_mode_combo.currentText(),
+            only_best=bool(self.only_best_check.isChecked()),
+            min_sharpness=float(self.min_sharp_spin.value()),
+            min_gap_sec=float(self.min_gap_spin.value()),
+            min_box_pixels=int(self.min_box_pix_spin.value()),
+            auto_crop_borders=bool(self.auto_crop_check.isChecked()),
+            border_threshold=int(self.border_thr_spin.value()),
             device=self.device_combo.currentText(),
             yolo_model=self.yolo_edit.text().strip() or "yolov8n.pt",
             face_model=self.face_yolo_edit.text().strip() or "yolov8n-face.pt",
@@ -543,6 +645,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.face_thr_spin.setValue(cfg.face_thresh)
         self.reid_thr_spin.setValue(cfg.reid_thresh)
         self.combine_combo.setCurrentText(cfg.combine)
+        self.match_mode_combo.setCurrentText(cfg.match_mode)
+        self.only_best_check.setChecked(cfg.only_best)
+        self.min_sharp_spin.setValue(cfg.min_sharpness)
+        self.min_gap_spin.setValue(cfg.min_gap_sec)
+        self.min_box_pix_spin.setValue(cfg.min_box_pixels)
+        self.auto_crop_check.setChecked(cfg.auto_crop_borders)
+        self.border_thr_spin.setValue(cfg.border_threshold)
         self.device_combo.setCurrentText(cfg.device)
         self.yolo_edit.setText(cfg.yolo_model)
         self.face_yolo_edit.setText(cfg.face_model)
@@ -656,6 +765,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.face_thr_spin.setValue(float(s.value("face_thresh", 0.32)))
         self.reid_thr_spin.setValue(float(s.value("reid_thresh", 0.38)))
         self.combine_combo.setCurrentText(s.value("combine", "min"))
+        self.match_mode_combo.setCurrentText(s.value("match_mode", "either"))
+        self.only_best_check.setChecked(bool(s.value("only_best", True)))
+        self.min_sharp_spin.setValue(float(s.value("min_sharpness", 120.0)))
+        self.min_gap_spin.setValue(float(s.value("min_gap_sec", 1.5)))
+        self.min_box_pix_spin.setValue(int(s.value("min_box_pixels", 5000)))
+        self.auto_crop_check.setChecked(bool(s.value("auto_crop_borders", True)))
+        self.border_thr_spin.setValue(int(s.value("border_threshold", 10)))
         self.device_combo.setCurrentText(s.value("device", "cuda"))
         self.yolo_edit.setText(s.value("yolo_model", "yolov8n.pt"))
         self.face_yolo_edit.setText(s.value("face_model", "yolov8n-face.pt"))
