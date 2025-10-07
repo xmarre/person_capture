@@ -56,11 +56,11 @@ class SessionConfig:
     face_thresh: float = 0.36
     reid_thresh: float = 0.42
     combine: str = "min"            # min | avg | face_priority
-    match_mode: str = "both"      # either | both | face_only | reid_only
+    match_mode: str = "either"      # either | both | face_only | reid_only
     only_best: bool = True
-    min_sharpness: float = 160.0
+    min_sharpness: float = 120.0
     min_gap_sec: float = 1.5
-    min_box_pixels: int = 8000
+    min_box_pixels: int = 4000
     auto_crop_borders: bool = False
     border_threshold: int = 10
     lock_after_hits: int = 1
@@ -167,6 +167,7 @@ class Processor(QtCore.QObject):
     @QtCore.Slot()
     def run(self):
         try:
+            self._init_status()
             cfg = self.cfg
             if not os.path.isfile(cfg.video):
                 raise FileNotFoundError(f"Video not found: {cfg.video}")
@@ -180,13 +181,13 @@ class Processor(QtCore.QObject):
             if ann_dir:
                 ensure_dir(ann_dir)
 
-            self.status.emit("Loading models...")
+            self._status("Loading models...", key="phase", interval=5.0)
             det = PersonDetector(model_name=cfg.yolo_model, device=cfg.device)
             face = FaceEmbedder(ctx=cfg.device, yolo_model=cfg.face_model, use_arcface=cfg.use_arcface, clip_model_name=cfg.clip_face_backbone, clip_pretrained=cfg.clip_face_pretrained, progress=self.status.emit)
             reid = ReIDEmbedder(device=cfg.device, model_name=cfg.reid_backbone, pretrained=cfg.reid_pretrained, progress=self.status.emit)
 
             # Reference
-            self.status.emit("Preparing reference features...")
+            self._status("Preparing reference features...", key="phase", interval=5.0)
             ref_img = cv2.imread(cfg.ref, cv2.IMREAD_COLOR)
             if ref_img is None:
                 raise RuntimeError("Cannot read reference image")
@@ -228,10 +229,10 @@ class Processor(QtCore.QObject):
             frame_idx = 0
             last_preview_emit = -999999
 
-            self.status.emit("Processing...")
+            self._status("Processing...", key="phase", interval=5.0)
             while True:
                 if self._abort:
-                    self.status.emit("Aborting...")
+                    self._status("Aborting...")
                     break
                 if self._pause:
                     time.sleep(0.05)
@@ -266,7 +267,7 @@ class Processor(QtCore.QObject):
                     frame_for_det = frame
                     off_x, off_y = 0, 0
                     H2, W2 = H, W
-                    self.status.emit("Border-crop yielded no detections. Fallback to full frame.")
+                    self._status("Border-crop yielded no detections. Fallback to full frame.", key="fallback", interval=2.0)
                 candidates = []
                 diag_persons = len(persons)
                 crops = []
@@ -305,14 +306,27 @@ class Processor(QtCore.QObject):
                     if bf is not None and ref_face_feat is not None:
                         fd = 1.0 - float(np.dot(bf["feat"], ref_face_feat))
 
-                    # Match decision by mode
+                    # Match decision with dynamic fallback
                     face_ok = (fd is not None and fd <= float(cfg.face_thresh))
                     reid_ok = (rd is not None and rd <= float(cfg.reid_thresh))
-                    if cfg.match_mode == "both":
-                        accept = face_ok and reid_ok
-                    elif cfg.match_mode == "face_only":
+
+                    eff_mode = cfg.match_mode
+                    # If reference features are missing, degrade mode
+                    if ref_face_feat is None and eff_mode in ("both", "face_only"):
+                        eff_mode = "reid_only"
+                    if ref_reid_feat is None and eff_mode in ("both", "reid_only"):
+                        eff_mode = "face_only"
+                    # If this candidate lacks a face or reid feature, allow the other branch
+                    if eff_mode == "both":
+                        if fd is None and rd is not None:
+                            accept = reid_ok
+                        elif rd is None and fd is not None:
+                            accept = face_ok
+                        else:
+                            accept = face_ok and reid_ok
+                    elif eff_mode == "face_only":
                         accept = face_ok
-                    elif cfg.match_mode == "reid_only":
+                    elif eff_mode == "reid_only":
                         accept = reid_ok
                     else:
                         accept = face_ok or reid_ok
@@ -367,7 +381,7 @@ class Processor(QtCore.QObject):
                     self._last_hit_t = -1e9
 
                 if not candidates:
-                    self.status.emit(f"No match. persons={diag_persons}")
+                    self._status(f"No match. persons={diag_persons}", key="no_match", interval=1.0)
                 else:
                     # Lock-aware scoring
                     def eff_score(c):
@@ -422,6 +436,12 @@ class Processor(QtCore.QObject):
                         cv2.rectangle(show, (bx1,by1),(bx2,by2),(255,0,0),2)
                     qimg = self._cv_bgr_to_qimage(show)
                     self.preview.emit(qimg)
+                # Always-on preview cadence
+                if cfg.preview_every > 0 and (frame_idx - last_preview_emit) >= int(cfg.preview_every):
+                    last_preview_emit = frame_idx
+                    base = frame.copy()
+                    qimg = self._cv_bgr_to_qimage(base)
+                    self.preview.emit(qimg)
 
                 frame_idx += 1
                 self.progress.emit(frame_idx)
@@ -437,6 +457,16 @@ class Processor(QtCore.QObject):
         except Exception as e:
             err = f"Error: {e}\n{traceback.format_exc()}"
             self.finished.emit(False, err)
+
+    def _status(self, msg: str):
+        now = time.time()
+        if not hasattr(self, '_last_status_time'):
+            self._last_status_time = 0.0
+            self._last_status_text = None
+        if (now - self._last_status_time) >= float(self.cfg.log_interval_sec) or msg != self._last_status_text:
+            self.status.emit(msg)
+            self._last_status_time = now
+            self._last_status_text = msg
 
     def _cv_bgr_to_qimage(self, bgr) -> QtGui.QImage:
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -508,6 +538,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.auto_crop_check = QtWidgets.QCheckBox("Auto‑crop black borders")
         self.auto_crop_check.setChecked(True)
         self.border_thr_spin = QtWidgets.QSpinBox(); self.border_thr_spin.setRange(0, 50); self.border_thr_spin.setValue(10)
+        self.log_every_spin = QtWidgets.QDoubleSpinBox(); self.log_every_spin.setDecimals(1); self.log_every_spin.setRange(0.1, 10.0); self.log_every_spin.setValue(1.0)
         self.lock_after_spin = QtWidgets.QSpinBox(); self.lock_after_spin.setRange(0, 10); self.lock_after_spin.setValue(1)
         self.lock_face_spin = QtWidgets.QDoubleSpinBox(); self.lock_face_spin.setDecimals(3); self.lock_face_spin.setRange(0.0, 2.0); self.lock_face_spin.setValue(0.28)
         self.lock_reid_spin = QtWidgets.QDoubleSpinBox(); self.lock_reid_spin.setDecimals(3); self.lock_reid_spin.setRange(0.0, 2.0); self.lock_reid_spin.setValue(0.30)
@@ -535,6 +566,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Min box area (px)", self.min_box_pix_spin),
             ("Auto‑crop black borders", self.auto_crop_check),
             ("Border threshold", self.border_thr_spin),
+            ("Log interval (s)", self.log_every_spin),
             ("Lock after N hits", self.lock_after_spin),
             ("Lock face dist ≤", self.lock_face_spin),
             ("Lock reid dist ≤", self.lock_reid_spin),
@@ -706,6 +738,7 @@ class MainWindow(QtWidgets.QMainWindow):
             min_box_pixels=int(self.min_box_pix_spin.value()),
             auto_crop_borders=bool(self.auto_crop_check.isChecked()),
             border_threshold=int(self.border_thr_spin.value()),
+            log_interval_sec=float(self.log_every_spin.value()),
             lock_after_hits=int(self.lock_after_spin.value()),
             lock_face_thresh=float(self.lock_face_spin.value()),
             lock_reid_thresh=float(self.lock_reid_spin.value()),
@@ -737,6 +770,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.min_box_pix_spin.setValue(cfg.min_box_pixels)
         self.auto_crop_check.setChecked(cfg.auto_crop_borders)
         self.border_thr_spin.setValue(cfg.border_threshold)
+        self.log_every_spin.setValue(cfg.log_interval_sec)
         self.lock_after_spin.setValue(cfg.lock_after_hits)
         self.lock_face_spin.setValue(cfg.lock_face_thresh)
         self.lock_reid_spin.setValue(cfg.lock_reid_thresh)
@@ -856,13 +890,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.face_thr_spin.setValue(float(s.value("face_thresh", 0.32)))
         self.reid_thr_spin.setValue(float(s.value("reid_thresh", 0.38)))
         self.combine_combo.setCurrentText(s.value("combine", "min"))
-        self.match_mode_combo.setCurrentText(s.value("match_mode", "both"))
+        self.match_mode_combo.setCurrentText(s.value("match_mode", "either"))
         self.only_best_check.setChecked(bool(s.value("only_best", True)))
         self.min_sharp_spin.setValue(float(s.value("min_sharpness", 120.0)))
         self.min_gap_spin.setValue(float(s.value("min_gap_sec", 1.5)))
         self.min_box_pix_spin.setValue(int(s.value("min_box_pixels", 5000)))
         self.auto_crop_check.setChecked(bool(s.value("auto_crop_borders", False)))
         self.border_thr_spin.setValue(int(s.value("border_threshold", 10)))
+        self.log_every_spin.setValue(float(s.value("log_interval_sec", 1.0)))
         self.lock_after_spin.setValue(int(s.value("lock_after_hits", 1)))
         self.lock_face_spin.setValue(float(s.value("lock_face_thresh", 0.28)))
         self.lock_reid_spin.setValue(float(s.value("lock_reid_thresh", 0.30)))

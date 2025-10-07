@@ -9,7 +9,10 @@ class PersonDetector:
 
     def detect(self, frame, conf=0.35):
         # Returns list of dicts: {xyxy: [x1,y1,x2,y2], conf: float, cls: int}
-        res = self.model.predict(frame, device=self.device, conf=conf, verbose=False)[0]
+        try:
+            res = self.model.predict(frame, device=self.device, conf=conf, iou=0.45, classes=0, verbose=False)[0]
+        except Exception:
+            return []
         out = []
         for b in res.boxes:
             cls_id = int(b.cls[0].item())
