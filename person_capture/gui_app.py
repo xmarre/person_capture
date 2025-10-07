@@ -81,7 +81,6 @@ class SessionConfig:
     preview_every: int = 30         # emit preview every N processed frames
 
     def to_json(self) -> str:
-(self) -> str:
         return json.dumps(asdict(self), indent=2)
 
     @staticmethod
@@ -92,7 +91,6 @@ class SessionConfig:
             if hasattr(c, k):
                 setattr(c, k, v)
         return c
-
 
 # ---------------------- Worker Thread ----------------------
 
