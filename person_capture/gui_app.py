@@ -63,6 +63,16 @@ class SessionConfig:
     min_box_pixels: int = 5000
     auto_crop_borders: bool = True
     border_threshold: int = 10
+    lock_after_hits: int = 1
+    lock_face_thresh: float = 0.28
+    lock_reid_thresh: float = 0.30
+    score_margin: float = 0.03
+    iou_gate: float = 0.05
+    reid_backbone: str = "ViT-L-14"
+    reid_pretrained: str = "laion2b_s32b_b82k"
+    clip_face_backbone: str = "ViT-L-14"
+    clip_face_pretrained: str = "laion2b_s32b_b82k"
+    use_arcface: bool = True
     device: str = "cuda"            # cuda | cpu
     yolo_model: str = "yolov8n.pt"
     face_model: str = "yolov8n-face.pt"
@@ -95,6 +105,17 @@ class Processor(QtCore.QObject):
         from utils import detect_black_borders
         x1,y1,x2,y2 = detect_black_borders(frame, thr=int(thr))
         return frame[y1:y2, x1:x2], (x1,y1)
+
+    def _iou(self, a, b):
+        ax1,ay1,ax2,ay2 = a; bx1,by1,bx2,by2 = b
+        inter_x1, inter_y1 = max(ax1,bx1), max(ay1,by1)
+        inter_x2, inter_y2 = min(ax2,bx2), min(ay2,by2)
+        iw, ih = max(0, inter_x2-inter_x1), max(0, inter_y2-inter_y1)
+        inter = iw*ih
+        a_area = max(0, (ax2-ax1)*(ay2-ay1))
+        b_area = max(0, (bx2-bx1)*(by2-by1))
+        union = a_area + b_area - inter + 1e-9
+        return inter/union
 
     def _expand_to_ratio(self, box, ratio_w, ratio_h, frame_w, frame_h, anchor=None):
         from utils import expand_box_to_ratio
@@ -161,8 +182,8 @@ class Processor(QtCore.QObject):
 
             self.status.emit("Loading models...")
             det = PersonDetector(model_name=cfg.yolo_model, device=cfg.device)
-            face = FaceEmbedder(ctx=cfg.device, yolo_model=cfg.face_model)
-            reid = ReIDEmbedder(device=cfg.device)
+            face = FaceEmbedder(ctx=cfg.device, yolo_model=cfg.face_model, use_arcface=cfg.use_arcface, clip_model_name=cfg.clip_face_backbone, clip_pretrained=cfg.clip_face_pretrained)
+            reid = ReIDEmbedder(device=cfg.device, model_name=cfg.reid_backbone, pretrained=cfg.reid_pretrained)
 
             # Reference
             self.status.emit("Preparing reference features...")
@@ -200,6 +221,10 @@ class Processor(QtCore.QObject):
             writer.writerow(["frame","time_secs","score","face_dist","reid_dist","x1","y1","x2","y2","crop_path","sharpness"])
 
             hit_count = 0
+            lock_hits = 0
+            locked_face = None
+            locked_reid = None
+            prev_box = None
             frame_idx = 0
             last_preview_emit = -999999
 
@@ -309,17 +334,24 @@ class Processor(QtCore.QObject):
                     # Map to original frame coords for annotation
                     ox1, oy1, ox2, oy2 = ex1+off_x, ey1+off_y, ex2+off_x, ey2+off_y
                     area = (ox2-ox1)*(oy2-oy1)
-                    candidates.append(dict(score=score, fd=fd, rd=rd, sharp=sharp, box=(ox1,oy1,ox2,oy2), area=area, show_box=(x1+off_x,y1+off_y,x2+off_x,y2+off_y)))
+                    candidates.append(dict(score=score, fd=fd, rd=rd, sharp=sharp, box=(ox1,oy1,ox2,oy2), area=area, show_box=(x1+off_x,y1+off_y,x2+off_x,y2+off_y), face_feat=(bf["feat"] if bf is not None else None), reid_feat=(reid_feats[i] if i < len(reid_feats) else None)))
 
-                # Choose best and save with cadence
+                # Choose best and save with cadence + lock + margin + IoU gate
                 def save_hit(c):
-                    nonlocal hit_count
+                    nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box
                     crop_img_path = os.path.join(crops_dir, f"f{frame_idx:08d}.jpg")
                     cx1,cy1,cx2,cy2 = c["box"]
                     crop_img2 = frame[cy1:cy2, cx1:cx2]
                     cv2.imwrite(crop_img_path, crop_img2)
                     writer.writerow([frame_idx, frame_idx/float(fps), c["score"], c["fd"], c["rd"], cx1, cy1, cx2, cy2, crop_img_path, c["sharp"]])
                     self.hit.emit(crop_img_path)
+                    # update lock source
+                    if c.get("face_feat") is not None:
+                        locked_face = c["face_feat"]
+                    if c.get("reid_feat") is not None:
+                        locked_reid = c["reid_feat"]
+                    lock_hits += 1
+                    prev_box = (cx1,cy1,cx2,cy2)
                     return True
 
                 # initialize cadence tracking
@@ -327,22 +359,46 @@ class Processor(QtCore.QObject):
                     self._last_hit_t = -1e9
 
                 if candidates:
-                    # sort by score asc then area desc
-                    candidates.sort(key=lambda d: (d["score"] if d["score"] is not None else 1e9, -d["area"]))
+                    # Lock-aware scoring
+                    def eff_score(c):
+                        s = c["score"] if c["score"] is not None else 1e9
+                        # prefer higher sharpness slightly
+                        return (s, -c["area"], -c["sharp"]) 
+
+                    candidates.sort(key=lambda d: eff_score(d))
+
+                    # Disambiguation margin vs #2
+                    if len(candidates) >= 2 and candidates[0]["score"] is not None and candidates[1]["score"] is not None:
+                        if abs(candidates[0]["score"] - candidates[1]["score"]) < float(cfg.score_margin):
+                            candidates = [c for c in candidates if c is candidates[0]]  # keep best only
+
                     now_t = frame_idx/float(fps)
-                    if cfg.only_best:
-                        c = candidates[0]
-                        if now_t - self._last_hit_t >= float(cfg.min_gap_sec):
-                            if save_hit(c):
-                                hit_count += 1
-                                self._last_hit_t = now_t
-                    else:
-                        for c in candidates:
-                            now_t = frame_idx/float(fps)
-                            if now_t - self._last_hit_t >= float(cfg.min_gap_sec):
-                                if save_hit(c):
-                                    hit_count += 1
-                                    self._last_hit_t = now_t
+
+                    # Lock logic: after N hits tighten thresholds and require IoU gate
+                    use_lock = lock_hits >= int(cfg.lock_after_hits) and (locked_face is not None or locked_reid is not None)
+                    chosen = None
+                    for c in candidates:
+                        if use_lock:
+                            ok = True
+                            if locked_face is not None and c.get("fd") is not None:
+                                ok = ok and (c["fd"] <= float(cfg.lock_face_thresh))
+                            if locked_reid is not None and c.get("rd") is not None:
+                                ok = ok and (c["rd"] <= float(cfg.lock_reid_thresh))
+                            if prev_box is not None:
+                                if self._iou(prev_box, c["box"]) < float(cfg.iou_gate):
+                                    ok = False
+                            if not ok:
+                                continue
+                        chosen = c
+                        break
+
+                    if chosen is None and candidates:
+                        chosen = candidates[0]
+
+                    if chosen is not None and now_t - self._last_hit_t >= float(cfg.min_gap_sec):
+                        if save_hit(chosen):
+                            hit_count += 1
+                            self._last_hit_t = now_t
 
                 # Annotated preview
                 if cfg.save_annot or (cfg.preview_every > 0 and (frame_idx - last_preview_emit) >= int(cfg.preview_every)):
@@ -442,6 +498,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.auto_crop_check = QtWidgets.QCheckBox("Auto‑crop black borders")
         self.auto_crop_check.setChecked(True)
         self.border_thr_spin = QtWidgets.QSpinBox(); self.border_thr_spin.setRange(0, 50); self.border_thr_spin.setValue(10)
+        self.lock_after_spin = QtWidgets.QSpinBox(); self.lock_after_spin.setRange(0, 10); self.lock_after_spin.setValue(1)
+        self.lock_face_spin = QtWidgets.QDoubleSpinBox(); self.lock_face_spin.setDecimals(3); self.lock_face_spin.setRange(0.0, 2.0); self.lock_face_spin.setValue(0.28)
+        self.lock_reid_spin = QtWidgets.QDoubleSpinBox(); self.lock_reid_spin.setDecimals(3); self.lock_reid_spin.setRange(0.0, 2.0); self.lock_reid_spin.setValue(0.30)
+        self.margin_spin = QtWidgets.QDoubleSpinBox(); self.margin_spin.setDecimals(3); self.margin_spin.setRange(0.0, 1.0); self.margin_spin.setValue(0.03)
+        self.iou_gate_spin = QtWidgets.QDoubleSpinBox(); self.iou_gate_spin.setDecimals(3); self.iou_gate_spin.setRange(0.0, 1.0); self.iou_gate_spin.setValue(0.05)
+        self.use_arc_check = QtWidgets.QCheckBox("Use ArcFace for face ID")
+        self.use_arc_check.setChecked(True)
         self.device_combo = QtWidgets.QComboBox(); self.device_combo.addItems(["cuda","cpu"])
         self.yolo_edit = QtWidgets.QLineEdit("yolov8n.pt")
         self.face_yolo_edit = QtWidgets.QLineEdit("yolov8n-face.pt")
@@ -462,6 +525,12 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Min box area (px)", self.min_box_pix_spin),
             ("Auto‑crop black borders", self.auto_crop_check),
             ("Border threshold", self.border_thr_spin),
+            ("Lock after N hits", self.lock_after_spin),
+            ("Lock face dist ≤", self.lock_face_spin),
+            ("Lock reid dist ≤", self.lock_reid_spin),
+            ("Score margin vs #2", self.margin_spin),
+            ("IoU gate", self.iou_gate_spin),
+            ("Face ID backend", self.use_arc_check),
             ("Device", self.device_combo),
             ("YOLO model", self.yolo_edit),
             ("Face YOLO model", self.face_yolo_edit),
@@ -627,6 +696,12 @@ class MainWindow(QtWidgets.QMainWindow):
             min_box_pixels=int(self.min_box_pix_spin.value()),
             auto_crop_borders=bool(self.auto_crop_check.isChecked()),
             border_threshold=int(self.border_thr_spin.value()),
+            lock_after_hits=int(self.lock_after_spin.value()),
+            lock_face_thresh=float(self.lock_face_spin.value()),
+            lock_reid_thresh=float(self.lock_reid_spin.value()),
+            score_margin=float(self.margin_spin.value()),
+            iou_gate=float(self.iou_gate_spin.value()),
+            use_arcface=bool(self.use_arc_check.isChecked()),
             device=self.device_combo.currentText(),
             yolo_model=self.yolo_edit.text().strip() or "yolov8n.pt",
             face_model=self.face_yolo_edit.text().strip() or "yolov8n-face.pt",
@@ -652,6 +727,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.min_box_pix_spin.setValue(cfg.min_box_pixels)
         self.auto_crop_check.setChecked(cfg.auto_crop_borders)
         self.border_thr_spin.setValue(cfg.border_threshold)
+        self.lock_after_spin.setValue(cfg.lock_after_hits)
+        self.lock_face_spin.setValue(cfg.lock_face_thresh)
+        self.lock_reid_spin.setValue(cfg.lock_reid_thresh)
+        self.margin_spin.setValue(cfg.score_margin)
+        self.iou_gate_spin.setValue(cfg.iou_gate)
+        self.use_arc_check.setChecked(cfg.use_arcface)
         self.device_combo.setCurrentText(cfg.device)
         self.yolo_edit.setText(cfg.yolo_model)
         self.face_yolo_edit.setText(cfg.face_model)
@@ -772,6 +853,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.min_box_pix_spin.setValue(int(s.value("min_box_pixels", 5000)))
         self.auto_crop_check.setChecked(bool(s.value("auto_crop_borders", True)))
         self.border_thr_spin.setValue(int(s.value("border_threshold", 10)))
+        self.lock_after_spin.setValue(int(s.value("lock_after_hits", 1)))
+        self.lock_face_spin.setValue(float(s.value("lock_face_thresh", 0.28)))
+        self.lock_reid_spin.setValue(float(s.value("lock_reid_thresh", 0.30)))
+        self.margin_spin.setValue(float(s.value("score_margin", 0.03)))
+        self.iou_gate_spin.setValue(float(s.value("iou_gate", 0.05)))
+        self.use_arc_check.setChecked(bool(s.value("use_arcface", True)))
         self.device_combo.setCurrentText(s.value("device", "cuda"))
         self.yolo_edit.setText(s.value("yolo_model", "yolov8n.pt"))
         self.face_yolo_edit.setText(s.value("face_model", "yolov8n-face.pt"))
