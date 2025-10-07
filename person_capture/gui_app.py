@@ -552,7 +552,6 @@ class Processor(QtCore.QObject):
                         face_dists_quality.append(fd_tmp)
                     if fd_tmp <= float(cfg.face_thresh):
                         any_face_match = True
-                any_face_match_qual = any((d <= float(cfg.face_thresh)) for d in face_dists_quality)
                 best_face_dist = min(face_dists_quality) if face_dists_quality else None
                 if min_fd_all is None and face_dists_all:
                     min_fd_all = min(face_dists_all)
@@ -610,7 +609,7 @@ class Processor(QtCore.QObject):
 
                     if (
                         getattr(cfg, "drop_reid_if_any_face_match", True)
-                        and (any_face_match_qual if 'any_face_match_qual' in locals() else any_face_match)
+                        and any_face_match
                         and not face_ok
                         and accept
                     ):
@@ -619,24 +618,19 @@ class Processor(QtCore.QObject):
 
                     accept_before_face_policy = accept
 
-                    # Face-first policy: candidate-level strict gate
+                    # Face-first policy: hard gate only when requested and reference face exists
                     if (
                         cfg.require_face_if_visible
-                        and any_face_detected
+                        and any_face_visible
                         and (ref_face_feat is not None)
                     ):
-                        if bf is None:
-                            # Allow ReID only when no quality‑passing face elsewhere matches.
-                            if not (reid_ok and not (any_face_match_qual if 'any_face_match_qual' in locals() else any_face_match)):
-                                accept = False
-                                cand_reason.append("gate_no_cand_face")
-                        else:
-                            if not face_ok:
-                                fd_tol = float(cfg.face_thresh) + float(cfg.score_margin)
-                                reid_escape = (reid_ok and rd is not None and rd <= max(0.0, float(cfg.reid_thresh) - float(cfg.score_margin)) and (fd is None or fd <= fd_tol))
-                                if not reid_escape:
-                                    accept = False
-                                    cand_reason.append("gate_face_present_no_escape")
+                        if (
+                            bf is None
+                            or bf.get('quality', 0.0) < float(cfg.face_quality_min)
+                            or not face_ok
+                        ):
+                            accept = False
+                            cand_reason.append("hard_gate_face_required")
                     elif cfg.prefer_face_when_available and any_face_visible and (bf is None):
                         cand_reason.append("soft_pref_face_missing")
 
@@ -944,7 +938,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(APP_NAME)
         # Toolbar
         self.toolbar = self.addToolBar("Main")
-        self.toolbar.setObjectName("Main")
         self.toolbar.setMovable(True)
         self.act_start = QtGui.QAction("Start", self); self.act_start.triggered.connect(self.on_start)
         self.act_pause = QtGui.QAction("Pause", self); self.act_pause.triggered.connect(self.on_pause)
@@ -1044,12 +1037,12 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Aspect ratio W:H", self.ratio_edit),
             ("Frame stride", self.stride_spin),
             ("YOLO min conf", self.det_conf_spin),
-            ("Face max dist (face_thresh)", self.face_thr_spin),
+            ("Face max dist", self.face_thr_spin),
             ("Face detector conf", self.face_det_conf_spin),
             ("Face detector pad", self.face_det_pad_spin),
             ("Face quality min", self.face_quality_spin),
             ("Face visible uses quality", self.face_vis_quality_check),
-            ("ReID max dist (reid_thresh)", self.reid_thr_spin),
+            ("ReID max dist", self.reid_thr_spin),
             ("Combine", self.combine_combo),
             ("Match mode", self.match_mode_combo),
             ("Only best", self.only_best_check),
@@ -1643,17 +1636,6 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         self._save_qsettings()
-        try:
-            if getattr(self, "_worker", None):
-                try:
-                    self._worker.request_abort()
-                except Exception:
-                    pass
-            if getattr(self, "_thread", None) and self._thread.isRunning():
-                self._thread.quit()
-                self._thread.wait(5000)
-        except Exception:
-            pass
         return super().closeEvent(e)
 
     def _load_qsettings(self):
