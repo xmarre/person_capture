@@ -14,10 +14,13 @@ class ReIDEmbedder:
 
     def __init__(self, device: str = 'cuda',
                  model_name: str = 'ViT-L-14',
-                 pretrained: str = 'laion2b_s32b_b82k'):
+                 pretrained: str = 'laion2b_s32b_b82k',
+                 progress=None):
         use_cuda = device == 'cuda' and torch.cuda.is_available()
         self.device = 'cuda' if use_cuda else 'cpu'
+        if False and progress: progress(f"Preparing ReID OpenCLIP {model_name} {pretrained} (will download if missing)...")
         self.model, _, self.preprocess = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
+        pass
         self.model.eval().to(self.device)
 
     def extract(self, bgr_list):

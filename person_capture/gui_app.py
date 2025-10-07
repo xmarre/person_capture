@@ -53,15 +53,15 @@ class SessionConfig:
     ratio: str = "2:3"
     frame_stride: int = 2
     min_det_conf: float = 0.35
-    face_thresh: float = 0.30
-    reid_thresh: float = 0.35
+    face_thresh: float = 0.36
+    reid_thresh: float = 0.42
     combine: str = "min"            # min | avg | face_priority
-    match_mode: str = "either"      # either | both | face_only | reid_only
+    match_mode: str = "both"      # either | both | face_only | reid_only
     only_best: bool = True
-    min_sharpness: float = 120.0
+    min_sharpness: float = 160.0
     min_gap_sec: float = 1.5
-    min_box_pixels: int = 5000
-    auto_crop_borders: bool = True
+    min_box_pixels: int = 8000
+    auto_crop_borders: bool = False
     border_threshold: int = 10
     lock_after_hits: int = 1
     lock_face_thresh: float = 0.28
@@ -182,8 +182,8 @@ class Processor(QtCore.QObject):
 
             self.status.emit("Loading models...")
             det = PersonDetector(model_name=cfg.yolo_model, device=cfg.device)
-            face = FaceEmbedder(ctx=cfg.device, yolo_model=cfg.face_model, use_arcface=cfg.use_arcface, clip_model_name=cfg.clip_face_backbone, clip_pretrained=cfg.clip_face_pretrained)
-            reid = ReIDEmbedder(device=cfg.device, model_name=cfg.reid_backbone, pretrained=cfg.reid_pretrained)
+            face = FaceEmbedder(ctx=cfg.device, yolo_model=cfg.face_model, use_arcface=cfg.use_arcface, clip_model_name=cfg.clip_face_backbone, clip_pretrained=cfg.clip_face_pretrained, progress=self.status.emit)
+            reid = ReIDEmbedder(device=cfg.device, model_name=cfg.reid_backbone, pretrained=cfg.reid_pretrained, progress=self.status.emit)
 
             # Reference
             self.status.emit("Preparing reference features...")
@@ -260,7 +260,15 @@ class Processor(QtCore.QObject):
                     H2, W2 = H, W
 
                 persons = det.detect(frame_for_det, conf=float(cfg.min_det_conf))
+                if not persons and cfg.auto_crop_borders:
+                    # Fallback to full frame if border-cropped frame yields nothing
+                    persons = det.detect(frame, conf=float(cfg.min_det_conf))
+                    frame_for_det = frame
+                    off_x, off_y = 0, 0
+                    H2, W2 = H, W
+                    self.status.emit("Border-crop yielded no detections. Fallback to full frame.")
                 candidates = []
+                diag_persons = len(persons)
                 crops = []
                 boxes = []
                 faces_local = {}
@@ -358,7 +366,9 @@ class Processor(QtCore.QObject):
                 if not hasattr(self, "_last_hit_t"):
                     self._last_hit_t = -1e9
 
-                if candidates:
+                if not candidates:
+                    self.status.emit(f"No match. persons={diag_persons}")
+                else:
                     # Lock-aware scoring
                     def eff_score(c):
                         s = c["score"] if c["score"] is not None else 1e9
@@ -846,12 +856,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.face_thr_spin.setValue(float(s.value("face_thresh", 0.32)))
         self.reid_thr_spin.setValue(float(s.value("reid_thresh", 0.38)))
         self.combine_combo.setCurrentText(s.value("combine", "min"))
-        self.match_mode_combo.setCurrentText(s.value("match_mode", "either"))
+        self.match_mode_combo.setCurrentText(s.value("match_mode", "both"))
         self.only_best_check.setChecked(bool(s.value("only_best", True)))
         self.min_sharp_spin.setValue(float(s.value("min_sharpness", 120.0)))
         self.min_gap_spin.setValue(float(s.value("min_gap_sec", 1.5)))
         self.min_box_pix_spin.setValue(int(s.value("min_box_pixels", 5000)))
-        self.auto_crop_check.setChecked(bool(s.value("auto_crop_borders", True)))
+        self.auto_crop_check.setChecked(bool(s.value("auto_crop_borders", False)))
         self.border_thr_spin.setValue(int(s.value("border_threshold", 10)))
         self.lock_after_spin.setValue(int(s.value("lock_after_hits", 1)))
         self.lock_face_spin.setValue(float(s.value("lock_face_thresh", 0.28)))
@@ -873,6 +883,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 def main():
+    # Suppress noisy HF hub warnings in GUI
+    import os, logging
+    os.environ.setdefault('HF_HUB_DISABLE_TELEMETRY', '1')
+    try:
+        import huggingface_hub
+        logging.getLogger('huggingface_hub').setLevel(logging.ERROR)
+        logging.getLogger('huggingface_hub.file_download').setLevel(logging.ERROR)
+    except Exception:
+        pass
     QtCore.QCoreApplication.setOrganizationName(APP_ORG)
     QtCore.QCoreApplication.setApplicationName(APP_NAME)
     app = QtWidgets.QApplication(sys.argv)

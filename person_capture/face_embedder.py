@@ -35,7 +35,7 @@ ARCFACE_URLS = [
     "https://huggingface.co/MonsterMMORPG/Arcface/resolve/main/arcface_r100.onnx",
 ]
 
-def _ensure_file(path: str, urls) -> str:
+def _ensure_file(path: str, urls, progress=None) -> str:
     p = Path(path)
     if p.exists():
         return str(p.resolve())
@@ -44,10 +44,23 @@ def _ensure_file(path: str, urls) -> str:
     last_err = None
     for url in urls:
         try:
-            with urlopen(url, timeout=45) as r, tempfile.NamedTemporaryFile(delete=False) as tmp:
-                tmp.write(r.read())
+            if progress: progress(f"Downloading: {url}")
+            with urlopen(url, timeout=45) as r:
+                total = int(r.headers.get('Content-Length') or 0)
+                tmp = tempfile.NamedTemporaryFile(delete=False)
+                downloaded = 0
+                while True:
+                    chunk = r.read(1024*1024)
+                    if not chunk:
+                        break
+                    tmp.write(chunk)
+                    downloaded += len(chunk)
+                    if progress and total:
+                        progress(f"Downloading: {url}  {downloaded/total*100:.1f}%")
+                tmp.close()
                 tmp_path = Path(tmp.name)
             shutil.move(str(tmp_path), str(p))
+            if progress: progress(f"Saved: {p}")
             return str(p.resolve())
         except (URLError, HTTPError, TimeoutError, OSError) as e:
             last_err = e
@@ -64,11 +77,12 @@ class FaceEmbedder:
     def __init__(self, ctx: str = 'cuda', yolo_model: str = Y8F_DEFAULT, conf: float = 0.30,
                  use_arcface: bool = True,
                  clip_model_name: str = 'ViT-L-14',
-                 clip_pretrained: str = 'laion2b_s32b_b82k'):
+                 clip_pretrained: str = 'laion2b_s32b_b82k',
+                 progress=None):
         # Auto-download face detector weights if a bare filename is given
         yolo_path = yolo_model
         if not os.path.isabs(yolo_path) and os.path.basename(yolo_path).startswith("yolov8") and yolo_path.endswith(".pt"):
-            yolo_path = _ensure_file(yolo_path, Y8F_URLS)
+            yolo_path = _ensure_file(yolo_path, Y8F_URLS, progress=progress)
 
         self.det = YOLO(yolo_path)
         self.device = 'cuda' if (ctx.startswith('cuda') and torch.cuda.is_available()) else 'cpu'
@@ -78,7 +92,7 @@ class FaceEmbedder:
         self.backend = None
         if self.use_arcface and ort is not None:
             try:
-                onnx_path = _ensure_file(ARCFACE_ONNX, ARCFACE_URLS)
+                onnx_path = _ensure_file(ARCFACE_ONNX, ARCFACE_URLS, progress=progress)
                 providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if self.device == 'cuda' else ['CPUExecutionProvider']
                 self.arc_sess = ort.InferenceSession(onnx_path, providers=providers)
                 self.arc_input = self.arc_sess.get_inputs()[0].name
@@ -87,9 +101,11 @@ class FaceEmbedder:
                 # Fallback to CLIP
                 self.use_arcface = False
         if not self.use_arcface or self.backend is None:
+            if False and progress: progress(f"Preparing OpenCLIP {clip_model_name} {clip_pretrained} (will download if missing)...")
             self.model, _, self.preprocess = open_clip.create_model_and_transforms(clip_model_name, pretrained=clip_pretrained)
             self.model.eval().to(self.device)
             self.backend = 'clip'
+            pass
 
     def _face_quality(self, bgr):
         g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
