@@ -58,7 +58,7 @@ class SessionConfig:
     face_thresh: float = 0.36
     reid_thresh: float = 0.42
     combine: str = "min"            # min | avg | face_priority
-    match_mode: str = "either"      # either | both | face_only | reid_only
+    match_mode: str = "both"        # either | both | face_only | reid_only
     only_best: bool = True
     min_sharpness: float = 160.0
     min_gap_sec: float = 1.5
@@ -703,7 +703,18 @@ class Processor(QtCore.QObject):
                             cx1 += dx; cx2 = cx1 + new_w
                     crop_img2 = frame[cy1:cy2, cx1:cx2]
                     cv2.imwrite(crop_img_path, crop_img2)
-                    writer.writerow([idx, idx/float(fps), c["score"], c["fd"], c["rd"], cx1, cy1, cx2, cy2, crop_img_path, c["sharp"], c.get("ratio", "")])
+                    writer.writerow([idx, idx/float(fps), c.get("score"), c.get("fd"), c.get("rd"), cx1, cy1, cx2, cy2, crop_img_path, c.get("sharp"), c.get("ratio", "")])
+                    reasons_list = c.get("reasons") or []
+                    reasons = "|".join(reasons_list)
+                    area = (cx2 - cx1) * (cy2 - cy1)
+                    self._status(
+                        (
+                            f"CAPTURE idx={idx} t={idx/float(fps):.2f} "
+                            f"fd={c.get('fd')} rd={c.get('rd')} score={c.get('score')} "
+                            f"area={area} reasons={reasons}"
+                        ),
+                        key="cap",
+                    )
                     self.hit.emit(crop_img_path)
                     # update lock source
                     if c.get("face_feat") is not None:
