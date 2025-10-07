@@ -88,6 +88,7 @@ class SessionConfig:
     face_det_pad: float = 0.08                  # expand person box before face detect (fraction of w/h)
     face_margin_min: float = 0.05
     require_face_if_visible: bool = True
+    drop_reid_if_any_face_match: bool = True
     # Debug/diagnostics
     debug_dump: bool = True
     debug_dir: str = "debug"
@@ -519,12 +520,23 @@ class Processor(QtCore.QObject):
                                 fd_all,
                             )
                         )
-                    bestf = FaceEmbedder.best_face(ffaces)
+                    if ref_face_feat is not None and ffaces:
+                        faces_with_feat = [f for f in ffaces if f.get("feat") is not None]
+                        if faces_with_feat:
+                            bestf = min(
+                                faces_with_feat,
+                                key=lambda f: 1.0 - float(np.dot(f["feat"], ref_face_feat)),
+                            )
+                        else:
+                            bestf = FaceEmbedder.best_face(ffaces)
+                    else:
+                        bestf = FaceEmbedder.best_face(ffaces)
                     faces_local[i] = bestf
                     if bestf is not None and bestf.get("quality", 0.0) >= float(cfg.face_quality_min):
                         faces_passing_quality += 1
 
                 any_face_detected = faces_detected > 0
+                any_face_match = False
                 any_face_visible = (
                     faces_passing_quality > 0 if bool(cfg.face_visible_uses_quality) else any_face_detected
                 )
@@ -538,6 +550,8 @@ class Processor(QtCore.QObject):
                     face_dists_all.append(fd_tmp)
                     if bf.get("quality", 0.0) >= float(cfg.face_quality_min):
                         face_dists_quality.append(fd_tmp)
+                    if fd_tmp <= float(cfg.face_thresh):
+                        any_face_match = True
                 best_face_dist = min(face_dists_quality) if face_dists_quality else None
                 if min_fd_all is None and face_dists_all:
                     min_fd_all = min(face_dists_all)
@@ -592,6 +606,15 @@ class Processor(QtCore.QObject):
                         accept = reid_ok
                     else:
                         accept = face_ok or reid_ok
+
+                    if (
+                        getattr(cfg, "drop_reid_if_any_face_match", True)
+                        and any_face_match
+                        and not face_ok
+                        and accept
+                    ):
+                        accept = False
+                        cand_reason.append("drop_reid_due_to_face_match_present")
 
                     accept_before_face_policy = accept
 
