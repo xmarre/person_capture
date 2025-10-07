@@ -1,0 +1,42 @@
+@'
+# Visual Studio
+.vs/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+*.user
+*.suo
+*.rsuser
+*.psess
+*.vsp
+*.vspx
+*.coverage
+*.coveragexml
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.dylib
+
+# Virtual environments
+env/
+.venv/
+ENV/
+venv/
+venv*/
+
+# Project outputs
+out/
+out/**
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# OS/editor
+Thumbs.db
+.DS_Store
+'@ | Set-Content -Encoding utf8 .gitignore
