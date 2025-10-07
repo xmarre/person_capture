@@ -46,3 +46,4 @@ Thumbs.db
 /yolov8n-face.pt
 /preset_face_strict.json
 /preset_face_balanced.json
+/yolov8x.pt
