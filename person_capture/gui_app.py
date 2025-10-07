@@ -722,14 +722,14 @@ class MainWindow(QtWidgets.QMainWindow):
         prev_layout = QtWidgets.QVBoxLayout(prev_group)
         self.preview_label = QtWidgets.QLabel()
         self.preview_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.preview_label.setMinimumHeight(300)
+        self.preview_label.setMinimumHeight(1)
         prev_layout.addWidget(self.preview_label)
         # Last hit
         hit_group = QtWidgets.QGroupBox("Last saved crop")
         hit_layout = QtWidgets.QVBoxLayout(hit_group)
         self.hit_label = QtWidgets.QLabel()
         self.hit_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.hit_label.setMinimumHeight(300)
+        self.hit_label.setMinimumHeight(1)
         hit_layout.addWidget(self.hit_label)
         mid_split.addWidget(prev_group)
         mid_split.addWidget(hit_group)
@@ -740,9 +740,10 @@ class MainWindow(QtWidgets.QMainWindow):
         log_layout = QtWidgets.QVBoxLayout(log_group)
         self.log_edit = QtWidgets.QPlainTextEdit()
         self.log_edit.setReadOnly(True)
+        self.log_edit.setMinimumHeight(60)
         log_layout.addWidget(self.log_edit)
 
-        # Assemble with vertical splitter for adjustable console
+        # Assemble with vertical splitter for adjustable console and scrollable top content
         upper = QtWidgets.QWidget()
         upper_layout = QtWidgets.QVBoxLayout(upper)
         upper_layout.setContentsMargins(0,0,0,0)
@@ -752,10 +753,15 @@ class MainWindow(QtWidgets.QMainWindow):
         upper_layout.addLayout(prog_layout)
         upper_layout.addWidget(mid_split, 1)
 
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidget(upper)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+
         self.vsplit = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        self.vsplit.addWidget(upper)
+        self.vsplit.addWidget(scroll)
         self.vsplit.addWidget(log_group)
-        self.vsplit.setSizes([700, 200])
+        self.vsplit.setSizes([900, 160])
         self.vsplit.setChildrenCollapsible(False)
         root.addWidget(self.vsplit, 1)
 
