@@ -39,6 +39,7 @@ PersonDetector, FaceEmbedder, ReIDEmbedder, ensure_dir, parse_ratio, expand_box_
 import cv2
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtWidgets import QDockWidget
 
 APP_ORG = "PersonCapture"
 APP_NAME = "PersonCapture GUI"
@@ -581,20 +582,35 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(1200, 800)
+        # Toolbar
+        self.toolbar = self.addToolBar("Main")
+        self.toolbar.setMovable(True)
+        self.act_start = QtGui.QAction("Start", self); self.act_start.triggered.connect(self.on_start)
+        self.act_pause = QtGui.QAction("Pause", self); self.act_pause.triggered.connect(self.on_pause)
+        self.act_stop = QtGui.QAction("Stop", self); self.act_stop.triggered.connect(self.on_stop)
+        self.act_compact = QtGui.QAction("Compact", self); self.act_compact.setCheckable(True); self.act_compact.toggled.connect(self.toggle_compact_mode)
+        self.act_reset_layout = QtGui.QAction("Reset layout", self); self.act_reset_layout.triggered.connect(self.reset_layout)
+        self.toolbar.addActions([self.act_start, self.act_pause, self.act_stop, self.act_compact, self.act_reset_layout])
         self._thread: Optional[QtCore.QThread] = None
         self._worker: Optional[Processor] = None
 
         self.cfg = SessionConfig()
         self._build_ui()
         self._load_qsettings()
+        self.statusbar = self.statusBar()
+        self.statusbar.showMessage("Ready")
+        self.safe_fit_window()
+        self._install_filter()
+        try:
+            s = QtCore.QSettings(APP_ORG, APP_NAME)
+            st = s.value("dock_state", None)
+            if st is not None:
+                self.restoreState(st)
+        except Exception:
+            pass
 
     # UI Construction
     def _build_ui(self):
-        central = QtWidgets.QWidget(self)
-        self.setCentralWidget(central)
-        root = QtWidgets.QVBoxLayout(central)
-
         # Top: file pickers
         file_group = QtWidgets.QGroupBox("Inputs / Outputs")
         file_layout = QtWidgets.QGridLayout(file_group)
@@ -743,27 +759,49 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log_edit.setMinimumHeight(60)
         log_layout.addWidget(self.log_edit)
 
-        # Assemble with vertical splitter for adjustable console and scrollable top content
-        upper = QtWidgets.QWidget()
-        upper_layout = QtWidgets.QVBoxLayout(upper)
-        upper_layout.setContentsMargins(0,0,0,0)
-        upper_layout.addWidget(file_group)
-        upper_layout.addWidget(param_group)
-        upper_layout.addLayout(ctrl_layout)
-        upper_layout.addLayout(prog_layout)
-        upper_layout.addWidget(mid_split, 1)
+        # ---------- Dockable UI ----------
+        # Left dock: controls (scrollable, tabs + search)
+        controls_container = QtWidgets.QWidget()
+        controls_layout = QtWidgets.QVBoxLayout(controls_container); controls_layout.setContentsMargins(6, 6, 6, 6)
+        self.search_edit = QtWidgets.QLineEdit(); self.search_edit.setPlaceholderText("Filter settings…")
+        controls_layout.addWidget(self.search_edit)
+        self.tabs = QtWidgets.QTabWidget()
+        tab_files = QtWidgets.QWidget(); tab_files_l = QtWidgets.QVBoxLayout(tab_files); tab_files_l.setContentsMargins(0, 0, 0, 0)
+        tab_params = QtWidgets.QWidget(); tab_params_l = QtWidgets.QVBoxLayout(tab_params); tab_params_l.setContentsMargins(0, 0, 0, 0)
+        tab_files_l.addWidget(file_group, 1); tab_files_l.addStretch(0)
+        tab_params_l.addWidget(param_group, 1); tab_params_l.addStretch(0)
+        self.tabs.addTab(tab_files, "Files")
+        self.tabs.addTab(tab_params, "Parameters")
+        controls_layout.addWidget(self.tabs, 1)
+        controls_layout.addLayout(ctrl_layout)
+        controls_layout.addLayout(prog_layout)
+        controls_scroll = QtWidgets.QScrollArea(); controls_scroll.setWidget(controls_container); controls_scroll.setWidgetResizable(True)
+        self.dock_controls = QDockWidget("Controls", self); self.dock_controls.setObjectName("dock_controls")
+        self.dock_controls.setWidget(controls_scroll)
+        self.dock_controls.setAllowedAreas(QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea)
+        self.dock_controls.setFeatures(
+            QDockWidget.DockWidgetClosable | QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable
+        )
+        self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, self.dock_controls)
 
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidget(upper)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        # Center: previews
+        center = QtWidgets.QWidget(); center_l = QtWidgets.QVBoxLayout(center); center_l.setContentsMargins(0, 0, 0, 0)
+        center_l.addWidget(mid_split, 1)
+        self.setCentralWidget(center)
 
-        self.vsplit = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        self.vsplit.addWidget(scroll)
-        self.vsplit.addWidget(log_group)
-        self.vsplit.setSizes([900, 160])
-        self.vsplit.setChildrenCollapsible(False)
-        root.addWidget(self.vsplit, 1)
+        # Bottom dock: log (resizable)
+        self.dock_log = QDockWidget("Log", self); self.dock_log.setObjectName("dock_log")
+        self.dock_log.setWidget(log_group)
+        self.dock_log.setAllowedAreas(QtCore.Qt.BottomDockWidgetArea | QtCore.Qt.TopDockWidgetArea)
+        self.dock_log.setFeatures(
+            QDockWidget.DockWidgetClosable | QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable
+        )
+        self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self.dock_log)
+
+        # Initial sizes
+        self.resize(1280, 800)
+        self.dock_controls.resize(360, 800)
+        self.dock_log.resize(1280, 180)
 
         # Menu
         self._build_menu()
@@ -794,6 +832,76 @@ class MainWindow(QtWidgets.QMainWindow):
         help_menu = bar.addMenu("&Help")
         act_about = QtGui.QAction("About", self, triggered=self._about)
         help_menu.addAction(act_about)
+
+    def safe_fit_window(self):
+        try:
+            screen = QtWidgets.QApplication.primaryScreen()
+            if screen:
+                avail = screen.availableGeometry()
+                w = min(self.width() or 1200, max(800, avail.width() - 40))
+                h = min(self.height() or 900, max(600, avail.height() - 80))
+                self.resize(w, h)
+        except Exception:
+            pass
+
+    def toggle_compact_mode(self, on: bool):
+        m = 2 if on else 6
+        try:
+            for gb in self.findChildren(QtWidgets.QGroupBox):
+                gb.setFlat(on)
+            for lay in self.findChildren(QtWidgets.QLayout):
+                if hasattr(lay, "setContentsMargins"):
+                    lay.setContentsMargins(m, m, m, m)
+        except Exception:
+            pass
+        if hasattr(self, "search_edit"):
+            self.search_edit.setVisible(not on)
+
+    def reset_layout(self):
+        try:
+            self.removeDockWidget(self.dock_controls)
+            self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, self.dock_controls)
+            self.removeDockWidget(self.dock_log)
+            self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self.dock_log)
+            self.resize(1280, 800)
+            self.dock_controls.resize(360, 800)
+            self.dock_log.resize(1280, 180)
+        except Exception:
+            pass
+
+    def _install_filter(self):
+        # Build label->row index for settings filtering
+        try:
+            self._param_rows = []
+            for gb in self.findChildren(QtWidgets.QGroupBox):
+                if "Parameters" in gb.title():
+                    layout = gb.layout()
+                    if isinstance(layout, QtWidgets.QFormLayout):
+                        for i in range(layout.rowCount()):
+                            li = layout.itemAt(i, QtWidgets.QFormLayout.LabelRole)
+                            fi = layout.itemAt(i, QtWidgets.QFormLayout.FieldRole)
+                            if li and fi and li.widget() and fi.widget():
+                                self._param_rows.append((li.widget(), fi.widget()))
+                    elif isinstance(layout, QtWidgets.QGridLayout):
+                        for i in range(layout.rowCount()):
+                            li = layout.itemAtPosition(i, 0)
+                            fi = layout.itemAtPosition(i, 1)
+                            if li and fi and li.widget() and fi.widget():
+                                self._param_rows.append((li.widget(), fi.widget()))
+            if hasattr(self, "search_edit"):
+                self.search_edit.textChanged.connect(self._apply_filter)
+        except Exception:
+            pass
+
+    def _apply_filter(self, text: str):
+        q = (text or "").strip().lower()
+        try:
+            for lbl, field in getattr(self, "_param_rows", []):
+                show = True if not q else (q in lbl.text().lower())
+                lbl.setVisible(show)
+                field.setVisible(show)
+        except Exception:
+            pass
 
     # ------------- Actions -------------
 
@@ -963,6 +1071,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._thread.start()
 
+    def on_pause(self):
+        self._pause(True)
+
     def on_stop(self):
         if not self._thread or not self._worker:
             return
@@ -1017,9 +1128,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pause_btn.setEnabled(running)
         self.resume_btn.setEnabled(running)
         self.stop_btn.setEnabled(running)
+        if hasattr(self, "act_start"):
+            self.act_start.setEnabled(not running)
+        if hasattr(self, "act_pause"):
+            self.act_pause.setEnabled(running)
+        if hasattr(self, "act_stop"):
+            self.act_stop.setEnabled(running)
 
     # Persist UI settings between runs
     def closeEvent(self, e: QtGui.QCloseEvent) -> None:
+        try:
+            s = QtCore.QSettings(APP_ORG, APP_NAME)
+            s.setValue("dock_state", self.saveState())
+        except Exception:
+            pass
         self._save_qsettings()
         return super().closeEvent(e)
 

@@ -1,0 +1,9 @@
+numpy==1.26.4
+Pillow>=10.0
+opencv-python==4.9.0.80      # optional; drop if even this is too big
+tqdm>=4.66
+pyyaml>=6.0
+# tooling (optional)
+black>=24.0
+ruff>=0.6
+mypy>=1.10

@@ -1,17 +1,30 @@
-from ultralytics import YOLO
-import torch
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover
+    import torch
+    from ultralytics import YOLO as YOLOType
 
 class PersonDetector:
     def __init__(self, model_name='yolov8n.pt', device='cuda', progress=None):
-        self.device = 'cuda' if (str(device).startswith('cuda') and torch.cuda.is_available()) else 'cpu'
+        try:
+            import torch as _torch
+            from ultralytics import YOLO as _YOLO
+        except Exception as e:  # pragma: no cover - executed only when deps missing
+            raise RuntimeError(
+                "Heavy dependencies not installed; install requirements.txt to run detection."
+            ) from e
+
+        self._torch = _torch
+        self._YOLO = _YOLO
+        self.device = 'cuda' if (str(device).startswith('cuda') and _torch.cuda.is_available()) else 'cpu'
         self.progress = progress
         self.model = self._load_model(model_name)
 
     def _load_model(self, model_name: str):
         name = str(model_name)
         try:
-            return YOLO(name)
+            return self._YOLO(name)
         except Exception as e:
             if self.progress:
                 self.progress(f"YOLO load failed ({e}). Recovering...")
@@ -28,7 +41,7 @@ class PersonDetector:
             # Derive a clean hub model name
             base = Path(name).name.lower()
             hub = base if base.startswith('yolov8') and base.endswith('.pt') else 'yolov8n.pt'
-            return YOLO(hub)
+            return self._YOLO(hub)
 
     def detect(self, frame, conf=0.35):
         """Return list of dicts for class=person only."""
