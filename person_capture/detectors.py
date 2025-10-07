@@ -1,17 +1,38 @@
 
 from ultralytics import YOLO
 import torch
+from pathlib import Path
 
 class PersonDetector:
-    def __init__(self, model_name='yolov8n.pt', device='cuda'):
-        self.model = YOLO(model_name)
-        self.device = 'cuda' if (device.startswith('cuda') and torch.cuda.is_available()) else 'cpu'
+    def __init__(self, model_name='yolov8n.pt', device='cuda', progress=None):
+        self.device = 'cuda' if (str(device).startswith('cuda') and torch.cuda.is_available()) else 'cpu'
+        self.progress = progress
+        self.model = self._load_model(model_name)
+
+    def _load_model(self, model_name: str):
+        name = str(model_name)
+        try:
+            return YOLO(name)
+        except Exception as e:
+            if self.progress:
+                self.progress(f"YOLO load failed ({e}). Recovering...")
+            # If user pointed to a local file, quarantine it and try hub name
+            try:
+                p = Path(name)
+                if p.is_file():
+                    bad = p.with_suffix(p.suffix + '.bad')
+                    p.rename(bad)
+                    if self.progress:
+                        self.progress(f\"Quarantined corrupt weights: {bad.name}\")
+            except Exception:
+                pass
+            # Derive a clean hub model name
+            base = Path(name).name.lower()
+            hub = base if base.startswith('yolov8') and base.endswith('.pt') else 'yolov8n.pt'
+            return YOLO(hub)
 
     def detect(self, frame, conf=0.35):
-        """
-        Returns list of dicts: {xyxy: [x1,y1,x2,y2], conf: float, cls: int}
-        Only class 0 (person).
-        """
+        \"\"\"Return list of dicts for class=person only.\"\"\"
         try:
             res = self.model.predict(
                 frame, device=self.device, conf=float(conf), iou=0.45, classes=[0], verbose=False
@@ -20,13 +41,11 @@ class PersonDetector:
             return []
 
         out = []
-        if getattr(res, "boxes", None) is None:
+        bxs = getattr(res, "boxes", None)
+        if bxs is None:
             return out
-
-        bxs = res.boxes
         for i in range(len(bxs)):
             xyxy = bxs.xyxy[i].tolist()
             c = float(bxs.conf[i].item()) if getattr(bxs, "conf", None) is not None else 0.0
-            cls = int(bxs.cls[i].item()) if getattr(bxs, "cls", None) is not None else 0
-            out.append({"xyxy": xyxy, "conf": c, "cls": cls})
+            out.append({"xyxy": xyxy, "conf": c, "cls": 0})
         return out
