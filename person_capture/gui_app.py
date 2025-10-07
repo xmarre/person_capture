@@ -92,6 +92,7 @@ class SessionConfig:
     debug_dump: bool = True
     debug_dir: str = "debug"
     overlay_scores: bool = True
+    overlay_face_fd: bool = True
     lock_momentum: float = 0.7
     suppress_negatives: bool = False
     neg_tolerance: float = 0.35
@@ -316,11 +317,19 @@ class Processor(QtCore.QObject):
             ref_faces = face.extract(ref_img)
             ref_face = FaceEmbedder.best_face(ref_faces)
             ref_face_feat = ref_face['feat'] if ref_face else None
-            self._status(
-                f"Ref face: {'ok' if ref_face_feat is not None else 'missing'}; backend={getattr(face, 'backend', None)}",
-                key="ref",
-                interval=60.0,
-            )
+            if ref_face_feat is not None:
+                ref_norm = float(np.linalg.norm(ref_face_feat))
+                self._status(
+                    f"Ref face: ok | ||ref||={ref_norm:.3f} backend={getattr(face, 'backend', None)}",
+                    key="ref",
+                    interval=60.0,
+                )
+            else:
+                self._status(
+                    "Ref face: missing",
+                    key="ref",
+                    interval=60.0,
+                )
 
             ref_persons = det.detect(ref_img, conf=0.1)
             if ref_persons:
@@ -463,9 +472,10 @@ class Processor(QtCore.QObject):
 
                 reid_feats = reid.extract(crops) if crops else []
 
-                face_debug_boxes = []  # [(x1,y1,x2,y2,q)]
+                face_debug_boxes = []  # [(x1,y1,x2,y2,q,fd)]
                 faces_detected = 0
                 faces_passing_quality = 0
+                min_fd_all = None
 
                 # Face features per person
                 for i, crop in enumerate(crops):
@@ -495,6 +505,10 @@ class Processor(QtCore.QObject):
                     faces_detected += len(ffaces)
                     for f in ffaces:
                         bx1, by1, bx2, by2 = [int(round(v)) for v in f["bbox"]]
+                        fd_all = None
+                        if ref_face_feat is not None and f.get("feat") is not None:
+                            fd_all = 1.0 - float(np.dot(f["feat"], ref_face_feat))
+                            min_fd_all = fd_all if min_fd_all is None else min(min_fd_all, fd_all)
                         face_debug_boxes.append(
                             (
                                 max(0, x1 + bx1 + off_x),
@@ -502,6 +516,7 @@ class Processor(QtCore.QObject):
                                 min(W - 1, x1 + bx2 + off_x),
                                 min(H - 1, y1 + by2 + off_y),
                                 float(f.get("quality", 0.0)),
+                                fd_all,
                             )
                         )
                     bestf = FaceEmbedder.best_face(ffaces)
@@ -514,16 +529,18 @@ class Processor(QtCore.QObject):
                     faces_passing_quality > 0 if bool(cfg.face_visible_uses_quality) else any_face_detected
                 )
 
-                face_dists = []
+                face_dists_all = []
+                face_dists_quality = []
                 for bf in faces_local.values():
-                    if bf is None:
+                    if bf is None or bf.get("feat") is None or ref_face_feat is None:
                         continue
-                    if bf.get("quality", 0.0) < float(cfg.face_quality_min):
-                        continue
-                    if ref_face_feat is not None:
-                        fd_tmp = 1.0 - float(np.dot(bf["feat"], ref_face_feat))
-                        face_dists.append(fd_tmp)
-                best_face_dist = min(face_dists) if face_dists else None
+                    fd_tmp = 1.0 - float(np.dot(bf["feat"], ref_face_feat))
+                    face_dists_all.append(fd_tmp)
+                    if bf.get("quality", 0.0) >= float(cfg.face_quality_min):
+                        face_dists_quality.append(fd_tmp)
+                best_face_dist = min(face_dists_quality) if face_dists_quality else None
+                if min_fd_all is None and face_dists_all:
+                    min_fd_all = min(face_dists_all)
 
                 # Evaluate candidates
                 for i, feat in enumerate(reid_feats):
@@ -681,7 +698,9 @@ class Processor(QtCore.QObject):
 
                 if not candidates:
                     self._status(
-                        f"No match. persons={diag_persons} faces={faces_detected} pass_q={faces_passing_quality} visible={any_face_visible} best_fd={best_face_dist if best_face_dist is not None else 'n/a'}",
+                        f"No match. persons={diag_persons} faces={faces_detected} pass_q={faces_passing_quality} "
+                        f"visible={any_face_visible} best_fd_qonly={best_face_dist if best_face_dist is not None else 'n/a'} "
+                        f"min_fd_all={min_fd_all if min_fd_all is not None else 'n/a'}",
                         key="no_match",
                         interval=1.0,
                     )
@@ -747,12 +766,15 @@ class Processor(QtCore.QObject):
                 # Annotated preview
                 if cfg.save_annot or preview_due:
                     show = frame.copy()
-                    for fx1, fy1, fx2, fy2, q in face_debug_boxes:
+                    for fx1, fy1, fx2, fy2, q, fd_box in face_debug_boxes:
                         color = (0, 255, 0) if q >= float(cfg.face_quality_min) else (0, 165, 255)
                         cv2.rectangle(show, (int(fx1), int(fy1)), (int(fx2), int(fy2)), color, 1)
+                        label = f"q {q:.0f}"
+                        if getattr(cfg, "overlay_face_fd", True) and fd_box is not None:
+                            label = f"{label} fd {fd_box:.2f}"
                         cv2.putText(
                             show,
-                            f"q {q:.0f}",
+                            label,
                             (int(fx1), max(0, int(fy1) - 5)),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.45,
@@ -809,6 +831,7 @@ class Processor(QtCore.QObject):
                             "faces_pass_quality": int(faces_passing_quality),
                             "any_face_detected": bool(any_face_detected),
                             "any_face_visible": bool(any_face_visible),
+                            "min_fd_all": (float(min_fd_all) if min_fd_all is not None else None),
                             "best_face_dist": (float(best_face_dist) if best_face_dist is not None else None),
                             "cfg": {
                                 "face_det_conf": float(cfg.face_det_conf),
