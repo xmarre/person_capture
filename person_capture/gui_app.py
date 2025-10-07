@@ -78,7 +78,12 @@ class SessionConfig:
     yolo_model: str = "yolov8n.pt"
     face_model: str = "yolov8n-face.pt"
     save_annot: bool = False
-    preview_every: int = 30         # emit preview every N processed frames
+    preview_every: int = 30
+    require_face_if_visible: bool = True
+    lock_momentum: float = 0.7
+    suppress_negatives: bool = False
+    neg_tolerance: float = 0.35
+    max_negatives: int = 5         # emit preview every N processed frames
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -95,6 +100,32 @@ class SessionConfig:
 # ---------------------- Worker Thread ----------------------
 
 class Processor(QtCore.QObject):
+    def _ema(self, prev, new, m):
+        if prev is None:
+            return new
+        return (m * prev + (1.0 - m) * new) if isinstance(prev, np.ndarray) else new
+
+    def _choose_best_ratio(self, det_box, ratios, frame_w, frame_h, anchor=None):
+        # Return expanded box and chosen ratio string that minimally enlarges the det box
+        (x1,y1,x2,y2) = det_box
+        det_area = max(1, (x2-x1)*(y2-y1))
+        best = None
+        best_ratio = None
+        best_factor = 1e9
+        for rs in ratios:
+            try:
+                rw, rh = parse_ratio(rs)
+            except Exception:
+                continue
+            ex1,ey1,ex2,ey2 = expand_box_to_ratio(x1,y1,x2,y2, rw, rh, frame_w, frame_h, anchor=anchor, head_bias=0.12)
+            area = max(1, (ex2-ex1)*(ey2-ey1))
+            factor = float(area)/float(det_area)
+            if factor < best_factor:
+                best_factor = factor
+                best = (ex1,ey1,ex2,ey2)
+                best_ratio = rs
+        return best, (best_ratio or (f"{int(rw)}:{int(rh)}" if 'rw' in locals() else "unk"))
+
     def _calc_sharpness(self, bgr):
         if bgr is None or bgr.size == 0:
             return 0.0
@@ -213,13 +244,15 @@ class Processor(QtCore.QObject):
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
             self.setup.emit(total_frames, float(fps))
 
-            ratio_w, ratio_h = parse_ratio(cfg.ratio)
+            ratios = [r.strip() for r in str(cfg.ratio).split(',') if r.strip()]
+            if not ratios:
+                ratios = ["2:3"]
 
             # CSV
             csv_path = os.path.join(cfg.out_dir, "index.csv")
             csv_f = open(csv_path, "w", newline="")
             writer = csv.writer(csv_f)
-            writer.writerow(["frame","time_secs","score","face_dist","reid_dist","x1","y1","x2","y2","crop_path","sharpness"])
+            writer.writerow(["frame","time_secs","score","face_dist","reid_dist","x1","y1","x2","y2","crop_path","sharpness","ratio"])
 
             hit_count = 0
             lock_hits = 0
@@ -336,6 +369,9 @@ class Processor(QtCore.QObject):
                     else:
                         accept = face_ok or reid_ok
 
+                    # Enforce 'require face if visible'
+                    if cfg.require_face_if_visible and bf is not None and not face_ok:
+                        accept = False
                     if not accept:
                         continue
 
@@ -350,7 +386,7 @@ class Processor(QtCore.QObject):
                         anchor = (acx, acy)
 
                     # expand to ratio within the DET frame
-                    ex1,ey1,ex2,ey2 = self._expand_to_ratio((x1,y1,x2,y2), ratio_w, ratio_h, W2, H2, anchor=anchor)
+                    (ex1,ey1,ex2,ey2), chosen_ratio = self._choose_best_ratio((x1,y1,x2,y2), ratios, W2, H2, anchor=anchor)
 
                     # Compute sharpness on final crop
                     crop_img = frame_for_det[ey1:ey2, ex1:ex2]
@@ -361,7 +397,7 @@ class Processor(QtCore.QObject):
                     # Map to original frame coords for annotation
                     ox1, oy1, ox2, oy2 = ex1+off_x, ey1+off_y, ex2+off_x, ey2+off_y
                     area = (ox2-ox1)*(oy2-oy1)
-                    candidates.append(dict(score=score, fd=fd, rd=rd, sharp=sharp, box=(ox1,oy1,ox2,oy2), area=area, show_box=(x1+off_x,y1+off_y,x2+off_x,y2+off_y), face_feat=(bf["feat"] if bf is not None else None), reid_feat=(reid_feats[i] if i < len(reid_feats) else None)))
+                    candidates.append(dict(score=score, fd=fd, rd=rd, sharp=sharp, box=(ox1,oy1,ox2,oy2), area=area, show_box=(x1+off_x,y1+off_y,x2+off_x,y2+off_y), face_feat=(bf["feat"] if bf is not None else None), reid_feat=(reid_feats[i] if i < len(reid_feats) else None), ratio=chosen_ratio))
 
                 # Choose best and save with cadence + lock + margin + IoU gate
                 def save_hit(c):
@@ -386,13 +422,14 @@ class Processor(QtCore.QObject):
                             cx1 += dx; cx2 = cx1 + new_w
                     crop_img2 = frame[cy1:cy2, cx1:cx2]
                     cv2.imwrite(crop_img_path, crop_img2)
-                    writer.writerow([frame_idx, frame_idx/float(fps), c["score"], c["fd"], c["rd"], cx1, cy1, cx2, cy2, crop_img_path, c["sharp"]])
+                    writer.writerow([frame_idx, frame_idx/float(fps), c["score"], c["fd"], c["rd"], cx1, cy1, cx2, cy2, crop_img_path, c["sharp"], c.get("ratio", "")])
                     self.hit.emit(crop_img_path)
                     # update lock source
                     if c.get("face_feat") is not None:
                         locked_face = c["face_feat"]
                     if c.get("reid_feat") is not None:
-                        locked_reid = c["reid_feat"]
+                        lr_prev = locked_reid
+                        locked_reid = self._ema(lr_prev, c["reid_feat"], float(cfg.lock_momentum))
                     lock_hits += 1
                     prev_box = (cx1,cy1,cx2,cy2)
                     return True
@@ -573,6 +610,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.auto_crop_check = QtWidgets.QCheckBox("Auto‑crop black borders")
         self.auto_crop_check.setChecked(True)
         self.border_thr_spin = QtWidgets.QSpinBox(); self.border_thr_spin.setRange(0, 50); self.border_thr_spin.setValue(10)
+        self.require_face_check = QtWidgets.QCheckBox("Require face if visible"); self.require_face_check.setChecked(True)
+        self.lock_mom_spin = QtWidgets.QDoubleSpinBox(); self.lock_mom_spin.setRange(0.0, 1.0); self.lock_mom_spin.setSingleStep(0.05); self.lock_mom_spin.setValue(0.7)
+        self.suppress_neg_check = QtWidgets.QCheckBox("Suppress hard negatives"); self.suppress_neg_check.setChecked(False)
+        self.neg_tol_spin = QtWidgets.QDoubleSpinBox(); self.neg_tol_spin.setDecimals(3); self.neg_tol_spin.setRange(0.0, 2.0); self.neg_tol_spin.setSingleStep(0.01); self.neg_tol_spin.setValue(0.35)
+        self.max_neg_spin = QtWidgets.QSpinBox(); self.max_neg_spin.setRange(0, 20); self.max_neg_spin.setValue(5)
         self.log_every_spin = QtWidgets.QDoubleSpinBox(); self.log_every_spin.setDecimals(1); self.log_every_spin.setRange(0.1, 10.0); self.log_every_spin.setValue(1.0)
         self.lock_after_spin = QtWidgets.QSpinBox(); self.lock_after_spin.setRange(0, 10); self.lock_after_spin.setValue(1)
         self.lock_face_spin = QtWidgets.QDoubleSpinBox(); self.lock_face_spin.setDecimals(3); self.lock_face_spin.setRange(0.0, 2.0); self.lock_face_spin.setValue(0.28)
@@ -601,6 +643,11 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Min box area (px)", self.min_box_pix_spin),
             ("Auto‑crop black borders", self.auto_crop_check),
             ("Border threshold", self.border_thr_spin),
+            ("Require face if visible", self.require_face_check),
+            ("Lock momentum", self.lock_mom_spin),
+            ("Suppress negatives", self.suppress_neg_check),
+            ("Neg tolerance", self.neg_tol_spin),
+            ("Max negatives", self.max_neg_spin),
             ("Log interval (s)", self.log_every_spin),
             ("Lock after N hits", self.lock_after_spin),
             ("Lock face dist ≤", self.lock_face_spin),
@@ -782,6 +829,11 @@ class MainWindow(QtWidgets.QMainWindow):
             min_box_pixels=int(self.min_box_pix_spin.value()),
             auto_crop_borders=bool(self.auto_crop_check.isChecked()),
             border_threshold=int(self.border_thr_spin.value()),
+            require_face_if_visible=bool(self.require_face_check.isChecked()),
+            lock_momentum=float(self.lock_mom_spin.value()),
+            suppress_negatives=bool(self.suppress_neg_check.isChecked()),
+            neg_tolerance=float(self.neg_tol_spin.value()),
+            max_negatives=int(self.max_neg_spin.value()),
             log_interval_sec=float(self.log_every_spin.value()),
             lock_after_hits=int(self.lock_after_spin.value()),
             lock_face_thresh=float(self.lock_face_spin.value()),
@@ -814,6 +866,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.min_box_pix_spin.setValue(cfg.min_box_pixels)
         self.auto_crop_check.setChecked(cfg.auto_crop_borders)
         self.border_thr_spin.setValue(cfg.border_threshold)
+        self.require_face_check.setChecked(cfg.require_face_if_visible)
+        self.lock_mom_spin.setValue(cfg.lock_momentum)
+        self.suppress_neg_check.setChecked(cfg.suppress_negatives)
+        self.neg_tol_spin.setValue(cfg.neg_tolerance)
+        self.max_neg_spin.setValue(cfg.max_negatives)
         self.log_every_spin.setValue(cfg.log_interval_sec)
         self.lock_after_spin.setValue(cfg.lock_after_hits)
         self.lock_face_spin.setValue(cfg.lock_face_thresh)
@@ -941,6 +998,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.min_box_pix_spin.setValue(int(s.value("min_box_pixels", 5000)))
         self.auto_crop_check.setChecked(bool(s.value("auto_crop_borders", False)))
         self.border_thr_spin.setValue(int(s.value("border_threshold", 10)))
+        self.require_face_check.setChecked(bool(s.value("require_face_if_visible", True)))
+        self.lock_mom_spin.setValue(float(s.value("lock_momentum", 0.7)))
+        self.suppress_neg_check.setChecked(bool(s.value("suppress_negatives", False)))
+        self.neg_tol_spin.setValue(float(s.value("neg_tolerance", 0.35)))
+        self.max_neg_spin.setValue(int(s.value("max_negatives", 5)))
         self.log_every_spin.setValue(float(s.value("log_interval_sec", 1.0)))
         self.lock_after_spin.setValue(int(s.value("lock_after_hits", 1)))
         self.lock_face_spin.setValue(float(s.value("lock_face_thresh", 0.28)))
