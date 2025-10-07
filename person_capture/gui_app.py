@@ -552,10 +552,7 @@ class Processor(QtCore.QObject):
                         face_dists_quality.append(fd_tmp)
                     if fd_tmp <= float(cfg.face_thresh):
                         any_face_match = True
-                
-                visible_for_gate = any_face_visible or (any_face_detected and not any_face_match_qual)
                 any_face_match_qual = any((d <= float(cfg.face_thresh)) for d in face_dists_quality)
-
                 best_face_dist = min(face_dists_quality) if face_dists_quality else None
                 if min_fd_all is None and face_dists_all:
                     min_fd_all = min(face_dists_all)
@@ -625,16 +622,22 @@ class Processor(QtCore.QObject):
                     # Face-first policy: hard gate only when requested and reference face exists
                     if (
                         cfg.require_face_if_visible
-                        and visible_for_gate
+                        and (any_face_visible or (any_face_detected and not any_face_match_qual))
                         and (ref_face_feat is not None)
                     ):
                         if (
                             bf is None
                             or bf.get('quality', 0.0) < float(cfg.face_quality_min)
-                            or not face_ok
                         ):
                             accept = False
                             cand_reason.append("hard_gate_face_required")
+                        elif not face_ok:
+                            # Escape hatch: allow strong ReID even if face mismatches,
+                            # provided ReID is clearly below threshold by margin.
+                            reid_escape = (rd is not None) and (rd <= max(0.0, float(cfg.reid_thresh) - float(cfg.score_margin)))
+                            if not (reid_ok and reid_escape):
+                                accept = False
+                                cand_reason.append("hard_gate_face_required_no_escape")
                     elif cfg.prefer_face_when_available and any_face_visible and (bf is None):
                         cand_reason.append("soft_pref_face_missing")
 
