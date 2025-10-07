@@ -619,18 +619,24 @@ class Processor(QtCore.QObject):
 
                     accept_before_face_policy = accept
 
-                    # Face-first policy: allow strong ReID when any face is present but no face matches well
-                    face_ok_any = (min_fd_all is not None) and (min_fd_all <= float(cfg.face_thresh))
+                    # Face-first policy: candidate-level strict gate
                     if (
                         cfg.require_face_if_visible
                         and any_face_detected
                         and (ref_face_feat is not None)
                     ):
-                        if not face_ok_any:
-                            reid_escape = (rd is not None) and (rd <= max(0.0, float(cfg.reid_thresh) - float(cfg.score_margin)))
-                            if not (reid_ok and reid_escape):
+                        if bf is None:
+                            # Allow ReID only when no quality‑passing face elsewhere matches.
+                            if not (reid_ok and not (any_face_match_qual if 'any_face_match_qual' in locals() else any_face_match)):
                                 accept = False
-                                cand_reason.append("hard_gate_face_any_failed_no_reid_escape")
+                                cand_reason.append("gate_no_cand_face")
+                        else:
+                            if not face_ok:
+                                fd_tol = float(cfg.face_thresh) + float(cfg.score_margin)
+                                reid_escape = (reid_ok and rd is not None and rd <= max(0.0, float(cfg.reid_thresh) - float(cfg.score_margin)) and (fd is None or fd <= fd_tol))
+                                if not reid_escape:
+                                    accept = False
+                                    cand_reason.append("gate_face_present_no_escape")
                     elif cfg.prefer_face_when_available and any_face_visible and (bf is None):
                         cand_reason.append("soft_pref_face_missing")
 
@@ -938,6 +944,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(APP_NAME)
         # Toolbar
         self.toolbar = self.addToolBar("Main")
+        self.toolbar.setObjectName("Main")
         self.toolbar.setMovable(True)
         self.act_start = QtGui.QAction("Start", self); self.act_start.triggered.connect(self.on_start)
         self.act_pause = QtGui.QAction("Pause", self); self.act_pause.triggered.connect(self.on_pause)
@@ -1636,6 +1643,17 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         self._save_qsettings()
+        try:
+            if getattr(self, "_worker", None):
+                try:
+                    self._worker.request_abort()
+                except Exception:
+                    pass
+            if getattr(self, "_thread", None) and self._thread.isRunning():
+                self._thread.quit()
+                self._thread.wait(5000)
+        except Exception:
+            pass
         return super().closeEvent(e)
 
     def _load_qsettings(self):
