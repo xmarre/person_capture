@@ -1,4 +1,3 @@
-
 from ultralytics import YOLO
 import torch
 from pathlib import Path
@@ -23,7 +22,7 @@ class PersonDetector:
                     bad = p.with_suffix(p.suffix + '.bad')
                     p.rename(bad)
                     if self.progress:
-                        self.progress(f\"Quarantined corrupt weights: {bad.name}\")
+                        self.progress(f"Quarantined corrupt weights: {bad.name}")
             except Exception:
                 pass
             # Derive a clean hub model name
@@ -32,7 +31,7 @@ class PersonDetector:
             return YOLO(hub)
 
     def detect(self, frame, conf=0.35):
-        \"\"\"Return list of dicts for class=person only.\"\"\"
+        """Return list of dicts for class=person only."""
         try:
             res = self.model.predict(
                 frame, device=self.device, conf=float(conf), iou=0.45, classes=[0], verbose=False

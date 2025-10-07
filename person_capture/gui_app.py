@@ -216,7 +216,7 @@ class Processor(QtCore.QObject):
                 ensure_dir(ann_dir)
 
             self._status("Loading models...", key="phase", interval=5.0)
-            det = PersonDetector(model_name=cfg.yolo_model, device=cfg.device)
+            det = PersonDetector(model_name=cfg.yolo_model, device=cfg.device, progress=self.status.emit)
             face = FaceEmbedder(ctx=cfg.device, yolo_model=cfg.face_model, use_arcface=cfg.use_arcface, clip_model_name=cfg.clip_face_backbone, clip_pretrained=cfg.clip_face_pretrained, progress=self.status.emit)
             reid = ReIDEmbedder(device=cfg.device, model_name=cfg.reid_backbone, pretrained=cfg.reid_pretrained, progress=self.status.emit)
 
