@@ -1,9 +1,12 @@
+from typing import TYPE_CHECKING
 
 import numpy as np
-import torch
 import cv2
 from PIL import Image
-import open_clip
+
+if TYPE_CHECKING:  # pragma: no cover
+    import torch
+    import open_clip as open_clip_type
 
 class ReIDEmbedder:
     """
@@ -16,10 +19,20 @@ class ReIDEmbedder:
                  model_name: str = 'ViT-L-14',
                  pretrained: str = 'laion2b_s32b_b82k',
                  progress=None):
-        use_cuda = device == 'cuda' and torch.cuda.is_available()
+        try:
+            import torch as _torch
+            import open_clip as _open_clip
+        except Exception as e:  # pragma: no cover - executed only when deps missing
+            raise RuntimeError(
+                "Heavy dependencies not installed; install requirements.txt to run ReID embedding."
+            ) from e
+
+        self._torch = _torch
+
+        use_cuda = device == 'cuda' and _torch.cuda.is_available()
         self.device = 'cuda' if use_cuda else 'cpu'
         if False and progress: progress(f"Preparing ReID OpenCLIP {model_name} {pretrained} (will download if missing)...")
-        self.model, _, self.preprocess = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
+        self.model, _, self.preprocess = _open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
         pass
         self.model.eval().to(self.device)
 
@@ -37,9 +50,9 @@ class ReIDEmbedder:
         if not tensors:
             return []
 
-        batch = torch.stack(tensors).to(self.device, non_blocking=True)
-        with torch.inference_mode():
+        batch = self._torch.stack(tensors).to(self.device, non_blocking=True)
+        with self._torch.inference_mode():
             feats = self.model.encode_image(batch)
-            feats = torch.nn.functional.normalize(feats, dim=1)
+            feats = self._torch.nn.functional.normalize(feats, dim=1)
         feats = feats.detach().cpu().numpy().astype(np.float32)
         return [f for f in feats]

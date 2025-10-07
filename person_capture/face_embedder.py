@@ -1,16 +1,20 @@
 
 import os
 import cv2
-import torch
 import numpy as np
-from PIL import Image
-from ultralytics import YOLO
-import open_clip
 from urllib.request import urlopen
 from urllib.error import URLError, HTTPError
 import tempfile
 from pathlib import Path
 import shutil
+from typing import TYPE_CHECKING
+
+from PIL import Image
+
+if TYPE_CHECKING:  # pragma: no cover - import only for type checking
+    import torch
+    from ultralytics import YOLO as YOLOType
+    import open_clip as open_clip_type
 
 try:
     import onnxruntime as ort
@@ -84,8 +88,18 @@ class FaceEmbedder:
         if not os.path.isabs(yolo_path) and os.path.basename(yolo_path).startswith("yolov8") and yolo_path.endswith(".pt"):
             yolo_path = _ensure_file(yolo_path, Y8F_URLS, progress=progress)
 
-        self.det = YOLO(yolo_path)
-        self.device = 'cuda' if (ctx.startswith('cuda') and torch.cuda.is_available()) else 'cpu'
+        try:
+            import torch as _torch
+            from ultralytics import YOLO as _YOLO
+            import open_clip as _open_clip
+        except Exception as e:  # pragma: no cover - executed only when deps missing
+            raise RuntimeError(
+                "Heavy dependencies not installed; install requirements.txt to run face embedding."
+            ) from e
+
+        self._torch = _torch
+        self.det = _YOLO(yolo_path)
+        self.device = 'cuda' if (ctx.startswith('cuda') and _torch.cuda.is_available()) else 'cpu'
         self.conf = float(conf)
 
         self.use_arcface = bool(use_arcface)
@@ -102,7 +116,9 @@ class FaceEmbedder:
                 self.use_arcface = False
         if not self.use_arcface or self.backend is None:
             if False and progress: progress(f"Preparing OpenCLIP {clip_model_name} {clip_pretrained} (will download if missing)...")
-            self.model, _, self.preprocess = open_clip.create_model_and_transforms(clip_model_name, pretrained=clip_pretrained)
+            self.model, _, self.preprocess = _open_clip.create_model_and_transforms(
+                clip_model_name, pretrained=clip_pretrained
+            )
             self.model.eval().to(self.device)
             self.backend = 'clip'
             pass
@@ -138,11 +154,10 @@ class FaceEmbedder:
             from PIL import Image
             pil = Image.fromarray(rgb)
             tensors.append(self.preprocess(pil))
-        import torch
-        batch = torch.stack(tensors).to(self.device, non_blocking=True)
-        with torch.inference_mode():
+        batch = self._torch.stack(tensors).to(self.device, non_blocking=True)
+        with self._torch.inference_mode():
             feats = self.model.encode_image(batch)
-            feats = torch.nn.functional.normalize(feats, dim=1)
+            feats = self._torch.nn.functional.normalize(feats, dim=1)
         return feats.detach().cpu().numpy().astype(np.float32)
 
     def extract(self, bgr_img: np.ndarray):
