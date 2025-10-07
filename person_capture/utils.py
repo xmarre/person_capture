@@ -18,53 +18,6 @@ def l2_normalize(x, eps=1e-10):
 def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
-def expand_box_to_ratio(x1, y1, x2, y2, ratio_w, ratio_h, frame_w, frame_h, anchor=None, head_bias=0.0):
-    """
-    Expand a box to the exact ratio (ratio_w:ratio_h) while clamping to frame.
-    Optionally bias the crop upward (head_bias in [0..0.5]) and anchor around a point.
-    Returns integer (nx1, ny1, nx2, ny2).
-    """
-    x1, y1, x2, y2 = map(float, (x1, y1, x2, y2))
-    bw = max(1.0, x2 - x1)
-    bh = max(1.0, y2 - y1)
-    target = float(ratio_w) / float(ratio_h)
-
-    # center
-    if anchor is not None:
-        cx, cy = float(anchor[0]), float(anchor[1])
-    else:
-        cx = x1 + bw * 0.5
-        cy = y1 + bh * 0.5
-
-    # bias upward for heads
-    cy = cy - head_bias * bh
-
-    # compute new size that encloses the box at target ratio
-    cur = bw / bh
-    if cur < target:
-        # need more width
-        new_w = target * bh
-        new_h = bh
-    else:
-        new_w = bw
-        new_h = bw / target
-
-    nx1 = cx - new_w * 0.5
-    ny1 = cy - new_h * 0.5
-    nx2 = cx + new_w * 0.5
-    ny2 = cy + new_h * 0.5
-
-    # clamp
-    nx1 = _clamp(nx1, 0, frame_w - 1)
-    ny1 = _clamp(ny1, 0, frame_h - 1)
-    nx2 = _clamp(nx2, 0, frame_w - 1)
-    ny2 = _clamp(ny2, 0, frame_h - 1)
-
-    # ensure exact ratio after clamping by expanding towards inside if needed
-    new_w = nx2 - nx1
-    new_h = ny2 - ny1
-    if new_w <= 1 or new_h <= 1:
-        return int(nx1), int(ny1), int(nx2), int(ny2)
 
     cur = new_w / new_h
     if abs(cur - target) > 1e-4:
@@ -129,3 +82,64 @@ def detect_black_borders(bgr, thr=10, max_scan=None):
     bottom = _clamp(bottom, top + 1, H)
 
     return int(left), int(top), int(right), int(bottom)
+
+def expand_box_to_ratio(x1, y1, x2, y2, ratio_w, ratio_h, frame_w, frame_h, anchor=None, head_bias=0.0):
+    """
+    Return a box with EXACT ratio_w:ratio_h that contains the input box and fits inside the frame.
+    Strategy: expand to target ratio around center/anchor, clamp, then if clamping broke the ratio,
+    shrink inside the frame while keeping center to hit the exact ratio.
+    """
+    x1, y1, x2, y2 = map(float, (x1, y1, x2, y2))
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    target = float(ratio_w) / float(ratio_h)
+
+    # center
+    if anchor is not None:
+        cx, cy = float(anchor[0]), float(anchor[1])
+    else:
+        cx = x1 + bw * 0.5
+        cy = y1 + bh * 0.5
+    cy = cy - head_bias * bh  # head bias
+
+    # expand to target ratio minimally
+    cur = bw / bh
+    if cur < target:
+        new_w, new_h = target * bh, bh
+    else:
+        new_w, new_h = bw, bw / target
+
+    nx1, ny1 = cx - new_w * 0.5, cy - new_h * 0.5
+    nx2, ny2 = cx + new_w * 0.5, cy + new_h * 0.5
+
+    # clamp
+    nx1 = _clamp(nx1, 0, frame_w - 1)
+    ny1 = _clamp(ny1, 0, frame_h - 1)
+    nx2 = _clamp(nx2, 0, frame_w - 1)
+    ny2 = _clamp(ny2, 0, frame_h - 1)
+
+    # enforce exact ratio by shrinking inside if necessary
+    cw, ch = nx2 - nx1, ny2 - ny1
+    if cw <= 1 or ch <= 1:
+        return int(nx1), int(ny1), int(nx2), int(ny2)
+
+    cur = cw / ch
+    if abs(cur - target) > 1e-4:
+        if cur < target:
+            # width too small relative to height -> reduce height
+            ch2 = cw / target
+            dy = (ch - ch2) * 0.5
+            ny1 += dy; ny2 -= dy
+        else:
+            # width too large -> reduce width
+            cw2 = ch * target
+            dx = (cw - cw2) * 0.5
+            nx1 += dx; nx2 -= dx
+
+        # ensure inside frame (minor corrections)
+        nx1 = _clamp(nx1, 0, frame_w - 1)
+        ny1 = _clamp(ny1, 0, frame_h - 1)
+        nx2 = _clamp(nx2, 0, frame_w - 1)
+        ny2 = _clamp(ny2, 0, frame_h - 1)
+
+    return int(round(nx1)), int(round(ny1)), int(round(nx2)), int(round(ny2))

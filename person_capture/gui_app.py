@@ -280,7 +280,12 @@ class Processor(QtCore.QObject):
                     x1 = max(0, x1); y1 = max(0, y1); x2 = min(W2-1, x2); y2 = min(H2-1, y2)
                     if x2 <= x1+2 or y2 <= y1+2:
                         continue
-                    if (x2-x1)*(y2-y1) < int(cfg.min_box_pixels):
+                    area = (x2-x1)*(y2-y1)
+                    if area < int(cfg.min_box_pixels):
+                        continue
+                    ar = (y2-y1) / max(1, (x2-x1))
+                    if ar < 0.7 or ar > 4.0:  # extreme aspect -> likely false
+                        continue
                         continue
                     crop = frame_for_det[y1:y2, x1:x2]
                     crops.append(crop); boxes.append((x1,y1,x2,y2))
@@ -363,6 +368,22 @@ class Processor(QtCore.QObject):
                     nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box
                     crop_img_path = os.path.join(crops_dir, f"f{frame_idx:08d}.jpg")
                     cx1,cy1,cx2,cy2 = c["box"]
+                     # final ratio enforcement
+                    tw, th = ratio_w, ratio_h
+                    w = cx2 - cx1; h = cy2 - cy1
+                    target = float(tw)/float(th)
+                    cur = w/float(h) if h>0 else target
+                    if abs(cur - target) > 1e-3 and w>2 and h>2:
+                        # shrink inside to exact ratio
+                        if cur < target:
+                            # reduce height
+                            new_h = int(round(w/target))
+                            dy = (h - new_h)//2
+                            cy1 += dy; cy2 = cy1 + new_h
+                        else:
+                            new_w = int(round(h*target))
+                            dx = (w - new_w)//2
+                            cx1 += dx; cx2 = cx1 + new_w
                     crop_img2 = frame[cy1:cy2, cx1:cx2]
                     cv2.imwrite(crop_img_path, crop_img2)
                     writer.writerow([frame_idx, frame_idx/float(fps), c["score"], c["fd"], c["rd"], cx1, cy1, cx2, cy2, crop_img_path, c["sharp"]])
