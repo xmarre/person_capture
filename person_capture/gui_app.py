@@ -610,7 +610,7 @@ class Processor(QtCore.QObject):
 
                     if (
                         getattr(cfg, "drop_reid_if_any_face_match", True)
-                        and any_face_match
+                        and (any_face_match_qual if 'any_face_match_qual' in locals() else any_face_match)
                         and not face_ok
                         and accept
                     ):
@@ -619,25 +619,18 @@ class Processor(QtCore.QObject):
 
                     accept_before_face_policy = accept
 
-                    # Face-first policy: hard gate only when requested and reference face exists
+                    # Face-first policy: allow strong ReID when any face is present but no face matches well
+                    face_ok_any = (min_fd_all is not None) and (min_fd_all <= float(cfg.face_thresh))
                     if (
                         cfg.require_face_if_visible
-                        and (any_face_visible or (any_face_detected and not any_face_match_qual))
+                        and any_face_detected
                         and (ref_face_feat is not None)
                     ):
-                        if (
-                            bf is None
-                            or bf.get('quality', 0.0) < float(cfg.face_quality_min)
-                        ):
-                            accept = False
-                            cand_reason.append("hard_gate_face_required")
-                        elif not face_ok:
-                            # Escape hatch: allow strong ReID even if face mismatches,
-                            # provided ReID is clearly below threshold by margin.
+                        if not face_ok_any:
                             reid_escape = (rd is not None) and (rd <= max(0.0, float(cfg.reid_thresh) - float(cfg.score_margin)))
                             if not (reid_ok and reid_escape):
                                 accept = False
-                                cand_reason.append("hard_gate_face_required_no_escape")
+                                cand_reason.append("hard_gate_face_any_failed_no_reid_escape")
                     elif cfg.prefer_face_when_available and any_face_visible and (bf is None):
                         cand_reason.append("soft_pref_face_missing")
 
@@ -1044,12 +1037,12 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Aspect ratio W:H", self.ratio_edit),
             ("Frame stride", self.stride_spin),
             ("YOLO min conf", self.det_conf_spin),
-            ("Face max dist", self.face_thr_spin),
+            ("Face max dist (face_thresh)", self.face_thr_spin),
             ("Face detector conf", self.face_det_conf_spin),
             ("Face detector pad", self.face_det_pad_spin),
             ("Face quality min", self.face_quality_spin),
             ("Face visible uses quality", self.face_vis_quality_check),
-            ("ReID max dist", self.reid_thr_spin),
+            ("ReID max dist (reid_thresh)", self.reid_thr_spin),
             ("Combine", self.combine_combo),
             ("Match mode", self.match_mode_combo),
             ("Only best", self.only_best_check),
