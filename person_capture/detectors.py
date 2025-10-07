@@ -1,35 +1,63 @@
-from typing import TYPE_CHECKING, List, Dict, Any
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover
     import torch
     from ultralytics import YOLO as YOLOType
 
 class PersonDetector:
-    """Ultralytics YOLO wrapper restricted to the person class (id=0)."""
-    def __init__(self, model_name: str = 'yolov8n.pt', device: str = 'cuda', progress=None):
+    def __init__(self, model_name='yolov8n.pt', device='cuda', progress=None):
         try:
             import torch as _torch
             from ultralytics import YOLO as _YOLO
-        except Exception as e:  # pragma: no cover
-            raise RuntimeError("Heavy dependencies not installed; install requirements.txt to run detection.") from e
-        self._torch = _torch
-        self.device = 'cuda' if (str(device).startswith('cuda') and _torch.cuda.is_available()) else 'cpu'
-        self.model = _YOLO(model_name)
-        self.progress = progress
+        except Exception as e:  # pragma: no cover - executed only when deps missing
+            raise RuntimeError(
+                "Heavy dependencies not installed; install requirements.txt to run detection."
+            ) from e
 
-    def detect(self, bgr, conf: float = 0.35) -> List[Dict[str, Any]]:
-        if bgr is None:
-            return []
+        self._torch = _torch
+        self._YOLO = _YOLO
+        self.device = 'cuda' if (str(device).startswith('cuda') and _torch.cuda.is_available()) else 'cpu'
+        self.progress = progress
+        self.model = self._load_model(model_name)
+
+    def _load_model(self, model_name: str):
+        name = str(model_name)
         try:
-            res = self.model.predict(bgr, conf=float(conf), iou=0.45, classes=[0], verbose=False)[0]
+            return self._YOLO(name)
+        except Exception as e:
+            if self.progress:
+                self.progress(f"YOLO load failed ({e}). Recovering...")
+            # If user pointed to a local file, quarantine it and try hub name
+            try:
+                p = Path(name)
+                if p.is_file():
+                    bad = p.with_suffix(p.suffix + '.bad')
+                    p.rename(bad)
+                    if self.progress:
+                        self.progress(f"Quarantined corrupt weights: {bad.name}")
+            except Exception:
+                pass
+            # Derive a clean hub model name
+            base = Path(name).name.lower()
+            hub = base if base.startswith('yolov8') and base.endswith('.pt') else 'yolov8n.pt'
+            return self._YOLO(hub)
+
+    def detect(self, frame, conf=0.35):
+        """Return list of dicts for class=person only."""
+        try:
+            res = self.model.predict(
+                frame, device=self.device, conf=float(conf), iou=0.45, classes=[0], verbose=False
+            )[0]
         except Exception:
             return []
-        out: List[Dict[str, Any]] = []
+
+        out = []
         bxs = getattr(res, "boxes", None)
-        if bxs is None or len(bxs) == 0:
+        if bxs is None:
             return out
         for i in range(len(bxs)):
-            xyxy = [float(v) for v in bxs.xyxy[i].tolist()]
+            xyxy = bxs.xyxy[i].tolist()
             c = float(bxs.conf[i].item()) if getattr(bxs, "conf", None) is not None else 0.0
             out.append({"xyxy": xyxy, "conf": c, "cls": 0})
         return out

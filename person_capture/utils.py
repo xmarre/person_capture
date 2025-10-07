@@ -1,116 +1,50 @@
-import os
+
 import math
+import os
 import cv2
 import numpy as np
 
-__all__ = [
-    "parse_ratio",
-    "ensure_dir",
-    "l2_normalize",
-    "cosine_distance",
-    "expand_box_to_ratio",
-    "crop_img",
-    "detect_black_borders",
-]
+def parse_ratio(s: str):
+    w, h = s.split(':')
+    return float(w), float(h)
 
-def parse_ratio(s: str) -> tuple[float, float]:
-    s = str(s).strip().lower().replace(" ", "")
-    if ":" not in s:
-        raise ValueError(f"Invalid ratio '{s}'. Use W:H, e.g., '2:3'.")
-    w, h = s.split(":")
-    w = float(w); h = float(h)
-    if w <= 0 or h <= 0:
-        raise ValueError("Ratio components must be > 0.")
-    return w, h
-
-def ensure_dir(p: str) -> None:
+def ensure_dir(p):
     os.makedirs(p, exist_ok=True)
 
-def l2_normalize(x: np.ndarray, eps: float = 1e-9) -> np.ndarray:
-    n = float(np.linalg.norm(x))
-    return x if n < eps else (x / (n + eps))
+def l2_normalize(x, eps=1e-10):
+    n = np.linalg.norm(x) + eps
+    return x / n
 
-def cosine_distance(a: np.ndarray | None, b: np.ndarray | None, eps: float = 1e-9) -> float | None:
-    if a is None or b is None:
-        return None
-    va = l2_normalize(np.asarray(a, dtype=np.float32), eps)
-    vb = l2_normalize(np.asarray(b, dtype=np.float32), eps)
-    return float(1.0 - np.dot(va, vb))
-
-def _clamp(v: float, lo: float, hi: float) -> float:
+def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
-def expand_box_to_ratio(x1: float, y1: float, x2: float, y2: float,
-                        ratio_w: float, ratio_h: float,
-                        frame_w: int, frame_h: int,
-                        anchor: tuple[float,float] | None = None,
-                        head_bias: float = 0.0) -> tuple[int,int,int,int]:
-    """Expand an input box to an exact W:H ratio inside frame bounds.
 
-    Strategy:
-      1) Choose center (anchor if provided else box center) with optional head bias.
-      2) Expand minimally to reach target ratio.
-      3) Clamp to frame.
-      4) If clamping broke the ratio, shrink inside to exact ratio.
-    """
-    x1, y1, x2, y2 = map(float, (x1, y1, x2, y2))
-    bw = max(1.0, x2 - x1)
-    bh = max(1.0, y2 - y1)
-    target = float(ratio_w) / float(ratio_h)
-
-    # center
-    if anchor is not None:
-        cx, cy = float(anchor[0]), float(anchor[1])
-    else:
-        cx = x1 + 0.5 * bw
-        cy = y1 + 0.5 * bh
-    cy -= head_bias * bh  # bias upwards
-
-    # minimal expansion to target
-    cur = bw / bh
-    if cur < target:
-        new_w, new_h = target * bh, bh
-    else:
-        new_w, new_h = bw, bw / target
-
-    nx1, ny1 = cx - 0.5 * new_w, cy - 0.5 * new_h
-    nx2, ny2 = cx + 0.5 * new_w, cy + 0.5 * new_h
-
-    # clamp to frame
-    nx1 = _clamp(nx1, 0, frame_w - 1)
-    ny1 = _clamp(ny1, 0, frame_h - 1)
-    nx2 = _clamp(nx2, 0, frame_w - 1)
-    ny2 = _clamp(ny2, 0, frame_h - 1)
-
-    # enforce exact ratio by shrinking if needed
-    cw, ch = nx2 - nx1, ny2 - ny1
-    if cw <= 1 or ch <= 1:
-        return int(round(nx1)), int(round(ny1)), int(round(nx2)), int(round(ny2))
-
-    cur = cw / ch
+    cur = new_w / new_h
     if abs(cur - target) > 1e-4:
         if cur < target:
-            # width too small -> shrink height
-            new_h = cw / target
-            dy = 0.5 * (ch - new_h)
-            ny1 += dy; ny2 -= dy
+            # grow width if possible
+            pad = (target * new_h - new_w) * 0.5
+            nx1 = _clamp(nx1 - pad, 0, frame_w - 1)
+            nx2 = _clamp(nx2 + pad, 0, frame_w - 1)
         else:
-            # height too small -> shrink width
-            new_w = ch * target
-            dx = 0.5 * (cw - new_w)
-            nx1 += dx; nx2 -= dx
+            pad = (new_w / target - new_h) * 0.5
+            ny1 = _clamp(ny1 - pad, 0, frame_h - 1)
+            ny2 = _clamp(ny2 + pad, 0, frame_h - 1)
 
     return int(round(nx1)), int(round(ny1)), int(round(nx2)), int(round(ny2))
 
-def crop_img(frame: np.ndarray, box: tuple[int,int,int,int]) -> np.ndarray:
-    x1, y1, x2, y2 = [int(v) for v in box]
-    x1 = max(0, x1); y1 = max(0, y1)
+def crop_img(frame, box):
+    x1,y1,x2,y2 = [int(v) for v in box]
     return frame[y1:y2, x1:x2]
 
-def detect_black_borders(bgr: np.ndarray, thr: int = 10, max_scan: int | None = None) -> tuple[int,int,int,int]:
-    """Detect constant black borders. Return ROI (x1,y1,x2,y2)."""
+def detect_black_borders(bgr, thr=10, max_scan=None):
+    """
+    Detect constant black borders and return ROI (x1,y1,x2,y2).
+    thr: pixel intensity threshold (0-255) below which we consider black.
+    max_scan: optional limit for scanning depth from edges.
+    """
     if bgr is None or bgr.size == 0:
-        return (0, 0, 0, 0)
+        return (0,0,0,0)
     H, W = bgr.shape[:2]
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     if max_scan is None:
@@ -142,9 +76,70 @@ def detect_black_borders(bgr: np.ndarray, thr: int = 10, max_scan: int | None = 
         right = c
 
     # sanity
-    left = max(0, min(left, right - 1))
-    top = max(0, min(top, bottom - 1))
-    right = max(left + 1, min(right, W))
-    bottom = max(top + 1, min(bottom, H))
+    left = _clamp(left, 0, right - 1)
+    top = _clamp(top, 0, bottom - 1)
+    right = _clamp(right, left + 1, W)
+    bottom = _clamp(bottom, top + 1, H)
 
     return int(left), int(top), int(right), int(bottom)
+
+def expand_box_to_ratio(x1, y1, x2, y2, ratio_w, ratio_h, frame_w, frame_h, anchor=None, head_bias=0.0):
+    """
+    Return a box with EXACT ratio_w:ratio_h that contains the input box and fits inside the frame.
+    Strategy: expand to target ratio around center/anchor, clamp, then if clamping broke the ratio,
+    shrink inside the frame while keeping center to hit the exact ratio.
+    """
+    x1, y1, x2, y2 = map(float, (x1, y1, x2, y2))
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    target = float(ratio_w) / float(ratio_h)
+
+    # center
+    if anchor is not None:
+        cx, cy = float(anchor[0]), float(anchor[1])
+    else:
+        cx = x1 + bw * 0.5
+        cy = y1 + bh * 0.5
+    cy = cy - head_bias * bh  # head bias
+
+    # expand to target ratio minimally
+    cur = bw / bh
+    if cur < target:
+        new_w, new_h = target * bh, bh
+    else:
+        new_w, new_h = bw, bw / target
+
+    nx1, ny1 = cx - new_w * 0.5, cy - new_h * 0.5
+    nx2, ny2 = cx + new_w * 0.5, cy + new_h * 0.5
+
+    # clamp
+    nx1 = _clamp(nx1, 0, frame_w - 1)
+    ny1 = _clamp(ny1, 0, frame_h - 1)
+    nx2 = _clamp(nx2, 0, frame_w - 1)
+    ny2 = _clamp(ny2, 0, frame_h - 1)
+
+    # enforce exact ratio by shrinking inside if necessary
+    cw, ch = nx2 - nx1, ny2 - ny1
+    if cw <= 1 or ch <= 1:
+        return int(nx1), int(ny1), int(nx2), int(ny2)
+
+    cur = cw / ch
+    if abs(cur - target) > 1e-4:
+        if cur < target:
+            # width too small relative to height -> reduce height
+            ch2 = cw / target
+            dy = (ch - ch2) * 0.5
+            ny1 += dy; ny2 -= dy
+        else:
+            # width too large -> reduce width
+            cw2 = ch * target
+            dx = (cw - cw2) * 0.5
+            nx1 += dx; nx2 -= dx
+
+        # ensure inside frame (minor corrections)
+        nx1 = _clamp(nx1, 0, frame_w - 1)
+        ny1 = _clamp(ny1, 0, frame_h - 1)
+        nx2 = _clamp(nx2, 0, frame_w - 1)
+        ny2 = _clamp(ny2, 0, frame_h - 1)
+
+    return int(round(nx1)), int(round(ny1)), int(round(nx2)), int(round(ny2))
