@@ -1,17 +1,14 @@
-
 import os
 import cv2
 import numpy as np
-from urllib.request import urlopen
-from urllib.error import URLError, HTTPError
 import tempfile
-from pathlib import Path
 import shutil
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, List, Dict, Any, Optional, Tuple
 
 from PIL import Image
 
-if TYPE_CHECKING:  # pragma: no cover - import only for type checking
+if TYPE_CHECKING:  # pragma: no cover
     import torch
     from ultralytics import YOLO as YOLOType
     import open_clip as open_clip_type
@@ -19,11 +16,9 @@ if TYPE_CHECKING:  # pragma: no cover - import only for type checking
 try:
     import onnxruntime as ort
 except Exception:
-    ort = None  # fallback later
+    ort = None  # optional
 
 Y8F_DEFAULT = "yolov8n-face.pt"
-
-# Candidate mirrors for yolov8n-face weights
 Y8F_URLS = [
     "https://github.com/lindevs/yolov8-face/releases/download/1.0.1/yolov8n-face.pt",
     "https://github.com/lindevs/yolov8-face/releases/download/1.0.0/yolov8n-face.pt",
@@ -31,7 +26,6 @@ Y8F_URLS = [
     "https://huggingface.co/junjiang/GestureFace/resolve/main/yolov8n-face.pt",
 ]
 
-# ArcFace ONNX mirrors (R100 model). Any that succeeds is fine.
 ARCFACE_ONNX = "arcface_r100.onnx"
 ARCFACE_URLS = [
     "https://github.com/deepinsight/insightface/releases/download/v0.7/arcface_r100.onnx",
@@ -39,166 +33,176 @@ ARCFACE_URLS = [
     "https://huggingface.co/MonsterMMORPG/Arcface/resolve/main/arcface_r100.onnx",
 ]
 
+def _download_to(path: Path, url: str, progress=None) -> bool:
+    try:
+        from urllib.request import urlopen
+        from urllib.error import URLError, HTTPError
+        if progress: progress(f"Downloading: {url}")
+        with urlopen(url, timeout=45) as r:
+            total = int(r.headers.get("Content-Length") or 0)
+            tmp = tempfile.NamedTemporaryFile(delete=False)
+            downloaded = 0
+            while True:
+                chunk = r.read(1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+                downloaded += len(chunk)
+                if progress and total:
+                    progress(f"Downloading: {url}  {downloaded/total*100:.1f}%")
+            tmp.close()
+            shutil.move(tmp.name, str(path))
+        if progress: progress(f"Saved: {path}")
+        return True
+    except Exception:
+        return False
+
 def _ensure_file(path: str, urls, progress=None) -> str:
     p = Path(path)
     if p.exists():
         return str(p.resolve())
     if p.parent and not p.parent.exists():
         p.parent.mkdir(parents=True, exist_ok=True)
-    last_err = None
     for url in urls:
-        try:
-            if progress: progress(f"Downloading: {url}")
-            with urlopen(url, timeout=45) as r:
-                total = int(r.headers.get('Content-Length') or 0)
-                tmp = tempfile.NamedTemporaryFile(delete=False)
-                downloaded = 0
-                while True:
-                    chunk = r.read(1024*1024)
-                    if not chunk:
-                        break
-                    tmp.write(chunk)
-                    downloaded += len(chunk)
-                    if progress and total:
-                        progress(f"Downloading: {url}  {downloaded/total*100:.1f}%")
-                tmp.close()
-                tmp_path = Path(tmp.name)
-            shutil.move(str(tmp_path), str(p))
-            if progress: progress(f"Saved: {p}")
+        if _download_to(p, url, progress=progress):
             return str(p.resolve())
-        except (URLError, HTTPError, TimeoutError, OSError) as e:
-            last_err = e
-            continue
-    raise FileNotFoundError(f"Could not obtain '{path}'. Tried: {', '.join(urls)}. Last error: {last_err}")
+    raise FileNotFoundError(f"Could not obtain '{path}'. Tried: {', '.join(urls)}")
 
 class FaceEmbedder:
-    """
-    Face detection: YOLOv8-face.
-    Face embedding: OpenCLIP (strong backbone) or ArcFace ONNX for identity.
-    Returns list of dicts: {'bbox': np.int32[x1,y1,x2,y2], 'feat': np.float32[D], 'quality': float}
-    """
+    """Face detector + identity embedding.
 
-    def __init__(self, ctx: str = 'cuda', yolo_model: str = Y8F_DEFAULT, conf: float = 0.30,
-                 use_arcface: bool = True,
+    Detection: YOLOv8-face (Ultralytics).
+    Embedding: ArcFace ONNX if available else OpenCLIP image encoder.
+    Output: List[{'bbox': np.int32[4], 'feat': np.float32[D] | None, 'quality': float}]
+    """
+    def __init__(self, ctx: str = 'cuda',
+                 yolo_model: str = Y8F_DEFAULT,
+                 conf: float = 0.25,
+                 use_arcface: bool = False,
                  clip_model_name: str = 'ViT-L-14',
                  clip_pretrained: str = 'laion2b_s32b_b82k',
                  progress=None):
-        # Auto-download face detector weights if a bare filename is given
-        yolo_path = yolo_model
-        if not os.path.isabs(yolo_path) and os.path.basename(yolo_path).startswith("yolov8") and yolo_path.endswith(".pt"):
-            yolo_path = _ensure_file(yolo_path, Y8F_URLS, progress=progress)
-
         try:
             import torch as _torch
             from ultralytics import YOLO as _YOLO
             import open_clip as _open_clip
-        except Exception as e:  # pragma: no cover - executed only when deps missing
-            raise RuntimeError(
-                "Heavy dependencies not installed; install requirements.txt to run face embedding."
-            ) from e
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError("Heavy dependencies not installed; install requirements.txt to run face embedding.") from e
 
         self._torch = _torch
+        # face detector weights: auto-download if given as a bare name
+        yolo_path = yolo_model
+        if not os.path.isabs(yolo_path) and os.path.basename(yolo_path).startswith("yolov8") and yolo_path.endswith(".pt"):
+            yolo_path = _ensure_file(yolo_path, Y8F_URLS, progress=progress)
         self.det = _YOLO(yolo_path)
-        self.device = 'cuda' if (ctx.startswith('cuda') and _torch.cuda.is_available()) else 'cpu'
         self.conf = float(conf)
+        self.device = 'cuda' if (str(ctx).startswith('cuda') and _torch.cuda.is_available()) else 'cpu'
 
-        self.use_arcface = bool(use_arcface)
+        # Embedding backend
         self.backend = None
-        if self.use_arcface and ort is not None:
+        self.use_arcface = bool(use_arcface) and (ort is not None)
+        if self.use_arcface:
             try:
                 onnx_path = _ensure_file(ARCFACE_ONNX, ARCFACE_URLS, progress=progress)
                 providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if self.device == 'cuda' else ['CPUExecutionProvider']
                 self.arc_sess = ort.InferenceSession(onnx_path, providers=providers)
                 self.arc_input = self.arc_sess.get_inputs()[0].name
                 self.backend = 'arcface'
-            except Exception as _e:
-                # Fallback to CLIP
+            except Exception:
                 self.use_arcface = False
-        if not self.use_arcface or self.backend is None:
-            if False and progress: progress(f"Preparing OpenCLIP {clip_model_name} {clip_pretrained} (will download if missing)...")
-            self.model, _, self.preprocess = _open_clip.create_model_and_transforms(
-                clip_model_name, pretrained=clip_pretrained
-            )
+
+        if not self.use_arcface:
+            self.model, _, self.preprocess = _open_clip.create_model_and_transforms(clip_model_name, pretrained=clip_pretrained)
             self.model.eval().to(self.device)
             self.backend = 'clip'
-            pass
 
-    def _face_quality(self, bgr):
+    # ---------- utilities ----------
+    @staticmethod
+    def best_face(faces: List[Dict[str, Any]] | None) -> Optional[Dict[str, Any]]:
+        if not faces:
+            return None
+        def keyf(f):
+            x1,y1,x2,y2 = f.get('bbox', [0,0,0,0])
+            area = max(1, (x2-x1)*(y2-y1))
+            return (float(f.get('quality', 0.0)), float(area))
+        return sorted(faces, key=keyf, reverse=True)[0]
+
+    def _lap_var(self, bgr: np.ndarray) -> float:
         g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         return float(cv2.Laplacian(g, cv2.CV_64F).var())
 
-    def _arcface_preprocess(self, bgr):
-        # Expect 112x112 RGB, BGR->RGB, transpose to NCHW, normalize to [-1,1]
+    def _arc_pre(self, bgr: np.ndarray) -> np.ndarray:
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         rgb = cv2.resize(rgb, (112,112), interpolation=cv2.INTER_LINEAR)
         arr = rgb.astype(np.float32) / 127.5 - 1.0
         arr = np.transpose(arr, (2,0,1))[None, ...]  # NCHW
         return arr
 
-    def _arcface_encode(self, bgr_list):
-        if not bgr_list:
+    def _arc_encode(self, crops: List[np.ndarray]) -> List[np.ndarray]:
+        if not crops:
             return []
-        batch = np.concatenate([self._arcface_preprocess(b) for b in bgr_list], axis=0)
+        batch = np.concatenate([self._arc_pre(c) for c in crops], axis=0)
         feats = self.arc_sess.run(None, {self.arc_input: batch})[0]
         # L2 normalize
         norms = np.linalg.norm(feats, axis=1, keepdims=True) + 1e-9
         feats = feats / norms
-        return feats.astype(np.float32)
+        return [f.astype(np.float32) for f in feats]
 
-    def _clip_encode(self, bgr_list):
-        if not bgr_list:
+    def _clip_encode(self, crops: List[np.ndarray]) -> List[np.ndarray]:
+        if not crops:
             return []
         tensors = []
-        for bgr in bgr_list:
+        for bgr in crops:
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            from PIL import Image
-            pil = Image.fromarray(rgb)
-            tensors.append(self.preprocess(pil))
+            tensors.append(self.preprocess(Image.fromarray(rgb)))
+        if not tensors:
+            return []
         batch = self._torch.stack(tensors).to(self.device, non_blocking=True)
         with self._torch.inference_mode():
-            feats = self.model.encode_image(batch)
-            feats = self._torch.nn.functional.normalize(feats, dim=1)
-        return feats.detach().cpu().numpy().astype(np.float32)
+            emb = self.model.encode_image(batch)
+            emb = self._torch.nn.functional.normalize(emb, dim=1)
+        feats = emb.detach().cpu().numpy().astype(np.float32)
+        return [f for f in feats]
 
-    def extract(self, bgr_img: np.ndarray):
-        if bgr_img is None or bgr_img.size == 0:
+    # ---------- public ----------
+    def extract(self, bgr: np.ndarray) -> List[Dict[str, Any]]:
+        """Return list of faces with embeddings and quality."""
+        try:
+            res = self.det.predict(bgr, conf=self.conf, iou=0.45, classes=None, verbose=False)[0]
+        except Exception:
             return []
-
-        # YOLOv8-face detection
-        res = self.det.predict(bgr_img, conf=self.conf, verbose=False, device=self.device)[0]
+        faces = []
+        bxs = getattr(res, "boxes", None)
+        if bxs is None or len(bxs) == 0:
+            return faces
+        H, W = bgr.shape[:2]
+        # Build crops
+        crops = []
         boxes = []
-        for b in res.boxes:
-            x1, y1, x2, y2 = [int(v.item()) for v in b.xyxy[0]]
-            boxes.append((x1, y1, x2, y2))
+        for i in range(len(bxs)):
+            xyxy = [int(v) for v in bxs.xyxy[i].tolist()]
+            x1,y1,x2,y2 = xyxy
+            x1 = max(0, x1); y1 = max(0, y1); x2 = min(W-1, x2); y2 = min(H-1, y2)
+            if x2 <= x1+1 or y2 <= y1+1:
+                continue
+            crop = bgr[y1:y2, x1:x2]
+            crops.append(crop); boxes.append((x1,y1,x2,y2))
 
         if not boxes:
             return []
 
-        faces = []
-        crops = []
-        for (x1, y1, x2, y2) in boxes:
-            x1 = max(0, x1); y1 = max(0, y1)
-            x2 = max(x1+1, x2); y2 = max(y1+1, y2)
-            face_bgr = bgr_img[y1:y2, x1:x2]
-            faces.append((x1,y1,x2,y2, face_bgr, self._face_quality(face_bgr)))
-            crops.append(face_bgr)
-
-        if self.use_arcface:
-            feats = self._arcface_encode(crops)
+        if self.backend == 'arcface':
+            feats = self._arc_encode(crops)
         else:
             feats = self._clip_encode(crops)
 
         out = []
-        for i, (x1,y1,x2,y2, crop, q) in enumerate(faces):
-            out.append({'bbox': np.array([x1,y1,x2,y2], dtype=np.int32),
-                        'feat': feats[i],
-                        'quality': float(q)})
+        for i, box in enumerate(boxes):
+            q = self._lap_var(crops[i])
+            feat = feats[i] if i < len(feats) else None
+            out.append({"bbox": np.array(box, dtype=np.int32), "feat": feat, "quality": float(q)})
         # Sort by quality then area
-        out.sort(key=lambda f: (f['quality'], (f['bbox'][2]-f['bbox'][0])*(f['bbox'][3]-f['bbox'][1])), reverse=True)
+        out.sort(key=lambda f: (float(f.get('quality', 0.0)),
+                                (int(f['bbox'][2])-int(f['bbox'][0]))*(int(f['bbox'][3])-int(f['bbox'][1]))),
+                 reverse=True)
         return out
-
-    @staticmethod
-    def best_face(faces):
-        if not faces:
-            return None
-        return max(faces, key=lambda f: (f['quality'], (f['bbox'][2]-f['bbox'][0]) * (f['bbox'][3]-f['bbox'][1])))
