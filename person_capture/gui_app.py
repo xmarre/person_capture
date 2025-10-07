@@ -232,7 +232,7 @@ class Processor(QtCore.QObject):
             self._status("Processing...", key="phase", interval=5.0)
             while True:
                 if self._abort:
-                    self._status("Aborting...")
+                    self._status("Aborting...", key="phase")
                     break
                 if self._pause:
                     time.sleep(0.05)
@@ -462,17 +462,29 @@ class Processor(QtCore.QObject):
         self._last_status_time = 0.0
         self._last_status_text = None
 
-    def _status(self, msg: str):
+    def _init_status(self):
+        # Per-key throttle timestamps and last texts
+        self._status_last_time = {}
+        self._status_last_text = {}
+
+    def _status(self, msg: str, key: str = None, interval: float = None):
+        """
+        Thread-safe-ish status throttle.
+        key: logical channel ('phase','det','nomatch', etc.). None uses a global key.
+        interval: seconds between repeats. Defaults to cfg.log_interval_sec.
+        """
+        k = key or "_global"
         now = time.time()
-        if not hasattr(self, '_last_status_time'):
-            self._last_status_time = 0.0
-            self._last_status_text = None
-        if (now - self._last_status_time) >= float(self.cfg.log_interval_sec) or msg != self._last_status_text:
+        iv = float(interval if interval is not None else getattr(self.cfg, 'log_interval_sec', 1.0))
+        last_t = self._status_last_time.get(k, 0.0)
+        last_txt = self._status_last_text.get(k, None)
+        if (now - last_t) >= iv or msg != last_txt:
             self.status.emit(msg)
-            self._last_status_time = now
-            self._last_status_text = msg
+            self._status_last_time[k] = now
+            self._status_last_text[k] = msg
 
     def _cv_bgr_to_qimage(self, bgr) -> QtGui.QImage:
+(self, bgr) -> QtGui.QImage:
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
@@ -636,13 +648,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log_edit.setReadOnly(True)
         log_layout.addWidget(self.log_edit)
 
-        # Assemble
-        root.addWidget(file_group)
-        root.addWidget(param_group)
-        root.addLayout(ctrl_layout)
-        root.addLayout(prog_layout)
-        root.addWidget(mid_split, 1)
-        root.addWidget(log_group, 1)
+        # Assemble with vertical splitter for adjustable console
+        upper = QtWidgets.QWidget()
+        upper_layout = QtWidgets.QVBoxLayout(upper)
+        upper_layout.setContentsMargins(0,0,0,0)
+        upper_layout.addWidget(file_group)
+        upper_layout.addWidget(param_group)
+        upper_layout.addLayout(ctrl_layout)
+        upper_layout.addLayout(prog_layout)
+        upper_layout.addWidget(mid_split, 1)
+
+        self.vsplit = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        self.vsplit.addWidget(upper)
+        self.vsplit.addWidget(log_group)
+        self.vsplit.setSizes([700, 200])
+        self.vsplit.setChildrenCollapsible(False)
+        root.addWidget(self.vsplit, 1)
 
         # Menu
         self._build_menu()
