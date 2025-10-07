@@ -11,6 +11,8 @@ Run:
 """
 
 import sys, os, json, time, csv, traceback
+import subprocess
+import bisect
 import queue
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple, List
@@ -1016,6 +1018,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker: Optional[Processor] = None
         self._fps: Optional[float] = None
         self._total_frames: Optional[int] = None
+        self._keyframes: List[int] = []
+        self._current_idx: int = 0
 
         self.cfg = SessionConfig()
         self._build_ui()
@@ -1187,7 +1191,7 @@ class MainWindow(QtWidgets.QMainWindow):
         prog_layout.addWidget(self.meta_lbl, 1)
         prog_layout.addWidget(self.status_lbl, 2)
 
-        # Center: preview + last hit
+        # Center: preview + player (below) + last hit
         mid_split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         # Preview
         prev_group = QtWidgets.QGroupBox("Live preview")
@@ -1196,6 +1200,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.preview_label.setAlignment(QtCore.Qt.AlignCenter)
         self.preview_label.setMinimumHeight(1)
         prev_layout.addWidget(self.preview_label)
+        prev_container = QtWidgets.QWidget()
+        prev_container_layout = QtWidgets.QVBoxLayout(prev_container)
+        prev_container_layout.setContentsMargins(0, 0, 0, 0)
+        prev_container_layout.addWidget(prev_group, 4)
+        prev_container_layout.addWidget(player_group, 1)
         # Last hit
         hit_group = QtWidgets.QGroupBox("Last saved crop")
         hit_layout = QtWidgets.QVBoxLayout(hit_group)
@@ -1203,7 +1212,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hit_label.setAlignment(QtCore.Qt.AlignCenter)
         self.hit_label.setMinimumHeight(1)
         hit_layout.addWidget(self.hit_label)
-        mid_split.addWidget(prev_group)
+        mid_split.addWidget(prev_container)
         mid_split.addWidget(hit_group)
         mid_split.setSizes([600, 600])
 
@@ -1230,7 +1239,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(tab_params, "Parameters")
         controls_layout.addWidget(self.tabs, 1)
         controls_layout.addLayout(ctrl_layout)
-        controls_layout.addWidget(player_group)
         controls_layout.addLayout(prog_layout)
         controls_scroll = QtWidgets.QScrollArea(); controls_scroll.setWidget(controls_container); controls_scroll.setWidgetResizable(True)
         self.dock_controls = QDockWidget("Controls", self); self.dock_controls.setObjectName("dock_controls")
@@ -1402,12 +1410,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._worker.pause()
 
     def _handle_step_back(self, _checked: bool = False):
-        if self._worker:
-            self._worker.step(-1)
+        self._jump_keyframe(False)
 
     def _handle_step_forward(self, _checked: bool = False):
-        if self._worker:
-            self._worker.step(1)
+        self._jump_keyframe(True)
 
     def _handle_seek_slider(self, value: int):
         if self._worker:
@@ -1584,6 +1590,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_setup(self, total_frames: int, fps: float):
         self._total_frames = int(total_frames)
         self._fps = float(fps)
+        self._current_idx = 0
         self.progress.setRange(0, max(0, total_frames))
         self.meta_lbl.setText(f"fps={fps:.2f} frames={total_frames if total_frames>0 else 'unknown'}")
         if hasattr(self, "seek_slider"):
@@ -1591,8 +1598,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.seek_slider.setValue(0)
             if hasattr(self, "time_lbl"):
                 self.time_lbl.setText(f"{self._fmt_time(0)} / {self._fmt_time(total_frames)}")
+        # Load existing keyframes (I-frames) from the video file
+        try:
+            vf = self.video_edit.text().strip() if hasattr(self, "video_edit") else ""
+            self._keyframes = self._read_keyframes(vf, self._fps, self._total_frames)
+            if self._keyframes:
+                self._log(f"Keyframes: {len(self._keyframes)} loaded from file")
+            else:
+                self._log("No keyframes found or ffprobe unavailable; arrows will step ±1")
+        except Exception as ex:
+            self._keyframes = []
+            self._log(f"Keyframe load error: {ex}")
 
     def _on_progress(self, idx: int):
+        self._current_idx = int(idx)
         if self.progress.maximum() > 0 and idx <= self.progress.maximum():
             self.progress.setValue(idx)
         if hasattr(self, "seek_slider"):
@@ -1633,6 +1652,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.time_lbl.setText("00:00 / 00:00")
         self._fps = None
         self._total_frames = None
+        self._keyframes = []
+        self._current_idx = 0
         # Clean up thread
         try:
             if self._thread and self._thread.isRunning():
@@ -1649,6 +1670,71 @@ class MainWindow(QtWidgets.QMainWindow):
         ts = time.strftime("%H:%M:%S")
         self.log_edit.appendPlainText(f"[{ts}] {s}")
 
+    def _read_keyframes(self, video_path: str, fps: Optional[float], total: Optional[int]) -> List[int]:
+        if not video_path or not os.path.exists(video_path):
+            return []
+        try:
+            cmd = [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-skip_frame", "nokey",
+                "-show_entries", "frame=pkt_pts_time,best_effort_timestamp_time,pict_type",
+                "-show_frames",
+                "-of", "json",
+                video_path,
+            ]
+            p = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            data = json.loads(p.stdout or "{}")
+            frames = data.get("frames", [])
+            if not frames or not fps or fps <= 0:
+                return []
+            out: List[int] = []
+            seen = set()
+            tf = total if isinstance(total, int) and total > 0 else None
+            for fr in frames:
+                t = fr.get("best_effort_timestamp_time") or fr.get("pkt_pts_time")
+                try:
+                    sec = float(t)
+                except Exception:
+                    continue
+                idx = int(round(sec * float(fps)))
+                if tf is not None:
+                    idx = max(0, min(tf - 1, idx))
+                if idx not in seen:
+                    seen.add(idx)
+                    out.append(idx)
+            out.sort()
+            return out
+        except Exception:
+            return []
+
+    def _jump_keyframe(self, forward: bool):
+        ks = self._keyframes
+        if not ks:
+            if self._worker:
+                self._worker.step(1 if forward else -1)
+            return
+        cur = int(self.seek_slider.value()) if hasattr(self, "seek_slider") else self._current_idx
+        if forward:
+            i = bisect.bisect_right(ks, cur)
+            if i >= len(ks):
+                # past last keyframe -> regular step forward
+                if self._worker:
+                    self._worker.step(1)
+                return
+        else:
+            i = bisect.bisect_left(ks, cur) - 1
+            if i < 0:
+                # before first keyframe -> regular step back
+                if self._worker:
+                    self._worker.step(-1)
+                return
+        target = int(ks[i])
+        if self._worker:
+            self._pause(True)
+            self._worker.seek_frame(target)
+
     def keyPressEvent(self, e: QtGui.QKeyEvent):
         try:
             if e.key() == QtCore.Qt.Key_Space and self._worker:
@@ -1659,11 +1745,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 e.accept()
                 return
             if e.key() == QtCore.Qt.Key_Right and self._worker:
-                self._worker.step(1)
+                self._jump_keyframe(True)
                 e.accept()
                 return
             if e.key() == QtCore.Qt.Key_Left and self._worker:
-                self._worker.step(-1)
+                self._jump_keyframe(False)
                 e.accept()
                 return
         except Exception:
