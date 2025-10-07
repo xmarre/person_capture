@@ -42,3 +42,5 @@ Thumbs.db
 '@ | Set-Content -Encoding utf8 .gitignore
 /preset.json
 /yolov8n.pt
+/output
+/yolov8n-face.pt
