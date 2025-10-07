@@ -7,6 +7,7 @@ from PIL import Image
 from ultralytics import YOLO
 import open_clip
 from urllib.request import urlopen
+import shutil
 from urllib.error import URLError, HTTPError
 import tempfile
 from pathlib import Path
