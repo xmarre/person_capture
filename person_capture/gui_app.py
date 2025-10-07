@@ -11,6 +11,7 @@ Run:
 """
 
 import sys, os, json, time, csv, traceback
+import queue
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple, List
 from pathlib import Path
@@ -170,11 +171,62 @@ class Processor(QtCore.QObject):
     hit = QtCore.Signal(str)                         # crop path
     finished = QtCore.Signal(bool, str)              # success, message
 
+    # --- Player control slots (queued, thread-safe) ---
+    @QtCore.Slot(int)
+    def seek_frame(self, frame_idx: int):
+        try:
+            self._cmd_q.put_nowait(("seek", int(frame_idx)))
+        except Exception:
+            pass
+
+    @QtCore.Slot(float)
+    def seek_time(self, secs: float):
+        try:
+            if getattr(self, "_fps", None):
+                tgt = int(max(0, round(secs * float(self._fps))))
+                self._cmd_q.put_nowait(("seek", tgt))
+        except Exception:
+            pass
+
+    @QtCore.Slot()
+    def play(self):
+        try:
+            self._cmd_q.put_nowait(("play", None))
+        except Exception:
+            pass
+
+    @QtCore.Slot()
+    def pause(self):
+        try:
+            self._cmd_q.put_nowait(("pause", None))
+        except Exception:
+            pass
+
+    @QtCore.Slot(int)
+    def step(self, n: int = 1):
+        try:
+            self._cmd_q.put_nowait(("step", int(n)))
+        except Exception:
+            pass
+
+    @QtCore.Slot(float)
+    def set_speed(self, s: float):
+        try:
+            self._cmd_q.put_nowait(("speed", float(s)))
+        except Exception:
+            pass
+
     def __init__(self, cfg: SessionConfig, parent=None):
         super().__init__(parent)
         self.cfg = cfg
         self._abort = False
         self._pause = False
+        # Player state
+        self._cmd_q: queue.Queue = queue.Queue()
+        self._paused = False
+        self._speed = 1.0
+        self._fps: Optional[float] = None
+        self._total_frames: Optional[int] = None
 
     @QtCore.Slot()
     def request_abort(self):
@@ -183,6 +235,7 @@ class Processor(QtCore.QObject):
     @QtCore.Slot(bool)
     def request_pause(self, p: bool):
         self._pause = bool(p)
+        self._paused = bool(p)
 
     def _combine_scores(self, face_dist, reid_dist, mode='min'):
         vals = []
@@ -206,6 +259,7 @@ class Processor(QtCore.QObject):
     @QtCore.Slot()
     def run(self):
         try:
+            self._paused = False
             self._init_status()
             cfg = self.cfg
             if not os.path.isfile(cfg.video):
@@ -277,6 +331,8 @@ class Processor(QtCore.QObject):
                 raise RuntimeError(f"Cannot open video: {cfg.video}")
             fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            self._fps = float(fps)
+            self._total_frames = int(total_frames)
             self.setup.emit(total_frames, float(fps))
 
             ratios = [r.strip() for r in str(cfg.ratio).split(',') if r.strip()]
@@ -294,7 +350,7 @@ class Processor(QtCore.QObject):
             locked_face = None
             locked_reid = None
             prev_box = None
-            frame_idx = 0
+            frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
             last_preview_emit = -999999
 
             self._status("Processing...", key="phase", interval=5.0)
@@ -302,16 +358,53 @@ class Processor(QtCore.QObject):
                 if self._abort:
                     self._status("Aborting...", key="phase")
                     break
+                force_process = False
+                try:
+                    while True:
+                        cmd, arg = self._cmd_q.get_nowait()
+                        if cmd == "seek":
+                            tgt = int(arg)
+                            if self._total_frames is not None:
+                                tgt = max(0, min(self._total_frames - 1, tgt))
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, tgt)
+                            frame_idx = tgt
+                            self.progress.emit(frame_idx)
+                            force_process = True
+                        elif cmd == "pause":
+                            self._paused = True
+                        elif cmd == "play":
+                            self._paused = False
+                        elif cmd == "step":
+                            stepn = int(arg) if arg is not None else 1
+                            tgt = frame_idx + stepn
+                            if self._total_frames is not None:
+                                tgt = max(0, min(self._total_frames - 1, tgt))
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, tgt)
+                            frame_idx = tgt
+                            self.progress.emit(frame_idx)
+                            self._paused = True
+                            force_process = True
+                        elif cmd == "speed":
+                            try:
+                                self._speed = max(0.1, min(4.0, float(arg)))
+                            except Exception:
+                                pass
+                except queue.Empty:
+                    pass
+
                 if self._pause:
-                    time.sleep(0.05)
+                    self._paused = True
+                if self._paused and not force_process:
+                    time.sleep(0.01)
                     continue
 
                 ret = cap.grab()
                 if not ret:
                     break
-                if frame_idx % max(1, int(cfg.frame_stride)) != 0:
-                    frame_idx += 1
-                    self.progress.emit(frame_idx)
+                current_idx = frame_idx
+                if not force_process and current_idx % max(1, int(cfg.frame_stride)) != 0:
+                    frame_idx = current_idx + 1
+                    self.progress.emit(current_idx)
                     continue
                 ret, frame = cap.retrieve()
                 if not ret:
@@ -493,9 +586,9 @@ class Processor(QtCore.QObject):
                     )
 
                 # Choose best and save with cadence + lock + margin + IoU gate
-                def save_hit(c):
+                def save_hit(c, idx):
                     nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box
-                    crop_img_path = os.path.join(crops_dir, f"f{frame_idx:08d}.jpg")
+                    crop_img_path = os.path.join(crops_dir, f"f{idx:08d}.jpg")
                     cx1,cy1,cx2,cy2 = c["box"]
                      # final ratio enforcement
                     ratio_str = c.get("ratio") or (ratios[0] if 'ratios' in locals() and ratios else (self.cfg.ratio.split(',')[0] if self.cfg.ratio else '2:3'))
@@ -517,7 +610,7 @@ class Processor(QtCore.QObject):
                             cx1 += dx; cx2 = cx1 + new_w
                     crop_img2 = frame[cy1:cy2, cx1:cx2]
                     cv2.imwrite(crop_img_path, crop_img2)
-                    writer.writerow([frame_idx, frame_idx/float(fps), c["score"], c["fd"], c["rd"], cx1, cy1, cx2, cy2, crop_img_path, c["sharp"], c.get("ratio", "")])
+                    writer.writerow([idx, idx/float(fps), c["score"], c["fd"], c["rd"], cx1, cy1, cx2, cy2, crop_img_path, c["sharp"], c.get("ratio", "")])
                     self.hit.emit(crop_img_path)
                     # update lock source
                     if c.get("face_feat") is not None:
@@ -562,7 +655,7 @@ class Processor(QtCore.QObject):
                         if abs(candidates[0]["score"] - candidates[1]["score"]) < float(cfg.score_margin):
                             candidates = [c for c in candidates if c is candidates[0]]  # keep best only
 
-                    now_t = frame_idx/float(fps)
+                    now_t = current_idx/float(fps)
 
                     # Lock logic: after N hits tighten thresholds and require IoU gate
                     use_lock = lock_hits >= int(cfg.lock_after_hits) and (locked_face is not None or locked_reid is not None)
@@ -586,12 +679,20 @@ class Processor(QtCore.QObject):
                         chosen = candidates[0]
 
                     if chosen is not None and now_t - self._last_hit_t >= float(cfg.min_gap_sec):
-                        if save_hit(chosen):
+                        if save_hit(chosen, current_idx):
                             hit_count += 1
                             self._last_hit_t = now_t
 
+                preview_due = bool(force_process)
+                if cfg.preview_every > 0:
+                    if force_process or (current_idx - last_preview_emit) >= int(cfg.preview_every):
+                        preview_due = True
+                        last_preview_emit = current_idx
+                elif preview_due:
+                    last_preview_emit = current_idx
+
                 # Annotated preview
-                if cfg.save_annot or (cfg.preview_every > 0 and (frame_idx - last_preview_emit) >= int(cfg.preview_every)):
+                if cfg.save_annot or preview_due:
                     show = frame.copy()
                     # draw person boxes
                     for c in candidates:
@@ -622,19 +723,21 @@ class Processor(QtCore.QObject):
                     qimg = self._cv_bgr_to_qimage(show)
                     self.preview.emit(qimg)
                 # Always-on preview cadence
-                if cfg.preview_every > 0 and (frame_idx - last_preview_emit) >= int(cfg.preview_every):
-                    last_preview_emit = frame_idx
+                if preview_due:
                     base = frame.copy()
                     qimg = self._cv_bgr_to_qimage(base)
                     self.preview.emit(qimg)
 
-                frame_idx += 1
-                self.progress.emit(frame_idx)
+                # single progress update per loop
+                self.progress.emit(current_idx)
+                frame_idx = current_idx + 1
+                if self._speed and self._speed > 0:
+                    time.sleep(max(0.0, (1.0 / float(fps)) / float(self._speed)))
                 # Per-frame debug dump
                 if dbg_f:
                     _dump_debug(
                         {
-                            "frame": frame_idx,
+                            "frame": current_idx,
                             "persons": int(diag_persons),
                             "any_face_visible": bool(any_face_visible),
                             "best_face_dist": (float(best_face_dist) if best_face_dist is not None else None),
@@ -726,6 +829,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.toolbar.addActions([self.act_start, self.act_pause, self.act_stop, self.act_compact, self.act_reset_layout])
         self._thread: Optional[QtCore.QThread] = None
         self._worker: Optional[Processor] = None
+        self._fps: Optional[float] = None
+        self._total_frames: Optional[int] = None
 
         self.cfg = SessionConfig()
         self._build_ui()
@@ -855,6 +960,31 @@ class MainWindow(QtWidgets.QMainWindow):
         for b in (self.start_btn, self.pause_btn, self.resume_btn, self.stop_btn, self.open_out_btn):
             ctrl_layout.addWidget(b)
 
+        # Player
+        player_group = QtWidgets.QGroupBox("Player")
+        player_layout = QtWidgets.QHBoxLayout(player_group)
+        self.play_btn = QtWidgets.QToolButton(); self.play_btn.setText("Play")
+        self.pause_btn2 = QtWidgets.QToolButton(); self.pause_btn2.setText("Pause")
+        self.step_back_btn = QtWidgets.QToolButton(); self.step_back_btn.setText("⟨⟨")
+        self.step_fwd_btn = QtWidgets.QToolButton(); self.step_fwd_btn.setText("⟩⟩")
+        self.speed_combo = QtWidgets.QComboBox(); self.speed_combo.addItems(["0.25x", "0.5x", "1.0x", "1.5x", "2.0x"])
+        self.speed_combo.setCurrentText("1.0x")
+        self.seek_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.seek_slider.setRange(0, 0)
+        self.seek_slider.setSingleStep(1)
+        self.time_lbl = QtWidgets.QLabel("00:00 / 00:00")
+        for w in (self.play_btn, self.pause_btn2, self.step_back_btn, self.step_fwd_btn, self.speed_combo):
+            player_layout.addWidget(w)
+        player_layout.addWidget(self.seek_slider, 1)
+        player_layout.addWidget(self.time_lbl)
+        self.play_btn.clicked.connect(self._handle_play_clicked)
+        self.pause_btn2.clicked.connect(self._handle_pause_clicked)
+        self.step_back_btn.clicked.connect(self._handle_step_back)
+        self.step_fwd_btn.clicked.connect(self._handle_step_forward)
+        self.seek_slider.sliderReleased.connect(lambda: self._handle_seek_slider(self.seek_slider.value()))
+        self.seek_slider.sliderMoved.connect(lambda _v: None)  # keep if you prefer release-only
+        self.speed_combo.currentTextChanged.connect(self._on_speed_combo_changed)
+
         # Progress + status
         prog_layout = QtWidgets.QHBoxLayout()
         self.progress = QtWidgets.QProgressBar()
@@ -907,6 +1037,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(tab_params, "Parameters")
         controls_layout.addWidget(self.tabs, 1)
         controls_layout.addLayout(ctrl_layout)
+        controls_layout.addWidget(player_group)
         controls_layout.addLayout(prog_layout)
         controls_scroll = QtWidgets.QScrollArea(); controls_scroll.setWidget(controls_container); controls_scroll.setWidgetResizable(True)
         self.dock_controls = QDockWidget("Controls", self); self.dock_controls.setObjectName("dock_controls")
@@ -1060,6 +1191,35 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             os.system(f'xdg-open "{p}"')
 
+    def _on_speed_combo_changed(self, txt: str):
+        if not self._worker:
+            return
+        try:
+            speed = float(txt.replace("x", ""))
+        except Exception:
+            speed = 1.0
+        self._worker.set_speed(speed)
+
+    def _handle_play_clicked(self, _checked: bool = False):
+        if self._worker:
+            self._worker.play()
+
+    def _handle_pause_clicked(self, _checked: bool = False):
+        if self._worker:
+            self._worker.pause()
+
+    def _handle_step_back(self, _checked: bool = False):
+        if self._worker:
+            self._worker.step(-1)
+
+    def _handle_step_forward(self, _checked: bool = False):
+        if self._worker:
+            self._worker.step(1)
+
+    def _handle_seek_slider(self, value: int):
+        if self._worker:
+            self._worker.seek_frame(int(value))
+
     def _pause(self, flag: bool):
         if self._worker:
             self._worker.request_pause(flag)
@@ -1202,6 +1362,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker.hit.connect(self._on_hit)
         self._worker.finished.connect(self._on_finished)
 
+        self._on_speed_combo_changed(self.speed_combo.currentText())
         self._thread.start()
 
     def on_pause(self):
@@ -1215,12 +1376,32 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # Signal handlers
     def _on_setup(self, total_frames: int, fps: float):
+        self._total_frames = int(total_frames)
+        self._fps = float(fps)
         self.progress.setRange(0, max(0, total_frames))
         self.meta_lbl.setText(f"fps={fps:.2f} frames={total_frames if total_frames>0 else 'unknown'}")
+        if hasattr(self, "seek_slider"):
+            self.seek_slider.setRange(0, max(0, total_frames - 1))
+            self.seek_slider.setValue(0)
+            if hasattr(self, "time_lbl"):
+                self.time_lbl.setText(f"{self._fmt_time(0)} / {self._fmt_time(total_frames)}")
 
     def _on_progress(self, idx: int):
         if self.progress.maximum() > 0 and idx <= self.progress.maximum():
             self.progress.setValue(idx)
+        if hasattr(self, "seek_slider"):
+            if not self.seek_slider.isSliderDown():
+                self.seek_slider.setValue(int(idx))
+            if self._total_frames is not None and self._fps:
+                self.time_lbl.setText(f"{self._fmt_time(idx)} / {self._fmt_time(self._total_frames)}")
+
+    def _fmt_time(self, frames: int) -> str:
+        if not self._fps:
+            return "00:00"
+        secs = max(0, int(round(frames / float(self._fps))))
+        m, s = divmod(secs, 60)
+        h, m = divmod(m, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
     def _on_status(self, txt: str):
         self.status_lbl.setText(txt)
@@ -1239,6 +1420,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log(msg)
         self.status_lbl.setText("Idle" if ok else "Error")
         QtWidgets.QMessageBox.information(self, "Finished" if ok else "Error", msg)
+        if hasattr(self, "seek_slider"):
+            self.seek_slider.setValue(0)
+            self.seek_slider.setRange(0, 0)
+        if hasattr(self, "time_lbl"):
+            self.time_lbl.setText("00:00 / 00:00")
+        self._fps = None
+        self._total_frames = None
         # Clean up thread
         try:
             if self._thread and self._thread.isRunning():
@@ -1255,12 +1443,45 @@ class MainWindow(QtWidgets.QMainWindow):
         ts = time.strftime("%H:%M:%S")
         self.log_edit.appendPlainText(f"[{ts}] {s}")
 
+    def keyPressEvent(self, e: QtGui.QKeyEvent):
+        try:
+            if e.key() == QtCore.Qt.Key_Space and self._worker:
+                if getattr(self._worker, "_paused", False):
+                    self._worker.play()
+                else:
+                    self._worker.pause()
+                e.accept()
+                return
+            if e.key() == QtCore.Qt.Key_Right and self._worker:
+                self._worker.step(1)
+                e.accept()
+                return
+            if e.key() == QtCore.Qt.Key_Left and self._worker:
+                self._worker.step(-1)
+                e.accept()
+                return
+        except Exception:
+            pass
+        return super().keyPressEvent(e)
+
     def _update_buttons(self, state: str):
         running = (state == "running")
         self.start_btn.setEnabled(not running)
         self.pause_btn.setEnabled(running)
         self.resume_btn.setEnabled(running)
         self.stop_btn.setEnabled(running)
+        if hasattr(self, "play_btn"):
+            self.play_btn.setEnabled(running)
+        if hasattr(self, "pause_btn2"):
+            self.pause_btn2.setEnabled(running)
+        if hasattr(self, "step_back_btn"):
+            self.step_back_btn.setEnabled(running)
+        if hasattr(self, "step_fwd_btn"):
+            self.step_fwd_btn.setEnabled(running)
+        if hasattr(self, "seek_slider"):
+            self.seek_slider.setEnabled(running)
+        if hasattr(self, "speed_combo"):
+            self.speed_combo.setEnabled(running)
         if hasattr(self, "act_start"):
             self.act_start.setEnabled(not running)
         if hasattr(self, "act_pause"):
