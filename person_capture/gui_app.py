@@ -552,6 +552,10 @@ class Processor(QtCore.QObject):
                         face_dists_quality.append(fd_tmp)
                     if fd_tmp <= float(cfg.face_thresh):
                         any_face_match = True
+                
+                visible_for_gate = any_face_visible or (any_face_detected and not any_face_match_qual)
+                any_face_match_qual = any((d <= float(cfg.face_thresh)) for d in face_dists_quality)
+
                 best_face_dist = min(face_dists_quality) if face_dists_quality else None
                 if min_fd_all is None and face_dists_all:
                     min_fd_all = min(face_dists_all)
@@ -621,7 +625,7 @@ class Processor(QtCore.QObject):
                     # Face-first policy: hard gate only when requested and reference face exists
                     if (
                         cfg.require_face_if_visible
-                        and any_face_visible
+                        and visible_for_gate
                         and (ref_face_feat is not None)
                     ):
                         if (
