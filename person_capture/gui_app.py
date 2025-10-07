@@ -58,6 +58,7 @@ class SessionConfig:
     combine: str = "min"            # min | avg | face_priority
     device: str = "cuda"            # cuda | cpu
     yolo_model: str = "yolov8n.pt"
+    face_model: str = "yolov8n-face.pt"
     save_annot: bool = False
     preview_every: int = 30         # emit preview every N processed frames
 
@@ -136,7 +137,7 @@ class Processor(QtCore.QObject):
 
             self.status.emit("Loading models...")
             det = PersonDetector(model_name=cfg.yolo_model, device=cfg.device)
-            face = FaceEmbedder(ctx=cfg.device)
+            face = FaceEmbedder(ctx=cfg.device, yolo_model=cfg.face_model)
             reid = ReIDEmbedder(device=cfg.device)
 
             # Reference
@@ -355,6 +356,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combine_combo = QtWidgets.QComboBox(); self.combine_combo.addItems(["min","avg","face_priority"])
         self.device_combo = QtWidgets.QComboBox(); self.device_combo.addItems(["cuda","cpu"])
         self.yolo_edit = QtWidgets.QLineEdit("yolov8n.pt")
+        self.face_yolo_edit = QtWidgets.QLineEdit("yolov8n-face.pt")
         self.annot_check = QtWidgets.QCheckBox("Save annotated frames")
         self.preview_every_spin = QtWidgets.QSpinBox(); self.preview_every_spin.setRange(0, 5000); self.preview_every_spin.setValue(30)
 
@@ -367,6 +369,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Combine", self.combine_combo),
             ("Device", self.device_combo),
             ("YOLO model", self.yolo_edit),
+            ("Face YOLO model", self.face_yolo_edit),
             ("Preview every N frames", self.preview_every_spin),
             ("", self.annot_check),
         ]
@@ -524,6 +527,7 @@ class MainWindow(QtWidgets.QMainWindow):
             combine=self.combine_combo.currentText(),
             device=self.device_combo.currentText(),
             yolo_model=self.yolo_edit.text().strip() or "yolov8n.pt",
+            face_model=self.face_yolo_edit.text().strip() or "yolov8n-face.pt",
             save_annot=bool(self.annot_check.isChecked()),
             preview_every=int(self.preview_every_spin.value()),
         )
@@ -541,6 +545,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combine_combo.setCurrentText(cfg.combine)
         self.device_combo.setCurrentText(cfg.device)
         self.yolo_edit.setText(cfg.yolo_model)
+        self.face_yolo_edit.setText(cfg.face_model)
         self.annot_check.setChecked(cfg.save_annot)
         self.preview_every_spin.setValue(cfg.preview_every)
 
@@ -653,6 +658,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.combine_combo.setCurrentText(s.value("combine", "min"))
         self.device_combo.setCurrentText(s.value("device", "cuda"))
         self.yolo_edit.setText(s.value("yolo_model", "yolov8n.pt"))
+        self.face_yolo_edit.setText(s.value("face_model", "yolov8n-face.pt"))
         self.annot_check.setChecked(bool(s.value("save_annot", False)))
         self.preview_every_spin.setValue(int(s.value("preview_every", 30)))
 
