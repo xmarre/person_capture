@@ -84,6 +84,10 @@ class SessionConfig:
     face_quality_min: float = 120.0
     face_margin_min: float = 0.05
     require_face_if_visible: bool = True
+    # Debug/diagnostics
+    debug_dump: bool = True
+    debug_dir: str = "debug"
+    overlay_scores: bool = True
     lock_momentum: float = 0.7
     suppress_negatives: bool = False
     neg_tolerance: float = 0.35
@@ -215,6 +219,23 @@ class Processor(QtCore.QObject):
             ensure_dir(crops_dir)
             if ann_dir:
                 ensure_dir(ann_dir)
+            # Debug I/O
+            dbg_f = None
+            if getattr(cfg, "debug_dump", False):
+                dbg_dir = os.path.join(cfg.out_dir, getattr(cfg, "debug_dir", "debug"))
+                ensure_dir(dbg_dir)
+                dbg_f = open(os.path.join(dbg_dir, "debug.jsonl"), "w", encoding="utf-8")
+
+            def _dump_debug(obj):
+                if dbg_f:
+                    try:
+                        import json
+
+                        json.dump(obj, dbg_f, ensure_ascii=False)
+                        dbg_f.write("\n")
+                        dbg_f.flush()
+                    except Exception:
+                        pass
 
             self._status("Loading models...", key="phase", interval=5.0)
             det = PersonDetector(model_name=cfg.yolo_model, device=cfg.device, progress=self.status.emit)
@@ -230,6 +251,11 @@ class Processor(QtCore.QObject):
             ref_faces = face.extract(ref_img)
             ref_face = FaceEmbedder.best_face(ref_faces)
             ref_face_feat = ref_face['feat'] if ref_face else None
+            self._status(
+                f"Ref face: {'ok' if ref_face_feat is not None else 'missing'}; backend={getattr(face, 'backend', None)}",
+                key="ref",
+                interval=60.0,
+            )
 
             ref_persons = det.detect(ref_img, conf=0.1)
             if ref_persons:
@@ -239,6 +265,11 @@ class Processor(QtCore.QObject):
                 ref_reid_feat = reid.extract([ref_crop])[0]
             else:
                 ref_reid_feat = reid.extract([ref_img])[0]
+            self._status(
+                f"Ref ReID: {'ok' if ref_reid_feat is not None else 'missing'}",
+                key="ref_reid",
+                interval=60.0,
+            )
 
             # Video
             cap = cv2.VideoCapture(cfg.video)
@@ -350,16 +381,29 @@ class Processor(QtCore.QObject):
 
                 # Evaluate candidates
                 for i, feat in enumerate(reid_feats):
+                    cand_reason = []
                     rd = None
                     if ref_reid_feat is not None:
                         f = feat / max(np.linalg.norm(feat), 1e-9)
                         r = ref_reid_feat / max(np.linalg.norm(ref_reid_feat), 1e-9)
                         rd = 1.0 - float(np.dot(f, r))
+                    if rd is None:
+                        cand_reason.append("no_reid_ref_or_feat")
+                    else:
+                        cand_reason.append(f"rd={rd:.3f} thr={float(cfg.reid_thresh):.3f}")
 
                     bf = faces_local.get(i, None)
                     fd = None
                     if bf is not None and ref_face_feat is not None:
                         fd = 1.0 - float(np.dot(bf["feat"], ref_face_feat))
+                    if bf is None:
+                        cand_reason.append("no_face_in_crop")
+                    if ref_face_feat is None:
+                        cand_reason.append("no_ref_face_feat")
+                    if fd is not None:
+                        cand_reason.append(
+                            f"fd={fd:.3f} thr={float(cfg.face_thresh):.3f} q={bf.get('quality', 0):.0f}"
+                        )
 
                     # Match decision with dynamic fallback
                     face_ok = (fd is not None and fd <= float(cfg.face_thresh))
@@ -386,11 +430,26 @@ class Processor(QtCore.QObject):
                     else:
                         accept = face_ok or reid_ok
 
-                    # Global face-first policy: if any face is visible in the frame, only accept candidates with a valid face match and quality
-                    if cfg.prefer_face_when_available and any_face_visible:
-                        if bf is None or bf.get('quality',0.0) < float(cfg.face_quality_min) or not face_ok:
+                    accept_before_face_policy = accept
+
+                    # Face-first policy: hard gate only when requested and reference face exists
+                    if (
+                        cfg.require_face_if_visible
+                        and any_face_visible
+                        and (ref_face_feat is not None)
+                    ):
+                        if (
+                            bf is None
+                            or bf.get('quality', 0.0) < float(cfg.face_quality_min)
+                            or not face_ok
+                        ):
                             accept = False
+                            cand_reason.append("hard_gate_face_required")
+                    elif cfg.prefer_face_when_available and any_face_visible and (bf is None):
+                        cand_reason.append("soft_pref_face_missing")
+
                     if not accept:
+                        cand_reason.append("reject")
                         continue
 
                     score = self._combine_scores(fd, rd, mode=cfg.combine)
@@ -415,7 +474,23 @@ class Processor(QtCore.QObject):
                     # Map to original frame coords for annotation
                     ox1, oy1, ox2, oy2 = ex1+off_x, ey1+off_y, ex2+off_x, ey2+off_y
                     area = (ox2-ox1)*(oy2-oy1)
-                    candidates.append(dict(score=score, fd=fd, rd=rd, sharp=sharp, box=(ox1,oy1,ox2,oy2), area=area, show_box=(x1+off_x,y1+off_y,x2+off_x,y2+off_y), face_feat=(bf["feat"] if bf is not None else None), reid_feat=(reid_feats[i] if i < len(reid_feats) else None), ratio=chosen_ratio))
+                    candidates.append(
+                        dict(
+                            score=score,
+                            fd=fd,
+                            rd=rd,
+                            sharp=sharp,
+                            box=(ox1, oy1, ox2, oy2),
+                            area=area,
+                            show_box=(x1 + off_x, y1 + off_y, x2 + off_x, y2 + off_y),
+                            face_feat=(bf["feat"] if bf is not None else None),
+                            reid_feat=(reid_feats[i] if i < len(reid_feats) else None),
+                            ratio=chosen_ratio,
+                            reasons=cand_reason,
+                            face_quality=(bf.get('quality', 0.0) if bf is not None else None),
+                            accept_pre=accept_before_face_policy,
+                        )
+                    )
 
                 # Choose best and save with cadence + lock + margin + IoU gate
                 def save_hit(c):
@@ -459,7 +534,11 @@ class Processor(QtCore.QObject):
                     self._last_hit_t = -1e9
 
                 if not candidates:
-                    self._status(f"No match. persons={diag_persons}", key="no_match", interval=1.0)
+                    self._status(
+                        f"No match. persons={diag_persons} face_visible={any_face_visible} best_fd={best_face_dist if best_face_dist is not None else 'n/a'}",
+                        key="no_match",
+                        interval=1.0,
+                    )
                 else:
                     # Lock-aware scoring
                     # face margin check: chosen must be best face by a margin if faces are present
@@ -518,6 +597,25 @@ class Processor(QtCore.QObject):
                     for c in candidates:
                         x1,y1,x2,y2 = c["show_box"]
                         cv2.rectangle(show, (x1,y1),(x2,y2),(0,255,0),1)
+                        if getattr(cfg, "overlay_scores", True):
+                            txt = []
+                            if c.get("fd") is not None:
+                                txt.append(f"fd {c['fd']:.2f}")
+                            if c.get("rd") is not None:
+                                txt.append(f"rd {c['rd']:.2f}")
+                            if c.get("face_quality") is not None:
+                                txt.append(f"q {c['face_quality']:.0f}")
+                            if txt:
+                                cv2.putText(
+                                    show,
+                                    " | ".join(txt),
+                                    (x1, max(0, y1 - 5)),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.45,
+                                    (0, 255, 0),
+                                    1,
+                                    cv2.LINE_AA,
+                                )
                     if candidates:
                         bx1,by1,bx2,by2 = candidates[0]["box"]
                         cv2.rectangle(show, (bx1,by1),(bx2,by2),(255,0,0),2)
@@ -532,16 +630,51 @@ class Processor(QtCore.QObject):
 
                 frame_idx += 1
                 self.progress.emit(frame_idx)
+                # Per-frame debug dump
+                if dbg_f:
+                    _dump_debug(
+                        {
+                            "frame": frame_idx,
+                            "persons": int(diag_persons),
+                            "any_face_visible": bool(any_face_visible),
+                            "best_face_dist": (float(best_face_dist) if best_face_dist is not None else None),
+                            "cfg": {
+                                "face_thresh": float(cfg.face_thresh),
+                                "reid_thresh": float(cfg.reid_thresh),
+                                "face_quality_min": float(cfg.face_quality_min),
+                                "prefer_face_when_available": bool(cfg.prefer_face_when_available),
+                                "require_face_if_visible": bool(cfg.require_face_if_visible),
+                                "match_mode": str(cfg.match_mode),
+                            },
+                            "candidates": [
+                                {
+                                    "fd": (float(c["fd"]) if c["fd"] is not None else None),
+                                    "rd": (float(c["rd"]) if c["rd"] is not None else None),
+                                    "sharp": float(c["sharp"]),
+                                    "box": [int(v) for v in c["box"]],
+                                    "reasons": c.get("reasons", []),
+                                }
+                                for c in candidates
+                            ],
+                        }
+                    )
 
             cap.release()
             # finalize CSV
             csv_f.close()
+            if dbg_f:
+                dbg_f.close()
 
             if self._abort:
                 self.finished.emit(False, "Aborted")
             else:
                 self.finished.emit(True, f"Done. Hits: {hit_count}. Index: {csv_path}")
         except Exception as e:
+            if 'dbg_f' in locals() and dbg_f:
+                try:
+                    dbg_f.close()
+                except Exception:
+                    pass
             err = f"Error: {e}\n{traceback.format_exc()}"
             self.finished.emit(False, err)
 
