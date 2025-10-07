@@ -79,6 +79,9 @@ class SessionConfig:
     face_model: str = "yolov8n-face.pt"
     save_annot: bool = False
     preview_every: int = 30
+    prefer_face_when_available: bool = True
+    face_quality_min: float = 120.0
+    face_margin_min: float = 0.05
     require_face_if_visible: bool = True
     lock_momentum: float = 0.7
     suppress_negatives: bool = False
@@ -330,6 +333,19 @@ class Processor(QtCore.QObject):
                     ffaces = face.extract(crop)
                     bestf = FaceEmbedder.best_face(ffaces)
                     faces_local[i] = bestf
+                # Aggregate face visibility and best distance
+                any_face_visible = False
+                face_dists = []
+                for i, bf in faces_local.items():
+                    if bf is None:
+                        continue
+                    if bf.get('quality', 0.0) < float(cfg.face_quality_min):
+                        continue
+                    any_face_visible = True
+                    if ref_face_feat is not None:
+                        fd_tmp = 1.0 - float(np.dot(bf['feat'], ref_face_feat))
+                        face_dists.append(fd_tmp)
+                best_face_dist = min(face_dists) if face_dists else None
 
                 # Evaluate candidates
                 for i, feat in enumerate(reid_feats):
@@ -369,9 +385,10 @@ class Processor(QtCore.QObject):
                     else:
                         accept = face_ok or reid_ok
 
-                    # Enforce 'require face if visible'
-                    if cfg.require_face_if_visible and bf is not None and not face_ok:
-                        accept = False
+                    # Global face-first policy: if any face is visible in the frame, only accept candidates with a valid face match and quality
+                    if cfg.prefer_face_when_available and any_face_visible:
+                        if bf is None or bf.get('quality',0.0) < float(cfg.face_quality_min) or not face_ok:
+                            accept = False
                     if not accept:
                         continue
 
@@ -444,6 +461,15 @@ class Processor(QtCore.QObject):
                     self._status(f"No match. persons={diag_persons}", key="no_match", interval=1.0)
                 else:
                     # Lock-aware scoring
+                    # face margin check: chosen must be best face by a margin if faces are present
+                    if cfg.prefer_face_when_available and any_face_visible:
+                        # filter to face-bearing candidates
+                        face_cands = [c for c in candidates if c.get('fd') is not None]
+                        if len(face_cands) >= 2:
+                            face_cands.sort(key=lambda d: d['fd'])
+                            if (face_cands[1]['fd'] - face_cands[0]['fd']) < float(cfg.face_margin_min):
+                                # ambiguous faces -> drop frame
+                                candidates = []
                     def eff_score(c):
                         s = c["score"] if c["score"] is not None else 1e9
                         # prefer higher sharpness slightly
@@ -848,6 +874,9 @@ class MainWindow(QtWidgets.QMainWindow):
             face_model=self.face_yolo_edit.text().strip() or "yolov8n-face.pt",
             save_annot=bool(self.annot_check.isChecked()),
             preview_every=int(self.preview_every_spin.value()),
+            prefer_face_when_available=bool(getattr(self, 'require_face_check', QtWidgets.QCheckBox()).isChecked()) if hasattr(self, 'require_face_check') else True,
+            face_quality_min=float(getattr(self, 'min_sharp_spin', QtWidgets.QDoubleSpinBox()).value()) if hasattr(self, 'min_sharp_spin') else 120.0,
+            face_margin_min=float(getattr(self, 'margin_spin', QtWidgets.QDoubleSpinBox()).value()) if hasattr(self, 'margin_spin') else 0.05,
         )
         return cfg
 
@@ -885,6 +914,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.face_yolo_edit.setText(cfg.face_model)
         self.annot_check.setChecked(cfg.save_annot)
         self.preview_every_spin.setValue(cfg.preview_every)
+        if hasattr(self, 'require_face_check'):
+            self.require_face_check.setChecked(cfg.prefer_face_when_available)
+        if hasattr(self, 'min_sharp_spin'):
+            self.min_sharp_spin.setValue(max(cfg.min_sharpness, cfg.face_quality_min))
+        if hasattr(self, 'margin_spin'):
+            self.margin_spin.setValue(cfg.face_margin_min)
 
     # Thread control
     def on_start(self):
@@ -1017,6 +1052,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.face_yolo_edit.setText(s.value("face_model", "yolov8n-face.pt"))
         self.annot_check.setChecked(bool(s.value("save_annot", False)))
         self.preview_every_spin.setValue(int(s.value("preview_every", 30)))
+        # Face-first defaults if controls not present
+        if hasattr(self, 'require_face_check'):
+            self.require_face_check.setChecked(bool(s.value("prefer_face_when_available", True)))
+        # Use existing controls to hold thresholds for convenience
+        if hasattr(self, 'min_sharp_spin'):
+            self.min_sharp_spin.setValue(float(s.value("face_quality_min", 120.0)))
+        if hasattr(self, 'margin_spin'):
+            self.margin_spin.setValue(float(s.value("face_margin_min", 0.05)))
 
     def _save_qsettings(self):
         s = QtCore.QSettings(APP_ORG, APP_NAME)
