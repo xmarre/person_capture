@@ -504,7 +504,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.margin_spin = QtWidgets.QDoubleSpinBox(); self.margin_spin.setDecimals(3); self.margin_spin.setRange(0.0, 1.0); self.margin_spin.setValue(0.03)
         self.iou_gate_spin = QtWidgets.QDoubleSpinBox(); self.iou_gate_spin.setDecimals(3); self.iou_gate_spin.setRange(0.0, 1.0); self.iou_gate_spin.setValue(0.05)
         self.use_arc_check = QtWidgets.QCheckBox("Use ArcFace for face ID")
-        self.use_arc_check.setChecked(True)
+        self.use_arc_check.setChecked(False)
         self.device_combo = QtWidgets.QComboBox(); self.device_combo.addItems(["cuda","cpu"])
         self.yolo_edit = QtWidgets.QLineEdit("yolov8n.pt")
         self.face_yolo_edit = QtWidgets.QLineEdit("yolov8n-face.pt")

@@ -12,7 +12,10 @@ import tempfile
 from pathlib import Path
 import shutil
 
-import onnxruntime as ort
+try:
+    import onnxruntime as ort
+except Exception:
+    ort = None  # fallback later
 
 Y8F_DEFAULT = "yolov8n-face.pt"
 
@@ -72,14 +75,21 @@ class FaceEmbedder:
         self.conf = float(conf)
 
         self.use_arcface = bool(use_arcface)
-        if self.use_arcface:
-            onnx_path = _ensure_file(ARCFACE_ONNX, ARCFACE_URLS)
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if self.device == 'cuda' else ['CPUExecutionProvider']
-            self.arc_sess = ort.InferenceSession(onnx_path, providers=providers)
-            self.arc_input = self.arc_sess.get_inputs()[0].name
-        else:
+        self.backend = None
+        if self.use_arcface and ort is not None:
+            try:
+                onnx_path = _ensure_file(ARCFACE_ONNX, ARCFACE_URLS)
+                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if self.device == 'cuda' else ['CPUExecutionProvider']
+                self.arc_sess = ort.InferenceSession(onnx_path, providers=providers)
+                self.arc_input = self.arc_sess.get_inputs()[0].name
+                self.backend = 'arcface'
+            except Exception as _e:
+                # Fallback to CLIP
+                self.use_arcface = False
+        if not self.use_arcface or self.backend is None:
             self.model, _, self.preprocess = open_clip.create_model_and_transforms(clip_model_name, pretrained=clip_pretrained)
             self.model.eval().to(self.device)
+            self.backend = 'clip'
 
     def _face_quality(self, bgr):
         g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
