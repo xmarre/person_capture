@@ -83,6 +83,9 @@ class SessionConfig:
     preview_every: int = 30
     prefer_face_when_available: bool = True
     face_quality_min: float = 120.0
+    face_visible_uses_quality: bool = True      # if False, any detected face counts as "visible"
+    face_det_conf: float = 0.22                 # YOLOv8-face confidence
+    face_det_pad: float = 0.08                  # expand person box before face detect (fraction of w/h)
     face_margin_min: float = 0.05
     require_face_if_visible: bool = True
     # Debug/diagnostics
@@ -293,7 +296,15 @@ class Processor(QtCore.QObject):
 
             self._status("Loading models...", key="phase", interval=5.0)
             det = PersonDetector(model_name=cfg.yolo_model, device=cfg.device, progress=self.status.emit)
-            face = FaceEmbedder(ctx=cfg.device, yolo_model=cfg.face_model, use_arcface=cfg.use_arcface, clip_model_name=cfg.clip_face_backbone, clip_pretrained=cfg.clip_face_pretrained, progress=self.status.emit)
+            face = FaceEmbedder(
+                ctx=cfg.device,
+                yolo_model=cfg.face_model,
+                conf=float(cfg.face_det_conf),
+                use_arcface=cfg.use_arcface,
+                clip_model_name=cfg.clip_face_backbone,
+                clip_pretrained=cfg.clip_face_pretrained,
+                progress=self.status.emit,
+            )
             reid = ReIDEmbedder(device=cfg.device, model_name=cfg.reid_backbone, pretrained=cfg.reid_pretrained, progress=self.status.emit)
 
             # Reference
@@ -447,28 +458,70 @@ class Processor(QtCore.QObject):
                     ar = (y2-y1) / max(1, (x2-x1))
                     if ar < 0.7 or ar > 4.0:  # extreme aspect -> likely false
                         continue
-                        continue
                     crop = frame_for_det[y1:y2, x1:x2]
                     crops.append(crop); boxes.append((x1,y1,x2,y2))
 
                 reid_feats = reid.extract(crops) if crops else []
 
+                face_debug_boxes = []  # [(x1,y1,x2,y2,q)]
+                faces_detected = 0
+                faces_passing_quality = 0
+
                 # Face features per person
                 for i, crop in enumerate(crops):
+                    x1, y1, x2, y2 = boxes[i]
                     ffaces = face.extract(crop)
+                    if not ffaces and float(cfg.face_det_pad) > 0.0:
+                        pw = int(round((x2 - x1) * float(cfg.face_det_pad)))
+                        ph = int(round((y2 - y1) * float(cfg.face_det_pad)))
+                        if pw > 0 or ph > 0:
+                            px1 = max(0, x1 - pw)
+                            py1 = max(0, y1 - ph)
+                            px2 = min(W2, x2 + pw)
+                            py2 = min(H2, y2 + ph)
+                            if px2 > px1 and py2 > py1:
+                                big = frame_for_det[py1:py2, px1:px2]
+                                ff2 = face.extract(big)
+                                remap = []
+                                dx, dy = (x1 - px1), (y1 - py1)
+                                for f in ff2:
+                                    bb = f["bbox"].copy()
+                                    bb[0] -= dx
+                                    bb[2] -= dx
+                                    bb[1] -= dy
+                                    bb[3] -= dy
+                                    remap.append({"bbox": bb, "feat": f.get("feat"), "quality": f.get("quality", 0.0)})
+                                ffaces = remap
+                    faces_detected += len(ffaces)
+                    for f in ffaces:
+                        bx1, by1, bx2, by2 = [int(round(v)) for v in f["bbox"]]
+                        face_debug_boxes.append(
+                            (
+                                max(0, x1 + bx1 + off_x),
+                                max(0, y1 + by1 + off_y),
+                                min(W - 1, x1 + bx2 + off_x),
+                                min(H - 1, y1 + by2 + off_y),
+                                float(f.get("quality", 0.0)),
+                            )
+                        )
                     bestf = FaceEmbedder.best_face(ffaces)
                     faces_local[i] = bestf
-                # Aggregate face visibility and best distance
-                any_face_visible = False
+                    if bestf is not None and bestf.get("quality", 0.0) >= float(cfg.face_quality_min):
+                        faces_passing_quality += 1
+
+                any_face_detected = faces_detected > 0
+                any_face_visible = (
+                    faces_passing_quality > 0 if bool(cfg.face_visible_uses_quality) else any_face_detected
+                )
+
                 face_dists = []
-                for i, bf in faces_local.items():
+                for bf in faces_local.values():
                     if bf is None:
                         continue
-                    if bf.get('quality', 0.0) < float(cfg.face_quality_min):
+                    if bf.get("quality", 0.0) < float(cfg.face_quality_min):
                         continue
-                    any_face_visible = True
                     if ref_face_feat is not None:
-                        fd_tmp = 1.0 - float(np.dot(bf['feat'], ref_face_feat))
+                        fd_tmp = 1.0 - float(np.dot(bf["feat"], ref_face_feat))
                         face_dists.append(fd_tmp)
                 best_face_dist = min(face_dists) if face_dists else None
 
@@ -628,7 +681,7 @@ class Processor(QtCore.QObject):
 
                 if not candidates:
                     self._status(
-                        f"No match. persons={diag_persons} face_visible={any_face_visible} best_fd={best_face_dist if best_face_dist is not None else 'n/a'}",
+                        f"No match. persons={diag_persons} faces={faces_detected} pass_q={faces_passing_quality} visible={any_face_visible} best_fd={best_face_dist if best_face_dist is not None else 'n/a'}",
                         key="no_match",
                         interval=1.0,
                     )
@@ -694,6 +747,19 @@ class Processor(QtCore.QObject):
                 # Annotated preview
                 if cfg.save_annot or preview_due:
                     show = frame.copy()
+                    for fx1, fy1, fx2, fy2, q in face_debug_boxes:
+                        color = (0, 255, 0) if q >= float(cfg.face_quality_min) else (0, 165, 255)
+                        cv2.rectangle(show, (int(fx1), int(fy1)), (int(fx2), int(fy2)), color, 1)
+                        cv2.putText(
+                            show,
+                            f"q {q:.0f}",
+                            (int(fx1), max(0, int(fy1) - 5)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45,
+                            color,
+                            1,
+                            cv2.LINE_AA,
+                        )
                     # draw person boxes
                     for c in candidates:
                         x1,y1,x2,y2 = c["show_box"]
@@ -739,12 +805,18 @@ class Processor(QtCore.QObject):
                         {
                             "frame": current_idx,
                             "persons": int(diag_persons),
+                            "faces_detected": int(faces_detected),
+                            "faces_pass_quality": int(faces_passing_quality),
+                            "any_face_detected": bool(any_face_detected),
                             "any_face_visible": bool(any_face_visible),
                             "best_face_dist": (float(best_face_dist) if best_face_dist is not None else None),
                             "cfg": {
+                                "face_det_conf": float(cfg.face_det_conf),
+                                "face_det_pad": float(cfg.face_det_pad),
                                 "face_thresh": float(cfg.face_thresh),
                                 "reid_thresh": float(cfg.reid_thresh),
                                 "face_quality_min": float(cfg.face_quality_min),
+                                "face_visible_uses_quality": bool(cfg.face_visible_uses_quality),
                                 "prefer_face_when_available": bool(cfg.prefer_face_when_available),
                                 "require_face_if_visible": bool(cfg.require_face_if_visible),
                                 "match_mode": str(cfg.match_mode),
@@ -881,9 +953,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stride_spin = QtWidgets.QSpinBox(); self.stride_spin.setRange(1, 1000); self.stride_spin.setValue(2)
         self.det_conf_spin = QtWidgets.QDoubleSpinBox(); self.det_conf_spin.setDecimals(3); self.det_conf_spin.setRange(0.0, 1.0); self.det_conf_spin.setSingleStep(0.01); self.det_conf_spin.setValue(0.35)
         self.face_thr_spin = QtWidgets.QDoubleSpinBox(); self.face_thr_spin.setDecimals(3); self.face_thr_spin.setRange(0.0, 2.0); self.face_thr_spin.setSingleStep(0.01); self.face_thr_spin.setValue(0.32)
+        self.face_det_conf_spin = QtWidgets.QDoubleSpinBox(); self.face_det_conf_spin.setDecimals(3); self.face_det_conf_spin.setRange(0.0, 1.0); self.face_det_conf_spin.setSingleStep(0.01); self.face_det_conf_spin.setValue(0.22)
+        self.face_det_pad_spin = QtWidgets.QDoubleSpinBox(); self.face_det_pad_spin.setDecimals(3); self.face_det_pad_spin.setRange(0.0, 1.0); self.face_det_pad_spin.setSingleStep(0.01); self.face_det_pad_spin.setValue(0.08)
+        self.face_quality_spin = QtWidgets.QDoubleSpinBox(); self.face_quality_spin.setRange(0.0, 1000.0); self.face_quality_spin.setSingleStep(1.0); self.face_quality_spin.setValue(120.0)
+        self.face_vis_quality_check = QtWidgets.QCheckBox(); self.face_vis_quality_check.setChecked(True)
         self.reid_thr_spin = QtWidgets.QDoubleSpinBox(); self.reid_thr_spin.setDecimals(3); self.reid_thr_spin.setRange(0.0, 2.0); self.reid_thr_spin.setSingleStep(0.01); self.reid_thr_spin.setValue(0.38)
-        self.combine_combo = QtWidgets.QComboBox(); self.combine_combo.addItems(["min","avg","face_priority"]) 
-        self.match_mode_combo = QtWidgets.QComboBox(); self.match_mode_combo.addItems(["either","both","face_only","reid_only"]) 
+        self.combine_combo = QtWidgets.QComboBox(); self.combine_combo.addItems(["min","avg","face_priority"])
+        self.match_mode_combo = QtWidgets.QComboBox(); self.match_mode_combo.addItems(["either","both","face_only","reid_only"])
         self.only_best_check = QtWidgets.QCheckBox("Only best per frame")
         self.only_best_check.setChecked(True)
         self.min_sharp_spin = QtWidgets.QDoubleSpinBox(); self.min_sharp_spin.setRange(0.0, 5000.0); self.min_sharp_spin.setValue(120.0)
@@ -916,6 +992,10 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Frame stride", self.stride_spin),
             ("YOLO min conf", self.det_conf_spin),
             ("Face max dist", self.face_thr_spin),
+            ("Face detector conf", self.face_det_conf_spin),
+            ("Face detector pad", self.face_det_pad_spin),
+            ("Face quality min", self.face_quality_spin),
+            ("Face visible uses quality", self.face_vis_quality_check),
             ("ReID max dist", self.reid_thr_spin),
             ("Combine", self.combine_combo),
             ("Match mode", self.match_mode_combo),
@@ -1281,8 +1361,11 @@ class MainWindow(QtWidgets.QMainWindow):
             face_model=self.face_yolo_edit.text().strip() or "yolov8n-face.pt",
             save_annot=bool(self.annot_check.isChecked()),
             preview_every=int(self.preview_every_spin.value()),
-            prefer_face_when_available=bool(getattr(self, 'require_face_check', QtWidgets.QCheckBox()).isChecked()) if hasattr(self, 'require_face_check') else True,
-            face_quality_min=float(getattr(self, 'min_sharp_spin', QtWidgets.QDoubleSpinBox()).value()) if hasattr(self, 'min_sharp_spin') else 120.0,
+            prefer_face_when_available=bool(self.require_face_check.isChecked()) if hasattr(self, "require_face_check") else True,
+            face_quality_min=float(self.face_quality_spin.value()) if hasattr(self, "face_quality_spin") else 120.0,
+            face_visible_uses_quality=bool(self.face_vis_quality_check.isChecked()) if hasattr(self, "face_vis_quality_check") else True,
+            face_det_conf=float(self.face_det_conf_spin.value()) if hasattr(self, "face_det_conf_spin") else 0.22,
+            face_det_pad=float(self.face_det_pad_spin.value()) if hasattr(self, "face_det_pad_spin") else 0.08,
             face_margin_min=float(getattr(self, 'margin_spin', QtWidgets.QDoubleSpinBox()).value()) if hasattr(self, 'margin_spin') else 0.05,
         )
         return cfg
@@ -1295,6 +1378,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stride_spin.setValue(cfg.frame_stride)
         self.det_conf_spin.setValue(cfg.min_det_conf)
         self.face_thr_spin.setValue(cfg.face_thresh)
+        self.face_det_conf_spin.setValue(cfg.face_det_conf)
+        self.face_det_pad_spin.setValue(cfg.face_det_pad)
+        self.face_quality_spin.setValue(cfg.face_quality_min)
+        self.face_vis_quality_check.setChecked(cfg.face_visible_uses_quality)
         self.reid_thr_spin.setValue(cfg.reid_thresh)
         self.combine_combo.setCurrentText(cfg.combine)
         self.match_mode_combo.setCurrentText(cfg.match_mode)
@@ -1323,8 +1410,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.preview_every_spin.setValue(cfg.preview_every)
         if hasattr(self, 'require_face_check'):
             self.require_face_check.setChecked(cfg.prefer_face_when_available)
-        if hasattr(self, 'min_sharp_spin'):
-            self.min_sharp_spin.setValue(max(cfg.min_sharpness, cfg.face_quality_min))
+        if hasattr(self, 'face_quality_spin'):
+            self.face_quality_spin.setValue(cfg.face_quality_min)
+        if hasattr(self, 'face_vis_quality_check'):
+            self.face_vis_quality_check.setChecked(cfg.face_visible_uses_quality)
+        if hasattr(self, 'face_det_conf_spin'):
+            self.face_det_conf_spin.setValue(cfg.face_det_conf)
+        if hasattr(self, 'face_det_pad_spin'):
+            self.face_det_pad_spin.setValue(cfg.face_det_pad)
         if hasattr(self, 'margin_spin'):
             self.margin_spin.setValue(cfg.face_margin_min)
 
@@ -1508,6 +1601,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stride_spin.setValue(int(s.value("frame_stride", 2)))
         self.det_conf_spin.setValue(float(s.value("min_det_conf", 0.35)))
         self.face_thr_spin.setValue(float(s.value("face_thresh", 0.32)))
+        self.face_det_conf_spin.setValue(float(s.value("face_det_conf", 0.22)))
+        self.face_det_pad_spin.setValue(float(s.value("face_det_pad", 0.08)))
+        self.face_quality_spin.setValue(float(s.value("face_quality_min", 120.0)))
+        self.face_vis_quality_check.setChecked(bool(s.value("face_visible_uses_quality", True)))
         self.reid_thr_spin.setValue(float(s.value("reid_thresh", 0.38)))
         self.combine_combo.setCurrentText(s.value("combine", "min"))
         self.match_mode_combo.setCurrentText(s.value("match_mode", "either"))
@@ -1538,8 +1635,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'require_face_check'):
             self.require_face_check.setChecked(bool(s.value("prefer_face_when_available", True)))
         # Use existing controls to hold thresholds for convenience
-        if hasattr(self, 'min_sharp_spin'):
-            self.min_sharp_spin.setValue(float(s.value("face_quality_min", 120.0)))
+        if hasattr(self, 'face_quality_spin'):
+            self.face_quality_spin.setValue(float(s.value("face_quality_min", 120.0)))
+        if hasattr(self, 'face_vis_quality_check'):
+            self.face_vis_quality_check.setChecked(bool(s.value("face_visible_uses_quality", True)))
+        if hasattr(self, 'face_det_conf_spin'):
+            self.face_det_conf_spin.setValue(float(s.value("face_det_conf", 0.22)))
+        if hasattr(self, 'face_det_pad_spin'):
+            self.face_det_pad_spin.setValue(float(s.value("face_det_pad", 0.08)))
         if hasattr(self, 'margin_spin'):
             self.margin_spin.setValue(float(s.value("face_margin_min", 0.05)))
 
