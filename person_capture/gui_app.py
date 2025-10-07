@@ -58,11 +58,12 @@ class SessionConfig:
     combine: str = "min"            # min | avg | face_priority
     match_mode: str = "either"      # either | both | face_only | reid_only
     only_best: bool = True
-    min_sharpness: float = 120.0
+    min_sharpness: float = 160.0
     min_gap_sec: float = 1.5
-    min_box_pixels: int = 4000
+    min_box_pixels: int = 8000
     auto_crop_borders: bool = False
     border_threshold: int = 10
+    log_interval_sec: float = 1.0
     lock_after_hits: int = 1
     lock_face_thresh: float = 0.28
     lock_reid_thresh: float = 0.30
@@ -72,7 +73,7 @@ class SessionConfig:
     reid_pretrained: str = "laion2b_s32b_b82k"
     clip_face_backbone: str = "ViT-L-14"
     clip_face_pretrained: str = "laion2b_s32b_b82k"
-    use_arcface: bool = True
+    use_arcface: bool = False
     device: str = "cuda"            # cuda | cpu
     yolo_model: str = "yolov8n.pt"
     face_model: str = "yolov8n-face.pt"
@@ -80,6 +81,7 @@ class SessionConfig:
     preview_every: int = 30         # emit preview every N processed frames
 
     def to_json(self) -> str:
+(self) -> str:
         return json.dumps(asdict(self), indent=2)
 
     @staticmethod
