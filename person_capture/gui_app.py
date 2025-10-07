@@ -405,14 +405,16 @@ class Processor(QtCore.QObject):
                     crop_img_path = os.path.join(crops_dir, f"f{frame_idx:08d}.jpg")
                     cx1,cy1,cx2,cy2 = c["box"]
                      # final ratio enforcement
-                    tw, th = ratio_w, ratio_h
+                    ratio_str = c.get("ratio") or (ratios[0] if 'ratios' in locals() and ratios else (self.cfg.ratio.split(',')[0] if self.cfg.ratio else '2:3'))
+                    try:
+                        tw, th = parse_ratio(ratio_str)
+                    except Exception:
+                        tw, th = 2.0, 3.0
                     w = cx2 - cx1; h = cy2 - cy1
                     target = float(tw)/float(th)
                     cur = w/float(h) if h>0 else target
                     if abs(cur - target) > 1e-3 and w>2 and h>2:
-                        # shrink inside to exact ratio
                         if cur < target:
-                            # reduce height
                             new_h = int(round(w/target))
                             dy = (h - new_h)//2
                             cy1 += dy; cy2 = cy1 + new_h
