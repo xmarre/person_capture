@@ -232,6 +232,7 @@ class Processor(QtCore.QObject):
         self._speed = 1.0
         self._fps: Optional[float] = None
         self._total_frames: Optional[int] = None
+        self._seek_cooldown_frames: int = 0  # disable lock/IoU for a few frames after seek
 
     @QtCore.Slot()
     def request_abort(self):
@@ -295,6 +296,23 @@ class Processor(QtCore.QObject):
                         dbg_f.flush()
                     except Exception:
                         pass
+
+            def _frame_time(idx: int) -> float:
+                fps_val = float(self._fps or 30.0)
+                if fps_val <= 0:
+                    return 0.0
+                return float(idx) / fps_val
+
+            def _frame_stride() -> int:
+                try:
+                    stride_val = int(getattr(cfg, "frame_stride", 1))
+                except Exception:
+                    stride_val = 1
+                return max(1, stride_val)
+
+            def _cooldown_frames() -> int:
+                stride = _frame_stride()
+                return max(3, min(8, int(5 / stride)))
 
             self._status("Loading models...", key="phase", interval=5.0)
             det = PersonDetector(model_name=cfg.yolo_model, device=cfg.device, progress=self.status.emit)
@@ -373,6 +391,7 @@ class Processor(QtCore.QObject):
             prev_box = None
             frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
             last_preview_emit = -999999
+            self._seek_cooldown_frames = 0
 
             self._status("Processing...", key="phase", interval=5.0)
             while True:
@@ -391,6 +410,20 @@ class Processor(QtCore.QObject):
                             frame_idx = tgt
                             self.progress.emit(frame_idx)
                             force_process = True
+                            # --- reset temporal gating so scrolling back works ---
+                            lock_hits = 0
+                            locked_face = None
+                            locked_reid = None
+                            prev_box = None
+                            # allow immediate capture after seek by backdating last_hit
+                            now_t = _frame_time(frame_idx)
+                            self._last_hit_t = now_t - float(self.cfg.min_gap_sec)
+                            self._seek_cooldown_frames = _cooldown_frames()
+                            self._status(
+                                f"Seek reset at f={frame_idx} cooldown={self._seek_cooldown_frames}",
+                                key="seek_reset",
+                                interval=0.5,
+                            )
                         elif cmd == "pause":
                             self._paused = True
                         elif cmd == "play":
@@ -405,6 +438,21 @@ class Processor(QtCore.QObject):
                             self.progress.emit(frame_idx)
                             self._paused = True
                             force_process = True
+                            # If this was a scrub (|step| >= stride threshold), treat like a mini-seek
+                            scrub_threshold = max(2, _frame_stride())
+                            if abs(stepn) >= scrub_threshold:
+                                lock_hits = 0
+                                locked_face = None
+                                locked_reid = None
+                                prev_box = None
+                                now_t = _frame_time(frame_idx)
+                                self._last_hit_t = now_t - float(self.cfg.min_gap_sec)
+                                self._seek_cooldown_frames = _cooldown_frames()
+                                self._status(
+                                    f"Step reset at f={frame_idx} cooldown={self._seek_cooldown_frames}",
+                                    key="seek_reset",
+                                    interval=0.5,
+                                )
                         elif cmd == "speed":
                             try:
                                 self._speed = max(0.1, min(4.0, float(arg)))
@@ -764,7 +812,11 @@ class Processor(QtCore.QObject):
                     now_t = current_idx/float(fps)
 
                     # Lock logic: after N hits tighten thresholds and require IoU gate
-                    use_lock = lock_hits >= int(cfg.lock_after_hits) and (locked_face is not None or locked_reid is not None)
+                    use_lock = (
+                        self._seek_cooldown_frames <= 0
+                        and lock_hits >= int(cfg.lock_after_hits)
+                        and (locked_face is not None or locked_reid is not None)
+                    )
                     chosen = None
                     for c in candidates:
                         if use_lock:
@@ -853,6 +905,10 @@ class Processor(QtCore.QObject):
                 # single progress update per loop
                 self.progress.emit(current_idx)
                 frame_idx = current_idx + 1
+                if self._seek_cooldown_frames > 0:
+                    if self._seek_cooldown_frames == _cooldown_frames():
+                        self._status("Lock cooldown active", key="cooldown", interval=0.5)
+                    self._seek_cooldown_frames -= 1
                 if self._speed and self._speed > 0:
                     time.sleep(max(0.0, (1.0 / float(fps)) / float(self._speed)))
                 # Per-frame debug dump
