@@ -14,6 +14,7 @@ import sys, os, json, time, csv, traceback
 import subprocess
 import bisect
 import queue
+import math
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple, List
 from pathlib import Path
@@ -104,7 +105,12 @@ class SessionConfig:
     allow_faceless_when_locked: bool = True
     faceless_reid_thresh: float = 0.40      # <= lock if ReID distance <= this
     faceless_iou_min: float = 0.30          # accept person box if IoU with last lock >= this
-    faceless_persist_frames: int = 18       # carry last bbox this many frames when nothing is detected
+    faceless_persist_frames: int = 0        # disable carry to avoid background crops
+    faceless_min_area_frac: float = 0.03    # min area vs frame
+    faceless_max_area_frac: float = 0.55    # max area vs frame
+    faceless_center_max_frac: float = 0.12  # max center drift vs diag
+    faceless_min_motion_frac: float = 0.02  # min moving pixels in ROI
+    faceless_require_reid: bool = True      # require ReID, no IoU-only
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -245,6 +251,7 @@ class Processor(QtCore.QObject):
         self._lock_last_bbox: Optional[Tuple[int, int, int, int]] = None  # x,y,w,h in frame coords
         self._lock_last_seen_idx: int = -10**9
         self._locked_reid_feat: Optional[np.ndarray] = None
+        self._prev_gray: Optional[np.ndarray] = None
 
     @QtCore.Slot()
     def request_abort(self):
@@ -309,6 +316,52 @@ class Processor(QtCore.QObject):
                 return j_best, "iou"
         return -1, None
 
+    def _faceless_validate(self, box_xyxy, frame_shape, gray_frame):
+        cfg = self.cfg
+        if gray_frame is None or frame_shape is None:
+            return True, None
+        if len(frame_shape) < 2:
+            return True, None
+        H = int(frame_shape[0])
+        W = int(frame_shape[1])
+        x1, y1, x2, y2 = [int(round(v)) for v in box_xyxy]
+        x1 = max(0, min(W - 1, x1))
+        y1 = max(0, min(H - 1, y1))
+        x2 = max(x1 + 1, min(W, x2))
+        y2 = max(y1 + 1, min(H, y2))
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+        area = float(w * h)
+        frame_area = float(max(1, W * H))
+        frac = area / frame_area
+        if frac < float(cfg.faceless_min_area_frac):
+            return False, "area_min"
+        if frac > float(cfg.faceless_max_area_frac):
+            return False, "area_max"
+        if self._lock_last_bbox is not None:
+            lx, ly, lw, lh = self._lock_last_bbox
+            lock_cx = float(lx) + float(lw) / 2.0
+            lock_cy = float(ly) + float(lh) / 2.0
+            cx = x1 + w / 2.0
+            cy = y1 + h / 2.0
+            diag = math.hypot(W, H)
+            if diag > 0:
+                drift = math.hypot(cx - lock_cx, cy - lock_cy) / diag
+                if drift > float(cfg.faceless_center_max_frac):
+                    return False, "center_drift"
+        prev = self._prev_gray
+        if prev is not None and prev.shape == gray_frame.shape:
+            roi_prev = prev[y1:y2, x1:x2]
+            roi_cur = gray_frame[y1:y2, x1:x2]
+            if roi_prev.size > 0 and roi_cur.size > 0:
+                diff = cv2.absdiff(roi_cur, roi_prev)
+                _, mask = cv2.threshold(diff, 15, 255, cv2.THRESH_BINARY)
+                motion = cv2.countNonZero(mask)
+                motion_frac = motion / area if area > 0 else 0.0
+                if motion_frac < float(cfg.faceless_min_motion_frac):
+                    return False, "motion"
+        return True, None
+
     def _combine_scores(self, face_dist, reid_dist, mode='min'):
         vals = []
         if face_dist is not None:
@@ -335,6 +388,7 @@ class Processor(QtCore.QObject):
             self._init_status()
             cfg = self.cfg
             self._clear_lock()
+            self._prev_gray = None
             if not os.path.isfile(cfg.video):
                 raise FileNotFoundError(f"Video not found: {cfg.video}")
             if not os.path.isfile(cfg.ref):
@@ -483,6 +537,7 @@ class Processor(QtCore.QObject):
                             locked_reid = None
                             prev_box = None
                             self._clear_lock()
+                            self._prev_gray = None
                             # allow immediate capture after seek by backdating last_hit
                             now_t = _frame_time(frame_idx)
                             self._last_hit_t = now_t - float(self.cfg.min_gap_sec)
@@ -514,6 +569,7 @@ class Processor(QtCore.QObject):
                                 locked_reid = None
                                 prev_box = None
                                 self._clear_lock()
+                                self._prev_gray = None
                                 now_t = _frame_time(frame_idx)
                                 self._last_hit_t = now_t - float(self.cfg.min_gap_sec)
                                 self._seek_cooldown_frames = _cooldown_frames()
@@ -548,6 +604,7 @@ class Processor(QtCore.QObject):
                 if not ret:
                     break
                 H, W = frame.shape[:2]
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
                 
                 # Optional black border crop
@@ -881,41 +938,48 @@ class Processor(QtCore.QObject):
                             reid_feats_fb = []
                         pick, why = self._faceless_pick_from_persons(persons_xywh, reid_feats_fb, locked_feat)
                         if pick >= 0 and pick < len(boxes):
-                            bx1, by1, bx2, by2 = boxes[pick]
-                            sx1 = max(0, min(W - 1, int(round(bx1 + off_x))))
-                            sy1 = max(0, min(H - 1, int(round(by1 + off_y))))
-                            sx2 = max(sx1 + 1, min(W, int(round(bx2 + off_x))))
-                            sy2 = max(sy1 + 1, min(H, int(round(by2 + off_y))))
-                            (ex1, ey1, ex2, ey2), chosen_ratio = self._choose_best_ratio(
-                                (bx1, by1, bx2, by2), ratios, W2, H2, anchor=None
-                            )
-                            ox1, oy1, ox2, oy2 = ex1 + off_x, ey1 + off_y, ex2 + off_x, ey2 + off_y
-                            ox1 = max(0, min(W - 1, int(round(ox1))))
-                            oy1 = max(0, min(H - 1, int(round(oy1))))
-                            ox2 = max(ox1 + 1, min(W, int(round(ox2))))
-                            oy2 = max(oy1 + 1, min(H, int(round(oy2))))
-                            if ox2 > ox1 + 2 and oy2 > oy1 + 2:
-                                crop_img = frame[oy1:oy2, ox1:ox2]
-                                sharp = self._calc_sharpness(crop_img)
-                                if sharp >= float(cfg.min_sharpness):
-                                    reasons = [f"faceless_{why}" if why else "faceless"]
-                                    fallback_candidate = dict(
-                                        score=None,
-                                        fd=None,
-                                        rd=None,
-                                        sharp=sharp,
-                                        box=(ox1, oy1, ox2, oy2),
-                                        area=(ox2 - ox1) * (oy2 - oy1),
-                                        show_box=(sx1, sy1, sx2, sy2),
-                                        face_feat=None,
-                                        reid_feat=(reid_feats_fb[pick] if pick < len(reid_feats_fb) else None),
-                                        ratio=chosen_ratio,
-                                        reasons=reasons,
-                                        face_quality=None,
-                                        accept_pre=True,
-                                    )
+                            if bool(cfg.faceless_require_reid):
+                                if why != "reid" or pick >= len(reid_feats_fb) or reid_feats_fb[pick] is None:
+                                    pick, why = -1, None
+                            if pick >= 0:
+                                bx1, by1, bx2, by2 = boxes[pick]
+                                sx1 = max(0, min(W - 1, int(round(bx1 + off_x))))
+                                sy1 = max(0, min(H - 1, int(round(by1 + off_y))))
+                                sx2 = max(sx1 + 1, min(W, int(round(bx2 + off_x))))
+                                sy2 = max(sy1 + 1, min(H, int(round(by2 + off_y))))
+                                (ex1, ey1, ex2, ey2), chosen_ratio = self._choose_best_ratio(
+                                    (bx1, by1, bx2, by2), ratios, W2, H2, anchor=None
+                                )
+                                ox1, oy1, ox2, oy2 = ex1 + off_x, ey1 + off_y, ex2 + off_x, ey2 + off_y
+                                ox1 = max(0, min(W - 1, int(round(ox1))))
+                                oy1 = max(0, min(H - 1, int(round(oy1))))
+                                ox2 = max(ox1 + 1, min(W, int(round(ox2))))
+                                oy2 = max(oy1 + 1, min(H, int(round(oy2))))
+                                if ox2 > ox1 + 2 and oy2 > oy1 + 2:
+                                    valid, _why = self._faceless_validate((ox1, oy1, ox2, oy2), frame.shape, gray)
+                                    if valid:
+                                        crop_img = frame[oy1:oy2, ox1:ox2]
+                                        sharp = self._calc_sharpness(crop_img)
+                                        if sharp >= float(cfg.min_sharpness):
+                                            reasons = [f"faceless_{why}" if why else "faceless"]
+                                            fallback_candidate = dict(
+                                                score=None,
+                                                fd=None,
+                                                rd=None,
+                                                sharp=sharp,
+                                                box=(ox1, oy1, ox2, oy2),
+                                                area=(ox2 - ox1) * (oy2 - oy1),
+                                                show_box=(sx1, sy1, sx2, sy2),
+                                                face_feat=None,
+                                                reid_feat=(reid_feats_fb[pick] if pick < len(reid_feats_fb) else None),
+                                                ratio=chosen_ratio,
+                                                reasons=reasons,
+                                                face_quality=None,
+                                                accept_pre=True,
+                                            )
                         if (
                             fallback_candidate is None
+                            and not bool(cfg.faceless_require_reid)
                             and self._lock_last_bbox is not None
                             and (current_idx - self._lock_last_seen_idx)
                             <= int(cfg.faceless_persist_frames)
@@ -934,24 +998,26 @@ class Processor(QtCore.QObject):
                                 ex2 = max(ex1 + 1, min(W, int(round(ex2))))
                                 ey2 = max(ey1 + 1, min(H, int(round(ey2))))
                                 if ex2 > ex1 + 2 and ey2 > ey1 + 2:
-                                    crop_img = frame[ey1:ey2, ex1:ex2]
-                                    sharp = self._calc_sharpness(crop_img)
-                                    if sharp >= float(cfg.min_sharpness):
-                                        fallback_candidate = dict(
-                                            score=None,
-                                            fd=None,
-                                            rd=None,
-                                            sharp=sharp,
-                                            box=(ex1, ey1, ex2, ey2),
-                                            area=(ex2 - ex1) * (ey2 - ey1),
-                                            show_box=(x1, y1, x2, y2),
-                                            face_feat=None,
-                                            reid_feat=None,
-                                            ratio=chosen_ratio,
-                                            reasons=["faceless_carry"],
-                                            face_quality=None,
-                                            accept_pre=True,
-                                        )
+                                    valid, _why = self._faceless_validate((ex1, ey1, ex2, ey2), frame.shape, gray)
+                                    if valid:
+                                        crop_img = frame[ey1:ey2, ex1:ex2]
+                                        sharp = self._calc_sharpness(crop_img)
+                                        if sharp >= float(cfg.min_sharpness):
+                                            fallback_candidate = dict(
+                                                score=None,
+                                                fd=None,
+                                                rd=None,
+                                                sharp=sharp,
+                                                box=(ex1, ey1, ex2, ey2),
+                                                area=(ex2 - ex1) * (ey2 - ey1),
+                                                show_box=(x1, y1, x2, y2),
+                                                face_feat=None,
+                                                reid_feat=None,
+                                                ratio=chosen_ratio,
+                                                reasons=["faceless_carry"],
+                                                face_quality=None,
+                                                accept_pre=True,
+                                            )
                     if fallback_candidate is not None:
                         candidates = [fallback_candidate]
                     else:
@@ -1105,6 +1171,7 @@ class Processor(QtCore.QObject):
                     self.preview.emit(qimg)
 
                 # single progress update per loop
+                self._prev_gray = gray.copy()
                 self.progress.emit(current_idx)
                 frame_idx = current_idx + 1
                 if self._seek_cooldown_frames > 0:
@@ -1143,6 +1210,11 @@ class Processor(QtCore.QObject):
                                 "faceless_reid_thresh": float(cfg.faceless_reid_thresh),
                                 "faceless_iou_min": float(cfg.faceless_iou_min),
                                 "faceless_persist_frames": int(cfg.faceless_persist_frames),
+                                "faceless_min_area_frac": float(cfg.faceless_min_area_frac),
+                                "faceless_max_area_frac": float(cfg.faceless_max_area_frac),
+                                "faceless_center_max_frac": float(cfg.faceless_center_max_frac),
+                                "faceless_min_motion_frac": float(cfg.faceless_min_motion_frac),
+                                "faceless_require_reid": bool(cfg.faceless_require_reid),
                             },
                             "candidates": [
                                 {
@@ -1294,6 +1366,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.auto_crop_check.setChecked(True)
         self.border_thr_spin = QtWidgets.QSpinBox(); self.border_thr_spin.setRange(0, 50); self.border_thr_spin.setValue(10)
         self.require_face_check = QtWidgets.QCheckBox("Require face if visible"); self.require_face_check.setChecked(True)
+        self.pref_face_check = QtWidgets.QCheckBox()
+        self.pref_face_check.setChecked(bool(self.cfg.prefer_face_when_available))
+        self.pref_face_check.setToolTip("bool: prefer_face_when_available")
         self.lock_mom_spin = QtWidgets.QDoubleSpinBox(); self.lock_mom_spin.setRange(0.0, 1.0); self.lock_mom_spin.setSingleStep(0.05); self.lock_mom_spin.setValue(0.7)
         self.suppress_neg_check = QtWidgets.QCheckBox("Suppress hard negatives"); self.suppress_neg_check.setChecked(False)
         self.neg_tol_spin = QtWidgets.QDoubleSpinBox(); self.neg_tol_spin.setDecimals(3); self.neg_tol_spin.setRange(0.0, 2.0); self.neg_tol_spin.setSingleStep(0.01); self.neg_tol_spin.setValue(0.35)
@@ -1311,6 +1386,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self.face_yolo_edit = QtWidgets.QLineEdit("yolov8n-face.pt")
         self.annot_check = QtWidgets.QCheckBox("Save annotated frames")
         self.preview_every_spin = QtWidgets.QSpinBox(); self.preview_every_spin.setRange(0, 5000); self.preview_every_spin.setValue(30)
+
+        def _mk_fspin(minv: float, maxv: float, step: float, decimals: int, tooltip: str) -> QtWidgets.QDoubleSpinBox:
+            sb = QtWidgets.QDoubleSpinBox()
+            sb.setRange(minv, maxv)
+            sb.setSingleStep(step)
+            sb.setDecimals(decimals)
+            sb.setToolTip(tooltip)
+            sb.setKeyboardTracking(False)
+            return sb
+
+        self.faceless_allow_check = QtWidgets.QCheckBox()
+        self.faceless_allow_check.setChecked(bool(self.cfg.allow_faceless_when_locked))
+        self.faceless_allow_check.setToolTip("bool: allow_faceless_when_locked")
+        self.faceless_require_reid_check = QtWidgets.QCheckBox()
+        self.faceless_require_reid_check.setChecked(bool(self.cfg.faceless_require_reid))
+        self.faceless_require_reid_check.setToolTip("bool: faceless_require_reid")
+        self.faceless_reid_spin = _mk_fspin(0.0, 1.0, 0.01, 3, "float: faceless_reid_thresh")
+        self.faceless_reid_spin.setValue(float(self.cfg.faceless_reid_thresh))
+        self.faceless_iou_spin = _mk_fspin(0.0, 1.0, 0.01, 3, "float: faceless_iou_min")
+        self.faceless_iou_spin.setValue(float(self.cfg.faceless_iou_min))
+        self.faceless_persist_spin = QtWidgets.QSpinBox()
+        self.faceless_persist_spin.setRange(0, 300)
+        self.faceless_persist_spin.setToolTip("int: faceless_persist_frames")
+        self.faceless_persist_spin.setValue(int(self.cfg.faceless_persist_frames))
+        self.faceless_min_area_spin = _mk_fspin(0.0, 1.0, 0.01, 3, "float: faceless_min_area_frac")
+        self.faceless_min_area_spin.setValue(float(self.cfg.faceless_min_area_frac))
+        self.faceless_max_area_spin = _mk_fspin(0.0, 1.0, 0.01, 3, "float: faceless_max_area_frac")
+        self.faceless_max_area_spin.setValue(float(self.cfg.faceless_max_area_frac))
+        self.faceless_center_spin = _mk_fspin(0.0, 1.0, 0.01, 3, "float: faceless_center_max_frac")
+        self.faceless_center_spin.setValue(float(self.cfg.faceless_center_max_frac))
+        self.faceless_motion_spin = _mk_fspin(0.0, 1.0, 0.01, 3, "float: faceless_min_motion_frac")
+        self.faceless_motion_spin.setValue(float(self.cfg.faceless_min_motion_frac))
 
         labels = [
             ("Aspect ratio W:H", self.ratio_edit),
@@ -1331,6 +1438,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Auto‑crop black borders", self.auto_crop_check),
             ("Border threshold", self.border_thr_spin),
             ("Require face if visible", self.require_face_check),
+            ("prefer_face_when_available", self.pref_face_check),
             ("Lock momentum", self.lock_mom_spin),
             ("Suppress negatives", self.suppress_neg_check),
             ("Neg tolerance", self.neg_tol_spin),
@@ -1347,6 +1455,15 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Face YOLO model", self.face_yolo_edit),
             ("Preview every N frames", self.preview_every_spin),
             ("", self.annot_check),
+            ("allow_faceless_when_locked", self.faceless_allow_check),
+            ("faceless_require_reid", self.faceless_require_reid_check),
+            ("faceless_reid_thresh", self.faceless_reid_spin),
+            ("faceless_iou_min", self.faceless_iou_spin),
+            ("faceless_persist_frames", self.faceless_persist_spin),
+            ("faceless_min_area_frac", self.faceless_min_area_spin),
+            ("faceless_max_area_frac", self.faceless_max_area_spin),
+            ("faceless_center_max_frac", self.faceless_center_spin),
+            ("faceless_min_motion_frac", self.faceless_motion_spin),
         ]
         for row, (lab, w) in enumerate(labels):
             if lab:
@@ -1749,12 +1866,21 @@ class MainWindow(QtWidgets.QMainWindow):
             face_model=self.face_yolo_edit.text().strip() or "yolov8n-face.pt",
             save_annot=bool(self.annot_check.isChecked()),
             preview_every=int(self.preview_every_spin.value()),
-            prefer_face_when_available=bool(self.require_face_check.isChecked()) if hasattr(self, "require_face_check") else True,
+            prefer_face_when_available=bool(self.pref_face_check.isChecked()) if hasattr(self, "pref_face_check") else True,
             face_quality_min=float(self.face_quality_spin.value()) if hasattr(self, "face_quality_spin") else 120.0,
             face_visible_uses_quality=bool(self.face_vis_quality_check.isChecked()) if hasattr(self, "face_vis_quality_check") else True,
             face_det_conf=float(self.face_det_conf_spin.value()) if hasattr(self, "face_det_conf_spin") else 0.22,
             face_det_pad=float(self.face_det_pad_spin.value()) if hasattr(self, "face_det_pad_spin") else 0.08,
             face_margin_min=float(getattr(self, 'margin_spin', QtWidgets.QDoubleSpinBox()).value()) if hasattr(self, 'margin_spin') else 0.05,
+            allow_faceless_when_locked=bool(self.faceless_allow_check.isChecked()) if hasattr(self, "faceless_allow_check") else True,
+            faceless_require_reid=bool(self.faceless_require_reid_check.isChecked()) if hasattr(self, "faceless_require_reid_check") else True,
+            faceless_reid_thresh=float(self.faceless_reid_spin.value()) if hasattr(self, "faceless_reid_spin") else 0.40,
+            faceless_iou_min=float(self.faceless_iou_spin.value()) if hasattr(self, "faceless_iou_spin") else 0.30,
+            faceless_persist_frames=int(self.faceless_persist_spin.value()) if hasattr(self, "faceless_persist_spin") else 0,
+            faceless_min_area_frac=float(self.faceless_min_area_spin.value()) if hasattr(self, "faceless_min_area_spin") else 0.03,
+            faceless_max_area_frac=float(self.faceless_max_area_spin.value()) if hasattr(self, "faceless_max_area_spin") else 0.55,
+            faceless_center_max_frac=float(self.faceless_center_spin.value()) if hasattr(self, "faceless_center_spin") else 0.12,
+            faceless_min_motion_frac=float(self.faceless_motion_spin.value()) if hasattr(self, "faceless_motion_spin") else 0.02,
         )
         return cfg
 
@@ -1796,8 +1922,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.face_yolo_edit.setText(cfg.face_model)
         self.annot_check.setChecked(cfg.save_annot)
         self.preview_every_spin.setValue(cfg.preview_every)
-        if hasattr(self, 'require_face_check'):
-            self.require_face_check.setChecked(cfg.prefer_face_when_available)
+        if hasattr(self, 'pref_face_check'):
+            self.pref_face_check.setChecked(cfg.prefer_face_when_available)
         if hasattr(self, 'face_quality_spin'):
             self.face_quality_spin.setValue(cfg.face_quality_min)
         if hasattr(self, 'face_vis_quality_check'):
@@ -1808,6 +1934,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.face_det_pad_spin.setValue(cfg.face_det_pad)
         if hasattr(self, 'margin_spin'):
             self.margin_spin.setValue(cfg.face_margin_min)
+        if hasattr(self, 'faceless_allow_check'):
+            self.faceless_allow_check.setChecked(cfg.allow_faceless_when_locked)
+        if hasattr(self, 'faceless_require_reid_check'):
+            self.faceless_require_reid_check.setChecked(cfg.faceless_require_reid)
+        if hasattr(self, 'faceless_reid_spin'):
+            self.faceless_reid_spin.setValue(cfg.faceless_reid_thresh)
+        if hasattr(self, 'faceless_iou_spin'):
+            self.faceless_iou_spin.setValue(cfg.faceless_iou_min)
+        if hasattr(self, 'faceless_persist_spin'):
+            self.faceless_persist_spin.setValue(cfg.faceless_persist_frames)
+        if hasattr(self, 'faceless_min_area_spin'):
+            self.faceless_min_area_spin.setValue(cfg.faceless_min_area_frac)
+        if hasattr(self, 'faceless_max_area_spin'):
+            self.faceless_max_area_spin.setValue(cfg.faceless_max_area_frac)
+        if hasattr(self, 'faceless_center_spin'):
+            self.faceless_center_spin.setValue(cfg.faceless_center_max_frac)
+        if hasattr(self, 'faceless_motion_spin'):
+            self.faceless_motion_spin.setValue(cfg.faceless_min_motion_frac)
 
     # Thread control
     def on_start(self):
@@ -2095,9 +2239,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.face_yolo_edit.setText(s.value("face_model", "yolov8n-face.pt"))
         self.annot_check.setChecked(bool(s.value("save_annot", False)))
         self.preview_every_spin.setValue(int(s.value("preview_every", 30)))
+        if hasattr(self, 'faceless_allow_check'):
+            self.faceless_allow_check.setChecked(bool(s.value("allow_faceless_when_locked", self.cfg.allow_faceless_when_locked)))
+        if hasattr(self, 'faceless_require_reid_check'):
+            self.faceless_require_reid_check.setChecked(bool(s.value("faceless_require_reid", self.cfg.faceless_require_reid)))
+        if hasattr(self, 'faceless_reid_spin'):
+            self.faceless_reid_spin.setValue(float(s.value("faceless_reid_thresh", self.cfg.faceless_reid_thresh)))
+        if hasattr(self, 'faceless_iou_spin'):
+            self.faceless_iou_spin.setValue(float(s.value("faceless_iou_min", self.cfg.faceless_iou_min)))
+        if hasattr(self, 'faceless_persist_spin'):
+            self.faceless_persist_spin.setValue(int(s.value("faceless_persist_frames", self.cfg.faceless_persist_frames)))
+        if hasattr(self, 'faceless_min_area_spin'):
+            self.faceless_min_area_spin.setValue(float(s.value("faceless_min_area_frac", self.cfg.faceless_min_area_frac)))
+        if hasattr(self, 'faceless_max_area_spin'):
+            self.faceless_max_area_spin.setValue(float(s.value("faceless_max_area_frac", self.cfg.faceless_max_area_frac)))
+        if hasattr(self, 'faceless_center_spin'):
+            self.faceless_center_spin.setValue(float(s.value("faceless_center_max_frac", self.cfg.faceless_center_max_frac)))
+        if hasattr(self, 'faceless_motion_spin'):
+            self.faceless_motion_spin.setValue(float(s.value("faceless_min_motion_frac", self.cfg.faceless_min_motion_frac)))
         # Face-first defaults if controls not present
-        if hasattr(self, 'require_face_check'):
-            self.require_face_check.setChecked(bool(s.value("prefer_face_when_available", True)))
+        if hasattr(self, 'pref_face_check'):
+            self.pref_face_check.setChecked(bool(s.value("prefer_face_when_available", True)))
         # Use existing controls to hold thresholds for convenience
         if hasattr(self, 'face_quality_spin'):
             self.face_quality_spin.setValue(float(s.value("face_quality_min", 120.0)))
