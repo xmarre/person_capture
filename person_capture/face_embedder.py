@@ -118,6 +118,8 @@ class FaceEmbedder:
         self.device = 'cuda' if (ctx.startswith('cuda') and _torch.cuda.is_available()) else 'cpu'
         self.conf = float(conf)
         self.backend = None
+        self.arc_sess = None
+        self.arc_input = None
         if self.use_arcface and ort is not None:
             try:
                 onnx_path = _ensure_file(ARCFACE_ONNX, ARCFACE_URLS, progress=progress)
@@ -127,6 +129,11 @@ class FaceEmbedder:
                 self.backend = 'arcface'
             except Exception as _e:
                 # Fallback to CLIP
+                self.use_arcface = False
+        else:
+            if self.use_arcface:
+                if progress:
+                    progress("onnxruntime not available. Falling back to CLIP for face embeddings.")
                 self.use_arcface = False
         if not self.use_arcface or self.backend is None:
             if False and progress: progress(f"Preparing OpenCLIP {clip_model_name} {clip_pretrained} (will download if missing)...")
@@ -168,12 +175,39 @@ class FaceEmbedder:
         kps = getattr(res, "keypoints", None)
         if kps is None:
             return None
-        data = getattr(kps, "xy", None) or getattr(kps, "data", None)
+
+        # Avoid directly truth-testing tensors as this raises runtime errors.
+        data = getattr(kps, "xy", None)
+        if data is None:
+            data = getattr(kps, "data", None)
         if data is None:
             return None
-        arr = data.cpu().numpy() if hasattr(data, "cpu") else np.asarray(data)
+
+        # Normalize the keypoint container to a numpy array with shape [N, K, 2].
+        if isinstance(data, (list, tuple)):
+            if not data:
+                return None
+            stacked = []
+            for item in data:
+                arr = item.cpu().numpy() if hasattr(item, "cpu") else np.asarray(item)
+                if arr.ndim == 2 and arr.shape[-1] >= 2:
+                    stacked.append(arr[..., :2])
+            if not stacked:
+                return None
+            arr = np.stack(stacked, axis=0)
+        else:
+            arr = data.cpu().numpy() if hasattr(data, "cpu") else np.asarray(data)
+            if arr.ndim == 2:
+                arr = arr[None, ...]
+            if arr.shape[-1] >= 2:
+                arr = arr[..., :2]
+
+        arr = np.asarray(arr, dtype=np.float32)
+
         if arr.ndim == 3 and arr.shape[1] >= 5:
-            return arr[:, :5, :2].astype(np.float32)
+            if not np.isfinite(arr).all():
+                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+            return arr[:, :5, :2]
         return None
 
     def _align_by_5pts(self, bgr: np.ndarray, pts5: np.ndarray) -> np.ndarray:
@@ -229,9 +263,11 @@ class FaceEmbedder:
                 and np.isfinite(kps[i]).all()
             )
             if use_landmarks:
-                pts = kps[i].copy()
-                pts[:, 0] -= x1
-                pts[:, 1] -= y1
+                pts = kps[i].astype(np.float32, copy=True)
+                pts[:, 0] -= float(x1)
+                pts[:, 1] -= float(y1)
+                pts[:, 0] = np.clip(pts[:, 0], 0.0, max(0, face_bgr.shape[1] - 1))
+                pts[:, 1] = np.clip(pts[:, 1], 0.0, max(0, face_bgr.shape[0] - 1))
                 chip = self._align_by_5pts(face_bgr, pts)
             else:
                 chip = face_bgr
