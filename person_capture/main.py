@@ -5,6 +5,67 @@ import csv
 import numpy as np
 from tqdm import tqdm
 
+
+def _clip_to_frame(x1, y1, x2, y2, W, H):
+    dx1 = -x1 if x1 < 0 else 0.0
+    dx2 = W - x2 if x2 > W else 0.0
+    dy1 = -y1 if y1 < 0 else 0.0
+    dy2 = H - y2 if y2 > H else 0.0
+    sx = dx1 if dx1 != 0.0 else (dx2 if dx2 != 0.0 else 0.0)
+    sy = dy1 if dy1 != 0.0 else (dy2 if dy2 != 0.0 else 0.0)
+    x1 += sx
+    x2 += sx
+    y1 += sy
+    y2 += sy
+    x1 = max(0, min(W - 1, int(round(x1))))
+    x2 = max(x1 + 1, min(W, int(round(x2))))
+    y1 = max(0, min(H - 1, int(round(y1))))
+    y2 = max(y1 + 1, min(H, int(round(y2))))
+    return x1, y1, x2, y2
+
+
+def _enforce_scale_and_margins(
+    crop_xyxy,
+    ratio_wh,
+    frame_w,
+    frame_h,
+    face_box=None,
+    face_max_frac=0.42,
+    side_margin_frac=0.30,
+    min_h_frac=0.28,
+    min_face_frac=0.18,
+):
+    x1, y1, x2, y2 = map(int, crop_xyxy)
+    cw, ch = float(x2 - x1), float(y2 - y1)
+    try:
+        rw, rh = parse_ratio(ratio_wh)
+        asp = float(rw) / float(rh)
+    except Exception:
+        asp = cw / max(ch, 1e-6)
+    need_h = max(ch, float(min_h_frac) * frame_h)
+    if face_box is not None:
+        fx1, fy1, fx2, fy2 = face_box
+        fw, fh = float(fx2 - fx1), float(fy2 - fy1)
+        need_h = max(
+            need_h,
+            fh / max(face_max_frac, 1e-6),
+            fh / max(min_face_frac, 1e-6),
+            (fw + 2.0 * side_margin_frac * fw) / max(asp, 1e-6),
+        )
+    if need_h <= ch + 0.5:
+        return x1, y1, x2, y2
+    need_w = need_h * asp
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    return _clip_to_frame(
+        cx - need_w / 2.0,
+        cy - need_h / 2.0,
+        cx + need_w / 2.0,
+        cy + need_h / 2.0,
+        frame_w,
+        frame_h,
+    )
+
 from .detectors import PersonDetector
 from .face_embedder import FaceEmbedder
 from .reid_embedder import ReIDEmbedder
@@ -187,6 +248,22 @@ def main():
                         ratio_w, ratio_h, W, H,
                         anchor=anchor,
                         head_bias=head_bias
+                    )
+                    face_box_abs = None
+                    if bf is not None:
+                        fb = bf['bbox']
+                        face_box_abs = (
+                            x1 + fb[0],
+                            y1 + fb[1],
+                            x1 + fb[2],
+                            y1 + fb[3],
+                        )
+                    ex1,ey1,ex2,ey2 = _enforce_scale_and_margins(
+                        (ex1,ey1,ex2,ey2),
+                        f"{ratio_w}:{ratio_h}",
+                        W,
+                        H,
+                        face_box_abs,
                     )
                     crop_img_path = os.path.join(crops_dir, f"f{frame_idx:08d}.jpg")
                     crop = frame[ey1:ey2, ex1:ex2]
