@@ -7,7 +7,7 @@ from urllib.error import URLError, HTTPError
 import tempfile
 from pathlib import Path
 import shutil
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, List, Tuple
 
 from PIL import Image
 
@@ -99,10 +99,24 @@ class FaceEmbedder:
 
         self._torch = _torch
         self.det = _YOLO(yolo_path)
+        self.use_arcface = bool(use_arcface)
+        self._expect_5k = False
+        model_attr = getattr(self.det, "model", None)
+        kpt_shape = None
+        if model_attr is not None:
+            kpt_shape = getattr(model_attr, "kpt_shape", None)
+            if kpt_shape is None:
+                inner_model = getattr(model_attr, "model", None)
+                kpt_shape = getattr(inner_model, "kpt_shape", None) if inner_model is not None else None
+        if isinstance(kpt_shape, (list, tuple)) and kpt_shape:
+            self._expect_5k = bool(kpt_shape[0] >= 5)
+        if self.use_arcface and not self._expect_5k:
+            # fallback instead of aborting
+            if progress:
+                progress("YOLO face model has no 5-point keypoints. Falling back to CLIP.")
+            self.use_arcface = False
         self.device = 'cuda' if (ctx.startswith('cuda') and _torch.cuda.is_available()) else 'cpu'
         self.conf = float(conf)
-
-        self.use_arcface = bool(use_arcface)
         self.backend = None
         if self.use_arcface and ort is not None:
             try:
@@ -127,23 +141,48 @@ class FaceEmbedder:
         g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         return float(cv2.Laplacian(g, cv2.CV_64F).var())
 
+    # ArcFace 112x112 landmark template (lfw standard)
+    _ARC_DST = np.array([[38.2946,51.6963],[73.5318,51.5014],[56.0252,71.7366],[41.5493,92.3655],[70.7299,92.2041]], dtype=np.float32)
+
     def _arcface_preprocess(self, bgr):
-        # Expect 112x112 RGB, BGR->RGB, transpose to NCHW, normalize to [-1,1]
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        rgb = cv2.resize(rgb, (112,112), interpolation=cv2.INTER_LINEAR)
+        if rgb.shape[:2] != (112,112):
+            rgb = cv2.resize(rgb, (112,112), interpolation=cv2.INTER_LINEAR)
         arr = rgb.astype(np.float32) / 127.5 - 1.0
         arr = np.transpose(arr, (2,0,1))[None, ...]  # NCHW
         return arr
 
-    def _arcface_encode(self, bgr_list):
+    def _arcface_encode(self, bgr_list: List[np.ndarray]):
         if not bgr_list:
             return []
-        batch = np.concatenate([self._arcface_preprocess(b) for b in bgr_list], axis=0)
+        chips = [self._arcface_preprocess(b) for b in bgr_list]
+        chips_flip = [self._arcface_preprocess(cv2.flip(b, 1)) for b in bgr_list]
+        batch = np.concatenate(chips + chips_flip, axis=0)
         feats = self.arc_sess.run(None, {self.arc_input: batch})[0]
-        # L2 normalize
-        norms = np.linalg.norm(feats, axis=1, keepdims=True) + 1e-9
-        feats = feats / norms
-        return feats.astype(np.float32)
+        n = len(bgr_list)
+        f = feats[:n] + feats[n:]
+        f /= (np.linalg.norm(f, axis=1, keepdims=True) + 1e-9)
+        return f.astype(np.float32)
+
+    def _try_keypoints(self, res) -> Optional[np.ndarray]:
+        kps = getattr(res, "keypoints", None)
+        if kps is None:
+            return None
+        data = getattr(kps, "xy", None) or getattr(kps, "data", None)
+        if data is None:
+            return None
+        arr = data.cpu().numpy() if hasattr(data, "cpu") else np.asarray(data)
+        if arr.ndim == 3 and arr.shape[1] >= 5:
+            return arr[:, :5, :2].astype(np.float32)
+        return None
+
+    def _align_by_5pts(self, bgr: np.ndarray, pts5: np.ndarray) -> np.ndarray:
+        M, _ = cv2.estimateAffinePartial2D(pts5.astype(np.float32), self._ARC_DST, method=cv2.LMEDS)
+        if M is None:
+            M, _ = cv2.estimateAffinePartial2D(pts5[:3], self._ARC_DST[:3], method=cv2.LMEDS)
+        if M is None:
+            return cv2.resize(bgr, (112,112), interpolation=cv2.INTER_LINEAR)
+        return cv2.warpAffine(bgr, M, (112,112), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
     def _clip_encode(self, bgr_list):
         if not bgr_list:
@@ -174,14 +213,30 @@ class FaceEmbedder:
         if not boxes:
             return []
 
-        faces = []
-        crops = []
-        for (x1, y1, x2, y2) in boxes:
+        faces: List[Tuple[int, int, int, int, np.ndarray, float]] = []
+        crops: List[np.ndarray] = []
+        kps = self._try_keypoints(res)
+        if kps is not None and len(kps) != len(boxes):
+            kps = None  # fallback to unaligned chips when counts mismatch
+        for i, (x1, y1, x2, y2) in enumerate(boxes):
             x1 = max(0, x1); y1 = max(0, y1)
             x2 = max(x1+1, x2); y2 = max(y1+1, y2)
             face_bgr = bgr_img[y1:y2, x1:x2]
-            faces.append((x1,y1,x2,y2, face_bgr, self._face_quality(face_bgr)))
-            crops.append(face_bgr)
+            use_landmarks = (
+                self.use_arcface
+                and kps is not None
+                and i < len(kps)
+                and np.isfinite(kps[i]).all()
+            )
+            if use_landmarks:
+                pts = kps[i].copy()
+                pts[:, 0] -= x1
+                pts[:, 1] -= y1
+                chip = self._align_by_5pts(face_bgr, pts)
+            else:
+                chip = face_bgr
+            faces.append((x1,y1,x2,y2, chip, self._face_quality(chip)))
+            crops.append(chip)
 
         if self.use_arcface:
             feats = self._arcface_encode(crops)
