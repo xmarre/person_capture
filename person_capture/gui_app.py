@@ -100,6 +100,11 @@ class SessionConfig:
     suppress_negatives: bool = False
     neg_tolerance: float = 0.35
     max_negatives: int = 5         # emit preview every N processed frames
+    # --- faceless fallback controls ---
+    allow_faceless_when_locked: bool = True
+    faceless_reid_thresh: float = 0.40      # <= lock if ReID distance <= this
+    faceless_iou_min: float = 0.30          # accept person box if IoU with last lock >= this
+    faceless_persist_frames: int = 18       # carry last bbox this many frames when nothing is detected
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -235,6 +240,11 @@ class Processor(QtCore.QObject):
         self._fps: Optional[float] = None
         self._total_frames: Optional[int] = None
         self._seek_cooldown_frames: int = 0  # disable lock/IoU for a few frames after seek
+        # Target lock state for faceless fallback
+        self._lock_active: bool = False
+        self._lock_last_bbox: Optional[Tuple[int, int, int, int]] = None  # x,y,w,h in frame coords
+        self._lock_last_seen_idx: int = -10**9
+        self._locked_reid_feat: Optional[np.ndarray] = None
 
     @QtCore.Slot()
     def request_abort(self):
@@ -244,6 +254,60 @@ class Processor(QtCore.QObject):
     def request_pause(self, p: bool):
         self._pause = bool(p)
         self._paused = bool(p)
+
+    # --- Lock helpers ---
+    def _set_lock(self, bbox_xywh: Tuple[int, int, int, int], frame_idx: int):
+        x, y, w, h = [int(v) for v in bbox_xywh]
+        self._lock_active = True
+        self._lock_last_bbox = (x, y, w, h)
+        self._lock_last_seen_idx = int(frame_idx)
+
+    def _clear_lock(self):
+        self._lock_active = False
+        self._lock_last_bbox = None
+        self._lock_last_seen_idx = -10**9
+        self._locked_reid_feat = None
+
+    def _iou_xywh(self, a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+        ax, ay, aw, ah = a
+        bx, by, bw, bh = b
+        return self._iou((ax, ay, ax + aw, ay + ah), (bx, by, bx + bw, by + bh))
+
+    def _faceless_pick_from_persons(self, persons_xywh, reid_feats, locked_feat):
+        """Return (idx, reason) of best faceless fallback candidate or (-1, None)."""
+        best_idx, best_score, reason = -1, 1e9, None
+        if locked_feat is not None and reid_feats:
+            try:
+                lock_vec = np.asarray(locked_feat, dtype=np.float32)
+                lock_vec = lock_vec / max(float(np.linalg.norm(lock_vec)), 1e-9)
+            except Exception:
+                lock_vec = None
+            if lock_vec is not None:
+                for i, feat in enumerate(reid_feats):
+                    if feat is None:
+                        continue
+                    try:
+                        vec = np.asarray(feat, dtype=np.float32)
+                        vec = vec / max(float(np.linalg.norm(vec)), 1e-9)
+                        d = 1.0 - float(np.dot(lock_vec, vec))
+                    except Exception:
+                        continue
+                    if d < best_score:
+                        best_score, best_idx, reason = d, i, "reid"
+                if best_idx >= 0 and best_score <= float(self.cfg.faceless_reid_thresh):
+                    return best_idx, reason
+        if self._lock_last_bbox and persons_xywh:
+            iou_best, j_best = 0.0, -1
+            for j, b in enumerate(persons_xywh):
+                try:
+                    cur_iou = float(self._iou_xywh(self._lock_last_bbox, tuple(map(int, b))))
+                except Exception:
+                    cur_iou = 0.0
+                if cur_iou > iou_best:
+                    iou_best, j_best = cur_iou, j
+            if j_best >= 0 and iou_best >= float(self.cfg.faceless_iou_min):
+                return j_best, "iou"
+        return -1, None
 
     def _combine_scores(self, face_dist, reid_dist, mode='min'):
         vals = []
@@ -270,6 +334,7 @@ class Processor(QtCore.QObject):
             self._paused = False
             self._init_status()
             cfg = self.cfg
+            self._clear_lock()
             if not os.path.isfile(cfg.video):
                 raise FileNotFoundError(f"Video not found: {cfg.video}")
             if not os.path.isfile(cfg.ref):
@@ -417,6 +482,7 @@ class Processor(QtCore.QObject):
                             locked_face = None
                             locked_reid = None
                             prev_box = None
+                            self._clear_lock()
                             # allow immediate capture after seek by backdating last_hit
                             now_t = _frame_time(frame_idx)
                             self._last_hit_t = now_t - float(self.cfg.min_gap_sec)
@@ -447,6 +513,7 @@ class Processor(QtCore.QObject):
                                 locked_face = None
                                 locked_reid = None
                                 prev_box = None
+                                self._clear_lock()
                                 now_t = _frame_time(frame_idx)
                                 self._last_hit_t = now_t - float(self.cfg.min_gap_sec)
                                 self._seek_cooldown_frames = _cooldown_frames()
@@ -772,6 +839,16 @@ class Processor(QtCore.QObject):
                     if c.get("reid_feat") is not None:
                         lr_prev = locked_reid
                         locked_reid = self._ema(lr_prev, c["reid_feat"], float(cfg.lock_momentum))
+                    person_box = c.get("show_box") or (cx1, cy1, cx2, cy2)
+                    px1, py1, px2, py2 = [int(round(v)) for v in person_box]
+                    self._set_lock((px1, py1, px2 - px1, py2 - py1), idx)
+                    if locked_reid is not None:
+                        self._locked_reid_feat = locked_reid
+                    elif c.get("reid_feat") is not None:
+                        try:
+                            self._locked_reid_feat = np.asarray(c["reid_feat"], dtype=np.float32)
+                        except Exception:
+                            self._locked_reid_feat = None
                     lock_hits += 1
                     prev_box = (cx1,cy1,cx2,cy2)
                     return True
@@ -780,15 +857,113 @@ class Processor(QtCore.QObject):
                 if not hasattr(self, "_last_hit_t"):
                     self._last_hit_t = -1e9
 
+                fallback_candidate = None
                 if not candidates:
-                    self._status(
-                        f"No match. persons={diag_persons} faces={faces_detected} pass_q={faces_passing_quality} "
-                        f"visible={any_face_visible} best_fd_qonly={best_face_dist if best_face_dist is not None else 'n/a'} "
-                        f"min_fd_all={min_fd_all if min_fd_all is not None else 'n/a'}",
-                        key="no_match",
-                        interval=1.0,
-                    )
-                else:
+                    if (
+                        cfg.allow_faceless_when_locked
+                        and self._lock_active
+                        and lock_hits >= int(cfg.lock_after_hits)
+                        and self._seek_cooldown_frames <= 0
+                    ):
+                        persons_xywh = []
+                        for bx1, by1, bx2, by2 in boxes:
+                            ox1, oy1 = bx1 + off_x, by1 + off_y
+                            ow, oh = (bx2 - bx1), (by2 - by1)
+                            if ow <= 2 or oh <= 2:
+                                continue
+                            persons_xywh.append((ox1, oy1, ow, oh))
+                        locked_feat = self._locked_reid_feat
+                        reid_feats_fb = []
+                        try:
+                            if hasattr(self, "reid") and persons_xywh:
+                                reid_feats_fb = [self.reid.embed(frame, b) for b in persons_xywh]
+                        except Exception:
+                            reid_feats_fb = []
+                        pick, why = self._faceless_pick_from_persons(persons_xywh, reid_feats_fb, locked_feat)
+                        if pick >= 0 and pick < len(boxes):
+                            bx1, by1, bx2, by2 = boxes[pick]
+                            sx1 = max(0, min(W - 1, int(round(bx1 + off_x))))
+                            sy1 = max(0, min(H - 1, int(round(by1 + off_y))))
+                            sx2 = max(sx1 + 1, min(W, int(round(bx2 + off_x))))
+                            sy2 = max(sy1 + 1, min(H, int(round(by2 + off_y))))
+                            (ex1, ey1, ex2, ey2), chosen_ratio = self._choose_best_ratio(
+                                (bx1, by1, bx2, by2), ratios, W2, H2, anchor=None
+                            )
+                            ox1, oy1, ox2, oy2 = ex1 + off_x, ey1 + off_y, ex2 + off_x, ey2 + off_y
+                            ox1 = max(0, min(W - 1, int(round(ox1))))
+                            oy1 = max(0, min(H - 1, int(round(oy1))))
+                            ox2 = max(ox1 + 1, min(W, int(round(ox2))))
+                            oy2 = max(oy1 + 1, min(H, int(round(oy2))))
+                            if ox2 > ox1 + 2 and oy2 > oy1 + 2:
+                                crop_img = frame[oy1:oy2, ox1:ox2]
+                                sharp = self._calc_sharpness(crop_img)
+                                if sharp >= float(cfg.min_sharpness):
+                                    reasons = [f"faceless_{why}" if why else "faceless"]
+                                    fallback_candidate = dict(
+                                        score=None,
+                                        fd=None,
+                                        rd=None,
+                                        sharp=sharp,
+                                        box=(ox1, oy1, ox2, oy2),
+                                        area=(ox2 - ox1) * (oy2 - oy1),
+                                        show_box=(sx1, sy1, sx2, sy2),
+                                        face_feat=None,
+                                        reid_feat=(reid_feats_fb[pick] if pick < len(reid_feats_fb) else None),
+                                        ratio=chosen_ratio,
+                                        reasons=reasons,
+                                        face_quality=None,
+                                        accept_pre=True,
+                                    )
+                        if (
+                            fallback_candidate is None
+                            and self._lock_last_bbox is not None
+                            and (current_idx - self._lock_last_seen_idx)
+                            <= int(cfg.faceless_persist_frames)
+                        ):
+                            lx, ly, lw, lh = self._lock_last_bbox
+                            x1 = max(0, min(W - 1, int(round(lx))))
+                            y1 = max(0, min(H - 1, int(round(ly))))
+                            x2 = max(x1 + 1, min(W, int(round(lx + lw))))
+                            y2 = max(y1 + 1, min(H, int(round(ly + lh))))
+                            if x2 > x1 + 2 and y2 > y1 + 2:
+                                (ex1, ey1, ex2, ey2), chosen_ratio = self._choose_best_ratio(
+                                    (x1, y1, x2, y2), ratios, W, H, anchor=None
+                                )
+                                ex1 = max(0, min(W - 1, int(round(ex1))))
+                                ey1 = max(0, min(H - 1, int(round(ey1))))
+                                ex2 = max(ex1 + 1, min(W, int(round(ex2))))
+                                ey2 = max(ey1 + 1, min(H, int(round(ey2))))
+                                if ex2 > ex1 + 2 and ey2 > ey1 + 2:
+                                    crop_img = frame[ey1:ey2, ex1:ex2]
+                                    sharp = self._calc_sharpness(crop_img)
+                                    if sharp >= float(cfg.min_sharpness):
+                                        fallback_candidate = dict(
+                                            score=None,
+                                            fd=None,
+                                            rd=None,
+                                            sharp=sharp,
+                                            box=(ex1, ey1, ex2, ey2),
+                                            area=(ex2 - ex1) * (ey2 - ey1),
+                                            show_box=(x1, y1, x2, y2),
+                                            face_feat=None,
+                                            reid_feat=None,
+                                            ratio=chosen_ratio,
+                                            reasons=["faceless_carry"],
+                                            face_quality=None,
+                                            accept_pre=True,
+                                        )
+                    if fallback_candidate is not None:
+                        candidates = [fallback_candidate]
+                    else:
+                        self._status(
+                            f"No match. persons={diag_persons} faces={faces_detected} pass_q={faces_passing_quality} "
+                            f"visible={any_face_visible} best_fd_qonly={best_face_dist if best_face_dist is not None else 'n/a'} "
+                            f"min_fd_all={min_fd_all if min_fd_all is not None else 'n/a'}",
+                            key="no_match",
+                            interval=1.0,
+                        )
+                chosen = None
+                if candidates:
                     # Lock-aware scoring
                     # face margin check: chosen must be best face by a margin if faces are present
                     if cfg.prefer_face_when_available and any_face_visible:
@@ -838,7 +1013,20 @@ class Processor(QtCore.QObject):
                     if chosen is None and candidates:
                         chosen = candidates[0]
 
-                    if chosen is not None and now_t - self._last_hit_t >= float(cfg.min_gap_sec):
+                    if chosen is not None:
+                        show_box = chosen.get("show_box") or chosen.get("box")
+                        if show_box is not None and len(show_box) == 4:
+                            px1, py1, px2, py2 = [int(round(v)) for v in show_box]
+                            self._set_lock((px1, py1, px2 - px1, py2 - py1), current_idx)
+                        if chosen.get("reid_feat") is not None:
+                            try:
+                                self._locked_reid_feat = np.asarray(chosen["reid_feat"], dtype=np.float32)
+                            except Exception:
+                                pass
+                    if (
+                        chosen is not None
+                        and now_t - self._last_hit_t >= float(cfg.min_gap_sec)
+                    ):
                         if save_hit(chosen, current_idx):
                             hit_count += 1
                             self._last_hit_t = now_t
@@ -896,6 +1084,18 @@ class Processor(QtCore.QObject):
                     if candidates:
                         bx1,by1,bx2,by2 = candidates[0]["box"]
                         cv2.rectangle(show, (bx1,by1),(bx2,by2),(255,0,0),2)
+                        rs = candidates[0].get("reasons")
+                        if rs:
+                            cv2.putText(
+                                show,
+                                str(rs[0]),
+                                (bx1, max(0, by1 - 5)),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.45,
+                                (255, 0, 0),
+                                1,
+                                cv2.LINE_AA,
+                            )
                     qimg = self._cv_bgr_to_qimage(show)
                     self.preview.emit(qimg)
                 # Always-on preview cadence
@@ -911,6 +1111,10 @@ class Processor(QtCore.QObject):
                     if self._seek_cooldown_frames == _cooldown_frames():
                         self._status("Lock cooldown active", key="cooldown", interval=0.5)
                     self._seek_cooldown_frames -= 1
+                if self._lock_active:
+                    lose_after = max(int(cfg.faceless_persist_frames) * 2, _frame_stride() * 6)
+                    if current_idx - self._lock_last_seen_idx > lose_after:
+                        self._clear_lock()
                 if self._speed and self._speed > 0:
                     time.sleep(max(0.0, (1.0 / float(fps)) / float(self._speed)))
                 # Per-frame debug dump
@@ -935,6 +1139,10 @@ class Processor(QtCore.QObject):
                                 "prefer_face_when_available": bool(cfg.prefer_face_when_available),
                                 "require_face_if_visible": bool(cfg.require_face_if_visible),
                                 "match_mode": str(cfg.match_mode),
+                                "allow_faceless_when_locked": bool(cfg.allow_faceless_when_locked),
+                                "faceless_reid_thresh": float(cfg.faceless_reid_thresh),
+                                "faceless_iou_min": float(cfg.faceless_iou_min),
+                                "faceless_persist_frames": int(cfg.faceless_persist_frames),
                             },
                             "candidates": [
                                 {
