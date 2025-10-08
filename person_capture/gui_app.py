@@ -98,6 +98,10 @@ class SessionConfig:
     crop_bottom_min_face_heights: float = 1.5    # min bottom margin in face-heights
     crop_penalty_weight: float = 3.0             # weight for placement penalties vs area growth
     face_anchor_down_frac: float = 1.1           # shift center downward by this * face_h (torso bias)
+    # --- anti-zoom guards ---
+    face_max_frac_in_crop: float = 0.42          # face_h / crop_h ≤ this
+    face_min_frac_in_crop: float = 0.18          # optional lower bound to avoid face too small
+    crop_min_height_frac: float = 0.28           # crop_h ≥ this * frame_h
 
     # Debug/diagnostics
     debug_dump: bool = True
@@ -137,6 +141,83 @@ class Processor(QtCore.QObject):
         if prev is None:
             return new
         return (m * prev + (1.0 - m) * new) if isinstance(prev, np.ndarray) else new
+
+    @staticmethod
+    def _clip_to_frame(x1: float, y1: float, x2: float, y2: float, frame_w: int, frame_h: int) -> Tuple[int, int, int, int]:
+        """Shift and clamp coordinates so the crop stays inside the frame."""
+
+        dx1 = -x1 if x1 < 0 else 0.0
+        dx2 = frame_w - x2 if x2 > frame_w else 0.0
+        dy1 = -y1 if y1 < 0 else 0.0
+        dy2 = frame_h - y2 if y2 > frame_h else 0.0
+
+        shift_x = dx1 if dx1 != 0.0 else (dx2 if dx2 != 0.0 else 0.0)
+        shift_y = dy1 if dy1 != 0.0 else (dy2 if dy2 != 0.0 else 0.0)
+
+        x1 += shift_x
+        x2 += shift_x
+        y1 += shift_y
+        y2 += shift_y
+
+        ix1 = max(0, min(frame_w - 1, int(round(x1))))
+        ix2 = max(ix1 + 1, min(frame_w, int(round(x2))))
+        iy1 = max(0, min(frame_h - 1, int(round(y1))))
+        iy2 = max(iy1 + 1, min(frame_h, int(round(y2))))
+        return ix1, iy1, ix2, iy2
+
+    def _enforce_scale_and_margins(
+        self,
+        crop_xyxy: Tuple[int, int, int, int],
+        ratio_str: str,
+        frame_w: int,
+        frame_h: int,
+        face_box: Optional[Tuple[int, int, int, int]] = None,
+        anchor: Optional[Tuple[float, float]] = None,
+    ) -> Tuple[int, int, int, int]:
+        """Expand the crop if needed to keep face fraction and min height in check."""
+
+        cx1, cy1, cx2, cy2 = map(int, crop_xyxy)
+        current_w = float(cx2 - cx1)
+        current_h = float(cy2 - cy1)
+        try:
+            rw, rh = parse_ratio(ratio_str)
+            target_aspect = float(rw) / float(rh)
+        except Exception:
+            current_aspect = current_w / current_h if current_h > 0 else 1.0
+            target_aspect = current_aspect if current_aspect > 0 else 1.0
+        cfg = self.cfg
+
+        required_h = current_h
+
+        if face_box is not None:
+            fx1, fy1, fx2, fy2 = face_box
+            face_w = float(fx2 - fx1)
+            face_h = float(fy2 - fy1)
+            if face_h > 0:
+                required_h = max(required_h, face_h / max(cfg.face_max_frac_in_crop, 1e-6))
+                want_side = float(cfg.crop_face_side_margin_frac) * face_w
+                required_w = face_w + 2.0 * want_side
+                required_h = max(required_h, required_w / max(target_aspect, 1e-6))
+                if cfg.face_min_frac_in_crop > 0:
+                    required_h = max(required_h, face_h / max(cfg.face_min_frac_in_crop, 1e-6))
+
+        required_h = max(required_h, float(cfg.crop_min_height_frac) * float(frame_h))
+
+        if required_h <= current_h + 0.5:
+            return cx1, cy1, cx2, cy2
+
+        required_w = required_h * target_aspect
+        if anchor is not None:
+            anchor_x, anchor_y = anchor
+        else:
+            anchor_x = (cx1 + cx2) / 2.0
+            anchor_y = (cy1 + cy2) / 2.0
+
+        new_x1 = anchor_x - required_w / 2.0
+        new_x2 = anchor_x + required_w / 2.0
+        new_y1 = anchor_y - required_h / 2.0
+        new_y2 = anchor_y + required_h / 2.0
+        return self._clip_to_frame(new_x1, new_y1, new_x2, new_y2, frame_w, frame_h)
 
     def _choose_best_ratio(self, det_box, ratios, frame_w, frame_h, anchor=None, face_box=None):
         """
@@ -877,6 +958,14 @@ class Processor(QtCore.QObject):
                     (ex1,ey1,ex2,ey2), chosen_ratio = self._choose_best_ratio(
                         (x1,y1,x2,y2), ratios, W2, H2, anchor=anchor, face_box=face_box_abs
                     )
+                    ex1, ey1, ex2, ey2 = self._enforce_scale_and_margins(
+                        (ex1, ey1, ex2, ey2),
+                        chosen_ratio,
+                        W2,
+                        H2,
+                        face_box=face_box_abs,
+                        anchor=anchor,
+                    )
 
                     # Compute sharpness on final crop
                     crop_img = frame_for_det[ey1:ey2, ex1:ex2]
@@ -1002,6 +1091,14 @@ class Processor(QtCore.QObject):
                                 (ex1, ey1, ex2, ey2), chosen_ratio = self._choose_best_ratio(
                                     (bx1, by1, bx2, by2), ratios, W2, H2, anchor=None
                                 )
+                                ex1, ey1, ex2, ey2 = self._enforce_scale_and_margins(
+                                    (ex1, ey1, ex2, ey2),
+                                    chosen_ratio,
+                                    W2,
+                                    H2,
+                                    face_box=None,
+                                    anchor=None,
+                                )
                                 ox1, oy1, ox2, oy2 = ex1 + off_x, ey1 + off_y, ex2 + off_x, ey2 + off_y
                                 ox1 = max(0, min(W - 1, int(round(ox1))))
                                 oy1 = max(0, min(H - 1, int(round(oy1))))
@@ -1043,6 +1140,14 @@ class Processor(QtCore.QObject):
                             if x2 > x1 + 2 and y2 > y1 + 2:
                                 (ex1, ey1, ex2, ey2), chosen_ratio = self._choose_best_ratio(
                                     (x1, y1, x2, y2), ratios, W, H, anchor=None
+                                )
+                                ex1, ey1, ex2, ey2 = self._enforce_scale_and_margins(
+                                    (ex1, ey1, ex2, ey2),
+                                    chosen_ratio,
+                                    W,
+                                    H,
+                                    face_box=None,
+                                    anchor=None,
                                 )
                                 ex1 = max(0, min(W - 1, int(round(ex1))))
                                 ey1 = max(0, min(H - 1, int(round(ey1))))
@@ -1480,6 +1585,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.crop_penalty_weight_spin.setValue(float(self.cfg.crop_penalty_weight))
         self.face_anchor_down_spin = _mk_fspin(0.0, 2.0, 0.05, 2, "float: face_anchor_down_frac")
         self.face_anchor_down_spin.setValue(float(self.cfg.face_anchor_down_frac))
+        self.face_max_frac_spin = _mk_fspin(0.05, 1.0, 0.01, 3, "float: face_max_frac_in_crop")
+        self.face_max_frac_spin.setValue(float(self.cfg.face_max_frac_in_crop))
+        self.face_min_frac_spin = _mk_fspin(0.0, 1.0, 0.01, 3, "float: face_min_frac_in_crop")
+        self.face_min_frac_spin.setValue(float(self.cfg.face_min_frac_in_crop))
+        self.crop_min_height_frac_spin = _mk_fspin(0.0, 1.0, 0.01, 3, "float: crop_min_height_frac")
+        self.crop_min_height_frac_spin.setValue(float(self.cfg.crop_min_height_frac))
 
         labels = [
             ("Aspect ratio W:H", self.ratio_edit),
@@ -1531,6 +1642,9 @@ class MainWindow(QtWidgets.QMainWindow):
             ("crop_bottom_min_face_heights", self.crop_bottom_min_face_spin),
             ("crop_penalty_weight", self.crop_penalty_weight_spin),
             ("face_anchor_down_frac", self.face_anchor_down_spin),
+            ("face_max_frac_in_crop", self.face_max_frac_spin),
+            ("face_min_frac_in_crop", self.face_min_frac_spin),
+            ("crop_min_height_frac", self.crop_min_height_frac_spin),
         ]
         for row, (lab, w) in enumerate(labels):
             if lab:
@@ -1953,6 +2067,9 @@ class MainWindow(QtWidgets.QMainWindow):
             crop_bottom_min_face_heights=float(self.crop_bottom_min_face_spin.value()) if hasattr(self, "crop_bottom_min_face_spin") else 1.5,
             crop_penalty_weight=float(self.crop_penalty_weight_spin.value()) if hasattr(self, "crop_penalty_weight_spin") else 3.0,
             face_anchor_down_frac=float(self.face_anchor_down_spin.value()) if hasattr(self, "face_anchor_down_spin") else 1.1,
+            face_max_frac_in_crop=float(self.face_max_frac_spin.value()) if hasattr(self, "face_max_frac_spin") else 0.42,
+            face_min_frac_in_crop=float(self.face_min_frac_spin.value()) if hasattr(self, "face_min_frac_spin") else 0.18,
+            crop_min_height_frac=float(self.crop_min_height_frac_spin.value()) if hasattr(self, "crop_min_height_frac_spin") else 0.28,
         )
         return cfg
 
@@ -2034,6 +2151,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.crop_penalty_weight_spin.setValue(cfg.crop_penalty_weight)
         if hasattr(self, 'face_anchor_down_spin'):
             self.face_anchor_down_spin.setValue(cfg.face_anchor_down_frac)
+        if hasattr(self, 'face_max_frac_spin'):
+            self.face_max_frac_spin.setValue(cfg.face_max_frac_in_crop)
+        if hasattr(self, 'face_min_frac_spin'):
+            self.face_min_frac_spin.setValue(cfg.face_min_frac_in_crop)
+        if hasattr(self, 'crop_min_height_frac_spin'):
+            self.crop_min_height_frac_spin.setValue(cfg.crop_min_height_frac)
 
     # Thread control
     def on_start(self):
@@ -2374,6 +2497,18 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'face_anchor_down_spin'):
             self.face_anchor_down_spin.setValue(
                 float(s.value("face_anchor_down_frac", self.cfg.face_anchor_down_frac))
+            )
+        if hasattr(self, 'face_max_frac_spin'):
+            self.face_max_frac_spin.setValue(
+                float(s.value("face_max_frac_in_crop", self.cfg.face_max_frac_in_crop))
+            )
+        if hasattr(self, 'face_min_frac_spin'):
+            self.face_min_frac_spin.setValue(
+                float(s.value("face_min_frac_in_crop", self.cfg.face_min_frac_in_crop))
+            )
+        if hasattr(self, 'crop_min_height_frac_spin'):
+            self.crop_min_height_frac_spin.setValue(
+                float(s.value("crop_min_height_frac", self.cfg.crop_min_height_frac))
             )
         # Face-first defaults if controls not present
         if hasattr(self, 'pref_face_check'):
