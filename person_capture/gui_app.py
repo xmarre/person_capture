@@ -14,6 +14,7 @@ import sys, os, json, time, csv, traceback
 import subprocess
 import bisect
 import queue
+import math
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple, List
 from pathlib import Path
@@ -104,7 +105,12 @@ class SessionConfig:
     allow_faceless_when_locked: bool = True
     faceless_reid_thresh: float = 0.40      # <= lock if ReID distance <= this
     faceless_iou_min: float = 0.30          # accept person box if IoU with last lock >= this
-    faceless_persist_frames: int = 18       # carry last bbox this many frames when nothing is detected
+    faceless_persist_frames: int = 0        # disable carry to avoid background crops
+    faceless_min_area_frac: float = 0.03    # min area vs frame
+    faceless_max_area_frac: float = 0.55    # max area vs frame
+    faceless_center_max_frac: float = 0.12  # max center drift vs diag
+    faceless_min_motion_frac: float = 0.02  # min moving pixels in ROI
+    faceless_require_reid: bool = True      # require ReID, no IoU-only
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -245,6 +251,7 @@ class Processor(QtCore.QObject):
         self._lock_last_bbox: Optional[Tuple[int, int, int, int]] = None  # x,y,w,h in frame coords
         self._lock_last_seen_idx: int = -10**9
         self._locked_reid_feat: Optional[np.ndarray] = None
+        self._prev_gray: Optional[np.ndarray] = None
 
     @QtCore.Slot()
     def request_abort(self):
@@ -274,8 +281,9 @@ class Processor(QtCore.QObject):
         return self._iou((ax, ay, ax + aw, ay + ah), (bx, by, bx + bw, by + bh))
 
     def _faceless_pick_from_persons(self, persons_xywh, reid_feats, locked_feat):
-        """Return (idx, reason) of best faceless fallback candidate or (-1, None)."""
-        best_idx, best_score, reason = -1, 1e9, None
+        """Return (idx, reason) or (-1, None). Requires ReID and IoU."""
+        require_reid = bool(getattr(self.cfg, "faceless_require_reid", False))
+        best_idx, best_score = -1, 1e9
         if locked_feat is not None and reid_feats:
             try:
                 lock_vec = np.asarray(locked_feat, dtype=np.float32)
@@ -293,10 +301,18 @@ class Processor(QtCore.QObject):
                     except Exception:
                         continue
                     if d < best_score:
-                        best_score, best_idx, reason = d, i, "reid"
+                        best_score, best_idx = d, i
                 if best_idx >= 0 and best_score <= float(self.cfg.faceless_reid_thresh):
-                    return best_idx, reason
-        if self._lock_last_bbox and persons_xywh:
+                    if self._lock_last_bbox is not None:
+                        try:
+                            iou = float(self._iou_xywh(self._lock_last_bbox, tuple(map(int, persons_xywh[best_idx]))))
+                        except Exception:
+                            iou = 0.0
+                        if iou >= float(self.cfg.faceless_iou_min):
+                            return best_idx, "reid+iou"
+                    if not require_reid:
+                        return best_idx, "reid"
+        if (not require_reid) and self._lock_last_bbox and persons_xywh:
             iou_best, j_best = 0.0, -1
             for j, b in enumerate(persons_xywh):
                 try:
@@ -335,6 +351,7 @@ class Processor(QtCore.QObject):
             self._init_status()
             cfg = self.cfg
             self._clear_lock()
+            self._prev_gray = None
             if not os.path.isfile(cfg.video):
                 raise FileNotFoundError(f"Video not found: {cfg.video}")
             if not os.path.isfile(cfg.ref):
@@ -872,10 +889,32 @@ class Processor(QtCore.QObject):
                             if ow <= 2 or oh <= 2:
                                 continue
                             persons_xywh.append((ox1, oy1, ow, oh))
+                        area_min = float(cfg.faceless_min_area_frac) * float(W * H)
+                        area_max = float(cfg.faceless_max_area_frac) * float(W * H)
+                        persons_xywh = [
+                            b for b in persons_xywh if area_min <= (b[2] * b[3]) <= area_max
+                        ]
+                        if self._lock_last_bbox:
+                            lx, ly, lw, lh = self._lock_last_bbox
+                            lcx, lcy = lx + lw * 0.5, ly + lh * 0.5
+                            diag = max(1.0, math.hypot(W, H))
+                            persons_xywh = [
+                                b
+                                for b in persons_xywh
+                                if (
+                                    math.hypot((b[0] + b[2] * 0.5) - lcx, (b[1] + b[3] * 0.5) - lcy)
+                                    / diag
+                                )
+                                <= float(cfg.faceless_center_max_frac)
+                            ]
                         locked_feat = self._locked_reid_feat
                         reid_feats_fb = []
                         try:
-                            if hasattr(self, "reid") and persons_xywh:
+                            if (
+                                hasattr(self, "reid")
+                                and persons_xywh
+                                and (locked_feat is not None or not bool(cfg.faceless_require_reid))
+                            ):
                                 reid_feats_fb = [self.reid.embed(frame, b) for b in persons_xywh]
                         except Exception:
                             reid_feats_fb = []
@@ -895,9 +934,29 @@ class Processor(QtCore.QObject):
                             ox2 = max(ox1 + 1, min(W, int(round(ox2))))
                             oy2 = max(oy1 + 1, min(H, int(round(oy2))))
                             if ox2 > ox1 + 2 and oy2 > oy1 + 2:
+                                if self._prev_gray is None:
+                                    try:
+                                        self._prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                                    except Exception:
+                                        self._prev_gray = None
+                                gray_frame = None
+                                motion_ok = True
+                                try:
+                                    gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                                    gx1, gy1, gx2, gy2 = sx1, sy1, sx2, sy2
+                                    if gy2 > gy1 and gx2 > gx1:
+                                        m = cv2.absdiff(
+                                            self._prev_gray[gy1:gy2, gx1:gx2],
+                                            gray_frame[gy1:gy2, gx1:gx2],
+                                        )
+                                        motion_ok = float((m > 6).mean()) >= float(
+                                            cfg.faceless_min_motion_frac
+                                        )
+                                except Exception:
+                                    motion_ok = True
                                 crop_img = frame[oy1:oy2, ox1:ox2]
                                 sharp = self._calc_sharpness(crop_img)
-                                if sharp >= float(cfg.min_sharpness):
+                                if motion_ok and sharp >= float(cfg.min_sharpness):
                                     reasons = [f"faceless_{why}" if why else "faceless"]
                                     fallback_candidate = dict(
                                         score=None,
@@ -914,44 +973,6 @@ class Processor(QtCore.QObject):
                                         face_quality=None,
                                         accept_pre=True,
                                     )
-                        if (
-                            fallback_candidate is None
-                            and self._lock_last_bbox is not None
-                            and (current_idx - self._lock_last_seen_idx)
-                            <= int(cfg.faceless_persist_frames)
-                        ):
-                            lx, ly, lw, lh = self._lock_last_bbox
-                            x1 = max(0, min(W - 1, int(round(lx))))
-                            y1 = max(0, min(H - 1, int(round(ly))))
-                            x2 = max(x1 + 1, min(W, int(round(lx + lw))))
-                            y2 = max(y1 + 1, min(H, int(round(ly + lh))))
-                            if x2 > x1 + 2 and y2 > y1 + 2:
-                                (ex1, ey1, ex2, ey2), chosen_ratio = self._choose_best_ratio(
-                                    (x1, y1, x2, y2), ratios, W, H, anchor=None
-                                )
-                                ex1 = max(0, min(W - 1, int(round(ex1))))
-                                ey1 = max(0, min(H - 1, int(round(ey1))))
-                                ex2 = max(ex1 + 1, min(W, int(round(ex2))))
-                                ey2 = max(ey1 + 1, min(H, int(round(ey2))))
-                                if ex2 > ex1 + 2 and ey2 > ey1 + 2:
-                                    crop_img = frame[ey1:ey2, ex1:ex2]
-                                    sharp = self._calc_sharpness(crop_img)
-                                    if sharp >= float(cfg.min_sharpness):
-                                        fallback_candidate = dict(
-                                            score=None,
-                                            fd=None,
-                                            rd=None,
-                                            sharp=sharp,
-                                            box=(ex1, ey1, ex2, ey2),
-                                            area=(ex2 - ex1) * (ey2 - ey1),
-                                            show_box=(x1, y1, x2, y2),
-                                            face_feat=None,
-                                            reid_feat=None,
-                                            ratio=chosen_ratio,
-                                            reasons=["faceless_carry"],
-                                            face_quality=None,
-                                            accept_pre=True,
-                                        )
                     if fallback_candidate is not None:
                         candidates = [fallback_candidate]
                     else:
@@ -1115,6 +1136,12 @@ class Processor(QtCore.QObject):
                     lose_after = max(int(cfg.faceless_persist_frames) * 2, _frame_stride() * 6)
                     if current_idx - self._lock_last_seen_idx > lose_after:
                         self._clear_lock()
+                # keep last gray for motion gate
+                try:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    self._prev_gray = gray
+                except Exception:
+                    pass
                 if self._speed and self._speed > 0:
                     time.sleep(max(0.0, (1.0 / float(fps)) / float(self._speed)))
                 # Per-frame debug dump
@@ -1143,6 +1170,11 @@ class Processor(QtCore.QObject):
                                 "faceless_reid_thresh": float(cfg.faceless_reid_thresh),
                                 "faceless_iou_min": float(cfg.faceless_iou_min),
                                 "faceless_persist_frames": int(cfg.faceless_persist_frames),
+                                "faceless_min_area_frac": float(cfg.faceless_min_area_frac),
+                                "faceless_max_area_frac": float(cfg.faceless_max_area_frac),
+                                "faceless_center_max_frac": float(cfg.faceless_center_max_frac),
+                                "faceless_min_motion_frac": float(cfg.faceless_min_motion_frac),
+                                "faceless_require_reid": bool(cfg.faceless_require_reid),
                             },
                             "candidates": [
                                 {

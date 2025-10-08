@@ -35,5 +35,14 @@
   "lock_momentum": 0.7,
   "suppress_negatives": false,
   "neg_tolerance": 0.35,
-  "max_negatives": 5
+  "max_negatives": 5,
+  "allow_faceless_when_locked": true,
+  "faceless_require_reid": true,
+  "faceless_reid_thresh": 0.32,
+  "faceless_iou_min": 0.45,
+  "faceless_persist_frames": 0,
+  "faceless_min_area_frac": 0.03,
+  "faceless_max_area_frac": 0.55,
+  "faceless_center_max_frac": 0.12,
+  "faceless_min_motion_frac": 0.02
 }
