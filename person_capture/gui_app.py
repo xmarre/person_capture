@@ -1159,28 +1159,67 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Player
         player_group = QtWidgets.QGroupBox("Player")
-        player_layout = QtWidgets.QHBoxLayout(player_group)
-        self.play_btn = QtWidgets.QToolButton(); self.play_btn.setText("Play")
-        self.pause_btn2 = QtWidgets.QToolButton(); self.pause_btn2.setText("Pause")
-        self.step_back_btn = QtWidgets.QToolButton(); self.step_back_btn.setText("⟨⟨")
-        self.step_fwd_btn = QtWidgets.QToolButton(); self.step_fwd_btn.setText("⟩⟩")
-        self.speed_combo = QtWidgets.QComboBox(); self.speed_combo.addItems(["0.25x", "0.5x", "1.0x", "1.5x", "2.0x"])
+        player_v = QtWidgets.QVBoxLayout(player_group)
+
+        # Row 1: transport + speed
+        transport_h = QtWidgets.QHBoxLayout()
+        self.play_toggle = QtWidgets.QToolButton()
+        self.play_toggle.setCheckable(True)
+        _style = self.style()
+        self._icon_play = _style.standardIcon(QtWidgets.QStyle.SP_MediaPlay)
+        self._icon_pause = _style.standardIcon(QtWidgets.QStyle.SP_MediaPause)
+        self._update_play_toggle_ui(paused=True)
+
+        self.step_back_btn = QtWidgets.QToolButton()
+        self.step_back_btn.setIcon(_style.standardIcon(QtWidgets.QStyle.SP_MediaSkipBackward))
+        self.step_back_btn.setToolTip("Prev keyframe (←)")
+        self.step_fwd_btn = QtWidgets.QToolButton()
+        self.step_fwd_btn.setIcon(_style.standardIcon(QtWidgets.QStyle.SP_MediaSkipForward))
+        self.step_fwd_btn.setToolTip("Next keyframe (→)")
+
+        self.speed_combo = QtWidgets.QComboBox()
+        self.speed_combo.addItems(["0.25x", "0.5x", "1.0x", "1.5x", "2.0x"])
         self.speed_combo.setCurrentText("1.0x")
+        self.speed_combo.setToolTip("Playback speed")
+
+        transport_h.addWidget(self.play_toggle)
+        transport_h.addWidget(self.step_back_btn)
+        transport_h.addWidget(self.step_fwd_btn)
+        transport_h.addWidget(self.speed_combo)
+        transport_h.addStretch(1)
+
+        # Row 2: full-width seek bar
+        seek_h = QtWidgets.QHBoxLayout()
         self.seek_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.seek_slider.setRange(0, 0)
         self.seek_slider.setSingleStep(1)
+        self.seek_slider.setTracking(False)  # only seek on release for performance
+        self.seek_slider.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         self.time_lbl = QtWidgets.QLabel("00:00 / 00:00")
-        for w in (self.play_btn, self.pause_btn2, self.step_back_btn, self.step_fwd_btn, self.speed_combo):
-            player_layout.addWidget(w)
-        player_layout.addWidget(self.seek_slider, 1)
-        player_layout.addWidget(self.time_lbl)
-        self.play_btn.clicked.connect(self._handle_play_clicked)
-        self.pause_btn2.clicked.connect(self._handle_pause_clicked)
+        seek_h.addWidget(self.seek_slider, 1)
+        seek_h.addWidget(self.time_lbl)
+
+        player_v.addLayout(transport_h)
+        player_v.addLayout(seek_h)
+
+        # Wire up transport
+        self.play_toggle.toggled.connect(self._toggle_play_pause)
         self.step_back_btn.clicked.connect(self._handle_step_back)
         self.step_fwd_btn.clicked.connect(self._handle_step_forward)
         self.seek_slider.sliderReleased.connect(lambda: self._handle_seek_slider(self.seek_slider.value()))
-        self.seek_slider.sliderMoved.connect(lambda _v: None)  # keep if you prefer release-only
+        self.seek_slider.sliderMoved.connect(lambda _v: None)
         self.speed_combo.currentTextChanged.connect(self._on_speed_combo_changed)
+
+        # Keyboard shortcuts (active even when slider has focus)
+        self._shortcut_space = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Space), self)
+        self._shortcut_space.activated.connect(self._shortcut_play_pause)
+        self._shortcut_left = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Left), self)
+        self._shortcut_left.activated.connect(lambda: self._shortcut_step(False))
+        self._shortcut_right = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Right), self)
+        self._shortcut_right.activated.connect(lambda: self._shortcut_step(True))
+        # Ensure shortcuts fire regardless of focused widget
+        for sc in (self._shortcut_space, self._shortcut_left, self._shortcut_right):
+            sc.setContext(QtCore.Qt.ShortcutContext.ApplicationShortcut)
 
         # Progress + status
         prog_layout = QtWidgets.QHBoxLayout()
@@ -1401,13 +1440,32 @@ class MainWindow(QtWidgets.QMainWindow):
             speed = 1.0
         self._worker.set_speed(speed)
 
-    def _handle_play_clicked(self, _checked: bool = False):
-        if self._worker:
-            self._worker.play()
+    # --- Play/Pause toggle ---
+    def _update_play_toggle_ui(self, paused: bool):
+        if not hasattr(self, "play_toggle"):
+            return
+        self.play_toggle.blockSignals(True)
+        if paused:
+            self.play_toggle.setChecked(False)
+            self.play_toggle.setIcon(self._icon_play)
+            self.play_toggle.setText("Play")
+            self.play_toggle.setToolTip("Play (Space)")
+        else:
+            self.play_toggle.setChecked(True)
+            self.play_toggle.setIcon(self._icon_pause)
+            self.play_toggle.setText("Pause")
+            self.play_toggle.setToolTip("Pause (Space)")
+        self.play_toggle.blockSignals(False)
 
-    def _handle_pause_clicked(self, _checked: bool = False):
-        if self._worker:
+    def _toggle_play_pause(self, checked: bool):
+        if not self._worker:
+            return
+        if checked:
+            self._worker.play()
+            self._update_play_toggle_ui(paused=False)
+        else:
             self._worker.pause()
+            self._update_play_toggle_ui(paused=True)
 
     def _handle_step_back(self, _checked: bool = False):
         self._jump_keyframe(False)
@@ -1423,6 +1481,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._worker:
             self._worker.request_pause(flag)
             self._log(f"{'Paused' if flag else 'Resumed'}")
+            self._update_play_toggle_ui(paused=bool(flag))
+        else:
+            self._update_play_toggle_ui(paused=True)
 
     def _save_preset(self):
         cfg = self._collect_cfg()
@@ -1596,8 +1657,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "seek_slider"):
             self.seek_slider.setRange(0, max(0, total_frames - 1))
             self.seek_slider.setValue(0)
+            self.seek_slider.setPageStep(max(1, self.seek_slider.maximum() // 100))
             if hasattr(self, "time_lbl"):
                 self.time_lbl.setText(f"{self._fmt_time(0)} / {self._fmt_time(total_frames)}")
+        self._update_play_toggle_ui(paused=False)
         # Load existing keyframes (I-frames) from the video file
         try:
             vf = self.video_edit.text().strip() if hasattr(self, "video_edit") else ""
@@ -1654,6 +1717,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._total_frames = None
         self._keyframes = []
         self._current_idx = 0
+        self._update_play_toggle_ui(paused=True)
         # Clean up thread
         try:
             if self._thread and self._thread.isRunning():
@@ -1735,25 +1799,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self._pause(True)
             self._worker.seek_frame(target)
 
+    def _shortcut_play_pause(self):
+        if not self._worker or not hasattr(self, "play_toggle"):
+            return
+        paused = bool(getattr(self._worker, "_paused", False))
+        # Reflect worker state in toggle; toggled signal drives play/pause
+        self.play_toggle.setChecked(paused)
+
+    def _shortcut_step(self, forward: bool):
+        if not self._worker:
+            return
+        self._jump_keyframe(forward)
+
     def keyPressEvent(self, e: QtGui.QKeyEvent):
-        try:
-            if e.key() == QtCore.Qt.Key_Space and self._worker:
-                if getattr(self._worker, "_paused", False):
-                    self._worker.play()
-                else:
-                    self._worker.pause()
-                e.accept()
-                return
-            if e.key() == QtCore.Qt.Key_Right and self._worker:
-                self._jump_keyframe(True)
-                e.accept()
-                return
-            if e.key() == QtCore.Qt.Key_Left and self._worker:
-                self._jump_keyframe(False)
-                e.accept()
-                return
-        except Exception:
-            pass
+        # Space/←/→ handled by QShortcuts. Defer others to default.
         return super().keyPressEvent(e)
 
     def _update_buttons(self, state: str):
@@ -1762,10 +1821,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pause_btn.setEnabled(running)
         self.resume_btn.setEnabled(running)
         self.stop_btn.setEnabled(running)
-        if hasattr(self, "play_btn"):
-            self.play_btn.setEnabled(running)
-        if hasattr(self, "pause_btn2"):
-            self.pause_btn2.setEnabled(running)
+        if hasattr(self, "play_toggle"):
+            self.play_toggle.setEnabled(running)
         if hasattr(self, "step_back_btn"):
             self.step_back_btn.setEnabled(running)
         if hasattr(self, "step_fwd_btn"):
