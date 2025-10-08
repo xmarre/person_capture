@@ -110,7 +110,6 @@ class SessionConfig:
     faceless_max_area_frac: float = 0.55    # max area vs frame
     faceless_center_max_frac: float = 0.12  # max center drift vs diag
     faceless_min_motion_frac: float = 0.02  # min moving pixels in ROI
-    faceless_require_reid: bool = True      # require ReID, no IoU-only
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -938,9 +937,8 @@ class Processor(QtCore.QObject):
                             reid_feats_fb = []
                         pick, why = self._faceless_pick_from_persons(persons_xywh, reid_feats_fb, locked_feat)
                         if pick >= 0 and pick < len(boxes):
-                            if bool(cfg.faceless_require_reid):
-                                if why != "reid" or pick >= len(reid_feats_fb) or reid_feats_fb[pick] is None:
-                                    pick, why = -1, None
+                            if why != "reid" or pick >= len(reid_feats_fb) or reid_feats_fb[pick] is None:
+                                pick, why = -1, None
                             if pick >= 0:
                                 bx1, by1, bx2, by2 = boxes[pick]
                                 sx1 = max(0, min(W - 1, int(round(bx1 + off_x))))
@@ -979,7 +977,6 @@ class Processor(QtCore.QObject):
                                             )
                         if (
                             fallback_candidate is None
-                            and not bool(cfg.faceless_require_reid)
                             and self._lock_last_bbox is not None
                             and (current_idx - self._lock_last_seen_idx)
                             <= int(cfg.faceless_persist_frames)
@@ -1214,7 +1211,7 @@ class Processor(QtCore.QObject):
                                 "faceless_max_area_frac": float(cfg.faceless_max_area_frac),
                                 "faceless_center_max_frac": float(cfg.faceless_center_max_frac),
                                 "faceless_min_motion_frac": float(cfg.faceless_min_motion_frac),
-                                "faceless_require_reid": bool(cfg.faceless_require_reid),
+                                "drop_reid_if_any_face_match": bool(cfg.drop_reid_if_any_face_match),
                             },
                             "candidates": [
                                 {
@@ -1399,9 +1396,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.faceless_allow_check = QtWidgets.QCheckBox()
         self.faceless_allow_check.setChecked(bool(self.cfg.allow_faceless_when_locked))
         self.faceless_allow_check.setToolTip("bool: allow_faceless_when_locked")
-        self.faceless_require_reid_check = QtWidgets.QCheckBox()
-        self.faceless_require_reid_check.setChecked(bool(self.cfg.faceless_require_reid))
-        self.faceless_require_reid_check.setToolTip("bool: faceless_require_reid")
+        self.drop_reid_if_any_face_match_check = QtWidgets.QCheckBox()
+        self.drop_reid_if_any_face_match_check.setChecked(bool(self.cfg.drop_reid_if_any_face_match))
+        self.drop_reid_if_any_face_match_check.setToolTip("bool: drop_reid_if_any_face_match")
         self.faceless_reid_spin = _mk_fspin(0.0, 1.0, 0.01, 3, "float: faceless_reid_thresh")
         self.faceless_reid_spin.setValue(float(self.cfg.faceless_reid_thresh))
         self.faceless_iou_spin = _mk_fspin(0.0, 1.0, 0.01, 3, "float: faceless_iou_min")
@@ -1456,7 +1453,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Preview every N frames", self.preview_every_spin),
             ("", self.annot_check),
             ("allow_faceless_when_locked", self.faceless_allow_check),
-            ("faceless_require_reid", self.faceless_require_reid_check),
+            ("drop_reid_if_any_face_match", self.drop_reid_if_any_face_match_check),
             ("faceless_reid_thresh", self.faceless_reid_spin),
             ("faceless_iou_min", self.faceless_iou_spin),
             ("faceless_persist_frames", self.faceless_persist_spin),
@@ -1873,7 +1870,7 @@ class MainWindow(QtWidgets.QMainWindow):
             face_det_pad=float(self.face_det_pad_spin.value()) if hasattr(self, "face_det_pad_spin") else 0.08,
             face_margin_min=float(getattr(self, 'margin_spin', QtWidgets.QDoubleSpinBox()).value()) if hasattr(self, 'margin_spin') else 0.05,
             allow_faceless_when_locked=bool(self.faceless_allow_check.isChecked()) if hasattr(self, "faceless_allow_check") else True,
-            faceless_require_reid=bool(self.faceless_require_reid_check.isChecked()) if hasattr(self, "faceless_require_reid_check") else True,
+            drop_reid_if_any_face_match=bool(self.drop_reid_if_any_face_match_check.isChecked()) if hasattr(self, "drop_reid_if_any_face_match_check") else True,
             faceless_reid_thresh=float(self.faceless_reid_spin.value()) if hasattr(self, "faceless_reid_spin") else 0.40,
             faceless_iou_min=float(self.faceless_iou_spin.value()) if hasattr(self, "faceless_iou_spin") else 0.30,
             faceless_persist_frames=int(self.faceless_persist_spin.value()) if hasattr(self, "faceless_persist_spin") else 0,
@@ -1936,8 +1933,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.margin_spin.setValue(cfg.face_margin_min)
         if hasattr(self, 'faceless_allow_check'):
             self.faceless_allow_check.setChecked(cfg.allow_faceless_when_locked)
-        if hasattr(self, 'faceless_require_reid_check'):
-            self.faceless_require_reid_check.setChecked(cfg.faceless_require_reid)
+        if hasattr(self, 'drop_reid_if_any_face_match_check'):
+            self.drop_reid_if_any_face_match_check.setChecked(cfg.drop_reid_if_any_face_match)
         if hasattr(self, 'faceless_reid_spin'):
             self.faceless_reid_spin.setValue(cfg.faceless_reid_thresh)
         if hasattr(self, 'faceless_iou_spin'):
@@ -2241,8 +2238,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.preview_every_spin.setValue(int(s.value("preview_every", 30)))
         if hasattr(self, 'faceless_allow_check'):
             self.faceless_allow_check.setChecked(bool(s.value("allow_faceless_when_locked", self.cfg.allow_faceless_when_locked)))
-        if hasattr(self, 'faceless_require_reid_check'):
-            self.faceless_require_reid_check.setChecked(bool(s.value("faceless_require_reid", self.cfg.faceless_require_reid)))
+        if hasattr(self, 'drop_reid_if_any_face_match_check'):
+            self.drop_reid_if_any_face_match_check.setChecked(
+                bool(s.value("drop_reid_if_any_face_match", self.cfg.drop_reid_if_any_face_match))
+            )
         if hasattr(self, 'faceless_reid_spin'):
             self.faceless_reid_spin.setValue(float(s.value("faceless_reid_thresh", self.cfg.faceless_reid_thresh)))
         if hasattr(self, 'faceless_iou_spin'):
