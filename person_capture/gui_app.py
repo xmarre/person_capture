@@ -1284,6 +1284,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(APP_NAME)
         # Toolbar
         self.toolbar = self.addToolBar("Main")
+        self.toolbar.setObjectName("toolbar_main")
         self.toolbar.setMovable(True)
         self.act_start = QtGui.QAction("Start", self); self.act_start.triggered.connect(self.on_start)
         self.act_pause = QtGui.QAction("Pause", self); self.act_pause.triggered.connect(self.on_pause)
@@ -2189,13 +2190,27 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # Persist UI settings between runs
     def closeEvent(self, e: QtGui.QCloseEvent) -> None:
+        # persist layout
         try:
             s = QtCore.QSettings(APP_ORG, APP_NAME)
             s.setValue("dock_state", self.saveState())
         except Exception:
             pass
         self._save_qsettings()
-        return super().closeEvent(e)
+        # stop running job cleanly
+        try:
+            if self._worker:
+                self._worker.request_abort()
+            if self._thread and self._thread.isRunning():
+                self._thread.quit()
+                if not self._thread.wait(4000):
+                    self._thread.terminate()
+                    self._thread.wait(1000)
+        except Exception:
+            pass
+        self._worker = None
+        self._thread = None
+        e.accept()
 
     def _load_qsettings(self):
         s = QtCore.QSettings(APP_ORG, APP_NAME)
