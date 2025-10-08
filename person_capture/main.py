@@ -170,6 +170,7 @@ def main():
                 if accept:
                     x1,y1,x2,y2 = boxes[i]
                     anchor = None
+                    head_bias = 0.0
                     bf = face_map.get(i, (None,None))[0]
                     if bf is not None:
                         # face bbox in crop -> map to frame coords
@@ -177,7 +178,16 @@ def main():
                         acx = x1 + (fb[0]+fb[2])/2.0
                         acy = y1 + (fb[1]+fb[3])/2.0
                         anchor = (acx, acy)
-                    ex1,ey1,ex2,ey2 = expand_box_to_ratio(x1,y1,x2,y2, ratio_w, ratio_h, W, H, anchor=anchor, head_bias=0.12)
+                        # dynamic downward shift to include torso: move center down by ~0.9 * face_h
+                        face_h = max(1.0, fb[3]-fb[1])
+                        box_h  = max(1.0, y2-y1)
+                        head_bias = -(0.9 * (face_h / box_h))
+                    ex1,ey1,ex2,ey2 = expand_box_to_ratio(
+                        x1,y1,x2,y2,
+                        ratio_w, ratio_h, W, H,
+                        anchor=anchor,
+                        head_bias=head_bias
+                    )
                     crop_img_path = os.path.join(crops_dir, f"f{frame_idx:08d}.jpg")
                     crop = frame[ey1:ey2, ex1:ex2]
                     cv2.imwrite(crop_img_path, crop)

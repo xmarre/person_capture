@@ -55,7 +55,7 @@ class SessionConfig:
     video: str = ""
     ref: str = ""
     out_dir: str = "output"
-    ratio: str = "2:3"
+    ratio: str = "2:3,1:1,3:2"
     frame_stride: int = 2
     min_det_conf: float = 0.35
     face_thresh: float = 0.36
@@ -92,6 +92,13 @@ class SessionConfig:
     face_margin_min: float = 0.05
     require_face_if_visible: bool = True
     drop_reid_if_any_face_match: bool = True
+    # --- crop placement heuristics ---
+    crop_face_side_margin_frac: float = 0.30     # min(side margin) >= this * face_w
+    crop_top_headroom_max_frac: float = 0.15     # max(top margin / crop_h)
+    crop_bottom_min_face_heights: float = 1.5    # min bottom margin in face-heights
+    crop_penalty_weight: float = 3.0             # weight for placement penalties vs area growth
+    face_anchor_down_frac: float = 1.1           # shift center downward by this * face_h (torso bias)
+
     # Debug/diagnostics
     debug_dump: bool = True
     debug_dir: str = "debug"
@@ -131,23 +138,63 @@ class Processor(QtCore.QObject):
             return new
         return (m * prev + (1.0 - m) * new) if isinstance(prev, np.ndarray) else new
 
-    def _choose_best_ratio(self, det_box, ratios, frame_w, frame_h, anchor=None):
-        # Return expanded box and chosen ratio string that minimally enlarges the det box
+    def _choose_best_ratio(self, det_box, ratios, frame_w, frame_h, anchor=None, face_box=None):
+        """
+        Expand det_box to each candidate ratio, then score:
+          score = area_factor + λ * placement_penalty
+        placement_penalty discourages: side-cut faces, excess headroom, missing lower torso.
+        """
         (x1,y1,x2,y2) = det_box
         det_area = max(1, (x2-x1)*(y2-y1))
         best = None
         best_ratio = None
-        best_factor = 1e9
+        best_score = 1e9
+        cfg = self.cfg
+
+        def _penalty(crop_xyxy, face_xyxy):
+            if face_xyxy is None:
+                return 0.0
+            cx1,cy1,cx2,cy2 = crop_xyxy
+            fx1,fy1,fx2,fy2 = face_xyxy
+            cw, ch = max(1.0, cx2-cx1), max(1.0, cy2-cy1)
+            fw, fh = max(1.0, fx2-fx1), max(1.0, fy2-fy1)
+            # margins around face inside crop
+            L = max(0.0, (fx1 - cx1)); R = max(0.0, (cx2 - fx2))
+            T = max(0.0, (fy1 - cy1)); B = max(0.0, (cy2 - fy2))
+            # 1) side margin deficit -> penalize half-face crops
+            want_side = float(cfg.crop_face_side_margin_frac) * fw
+            side_def = max(0.0, want_side - min(L, R)) / fw
+            # 2) headroom cap -> penalize too much space above head
+            headroom = T / ch
+            headroom_def = max(0.0, headroom - float(cfg.crop_top_headroom_max_frac))
+            # 3) bottom margin minimum in face-heights -> encourage torso inclusion
+            want_bottom = float(cfg.crop_bottom_min_face_heights) * fh
+            bottom_def = max(0.0, want_bottom - B) / fh
+            return side_def + headroom_def + bottom_def
+
         for rs in ratios:
             try:
                 rw, rh = parse_ratio(rs)
             except Exception:
                 continue
-            ex1,ey1,ex2,ey2 = expand_box_to_ratio(x1,y1,x2,y2, rw, rh, frame_w, frame_h, anchor=anchor, head_bias=0.12)
+            # dynamic head_bias: push framing downward to include torso
+            hb = 0.0
+            if face_box is not None:
+                fbw = max(1.0, face_box[2]-face_box[0])
+                fbh = max(1.0, face_box[3]-face_box[1])
+                bh  = max(1.0, y2-y1)
+                # move center DOWN by ~face_anchor_down_frac * face_h => negative head_bias
+                hb = -float(cfg.face_anchor_down_frac) * (fbh / bh)
+            ex1,ey1,ex2,ey2 = expand_box_to_ratio(
+                x1,y1,x2,y2, rw, rh, frame_w, frame_h, anchor=anchor, head_bias=hb
+            )
             area = max(1, (ex2-ex1)*(ey2-ey1))
-            factor = float(area)/float(det_area)
-            if factor < best_factor:
-                best_factor = factor
+            area_factor = float(area)/float(det_area)
+
+            pen = _penalty((ex1,ey1,ex2,ey2), face_box)
+            total = area_factor + float(cfg.crop_penalty_weight) * pen
+            if total < best_score:
+                best_score = total
                 best = (ex1,ey1,ex2,ey2)
                 best_ratio = rs
         return best, (best_ratio or (f"{int(rw)}:{int(rh)}" if 'rw' in locals() else "unk"))
@@ -815,14 +862,21 @@ class Processor(QtCore.QObject):
                     x1,y1,x2,y2 = boxes[i]
                     # map anchor to frame_for_det coords
                     anchor = None
+                    face_box_abs = None
                     if bf is not None:
                         fb = bf["bbox"]
                         acx = x1 + (fb[0]+fb[2])/2.0
                         acy = y1 + (fb[1]+fb[3])/2.0
                         anchor = (acx, acy)
+                        face_box_abs = tuple(
+                            int(round(v))
+                            for v in (x1 + fb[0], y1 + fb[1], x1 + fb[2], y1 + fb[3])
+                        )
 
-                    # expand to ratio within the DET frame
-                    (ex1,ey1,ex2,ey2), chosen_ratio = self._choose_best_ratio((x1,y1,x2,y2), ratios, W2, H2, anchor=anchor)
+                    # expand to ratio within the DET frame using placement heuristics
+                    (ex1,ey1,ex2,ey2), chosen_ratio = self._choose_best_ratio(
+                        (x1,y1,x2,y2), ratios, W2, H2, anchor=anchor, face_box=face_box_abs
+                    )
 
                     # Compute sharpness on final crop
                     crop_img = frame_for_det[ey1:ey2, ex1:ex2]
@@ -1416,6 +1470,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.faceless_center_spin.setValue(float(self.cfg.faceless_center_max_frac))
         self.faceless_motion_spin = _mk_fspin(0.0, 1.0, 0.01, 3, "float: faceless_min_motion_frac")
         self.faceless_motion_spin.setValue(float(self.cfg.faceless_min_motion_frac))
+        self.crop_face_side_margin_spin = _mk_fspin(0.0, 1.5, 0.01, 3, "float: crop_face_side_margin_frac")
+        self.crop_face_side_margin_spin.setValue(float(self.cfg.crop_face_side_margin_frac))
+        self.crop_top_headroom_spin = _mk_fspin(0.0, 1.0, 0.01, 3, "float: crop_top_headroom_max_frac")
+        self.crop_top_headroom_spin.setValue(float(self.cfg.crop_top_headroom_max_frac))
+        self.crop_bottom_min_face_spin = _mk_fspin(0.0, 5.0, 0.05, 2, "float: crop_bottom_min_face_heights")
+        self.crop_bottom_min_face_spin.setValue(float(self.cfg.crop_bottom_min_face_heights))
+        self.crop_penalty_weight_spin = _mk_fspin(0.0, 10.0, 0.1, 2, "float: crop_penalty_weight")
+        self.crop_penalty_weight_spin.setValue(float(self.cfg.crop_penalty_weight))
+        self.face_anchor_down_spin = _mk_fspin(0.0, 2.0, 0.05, 2, "float: face_anchor_down_frac")
+        self.face_anchor_down_spin.setValue(float(self.cfg.face_anchor_down_frac))
 
         labels = [
             ("Aspect ratio W:H", self.ratio_edit),
@@ -1462,6 +1526,11 @@ class MainWindow(QtWidgets.QMainWindow):
             ("faceless_max_area_frac", self.faceless_max_area_spin),
             ("faceless_center_max_frac", self.faceless_center_spin),
             ("faceless_min_motion_frac", self.faceless_motion_spin),
+            ("crop_face_side_margin_frac", self.crop_face_side_margin_spin),
+            ("crop_top_headroom_max_frac", self.crop_top_headroom_spin),
+            ("crop_bottom_min_face_heights", self.crop_bottom_min_face_spin),
+            ("crop_penalty_weight", self.crop_penalty_weight_spin),
+            ("face_anchor_down_frac", self.face_anchor_down_spin),
         ]
         for row, (lab, w) in enumerate(labels):
             if lab:
@@ -1879,6 +1948,11 @@ class MainWindow(QtWidgets.QMainWindow):
             faceless_max_area_frac=float(self.faceless_max_area_spin.value()) if hasattr(self, "faceless_max_area_spin") else 0.55,
             faceless_center_max_frac=float(self.faceless_center_spin.value()) if hasattr(self, "faceless_center_spin") else 0.12,
             faceless_min_motion_frac=float(self.faceless_motion_spin.value()) if hasattr(self, "faceless_motion_spin") else 0.02,
+            crop_face_side_margin_frac=float(self.crop_face_side_margin_spin.value()) if hasattr(self, "crop_face_side_margin_spin") else 0.30,
+            crop_top_headroom_max_frac=float(self.crop_top_headroom_spin.value()) if hasattr(self, "crop_top_headroom_spin") else 0.15,
+            crop_bottom_min_face_heights=float(self.crop_bottom_min_face_spin.value()) if hasattr(self, "crop_bottom_min_face_spin") else 1.5,
+            crop_penalty_weight=float(self.crop_penalty_weight_spin.value()) if hasattr(self, "crop_penalty_weight_spin") else 3.0,
+            face_anchor_down_frac=float(self.face_anchor_down_spin.value()) if hasattr(self, "face_anchor_down_spin") else 1.1,
         )
         return cfg
 
@@ -1950,6 +2024,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.faceless_center_spin.setValue(cfg.faceless_center_max_frac)
         if hasattr(self, 'faceless_motion_spin'):
             self.faceless_motion_spin.setValue(cfg.faceless_min_motion_frac)
+        if hasattr(self, 'crop_face_side_margin_spin'):
+            self.crop_face_side_margin_spin.setValue(cfg.crop_face_side_margin_frac)
+        if hasattr(self, 'crop_top_headroom_spin'):
+            self.crop_top_headroom_spin.setValue(cfg.crop_top_headroom_max_frac)
+        if hasattr(self, 'crop_bottom_min_face_spin'):
+            self.crop_bottom_min_face_spin.setValue(cfg.crop_bottom_min_face_heights)
+        if hasattr(self, 'crop_penalty_weight_spin'):
+            self.crop_penalty_weight_spin.setValue(cfg.crop_penalty_weight)
+        if hasattr(self, 'face_anchor_down_spin'):
+            self.face_anchor_down_spin.setValue(cfg.face_anchor_down_frac)
 
     # Thread control
     def on_start(self):
@@ -2271,6 +2355,26 @@ class MainWindow(QtWidgets.QMainWindow):
             self.faceless_center_spin.setValue(float(s.value("faceless_center_max_frac", self.cfg.faceless_center_max_frac)))
         if hasattr(self, 'faceless_motion_spin'):
             self.faceless_motion_spin.setValue(float(s.value("faceless_min_motion_frac", self.cfg.faceless_min_motion_frac)))
+        if hasattr(self, 'crop_face_side_margin_spin'):
+            self.crop_face_side_margin_spin.setValue(
+                float(s.value("crop_face_side_margin_frac", self.cfg.crop_face_side_margin_frac))
+            )
+        if hasattr(self, 'crop_top_headroom_spin'):
+            self.crop_top_headroom_spin.setValue(
+                float(s.value("crop_top_headroom_max_frac", self.cfg.crop_top_headroom_max_frac))
+            )
+        if hasattr(self, 'crop_bottom_min_face_spin'):
+            self.crop_bottom_min_face_spin.setValue(
+                float(s.value("crop_bottom_min_face_heights", self.cfg.crop_bottom_min_face_heights))
+            )
+        if hasattr(self, 'crop_penalty_weight_spin'):
+            self.crop_penalty_weight_spin.setValue(
+                float(s.value("crop_penalty_weight", self.cfg.crop_penalty_weight))
+            )
+        if hasattr(self, 'face_anchor_down_spin'):
+            self.face_anchor_down_spin.setValue(
+                float(s.value("face_anchor_down_frac", self.cfg.face_anchor_down_frac))
+            )
         # Face-first defaults if controls not present
         if hasattr(self, 'pref_face_check'):
             self.pref_face_check.setChecked(bool(s.value("prefer_face_when_available", True)))
