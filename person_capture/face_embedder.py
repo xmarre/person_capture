@@ -1,6 +1,8 @@
 
 import os
 import sys
+import glob
+import ctypes
 import cv2
 import numpy as np
 from urllib.request import urlopen, Request
@@ -176,18 +178,29 @@ class FaceEmbedder:
                     )
                 # Ensure CUDA/cuDNN/TensorRT DLLs are discoverable on Windows
                 if os.name == 'nt':
-                    try:
-                        from pathlib import Path as _P
-                        torch_lib = _P(_torch.__file__).parent / "lib"
-                        trt_lib = _P(sys.executable).parent.parent / "Lib" / "site-packages" / "tensorrt"
-                        for p in (torch_lib, trt_lib):
-                            if p.exists():
-                                os.add_dll_directory(str(p))
-                                if progress:
-                                    progress(f"Added DLL dir: {p}")
-                    except Exception as e:
-                        if progress:
-                            progress(f"add_dll_directory note: {e!r}")
+                    from pathlib import Path as _P
+                    import site as _site
+
+                    def _add(p):
+                        if p and p.exists():
+                            os.add_dll_directory(str(p))
+                            if progress:
+                                progress(f"Added DLL dir: {p}")
+
+                    _add(_P(_torch.__file__).parent / "lib")
+                    import tensorrt as _trt
+
+                    _add(_P(_trt.__file__).parent)
+                    for root in _site.getsitepackages():
+                        rootp = _P(root)
+                        for pat in ("**/nvinfer.dll", "**/nvinfer_plugin.dll", "**/nvonnxparser.dll"):
+                            for hit in glob.glob(str(rootp / pat), recursive=True):
+                                _add(_P(hit).parent)
+                    for n in ("nvinfer.dll", "nvinfer_plugin.dll", "nvonnxparser.dll"):
+                        try:
+                            ctypes.WinDLL(n)
+                        except OSError as e:
+                            raise RuntimeError(f"Missing TensorRT runtime DLL '{n}': {e}")
                 # Preload ORT DLL deps (safe no-op if not present)
                 if hasattr(ort, "preload_dlls"):
                     try:
