@@ -1,8 +1,7 @@
 
 import os
 import sys
-import glob
-import ctypes
+import glob, ctypes, site
 import cv2
 import numpy as np
 from urllib.request import urlopen, Request
@@ -22,9 +21,12 @@ if TYPE_CHECKING:  # pragma: no cover - import only for type checking
 
 try:
     import onnxruntime as ort
-    import tensorrt as trt
 except Exception:
     ort = None  # fallback later
+try:
+    import tensorrt as trt
+except Exception:
+    trt = None
 
 Y8F_DEFAULT = "yolov8n-face.pt"
 
@@ -179,7 +181,6 @@ class FaceEmbedder:
                 # Ensure CUDA/cuDNN/TensorRT DLLs are discoverable on Windows
                 if os.name == 'nt':
                     from pathlib import Path as _P
-                    import site as _site
 
                     def _add(p):
                         if p and p.exists():
@@ -188,19 +189,28 @@ class FaceEmbedder:
                                 progress(f"Added DLL dir: {p}")
 
                     _add(_P(_torch.__file__).parent / "lib")
-                    import tensorrt as _trt
-
-                    _add(_P(_trt.__file__).parent)
-                    for root in _site.getsitepackages():
-                        rootp = _P(root)
-                        for pat in ("**/nvinfer.dll", "**/nvinfer_plugin.dll", "**/nvonnxparser.dll"):
-                            for hit in glob.glob(str(rootp / pat), recursive=True):
+                    if trt is None:
+                        raise RuntimeError("TensorRT Python bindings not importable in this interpreter.")
+                    _add(_P(trt.__file__).parent)
+                    for root in ([_P(p) for p in site.getsitepackages()] + [_P(site.getusersitepackages())]):
+                        for pat in ("**/tensorrt_libs/*.dll", "**/nvidia/**/bin/*.dll", "**/nvidia/**/lib/*.dll"):
+                            for hit in glob.glob(str(root / pat), recursive=True):
                                 _add(_P(hit).parent)
-                    for n in ("nvinfer.dll", "nvinfer_plugin.dll", "nvonnxparser.dll"):
+
+                    def _load_any(base: str):
                         try:
-                            ctypes.WinDLL(n)
-                        except OSError as e:
-                            raise RuntimeError(f"Missing TensorRT runtime DLL '{n}': {e}")
+                            return ctypes.WinDLL(base + ".dll")
+                        except OSError:
+                            for root in ([_P(p) for p in site.getsitepackages()] + [_P(site.getusersitepackages())]):
+                                for hit in glob.glob(str(root / f"**/{base}_*.dll"), recursive=True):
+                                    try:
+                                        return ctypes.WinDLL(hit)
+                                    except OSError:
+                                        pass
+                            raise RuntimeError(f"Missing TensorRT runtime DLL for base '{base}'")
+
+                    for base in ("nvinfer", "nvinfer_plugin", "nvonnxparser"):
+                        _load_any(base)
                 # Preload ORT DLL deps (safe no-op if not present)
                 if hasattr(ort, "preload_dlls"):
                     try:
@@ -222,6 +232,8 @@ class FaceEmbedder:
                 so = ort.SessionOptions()
                 so.log_severity_level = 0  # VERBOSE
                 # Sanity: TensorRT Python bindings present
+                if trt is None:
+                    raise RuntimeError("TensorRT Python bindings not importable in this interpreter.")
                 _ = trt.__version__
                 trt_opts = {
                     "trt_engine_cache_enable": "1",
@@ -249,10 +261,7 @@ class FaceEmbedder:
                     raise RuntimeError(f"Unexpected ArcFace output dim: {out0.shape}")
                 self.backend = 'arcface'
                 if progress:
-                    import sys as _sys
-                    progress(
-                        f"ArcFace(TRT): exe={_sys.executable} avail={avail} bound={sess_prov} cache={trt_opts['trt_engine_cache_path']} file={onnx_path}"
-                    )
+                    progress(f"ArcFace(TRT): bound={sess_prov} file={onnx_path}")
             except Exception as _e:
                 # Hard fail so the real reason is visible
                 raise RuntimeError(f"ArcFace download/init failed: {_e!r}")

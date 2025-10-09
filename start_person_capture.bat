@@ -10,12 +10,15 @@ if not exist "%PYTHONW%" (
   exit /b 1
 )
 
-rem Add CUDA/TensorRT runtime DLL folders from venv wheels
+rem === add NVIDIA/TensorRT runtime DLL dirs from venv wheels ===
 set "PATH=%VENV%\Lib\site-packages\torch\lib;%PATH%"
 set "PATH=%VENV%\Lib\site-packages\tensorrt;%PATH%"
-for /d %%D in ("%VENV%\Lib\site-packages\nvidia\*") do (
-  if exist "%%D\bin" set "PATH=%%D\bin;%PATH%"
-  if exist "%%D\lib" set "PATH=%%D\lib;%PATH%"
+set "PATH=%VENV%\Lib\site-packages\tensorrt_libs;%PATH%"
+for /R "%VENV%\Lib\site-packages\nvidia" %%F in (nvinfer*.dll nvonnxparser*.dll nvinfer_plugin*.dll) do (
+  set "PATH=%%~dpF;%PATH%"
+)
+for /R "%VENV%\Lib\site-packages\tensorrt_libs" %%F in (nvinfer*.dll nvonnxparser*.dll nvinfer_plugin*.dll) do (
+  set "PATH=%%~dpF;%PATH%"
 )
 
 "%PYTHONW%" -m person_capture.gui_app
