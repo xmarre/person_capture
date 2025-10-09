@@ -1,5 +1,6 @@
 
 import os
+import sys
 import cv2
 import numpy as np
 from urllib.request import urlopen, Request
@@ -172,40 +173,56 @@ class FaceEmbedder:
                     onnx_path = _ensure_from_zip(
                         ARCFACE_ONNX, ANTELOPE_ZIPS, want_suffix="glintr100.onnx", progress=progress
                     )
-                # Ensure CUDA/cuDNN DLLs are discoverable on Windows
-                if os.name == 'nt' and self.device == 'cuda':
+                # Ensure CUDA/cuDNN/TensorRT DLLs are discoverable on Windows
+                if os.name == 'nt':
                     try:
                         from pathlib import Path as _P
                         torch_lib = _P(_torch.__file__).parent / "lib"
-                        if torch_lib.exists():
-                            os.add_dll_directory(str(torch_lib))
-                            if progress:
-                                progress(f"Added DLL dir: {torch_lib}")
+                        trt_lib = _P(sys.executable).parent.parent / "Lib" / "site-packages" / "tensorrt"
+                        for p in (torch_lib, trt_lib):
+                            if p.exists():
+                                os.add_dll_directory(str(p))
+                                if progress:
+                                    progress(f"Added DLL dir: {p}")
                     except Exception as e:
                         if progress:
                             progress(f"add_dll_directory note: {e!r}")
-                # Preload CUDA/cuDNN/MSVC DLLs so CUDA EP can initialize
-                if self.device == 'cuda' and hasattr(ort, "preload_dlls"):
+                # Preload ORT DLL deps (safe no-op if not present)
+                if hasattr(ort, "preload_dlls"):
                     try:
                         ort.preload_dlls()
                     except Exception as e:
                         if progress:
                             progress(f"ORT preload_dlls note: {e!r}")
-                # Strict provider binding: force CUDA when requested
+                # === TensorRT ONLY ===
+                def _trt_cache_dir() -> str:
+                    base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+                    d = Path(base) / "PersonCapture" / "trt_cache"
+                    d.mkdir(parents=True, exist_ok=True)
+                    return str(d)
+
                 avail = list(getattr(ort, "get_available_providers", lambda: [])())
-                if self.device == 'cuda':
-                    # Some ORT builds ignore dict opts on Windows; pass plain name first.
-                    want = ['CUDAExecutionProvider'] if 'CUDAExecutionProvider' in avail else []
-                    if not want:
-                        raise RuntimeError(f"CUDA EP not available in ORT. avail={avail}")
-                else:
-                    want = ['CPUExecutionProvider']
-                self.arc_sess = ort.InferenceSession(onnx_path, providers=want)
+                if 'TensorrtExecutionProvider' not in avail:
+                    raise RuntimeError(f"TensorRT EP not available in ORT. avail={avail}")
+
+                so = ort.SessionOptions()
+                so.log_severity_level = 0  # VERBOSE
+                trt_opts = {
+                    "trt_engine_cache_enable": "1",
+                    "trt_engine_cache_path": _trt_cache_dir(),
+                    "trt_timing_cache_enable": "1",
+                    "trt_timing_cache_path": _trt_cache_dir(),
+                    "trt_fp16_enable": "1",          # set "0" for FP32
+                    "trt_builder_optimization_level": "5",  # 0..5
+                    "trt_max_workspace_size": "4294967296", # 4GB
+                    "trt_cuda_graph_enable": "1",
+                }
+                want = [('TensorrtExecutionProvider', trt_opts)]
+                self.arc_sess = ort.InferenceSession(onnx_path, sess_options=so, providers=want)
                 sess_prov = list(getattr(self.arc_sess, "get_providers", lambda: [])())
-                if self.device == 'cuda' and not any(p in sess_prov for p in ('TensorrtExecutionProvider', 'CUDAExecutionProvider')):
-                    # Show deeper diagnostics
+                if sess_prov[:1] != ['TensorrtExecutionProvider']:
                     opts = getattr(self.arc_sess, "get_provider_options", lambda: {})()
-                    raise RuntimeError(f"Session bound to CPU despite CUDA. avail={avail} bound={sess_prov} opts={opts}")
+                    raise RuntimeError(f"TensorRT not bound. avail={avail} bound={sess_prov} opts={opts}")
                 self.arc_input = self.arc_sess.get_inputs()[0].name
                 # sanity: output embedding should be 512-D
                 out0 = self.arc_sess.get_outputs()[0]
@@ -214,7 +231,9 @@ class FaceEmbedder:
                 self.backend = 'arcface'
                 if progress:
                     import sys as _sys
-                    progress(f"ArcFace: exe={_sys.executable} avail={avail} bound={sess_prov} file={onnx_path}")
+                    progress(
+                        f"ArcFace(TRT): exe={_sys.executable} avail={avail} bound={sess_prov} cache={trt_opts['trt_engine_cache_path']} file={onnx_path}"
+                    )
             except Exception as _e:
                 # Hard fail so the real reason is visible
                 raise RuntimeError(f"ArcFace download/init failed: {_e!r}")
@@ -251,7 +270,7 @@ class FaceEmbedder:
             return []
         chips = [self._arcface_preprocess(b) for b in bgr_list]
         chips_flip = [self._arcface_preprocess(cv2.flip(b, 1)) for b in bgr_list]
-        batch = np.concatenate(chips + chips_flip, axis=0)
+        batch = np.ascontiguousarray(np.concatenate(chips + chips_flip, axis=0).astype(np.float32, copy=False))
         feats = self.arc_sess.run(None, {self.arc_input: batch})[0]
         n = len(bgr_list)
         f = feats[:n] + feats[n:]
