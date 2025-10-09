@@ -19,10 +19,7 @@ if TYPE_CHECKING:  # pragma: no cover - import only for type checking
     from ultralytics import YOLO as YOLOType
     import open_clip as open_clip_type
 
-try:
-    import onnxruntime as ort
-except Exception:
-    ort = None  # fallback later
+ort = None  # import after DLL dirs are added
 try:
     import tensorrt as trt
 except Exception:
@@ -169,7 +166,7 @@ class FaceEmbedder:
         self.backend = None
         self.arc_sess = None
         self.arc_input = None
-        if self.use_arcface and ort is not None:
+        if self.use_arcface:
             try:
                 try:
                     onnx_path = _ensure_file(ARCFACE_ONNX, ARCFACE_URLS, progress=progress)
@@ -211,13 +208,14 @@ class FaceEmbedder:
 
                     for base in ("nvinfer", "nvinfer_plugin", "nvonnxparser"):
                         _load_any(base)
-                # Preload ORT DLL deps (safe no-op if not present)
+                # Import ORT only after DLL dirs are set
+                global ort
+                import onnxruntime as ort  # noqa
                 if hasattr(ort, "preload_dlls"):
                     try:
                         ort.preload_dlls()
                     except Exception as e:
-                        if progress:
-                            progress(f"ORT preload_dlls note: {e!r}")
+                        if progress: progress(f"ORT preload_dlls note: {e!r}")
                 # === TensorRT ONLY ===
                 def _trt_cache_dir() -> str:
                     base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
@@ -225,7 +223,7 @@ class FaceEmbedder:
                     d.mkdir(parents=True, exist_ok=True)
                     return str(d)
 
-                avail = list(getattr(ort, "get_available_providers", lambda: [])())
+                avail = list(ort.get_available_providers())
                 if 'TensorrtExecutionProvider' not in avail:
                     raise RuntimeError(f"TensorRT EP not available in ORT. avail={avail}")
 
@@ -250,7 +248,7 @@ class FaceEmbedder:
                 self.arc_sess = ort.InferenceSession(
                     onnx_path, sess_options=so, providers=providers, provider_options=provider_options
                 )
-                sess_prov = list(getattr(self.arc_sess, "get_providers", lambda: [])())
+                sess_prov = self.arc_sess.get_providers()
                 if sess_prov[:1] != ['TensorrtExecutionProvider']:
                     opts = getattr(self.arc_sess, "get_provider_options", lambda: {})()
                     raise RuntimeError(f"TensorRT not bound. avail={avail} bound={sess_prov} opts={opts}")
