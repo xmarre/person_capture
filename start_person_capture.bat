@@ -1,12 +1,23 @@
 @echo off
-setlocal enableextensions
-cd /d "%~dp0"
+setlocal
+set "REPO=%~dp0"
+pushd "%REPO%"
+set "VENV=%REPO%env"
+set "PYTHONW=%VENV%\Scripts\pythonw.exe"
 
-if not exist "env\Scripts\pythonw.exe" (
-  echo [!] venv missing. Run setup_person_capture.bat first.
+if not exist "%PYTHONW%" (
+  echo Missing venv python: "%PYTHONW%"
   exit /b 1
 )
 
-REM Launch GUI with pythonw so no terminal remains
-start "" /min "env\Scripts\pythonw.exe" "person_capture\gui_app.py"
-exit /b 0
+rem Add CUDA/TensorRT runtime DLL folders from venv wheels
+set "PATH=%VENV%\Lib\site-packages\torch\lib;%PATH%"
+set "PATH=%VENV%\Lib\site-packages\tensorrt;%PATH%"
+for /d %%D in ("%VENV%\Lib\site-packages\nvidia\*") do (
+  if exist "%%D\bin" set "PATH=%%D\bin;%PATH%"
+  if exist "%%D\lib" set "PATH=%%D\lib;%PATH%"
+)
+
+"%PYTHONW%" -m person_capture.gui_app
+popd
+endlocal

@@ -1,25 +1,25 @@
 @echo off
-setlocal enableextensions
-cd /d "%~dp0"
+setlocal
+set "REPO=%~dp0"
+pushd "%REPO%"
 
-REM Pull latest code if this is a git repo
-if exist ".git" (
-  echo [*] Updating repo...
-  git pull --rebase || (echo [!] git pull failed & exit /b 1)
-)
-
-REM Ensure venv present
-if not exist "env\Scripts\python.exe" (
-  echo [!] venv missing. Run setup_person_capture.bat first.
+if not exist ".git" (
+  echo Not a git repo: %REPO%
   exit /b 1
 )
 
-call "env\Scripts\activate.bat" || (echo [!] Failed to activate venv & exit /b 1)
+rem Update repo (rebase onto upstream, keep your local changes stashed automatically)
+git fetch --all --tags --prune
+git pull --rebase --autostash
+git submodule update --init --recursive
 
-if exist "requirements.txt" (
-  echo [*] Updating deps...
-  pip install -r requirements.txt --upgrade || (echo [!] pip upgrade failed & exit /b 1)
+rem Update Python deps in the existing venv
+set "PIP=%REPO%env\Scripts\pip.exe"
+if not exist "%PIP%" (
+  echo venv missing. Run setup_person_capture.bat
+  exit /b 1
 )
+"%PIP%" install --upgrade -r requirements.txt
 
-echo [OK] Update complete.
-exit /b 0
+popd
+endlocal
