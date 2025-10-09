@@ -14,3 +14,4 @@ onnxruntime-gpu==1.23.0 ; platform_system != "Darwin"
 onnxruntime==1.23.0 ; platform_system == "Darwin"
 open-clip-torch==3.2.0
 PySide6
+tensorrt-cu12==10.13.3.9
