@@ -178,6 +178,13 @@ class FaceEmbedder:
                 # Ensure CUDA/cuDNN/TensorRT DLLs are discoverable on Windows
                 if os.name == 'nt':
                     from pathlib import Path as _P
+                    # Allow explicit TensorRT lib hints. Example:
+                    #   set TRT_LIB_DIR=D:\tensorrt\TensorRT-10.13.3.9\lib
+                    TRT_HINTS = [
+                        os.environ.get("TRT_LIB_DIR"),
+                        os.environ.get("TENSORRT_DIR"),
+                        os.environ.get("TENSORRT_HOME"),
+                    ]
 
                     def _add(p):
                         if p and p.exists():
@@ -188,25 +195,46 @@ class FaceEmbedder:
                     _add(_P(_torch.__file__).parent / "lib")
                     if trt is None:
                         raise RuntimeError("TensorRT Python bindings not importable in this interpreter.")
+                    # TRT wheel’s own folder (py bindings) + explicit hints
                     _add(_P(trt.__file__).parent)
+                    for hp in TRT_HINTS:
+                        if hp:
+                            _add(_P(hp))
                     for root in ([_P(p) for p in site.getsitepackages()] + [_P(site.getusersitepackages())]):
                         for pat in ("**/tensorrt_libs/*.dll", "**/nvidia/**/bin/*.dll", "**/nvidia/**/lib/*.dll"):
                             for hit in glob.glob(str(root / pat), recursive=True):
                                 _add(_P(hit).parent)
 
+                    # Load TRT DLLs from explicit dirs first, then fall back to site-packages sweep.
                     def _load_any(base: str):
+                        # 1) Hinted directories, try versioned names first.
+                        names = [f"{base}.dll", f"{base}_10.dll", f"{base}_9.dll", f"{base}_8.dll"]
+                        stubs = []
+                        for hp in [h for h in TRT_HINTS if h]:
+                            d = _P(hp)
+                            stubs += sorted(d.glob(f"{base}*.dll"), key=lambda p: -p.stat().st_size)
+                            for nm in names:
+                                stubs.append(d / nm)
+                        # 2) Wheel/site-packages fallbacks.
+                        for root in ([_P(p) for p in site.getsitepackages()] + [_P(site.getusersitepackages())]):
+                            stubs += [ _P(p) for p in glob.glob(str(root / f"**/{base}*.dll"), recursive=True) ]
+                        # Attempt loads
+                        tried = set()
+                        for hit in stubs:
+                            try:
+                                h = str(hit)
+                                if h in tried: continue
+                                tried.add(h)
+                                return ctypes.WinDLL(h)
+                            except OSError:
+                                continue
+                        # Final plain-name attempt
                         try:
                             return ctypes.WinDLL(base + ".dll")
                         except OSError:
-                            for root in ([_P(p) for p in site.getsitepackages()] + [_P(site.getusersitepackages())]):
-                                for hit in glob.glob(str(root / f"**/{base}_*.dll"), recursive=True):
-                                    try:
-                                        return ctypes.WinDLL(hit)
-                                    except OSError:
-                                        pass
                             raise RuntimeError(f"Missing TensorRT runtime DLL for base '{base}'")
 
-                    for base in ("nvinfer", "nvinfer_plugin", "nvonnxparser"):
+                    for base in ("nvinfer", "nvinfer_plugin", "nvonnxparser", "nvonnxparser_runtime"):
                         _load_any(base)
                 # Import ORT only after DLL dirs are set
                 global ort
@@ -218,8 +246,8 @@ class FaceEmbedder:
                         if progress: progress(f"ORT preload_dlls note: {e!r}")
                 # === TensorRT ONLY ===
                 def _trt_cache_dir() -> str:
-                    base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-                    d = Path(base) / "PersonCapture" / "trt_cache"
+                    base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_CACHE_HOME") or str(_P.home() / ".cache")
+                    d = _P(base) / "PersonCapture" / "trt_cache"
                     d.mkdir(parents=True, exist_ok=True)
                     return str(d)
 
