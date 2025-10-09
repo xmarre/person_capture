@@ -23,6 +23,13 @@ for %%D in (cublas cudnn cuda_runtime cuda_nvrtc cufft curand cusolver cusparse)
 if exist "%VENV%\Lib\site-packages\tensorrt"      set "PATH=%VENV%\Lib\site-packages\tensorrt;%PATH%"
 if exist "%VENV%\Lib\site-packages\tensorrt_libs" set "PATH=%VENV%\Lib\site-packages\tensorrt_libs;%PATH%"
 
+rem --- conservative TensorRT defaults ---
+set ORT_LOG_SEVERITY_LEVEL=0
+set ORT_TENSORRT_VERBOSE_LOGGING=1
+set PC_TRT_FP16=0
+set PC_TRT_OPT=3
+set PC_TRT_WS=4294967296
+
 rem --- must-have TRT DLLs ---
 for %%F in (nvinfer.dll nvinfer_plugin.dll nvonnxparser.dll) do (
   if not exist "%TRT_LIB_DIR%\%%F" (

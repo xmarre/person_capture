@@ -239,8 +239,8 @@ class FaceEmbedder:
                     for base in ("nvinfer", "nvinfer_plugin"):
                         if not _try_load(base):
                             raise RuntimeError(f"Missing TensorRT runtime DLL for base '{base}'")
-                    # Optional parsers (often absent on TRT10+; ORT TRT-EP doesn't require them)
-                    for base in ("nvonnxparser", "nvonnxparser_runtime"):
+                    # Optional extras: parsers and builder resource (TRT 10.x)
+                    for base in ("nvonnxparser", "nvonnxparser_runtime", "nvinfer_builder_resource"):
                         if not _try_load(base) and progress:
                             progress(f"Note: optional TensorRT DLL not found: {base}*.dll")
                 # Import ORT only after DLL dirs are set
@@ -273,10 +273,15 @@ class FaceEmbedder:
                     "trt_engine_cache_path": _trt_cache_dir(),
                     "trt_timing_cache_enable": "1",
                     "trt_timing_cache_path": _trt_cache_dir(),
-                    "trt_fp16_enable": "1",          # set "0" for FP32
-                    "trt_builder_optimization_level": "5",  # 0..5
-                    "trt_max_workspace_size": "4294967296", # 4GB
-                    "trt_cuda_graph_enable": "1",
+                    # Safer defaults first; can re-enable FP16 after it binds.
+                    "trt_fp16_enable": os.environ.get("PC_TRT_FP16", "0"),
+                    "trt_builder_optimization_level": os.environ.get("PC_TRT_OPT", "3"),
+                    "trt_max_workspace_size": os.environ.get("PC_TRT_WS", "4294967296"),
+                    "trt_cuda_graph_enable": "0",
+                    "trt_sparsity_enable": "0",
+                    "trt_force_sequential_engine_build": "1",
+                    "trt_max_partition_iterations": "1000",
+                    "trt_min_subgraph_size": "1",
                 }
                 providers = ['TensorrtExecutionProvider']
                 provider_options = [trt_opts]
