@@ -172,18 +172,40 @@ class FaceEmbedder:
                     onnx_path = _ensure_from_zip(
                         ARCFACE_ONNX, ANTELOPE_ZIPS, want_suffix="glintr100.onnx", progress=progress
                     )
-                # Strict provider binding: no CPU fallback when device=cuda
+                # Ensure CUDA/cuDNN DLLs are discoverable on Windows
+                if os.name == 'nt' and self.device == 'cuda':
+                    try:
+                        from pathlib import Path as _P
+                        torch_lib = _P(_torch.__file__).parent / "lib"
+                        if torch_lib.exists():
+                            os.add_dll_directory(str(torch_lib))
+                            if progress:
+                                progress(f"Added DLL dir: {torch_lib}")
+                    except Exception as e:
+                        if progress:
+                            progress(f"add_dll_directory note: {e!r}")
+                # Preload CUDA/cuDNN/MSVC DLLs so CUDA EP can initialize
+                if self.device == 'cuda' and hasattr(ort, "preload_dlls"):
+                    try:
+                        ort.preload_dlls()
+                    except Exception as e:
+                        if progress:
+                            progress(f"ORT preload_dlls note: {e!r}")
+                # Strict provider binding: force CUDA when requested
                 avail = list(getattr(ort, "get_available_providers", lambda: [])())
                 if self.device == 'cuda':
-                    want = [p for p in ('TensorrtExecutionProvider', 'CUDAExecutionProvider') if p in avail]
+                    # Some ORT builds ignore dict opts on Windows; pass plain name first.
+                    want = ['CUDAExecutionProvider'] if 'CUDAExecutionProvider' in avail else []
                     if not want:
-                        raise RuntimeError(f"CUDA/TRT EP not available in ORT. avail={avail}")
+                        raise RuntimeError(f"CUDA EP not available in ORT. avail={avail}")
                 else:
                     want = ['CPUExecutionProvider']
                 self.arc_sess = ort.InferenceSession(onnx_path, providers=want)
                 sess_prov = list(getattr(self.arc_sess, "get_providers", lambda: [])())
                 if self.device == 'cuda' and not any(p in sess_prov for p in ('TensorrtExecutionProvider', 'CUDAExecutionProvider')):
-                    raise RuntimeError(f"Session bound to CPU despite CUDA. session_providers={sess_prov}")
+                    # Show deeper diagnostics
+                    opts = getattr(self.arc_sess, "get_provider_options", lambda: {})()
+                    raise RuntimeError(f"Session bound to CPU despite CUDA. avail={avail} bound={sess_prov} opts={opts}")
                 self.arc_input = self.arc_sess.get_inputs()[0].name
                 # sanity: output embedding should be 512-D
                 out0 = self.arc_sess.get_outputs()[0]
@@ -191,7 +213,8 @@ class FaceEmbedder:
                     raise RuntimeError(f"Unexpected ArcFace output dim: {out0.shape}")
                 self.backend = 'arcface'
                 if progress:
-                    progress(f"ArcFace: bound providers={sess_prov} file={onnx_path}")
+                    import sys as _sys
+                    progress(f"ArcFace: exe={_sys.executable} avail={avail} bound={sess_prov} file={onnx_path}")
             except Exception as _e:
                 # Hard fail so the real reason is visible
                 raise RuntimeError(f"ArcFace download/init failed: {_e!r}")
