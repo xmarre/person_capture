@@ -20,6 +20,7 @@ if TYPE_CHECKING:  # pragma: no cover - import only for type checking
 
 try:
     import onnxruntime as ort
+    import tensorrt as trt
 except Exception:
     ort = None  # fallback later
 
@@ -207,6 +208,8 @@ class FaceEmbedder:
 
                 so = ort.SessionOptions()
                 so.log_severity_level = 0  # VERBOSE
+                # Sanity: TensorRT Python bindings present
+                _ = trt.__version__
                 trt_opts = {
                     "trt_engine_cache_enable": "1",
                     "trt_engine_cache_path": _trt_cache_dir(),
@@ -217,8 +220,11 @@ class FaceEmbedder:
                     "trt_max_workspace_size": "4294967296", # 4GB
                     "trt_cuda_graph_enable": "1",
                 }
-                want = [('TensorrtExecutionProvider', trt_opts)]
-                self.arc_sess = ort.InferenceSession(onnx_path, sess_options=so, providers=want)
+                providers = ['TensorrtExecutionProvider']
+                provider_options = [trt_opts]
+                self.arc_sess = ort.InferenceSession(
+                    onnx_path, sess_options=so, providers=providers, provider_options=provider_options
+                )
                 sess_prov = list(getattr(self.arc_sess, "get_providers", lambda: [])())
                 if sess_prov[:1] != ['TensorrtExecutionProvider']:
                     opts = getattr(self.arc_sess, "get_provider_options", lambda: {})()
