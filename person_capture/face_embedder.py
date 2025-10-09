@@ -206,7 +206,7 @@ class FaceEmbedder:
                                 _add(_P(hit).parent)
 
                     # Load TRT DLLs from explicit dirs first, then fall back to site-packages sweep.
-                    def _load_any(base: str):
+                    def _try_load(base: str) -> bool:
                         # 1) Hinted directories, try versioned names first.
                         names = [f"{base}.dll", f"{base}_10.dll", f"{base}_9.dll", f"{base}_8.dll"]
                         stubs = []
@@ -225,17 +225,24 @@ class FaceEmbedder:
                                 h = str(hit)
                                 if h in tried: continue
                                 tried.add(h)
-                                return ctypes.WinDLL(h)
+                                ctypes.WinDLL(h)
+                                return True
                             except OSError:
                                 continue
                         # Final plain-name attempt
                         try:
-                            return ctypes.WinDLL(base + ".dll")
+                            ctypes.WinDLL(base + ".dll")
+                            return True
                         except OSError:
+                            return False
+                    # Required cores
+                    for base in ("nvinfer", "nvinfer_plugin"):
+                        if not _try_load(base):
                             raise RuntimeError(f"Missing TensorRT runtime DLL for base '{base}'")
-
-                    for base in ("nvinfer", "nvinfer_plugin", "nvonnxparser", "nvonnxparser_runtime"):
-                        _load_any(base)
+                    # Optional parsers (often absent on TRT10+; ORT TRT-EP doesn't require them)
+                    for base in ("nvonnxparser", "nvonnxparser_runtime"):
+                        if not _try_load(base) and progress:
+                            progress(f"Note: optional TensorRT DLL not found: {base}*.dll")
                 # Import ORT only after DLL dirs are set
                 global ort
                 import onnxruntime as ort  # noqa
@@ -281,13 +288,13 @@ class FaceEmbedder:
                     opts = getattr(self.arc_sess, "get_provider_options", lambda: {})()
                     raise RuntimeError(f"TensorRT not bound. avail={avail} bound={sess_prov} opts={opts}")
                 self.arc_input = self.arc_sess.get_inputs()[0].name
+                self.backend = 'arcface'
+                if progress:
+                    progress(f"ArcFace(TRT): bound={sess_prov} file={onnx_path}")
                 # sanity: output embedding should be 512-D
                 out0 = self.arc_sess.get_outputs()[0]
                 if hasattr(out0, "shape") and (out0.shape is not None) and (out0.shape[-1] not in (512,)):
                     raise RuntimeError(f"Unexpected ArcFace output dim: {out0.shape}")
-                self.backend = 'arcface'
-                if progress:
-                    progress(f"ArcFace(TRT): bound={sess_prov} file={onnx_path}")
             except Exception as _e:
                 # Hard fail so the real reason is visible
                 raise RuntimeError(f"ArcFace download/init failed: {_e!r}")
