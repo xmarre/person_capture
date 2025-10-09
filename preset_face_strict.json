@@ -11,7 +11,7 @@
   "combine": "min",
   "match_mode": "either",
   "only_best": true,
-  "min_sharpness": 180.0,
+  "min_sharpness": 0.0,
   "min_gap_sec": 2.0,
   "min_box_pixels": 10000,
   "auto_crop_borders": false,

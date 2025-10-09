@@ -1,7 +1,4 @@
 {
-  "video": "F:/Filme/The.Falling.2014.NORDIC.1080p.BluRay.REMUX.AVC.DTS-HD.MA.5.1-Danishbits/tf.REMUX-Danishbits.mkv",
-  "ref": "D:/Screenshots/maisie the falling/tf.REMUX-Danishbits.mkv_snapshot_00.02.38.160.jpg",
-  "out_dir": "output",
   "ratio": "1:1,2:3,3:2",
   "frame_stride": 2,
   "min_det_conf": 0.22,
@@ -11,7 +8,7 @@
   "combine": "min",
   "match_mode": "either",
   "only_best": true,
-  "min_sharpness": 160.0,
+  "min_sharpness": 0.0,
   "min_gap_sec": 2.0,
   "min_box_pixels": 9000,
   "auto_crop_borders": false,

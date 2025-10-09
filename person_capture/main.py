@@ -66,6 +66,25 @@ def _enforce_scale_and_margins(
         frame_h,
     )
 
+
+def _calc_sharpness(bgr: np.ndarray) -> float:
+    if bgr is None or bgr.size == 0:
+        return 0.0
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    h, w = g.shape[:2]
+    max_dim = max(h, w)
+    if max_dim > 256:
+        scale = 256.0 / float(max_dim)
+        g = cv2.resize(
+            g,
+            (int(round(w * scale)), int(round(h * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    lap = cv2.Laplacian(g, cv2.CV_32F)
+    variance = float(np.var(lap))
+    mean_intensity = float(np.mean(g))
+    return variance / (mean_intensity * mean_intensity + 1e-6)
+
 from .detectors import PersonDetector
 from .face_embedder import FaceEmbedder
 from .reid_embedder import ReIDEmbedder
@@ -122,6 +141,7 @@ def main():
     ap.add_argument('--device', default='cuda', choices=['cuda','cpu'])
     ap.add_argument('--save-annot', action='store_true', help='save annotated frames')
     ap.add_argument('--yolo', default='yolov8n.pt', help='ultralytics model name or path')
+    ap.add_argument('--min-sharpness', type=float, default=0.0, help='minimum normalized sharpness; 0 disables the gate')
     args = ap.parse_args()
 
     ensure_dir(args.out)
@@ -265,8 +285,11 @@ def main():
                         H,
                         face_box_abs,
                     )
-                    crop_img_path = os.path.join(crops_dir, f"f{frame_idx:08d}.jpg")
                     crop = frame[ey1:ey2, ex1:ex2]
+                    sharp = _calc_sharpness(crop)
+                    if args.min_sharpness > 0 and sharp < args.min_sharpness:
+                        continue
+                    crop_img_path = os.path.join(crops_dir, f"f{frame_idx:08d}.jpg")
                     cv2.imwrite(crop_img_path, crop)
                     hit_count += 1
 
@@ -286,7 +309,7 @@ def main():
                         cv2.imwrite(ann_path, vis)
 
                     t = frame_idx / fps
-                    writer.writerow([frame_idx, f"{t:.3f}", f"{score:.4f}" if score is not None else "", 
+                    writer.writerow([frame_idx, f"{t:.3f}", f"{score:.4f}" if score is not None else "",
                                      f"{fd:.4f}" if fd is not None else "", f"{rd:.4f}" if rd is not None else "",
                                      ex1,ey1,ex2,ey2, os.path.basename(crop_img_path)])
 
