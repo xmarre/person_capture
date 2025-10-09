@@ -1,37 +1,52 @@
 @echo off
-setlocal
+setlocal EnableExtensions
 set "REPO=%~dp0"
 pushd "%REPO%"
-
-rem --- TensorRT absolute path ---
-set "TRT_LIB_DIR=D:\tensorrt\TensorRT-10.13.3.9\lib"
-set "PATH=%TRT_LIB_DIR%;%PATH%"
-
-rem --- activate venv ---
 set "VENV=%REPO%env"
+set "TRT_LIB_DIR=D:\tensorrt\TensorRT-10.13.3.9\lib"
+set "LOG=%REPO%last_run.log"
+
+> "%LOG%" echo ==== PersonCapture %DATE% %TIME% ====
+
+rem --- venv ---
+if not exist "%VENV%\Scripts\activate.bat" (
+  echo ERROR: venv missing at "%VENV%\Scripts\activate.bat" >>"%LOG%"
+  goto FAIL
+)
 call "%VENV%\Scripts\activate.bat"
 
-rem --- CUDA/cuDNN DLLs from wheels (needed before ORT import) ---
-set "PATH=%VENV%\Lib\site-packages\torch\lib;%PATH%"
+rem --- runtime DLLs (TRT first, then CUDA/cuDNN from wheels) ---
+set "PATH=%TRT_LIB_DIR%;%VENV%\Lib\site-packages\torch\lib;%PATH%"
 for %%D in (cublas cudnn cuda_runtime cuda_nvrtc cufft curand cusolver cusparse) do (
   if exist "%VENV%\Lib\site-packages\nvidia\%%D\bin" set "PATH=%VENV%\Lib\site-packages\nvidia\%%D\bin;%PATH%"
 )
-if exist "%VENV%\Lib\site-packages\tensorrt" set "PATH=%VENV%\Lib\site-packages\tensorrt;%PATH%"
+if exist "%VENV%\Lib\site-packages\tensorrt"      set "PATH=%VENV%\Lib\site-packages\tensorrt;%PATH%"
 if exist "%VENV%\Lib\site-packages\tensorrt_libs" set "PATH=%VENV%\Lib\site-packages\tensorrt_libs;%PATH%"
 
-rem --- quick sanity: required TRT parser DLLs present? ---
-if not exist "%TRT_LIB_DIR%\nvonnxparser.dll" if not exist "%TRT_LIB_DIR%\nvonnxparser_10.dll" (
-  echo ERROR: nvonnxparser*.dll missing in %TRT_LIB_DIR%
-  popd & endlocal & exit /b 2
+rem --- must-have TRT DLLs ---
+for %%F in (nvinfer.dll nvinfer_plugin.dll nvonnxparser.dll) do (
+  if not exist "%TRT_LIB_DIR%\%%F" (
+    if not "%%F"=="nvonnxparser.dll" goto FAIL_MISS
+    if not exist "%TRT_LIB_DIR%\nvonnxparser_10.dll" goto FAIL_MISS
+  )
 )
 
-rem --- ORT providers must include TensorRT ---
-python - <<^
-import onnxruntime as ort
-print("ORT providers:", ort.get_available_providers())
-^
+rem --- ORT must expose TensorrtExecutionProvider ---
+python -c "import onnxruntime as ort,sys; p=ort.get_available_providers(); print('ORT providers:',p); sys.exit(0 if 'TensorrtExecutionProvider' in p else 42)" 1>>"%LOG%" 2>&1 || goto FAIL
 
-rem --- run GUI ---
-python -Xfaulthandler -m person_capture.gui_app
+rem --- run GUI; nonzero exit == fail ---
+python -u -Xfaulthandler -m person_capture.gui_app 1>>"%LOG%" 2>&1 || goto FAIL
+
+echo OK >>"%LOG%"
+type "%LOG%"
+goto END
+
+:FAIL_MISS
+echo ERROR: Missing required TensorRT DLLs in %TRT_LIB_DIR% >>"%LOG%"
+:FAIL
+type "%LOG%"
+
+:END
 popd
+pause
 endlocal
