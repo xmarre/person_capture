@@ -2,8 +2,9 @@
 import os
 import cv2
 import numpy as np
-from urllib.request import urlopen
+from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
+from socket import timeout as SocketTimeout
 import tempfile
 from pathlib import Path
 import shutil
@@ -31,12 +32,22 @@ Y8F_URLS = [
     "https://huggingface.co/junjiang/GestureFace/resolve/main/yolov8n-face.pt",
 ]
 
-# ArcFace ONNX mirrors (R100 model). Any that succeeds is fine.
+# Recognition ONNX target path we write to (keep filename stable for the app).
 ARCFACE_ONNX = "arcface_r100.onnx"
+# Canonical, working sources (2024–2025):
+# 1) antelopev2/glintr100.onnx (InsightFace package)
+# 2) buffalo_l/w600k_r50.onnx  (InsightFace package)
 ARCFACE_URLS = [
-    "https://github.com/deepinsight/insightface/releases/download/v0.7/arcface_r100.onnx",
-    "https://raw.githubusercontent.com/deepinsight/insightface/master/python-package/insightface/model_zoo/arcface_r100.onnx",
-    "https://huggingface.co/MonsterMMORPG/Arcface/resolve/main/arcface_r100.onnx",
+    # glintr100.onnx mirrors
+    "https://huggingface.co/LPDoctor/insightface/resolve/25226b4048397eb2adc0fa5a3c21f416005fc228/models/antelopev2/glintr100.onnx",
+    "https://huggingface.co/XuminYu/example_safetensors/resolve/0e9cb8b6ec530f64c20e69fa33e9da6a79895e85/insightface/models/antelopev2/glintr100.onnx",
+    # buffalo_l recognition fallback
+    "https://huggingface.co/fofr/comfyui/resolve/b24971859a2d244d5f746ce707c3dfa4dd574108/insightface/models/buffalo_l/w600k_r50.onnx",
+    "https://huggingface.co/datasets/theanhntp/Liblib/resolve/ae4357741af379482690fe3e0f2fa6fd32ba33b4/insightface/models/buffalo_l/w600k_r50.onnx",
+]
+# Package ZIP fallback (contains glintr100.onnx + det_10g.onnx + 2d106det.onnx)
+ANTELOPE_ZIPS = [
+    "https://sourceforge.net/projects/insightface.mirror/files/v0.7/antelopev2.zip/download"
 ]
 
 def _ensure_file(path: str, urls, progress=None) -> str:
@@ -49,7 +60,8 @@ def _ensure_file(path: str, urls, progress=None) -> str:
     for url in urls:
         try:
             if progress: progress(f"Downloading: {url}")
-            with urlopen(url, timeout=45) as r:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0 PersonCapture"})
+            with urlopen(req, timeout=90) as r:
                 total = int(r.headers.get('Content-Length') or 0)
                 tmp = tempfile.NamedTemporaryFile(delete=False)
                 downloaded = 0
@@ -65,11 +77,56 @@ def _ensure_file(path: str, urls, progress=None) -> str:
                 tmp_path = Path(tmp.name)
             shutil.move(str(tmp_path), str(p))
             if progress: progress(f"Saved: {p}")
+            # minimal integrity: require > 50MB (real models are ~160–260MB)
+            if p.stat().st_size < 50 * 1024 * 1024:
+                raise OSError(f"Downloaded file too small: {p} ({p.stat().st_size} bytes)")
             return str(p.resolve())
-        except (URLError, HTTPError, TimeoutError, OSError) as e:
+        except (URLError, HTTPError, SocketTimeout, OSError) as e:
             last_err = e
             continue
     raise FileNotFoundError(f"Could not obtain '{path}'. Tried: {', '.join(urls)}. Last error: {last_err}")
+
+
+def _ensure_from_zip(out_path: str, zip_urls, want_suffix="glintr100.onnx", progress=None) -> str:
+    p = Path(out_path)
+    if p.exists():
+        return str(p.resolve())
+    if p.parent and not p.parent.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)
+    tmpzip = None
+    last_err = None
+    for url in zip_urls:
+        try:
+            if progress: progress(f"Downloading package: {url}")
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0 PersonCapture"})
+            with urlopen(req, timeout=120) as r:
+                tmpzip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+                shutil.copyfileobj(r, tmpzip)
+                tmpzip.close()
+            import zipfile
+            with zipfile.ZipFile(tmpzip.name, 'r') as zf:
+                cand = [n for n in zf.namelist() if n.lower().endswith(want_suffix)]
+                if not cand:
+                    raise FileNotFoundError(f"{want_suffix} not found in ZIP")
+                member = max(cand, key=len)
+                if progress: progress(f"Extracting: {member}")
+                with zf.open(member) as src, open(p, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                if p.stat().st_size < 50 * 1024 * 1024:
+                    raise OSError(f"Extracted file too small: {p} ({p.stat().st_size} bytes)")
+                return str(p.resolve())
+        except (URLError, HTTPError, SocketTimeout, OSError, Exception) as e:
+            last_err = e
+            continue
+        finally:
+            try:
+                if tmpzip:
+                    os.unlink(tmpzip.name)
+            except Exception:
+                pass
+    raise FileNotFoundError(
+        f"Could not extract '{out_path}' from ZIPs. Tried: {', '.join(zip_urls)}. Last error: {last_err}"
+    )
 
 class FaceEmbedder:
     """
@@ -108,19 +165,40 @@ class FaceEmbedder:
         self.arc_input = None
         if self.use_arcface and ort is not None:
             try:
-                onnx_path = _ensure_file(ARCFACE_ONNX, ARCFACE_URLS, progress=progress)
-                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if self.device == 'cuda' else ['CPUExecutionProvider']
-                self.arc_sess = ort.InferenceSession(onnx_path, providers=providers)
+                try:
+                    onnx_path = _ensure_file(ARCFACE_ONNX, ARCFACE_URLS, progress=progress)
+                except FileNotFoundError:
+                    # Fallback to package ZIP (antelopev2)
+                    onnx_path = _ensure_from_zip(
+                        ARCFACE_ONNX, ANTELOPE_ZIPS, want_suffix="glintr100.onnx", progress=progress
+                    )
+                # Strict provider binding: no CPU fallback when device=cuda
+                avail = list(getattr(ort, "get_available_providers", lambda: [])())
+                if self.device == 'cuda':
+                    want = [p for p in ('TensorrtExecutionProvider', 'CUDAExecutionProvider') if p in avail]
+                    if not want:
+                        raise RuntimeError(f"CUDA/TRT EP not available in ORT. avail={avail}")
+                else:
+                    want = ['CPUExecutionProvider']
+                self.arc_sess = ort.InferenceSession(onnx_path, providers=want)
+                sess_prov = list(getattr(self.arc_sess, "get_providers", lambda: [])())
+                if self.device == 'cuda' and not any(p in sess_prov for p in ('TensorrtExecutionProvider', 'CUDAExecutionProvider')):
+                    raise RuntimeError(f"Session bound to CPU despite CUDA. session_providers={sess_prov}")
                 self.arc_input = self.arc_sess.get_inputs()[0].name
+                # sanity: output embedding should be 512-D
+                out0 = self.arc_sess.get_outputs()[0]
+                if hasattr(out0, "shape") and (out0.shape is not None) and (out0.shape[-1] not in (512,)):
+                    raise RuntimeError(f"Unexpected ArcFace output dim: {out0.shape}")
                 self.backend = 'arcface'
+                if progress:
+                    progress(f"ArcFace: bound providers={sess_prov} file={onnx_path}")
             except Exception as _e:
-                # Fallback to CLIP
-                self.use_arcface = False
+                # Hard fail so the real reason is visible
+                raise RuntimeError(f"ArcFace download/init failed: {_e!r}")
         else:
             if self.use_arcface:
-                if progress:
-                    progress("onnxruntime not available. Falling back to CLIP for face embeddings.")
-                self.use_arcface = False
+                import sys as _sys
+                raise RuntimeError(f"onnxruntime not importable; exe={_sys.executable}")
         if not self.use_arcface or self.backend is None:
             if False and progress: progress(f"Preparing OpenCLIP {clip_model_name} {clip_pretrained} (will download if missing)...")
             self.model, _, self.preprocess = _open_clip.create_model_and_transforms(
@@ -177,7 +255,7 @@ class FaceEmbedder:
             for item in data:
                 arr = item.cpu().numpy() if hasattr(item, "cpu") else np.asarray(item)
                 if arr.ndim == 2 and arr.shape[-1] >= 2:
-                    stacked.append(arr[..., :2])
+                    stacked.append(arr[:, :2])
             if not stacked:
                 return None
             arr = np.stack(stacked, axis=0)
@@ -195,6 +273,41 @@ class FaceEmbedder:
                 arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
             return arr[:, :5, :2]
         return None
+
+    @staticmethod
+    def _canon_5pts(pts: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Accepts shape (5, 2) in any order and returns ArcFace ordering:
+        [left_eye, right_eye, nose, left_mouth, right_mouth].
+        """
+        if pts is None or pts.shape != (5, 2):
+            return None
+        pts = np.asarray(pts, dtype=np.float32)
+        if not np.isfinite(pts).all():
+            return None
+
+        order_y = np.argsort(pts[:, 1])
+        eyes_idx = order_y[:2]
+        nose_idx = order_y[2]
+        mouth_idx = order_y[3:]
+        if mouth_idx.size != 2:
+            return None
+
+        eyes = pts[eyes_idx]
+        mouth = pts[mouth_idx]
+
+        leye, reye = eyes[np.argsort(eyes[:, 0])]
+        lmouth, rmouth = mouth[np.argsort(mouth[:, 0])]
+        nose = pts[nose_idx]
+
+        if not (leye[0] < reye[0] and lmouth[0] < rmouth[0]):
+            return None
+        upper_eye = max(leye[1], reye[1])
+        lower_mouth = min(lmouth[1], rmouth[1])
+        if not (nose[1] > upper_eye and nose[1] < lower_mouth):
+            return None
+
+        return np.stack([leye, reye, nose, lmouth, rmouth], axis=0)
 
     def _align_by_5pts(self, bgr: np.ndarray, pts5: np.ndarray) -> np.ndarray:
         M, _ = cv2.estimateAffinePartial2D(pts5.astype(np.float32), self._ARC_DST, method=cv2.LMEDS)
@@ -249,14 +362,19 @@ class FaceEmbedder:
                 and np.isfinite(kps[i]).all()
             )
             if use_landmarks:
-                pts = kps[i].astype(np.float32, copy=True)
-                pts[:, 0] -= float(x1)
-                pts[:, 1] -= float(y1)
-                pts[:, 0] = np.clip(pts[:, 0], 0.0, max(0, face_bgr.shape[1] - 1))
-                pts[:, 1] = np.clip(pts[:, 1], 0.0, max(0, face_bgr.shape[0] - 1))
-                chip = self._align_by_5pts(face_bgr, pts)
+                pts = kps[i].astype(np.float32, copy=False)
+                five = self._canon_5pts(pts[:5])
+                if five is not None:
+                    pts = five.copy()
+                    pts[:, 0] -= float(x1)
+                    pts[:, 1] -= float(y1)
+                    pts[:, 0] = np.clip(pts[:, 0], 0.0, max(0, face_bgr.shape[1] - 1))
+                    pts[:, 1] = np.clip(pts[:, 1], 0.0, max(0, face_bgr.shape[0] - 1))
+                    chip = self._align_by_5pts(face_bgr, pts)
+                else:
+                    chip = cv2.resize(face_bgr, (112, 112), interpolation=cv2.INTER_LINEAR)
             else:
-                chip = face_bgr
+                chip = cv2.resize(face_bgr, (112, 112), interpolation=cv2.INTER_LINEAR) if self.use_arcface else face_bgr
             faces.append((x1,y1,x2,y2, chip, self._face_quality(chip)))
             crops.append(chip)
 
