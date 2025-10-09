@@ -100,21 +100,7 @@ class FaceEmbedder:
         self._torch = _torch
         self.det = _YOLO(yolo_path)
         self.use_arcface = bool(use_arcface)
-        self._expect_5k = False
-        model_attr = getattr(self.det, "model", None)
-        kpt_shape = None
-        if model_attr is not None:
-            kpt_shape = getattr(model_attr, "kpt_shape", None)
-            if kpt_shape is None:
-                inner_model = getattr(model_attr, "model", None)
-                kpt_shape = getattr(inner_model, "kpt_shape", None) if inner_model is not None else None
-        if isinstance(kpt_shape, (list, tuple)) and kpt_shape:
-            self._expect_5k = bool(kpt_shape[0] >= 5)
-        if self.use_arcface and not self._expect_5k:
-            # fallback instead of aborting
-            if progress:
-                progress("YOLO face model has no 5-point keypoints. Falling back to CLIP.")
-            self.use_arcface = False
+        # Keep ArcFace enabled; we'll align by 5pts only if keypoints are available at inference time.
         self.device = 'cuda' if (ctx.startswith('cuda') and _torch.cuda.is_available()) else 'cpu'
         self.conf = float(conf)
         self.backend = None

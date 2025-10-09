@@ -63,7 +63,7 @@ class SessionConfig:
     combine: str = "min"            # min | avg | face_priority
     match_mode: str = "either"        # either | both | face_only | reid_only
     only_best: bool = True
-    min_sharpness: float = 160.0
+    min_sharpness: float = 0.0
     min_gap_sec: float = 1.5
     min_box_pixels: int = 8000
     auto_crop_borders: bool = False
@@ -122,14 +122,22 @@ class SessionConfig:
     faceless_center_max_frac: float = 0.12  # max center drift vs diag
     faceless_min_motion_frac: float = 0.02  # min moving pixels in ROI
 
-    def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2)
+    def to_json(self, include_paths: bool = False) -> str:
+        d = asdict(self)
+        if not include_paths:
+            # do not publish local paths to preset files
+            for k in ("video", "ref", "out_dir"):
+                d.pop(k, None)
+        return json.dumps(d, indent=2)
 
     @staticmethod
-    def from_json(s: str) -> "SessionConfig":
+    def from_json(s: str, ignore_paths_in_json: bool = True) -> "SessionConfig":
         d = json.loads(s)
         c = SessionConfig()
         for k, v in d.items():
+            # ignore any paths that might be present in old presets
+            if ignore_paths_in_json and k in ("video", "ref", "out_dir"):
+                continue
             if hasattr(c, k):
                 setattr(c, k, v)
         return c
@@ -284,7 +292,19 @@ class Processor(QtCore.QObject):
         if bgr is None or bgr.size == 0:
             return 0.0
         g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        return float(cv2.Laplacian(g, cv2.CV_64F).var())
+        h, w = g.shape[:2]
+        max_dim = max(h, w)
+        if max_dim > 256:
+            scale = 256.0 / float(max_dim)
+            g = cv2.resize(
+                g,
+                (int(round(w * scale)), int(round(h * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        lap = cv2.Laplacian(g, cv2.CV_32F)
+        variance = float(np.var(lap))
+        mean_intensity = float(np.mean(g))
+        return variance / (mean_intensity * mean_intensity + 1e-6)
 
     def _autocrop_borders(self, frame, thr):
         from utils import detect_black_borders
@@ -970,7 +990,7 @@ class Processor(QtCore.QObject):
                     # Compute sharpness on final crop
                     crop_img = frame_for_det[ey1:ey2, ex1:ex2]
                     sharp = self._calc_sharpness(crop_img)
-                    if sharp < float(cfg.min_sharpness):
+                    if float(cfg.min_sharpness) > 0 and sharp < float(cfg.min_sharpness):
                         continue
 
                     # Map to original frame coords for annotation
@@ -1109,7 +1129,7 @@ class Processor(QtCore.QObject):
                                     if valid:
                                         crop_img = frame[oy1:oy2, ox1:ox2]
                                         sharp = self._calc_sharpness(crop_img)
-                                        if sharp >= float(cfg.min_sharpness):
+                                        if float(cfg.min_sharpness) <= 0 or sharp >= float(cfg.min_sharpness):
                                             reasons = [f"faceless_{why}" if why else "faceless"]
                                             fallback_candidate = dict(
                                                 score=None,
@@ -1158,7 +1178,7 @@ class Processor(QtCore.QObject):
                                     if valid:
                                         crop_img = frame[ey1:ey2, ex1:ex2]
                                         sharp = self._calc_sharpness(crop_img)
-                                        if sharp >= float(cfg.min_sharpness):
+                                        if float(cfg.min_sharpness) <= 0 or sharp >= float(cfg.min_sharpness):
                                             fallback_candidate = dict(
                                                 score=None,
                                                 fd=None,
@@ -1506,17 +1526,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ratio_edit = QtWidgets.QLineEdit("2:3")
         self.stride_spin = QtWidgets.QSpinBox(); self.stride_spin.setRange(1, 1000); self.stride_spin.setValue(2)
         self.det_conf_spin = QtWidgets.QDoubleSpinBox(); self.det_conf_spin.setDecimals(3); self.det_conf_spin.setRange(0.0, 1.0); self.det_conf_spin.setSingleStep(0.01); self.det_conf_spin.setValue(0.35)
-        self.face_thr_spin = QtWidgets.QDoubleSpinBox(); self.face_thr_spin.setDecimals(3); self.face_thr_spin.setRange(0.0, 2.0); self.face_thr_spin.setSingleStep(0.01); self.face_thr_spin.setValue(0.32)
-        self.face_det_conf_spin = QtWidgets.QDoubleSpinBox(); self.face_det_conf_spin.setDecimals(3); self.face_det_conf_spin.setRange(0.0, 1.0); self.face_det_conf_spin.setSingleStep(0.01); self.face_det_conf_spin.setValue(0.22)
+        self.face_thr_spin = QtWidgets.QDoubleSpinBox(); self.face_thr_spin.setDecimals(3); self.face_thr_spin.setRange(0.0, 2.0); self.face_thr_spin.setSingleStep(0.01); self.face_thr_spin.setValue(0.45)
+        self.face_det_conf_spin = QtWidgets.QDoubleSpinBox(); self.face_det_conf_spin.setDecimals(3); self.face_det_conf_spin.setRange(0.0, 1.0); self.face_det_conf_spin.setSingleStep(0.01); self.face_det_conf_spin.setValue(0.15)
         self.face_det_pad_spin = QtWidgets.QDoubleSpinBox(); self.face_det_pad_spin.setDecimals(3); self.face_det_pad_spin.setRange(0.0, 1.0); self.face_det_pad_spin.setSingleStep(0.01); self.face_det_pad_spin.setValue(0.08)
-        self.face_quality_spin = QtWidgets.QDoubleSpinBox(); self.face_quality_spin.setRange(0.0, 1000.0); self.face_quality_spin.setSingleStep(1.0); self.face_quality_spin.setValue(120.0)
+        self.face_quality_spin = QtWidgets.QDoubleSpinBox(); self.face_quality_spin.setRange(0.0, 1000.0); self.face_quality_spin.setSingleStep(1.0); self.face_quality_spin.setValue(70.0)
         self.face_vis_quality_check = QtWidgets.QCheckBox(); self.face_vis_quality_check.setChecked(True)
         self.reid_thr_spin = QtWidgets.QDoubleSpinBox(); self.reid_thr_spin.setDecimals(3); self.reid_thr_spin.setRange(0.0, 2.0); self.reid_thr_spin.setSingleStep(0.01); self.reid_thr_spin.setValue(0.38)
         self.combine_combo = QtWidgets.QComboBox(); self.combine_combo.addItems(["min","avg","face_priority"])
         self.match_mode_combo = QtWidgets.QComboBox(); self.match_mode_combo.addItems(["either","both","face_only","reid_only"])
         self.only_best_check = QtWidgets.QCheckBox("Only best per frame")
         self.only_best_check.setChecked(True)
-        self.min_sharp_spin = QtWidgets.QDoubleSpinBox(); self.min_sharp_spin.setRange(0.0, 5000.0); self.min_sharp_spin.setValue(120.0)
+        self.min_sharp_spin = QtWidgets.QDoubleSpinBox(); self.min_sharp_spin.setRange(0.0, 5000.0); self.min_sharp_spin.setValue(0.0)
         self.min_gap_spin = QtWidgets.QDoubleSpinBox(); self.min_gap_spin.setDecimals(2); self.min_gap_spin.setRange(0.0, 30.0); self.min_gap_spin.setValue(1.5)
         self.min_box_pix_spin = QtWidgets.QSpinBox(); self.min_box_pix_spin.setRange(0, 5000000); self.min_box_pix_spin.setValue(5000)
         self.auto_crop_check = QtWidgets.QCheckBox("Auto‑crop black borders")
@@ -1537,7 +1557,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.margin_spin = QtWidgets.QDoubleSpinBox(); self.margin_spin.setDecimals(3); self.margin_spin.setRange(0.0, 1.0); self.margin_spin.setValue(0.03)
         self.iou_gate_spin = QtWidgets.QDoubleSpinBox(); self.iou_gate_spin.setDecimals(3); self.iou_gate_spin.setRange(0.0, 1.0); self.iou_gate_spin.setValue(0.05)
         self.use_arc_check = QtWidgets.QCheckBox("Use ArcFace for face ID")
-        self.use_arc_check.setChecked(False)
+        self.use_arc_check.setChecked(True)
         self.device_combo = QtWidgets.QComboBox(); self.device_combo.addItems(["cuda","cpu"])
         self.yolo_edit = QtWidgets.QLineEdit("yolov8n.pt")
         self.face_yolo_edit = QtWidgets.QLineEdit("yolov8n-face.pt")
@@ -2004,8 +2024,12 @@ class MainWindow(QtWidgets.QMainWindow):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load preset", "", "JSON (*.json)")
         if not path:
             return
+        current_cfg = self._collect_cfg()
         with open(path, "r", encoding="utf-8") as f:
             cfg = SessionConfig.from_json(f.read())
+        cfg.video = current_cfg.video
+        cfg.ref = current_cfg.ref
+        cfg.out_dir = current_cfg.out_dir
         self._apply_cfg(cfg)
         self._log(f"Preset loaded: {path}")
 
@@ -2048,9 +2072,9 @@ class MainWindow(QtWidgets.QMainWindow):
             save_annot=bool(self.annot_check.isChecked()),
             preview_every=int(self.preview_every_spin.value()),
             prefer_face_when_available=bool(self.pref_face_check.isChecked()) if hasattr(self, "pref_face_check") else True,
-            face_quality_min=float(self.face_quality_spin.value()) if hasattr(self, "face_quality_spin") else 120.0,
+            face_quality_min=float(self.face_quality_spin.value()) if hasattr(self, "face_quality_spin") else 70.0,
             face_visible_uses_quality=bool(self.face_vis_quality_check.isChecked()) if hasattr(self, "face_vis_quality_check") else True,
-            face_det_conf=float(self.face_det_conf_spin.value()) if hasattr(self, "face_det_conf_spin") else 0.22,
+            face_det_conf=float(self.face_det_conf_spin.value()) if hasattr(self, "face_det_conf_spin") else 0.15,
             face_det_pad=float(self.face_det_pad_spin.value()) if hasattr(self, "face_det_pad_spin") else 0.08,
             face_margin_min=float(getattr(self, 'margin_spin', QtWidgets.QDoubleSpinBox()).value()) if hasattr(self, 'margin_spin') else 0.05,
             allow_faceless_when_locked=bool(self.faceless_allow_check.isChecked()) if hasattr(self, "faceless_allow_check") else True,
@@ -2397,27 +2421,33 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # Persist UI settings between runs
     def closeEvent(self, e: QtGui.QCloseEvent) -> None:
-        # persist layout
         try:
-            s = QtCore.QSettings(APP_ORG, APP_NAME)
-            s.setValue("dock_state", self.saveState())
-        except Exception:
-            pass
-        self._save_qsettings()
-        # stop running job cleanly
-        try:
-            if self._worker:
-                self._worker.request_abort()
-            if self._thread and self._thread.isRunning():
-                self._thread.quit()
-                if not self._thread.wait(4000):
-                    self._thread.terminate()
-                    self._thread.wait(1000)
-        except Exception:
-            pass
-        self._worker = None
-        self._thread = None
-        e.accept()
+            try:
+                s = QtCore.QSettings(APP_ORG, APP_NAME)
+                s.setValue("dock_state", self.saveState())
+                s.sync()
+            except Exception:
+                pass
+            try:
+                self._save_qsettings()
+            except Exception:
+                pass
+            finally:
+                # stop running job cleanly
+                try:
+                    if self._worker:
+                        self._worker.request_abort()
+                    if self._thread and self._thread.isRunning():
+                        self._thread.quit()
+                        if not self._thread.wait(4000):
+                            self._thread.terminate()
+                            self._thread.wait(1000)
+                except Exception:
+                    pass
+                self._worker = None
+                self._thread = None
+        finally:
+            super().closeEvent(e)
 
     def _load_qsettings(self):
         s = QtCore.QSettings(APP_ORG, APP_NAME)
@@ -2427,16 +2457,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ratio_edit.setText(s.value("ratio", "2:3"))
         self.stride_spin.setValue(int(s.value("frame_stride", 2)))
         self.det_conf_spin.setValue(float(s.value("min_det_conf", 0.35)))
-        self.face_thr_spin.setValue(float(s.value("face_thresh", 0.32)))
-        self.face_det_conf_spin.setValue(float(s.value("face_det_conf", 0.22)))
+        self.face_thr_spin.setValue(float(s.value("face_thresh", 0.45)))
+        self.face_det_conf_spin.setValue(float(s.value("face_det_conf", 0.15)))
         self.face_det_pad_spin.setValue(float(s.value("face_det_pad", 0.08)))
-        self.face_quality_spin.setValue(float(s.value("face_quality_min", 120.0)))
+        self.face_quality_spin.setValue(float(s.value("face_quality_min", 70.0)))
         self.face_vis_quality_check.setChecked(bool(s.value("face_visible_uses_quality", True)))
         self.reid_thr_spin.setValue(float(s.value("reid_thresh", 0.38)))
         self.combine_combo.setCurrentText(s.value("combine", "min"))
         self.match_mode_combo.setCurrentText(s.value("match_mode", "either"))
         self.only_best_check.setChecked(bool(s.value("only_best", True)))
-        self.min_sharp_spin.setValue(float(s.value("min_sharpness", 120.0)))
+        self.min_sharp_spin.setValue(float(s.value("min_sharpness", 0.0)))
         self.min_gap_spin.setValue(float(s.value("min_gap_sec", 1.5)))
         self.min_box_pix_spin.setValue(int(s.value("min_box_pixels", 5000)))
         self.auto_crop_check.setChecked(bool(s.value("auto_crop_borders", False)))
@@ -2515,11 +2545,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pref_face_check.setChecked(bool(s.value("prefer_face_when_available", True)))
         # Use existing controls to hold thresholds for convenience
         if hasattr(self, 'face_quality_spin'):
-            self.face_quality_spin.setValue(float(s.value("face_quality_min", 120.0)))
+            self.face_quality_spin.setValue(float(s.value("face_quality_min", 70.0)))
         if hasattr(self, 'face_vis_quality_check'):
             self.face_vis_quality_check.setChecked(bool(s.value("face_visible_uses_quality", True)))
         if hasattr(self, 'face_det_conf_spin'):
-            self.face_det_conf_spin.setValue(float(s.value("face_det_conf", 0.22)))
+            self.face_det_conf_spin.setValue(float(s.value("face_det_conf", 0.15)))
         if hasattr(self, 'face_det_pad_spin'):
             self.face_det_pad_spin.setValue(float(s.value("face_det_pad", 0.08)))
         if hasattr(self, 'margin_spin'):
@@ -2530,6 +2560,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg = self._collect_cfg()
         for k, v in asdict(cfg).items():
             s.setValue(k, v)
+        s.sync()
 
 
 def main():
