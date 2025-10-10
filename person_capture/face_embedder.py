@@ -1,14 +1,12 @@
 
-import os
-import sys
-import glob, ctypes, site
+import os, io, sys, glob, site, ctypes, math
+from pathlib import Path
 import cv2
 import numpy as np
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 from socket import timeout as SocketTimeout
 import tempfile
-from pathlib import Path
 import shutil
 from typing import TYPE_CHECKING, Optional, List, Tuple
 
@@ -254,8 +252,12 @@ class FaceEmbedder:
                         if progress: progress(f"ORT preload_dlls note: {e!r}")
                 # === TensorRT ONLY ===
                 def _trt_cache_dir() -> str:
-                    base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_CACHE_HOME") or str(_P.home() / ".cache")
-                    d = _P(base) / "PersonCapture" / "trt_cache"
+                    base = (
+                        os.environ.get("LOCALAPPDATA")
+                        or os.environ.get("XDG_CACHE_HOME")
+                        or str(Path.home() / ".cache")
+                    )
+                    d = Path(base).expanduser() / "PersonCapture" / "trt_cache"
                     d.mkdir(parents=True, exist_ok=True)
                     return str(d)
 
@@ -265,13 +267,25 @@ class FaceEmbedder:
 
                 so = ort.SessionOptions()
                 so.log_severity_level = 0  # VERBOSE
+                go = getattr(ort, "GraphOptimizationLevel", None)
+                if go is not None:
+                    level = getattr(go, "ORT_ENABLE_ALL", None)
+                    if level is not None:
+                        so.graph_optimization_level = level
                 # Do not allow fallback to any other EP
                 so.add_session_config_entry("session.disable_fallback", "1")
                 # Tag logs
                 so.add_session_config_entry("session.logid", "arcface_trt")
+                cache_dir = _trt_cache_dir()
                 # Python TRT bindings not required for ORT TRT-EP; skip strict check.
                 providers = ['TensorrtExecutionProvider']
-                provider_options = [{}]
+                provider_options = [{
+                    'trt_fp16_enable': '1',
+                    'trt_engine_cache_enable': '1',
+                    'trt_engine_cache_path': cache_dir,
+                    'trt_timing_cache_enable': '1',
+                    'trt_max_workspace_size': str(8 * 1024 * 1024 * 1024),
+                }]
                 self.arc_sess = ort.InferenceSession(
                     onnx_path, sess_options=so, providers=providers, provider_options=provider_options
                 )
@@ -323,10 +337,17 @@ class FaceEmbedder:
             return []
         chips = [self._arcface_preprocess(b) for b in bgr_list]
         chips_flip = [self._arcface_preprocess(cv2.flip(b, 1)) for b in bgr_list]
-        batch = np.ascontiguousarray(np.concatenate(chips + chips_flip, axis=0).astype(np.float32, copy=False))
+        batch = np.concatenate(chips + chips_flip, axis=0).astype(np.float32, copy=False)
+        # Pad to fixed batch so TRT compiles once
+        FIX = 32
+        n = batch.shape[0]
+        if n < FIX:
+            pad = np.repeat(batch[:1], FIX - n, axis=0)
+            batch = np.concatenate([batch, pad], axis=0)
+        batch = np.ascontiguousarray(batch)
         feats = self.arc_sess.run(None, {self.arc_input: batch})[0]
-        n = len(bgr_list)
-        f = feats[:n] + feats[n:]
+        m = len(bgr_list)
+        f = feats[:m] + feats[m:2*m]
         f /= (np.linalg.norm(f, axis=1, keepdims=True) + 1e-9)
         return f.astype(np.float32)
 

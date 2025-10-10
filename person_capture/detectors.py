@@ -20,6 +20,12 @@ class PersonDetector:
         self.device = 'cuda' if (str(device).startswith('cuda') and _torch.cuda.is_available()) else 'cpu'
         self.progress = progress
         self.model = self._load_model(model_name)
+        try:
+            self.model.fuse()
+            if self.device == 'cuda':
+                self.model.model.half()
+        except Exception:
+            pass
 
     def _load_model(self, model_name: str):
         name = str(model_name)
@@ -46,6 +52,7 @@ class PersonDetector:
     def detect(self, frame, conf=0.35):
         """Return list of dicts for class=person only."""
         try:
+            # Ultralytics auto-handles dtype from model; ensure fp16 path on CUDA model
             res = self.model.predict(
                 frame, device=self.device, conf=float(conf), iou=0.45, classes=[0], verbose=False
             )[0]
