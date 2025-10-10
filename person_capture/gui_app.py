@@ -347,6 +347,13 @@ class Processor(QtCore.QObject):
     finished = QtCore.Signal(bool, str)              # success, message
 
     # --- Player control slots (queued, thread-safe) ---
+    @QtCore.Slot(dict)
+    def update_cfg(self, changes: dict):
+        try:
+            self._cmd_q.put_nowait(("cfg", dict(changes)))
+        except Exception:
+            pass
+
     @QtCore.Slot(int)
     def seek_frame(self, frame_idx: int):
         try:
@@ -740,6 +747,60 @@ class Processor(QtCore.QObject):
                                 self._speed = max(0.1, min(4.0, float(arg)))
                             except Exception:
                                 pass
+                        elif cmd == "cfg":
+                            LIVE = {
+                                "frame_stride",
+                                "min_det_conf",
+                                "face_thresh",
+                                "reid_thresh",
+                                "combine",
+                                "match_mode",
+                                "only_best",
+                                "min_sharpness",
+                                "min_gap_sec",
+                                "min_box_pixels",
+                                "auto_crop_borders",
+                                "border_threshold",
+                                "score_margin",
+                                "iou_gate",
+                                "preview_every",
+                                # keep score_margin; do not use face_margin_min here
+                                "require_face_if_visible",
+                                "prefer_face_when_available",
+                                "suppress_negatives",
+                                "neg_tolerance",
+                                "max_negatives",
+                                "log_interval_sec",
+                                "lock_after_hits",
+                                "lock_face_thresh",
+                                "lock_reid_thresh",
+                                "lock_momentum",
+                                "allow_faceless_when_locked",
+                                "drop_reid_if_any_face_match",
+                                "faceless_reid_thresh",
+                                "faceless_iou_min",
+                                "faceless_persist_frames",
+                                "faceless_min_area_frac",
+                                "faceless_max_area_frac",
+                                "faceless_center_max_frac",
+                                "faceless_min_motion_frac",
+                                "crop_face_side_margin_frac",
+                                "crop_top_headroom_max_frac",
+                                "crop_bottom_min_face_heights",
+                                "crop_penalty_weight",
+                                "face_anchor_down_frac",
+                                "face_max_frac_in_crop",
+                                "face_min_frac_in_crop",
+                                "crop_min_height_frac",
+                                "face_visible_uses_quality",
+                                "face_quality_min",
+                                "face_det_conf",
+                                "face_det_pad",
+                            }
+                            for k, v in (arg or {}).items():
+                                if k in LIVE and hasattr(self.cfg, k):
+                                    setattr(self.cfg, k, v)
+                            continue
                 except queue.Empty:
                     pass
 
@@ -1690,7 +1751,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resume_btn = QtWidgets.QPushButton("Resume")
         self.stop_btn = QtWidgets.QPushButton("Stop")
         self.open_out_btn = QtWidgets.QPushButton("Open Output")
-        for b in (self.start_btn, self.pause_btn, self.resume_btn, self.stop_btn, self.open_out_btn):
+        self.apply_live_btn = QtWidgets.QPushButton("Apply live")
+        for b in (self.start_btn, self.pause_btn, self.resume_btn, self.stop_btn, self.open_out_btn, self.apply_live_btn):
             ctrl_layout.addWidget(b)
 
         # Player
@@ -1855,6 +1917,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.pause_btn.clicked.connect(lambda: self._pause(True))
         self.resume_btn.clicked.connect(lambda: self._pause(False))
         self.open_out_btn.clicked.connect(self._open_out_dir)
+        self.apply_live_btn.clicked.connect(self._apply_live_cfg)
 
         self._update_buttons(state="idle")
 
@@ -2045,6 +2108,70 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _about(self):
         QtWidgets.QMessageBox.information(self, "About", "PersonCapture GUI\nControls the video→crops pipeline with live preview, presets, and CSV index.")
+
+    def _apply_live_cfg(self):
+        if not self._worker:
+            return
+        new = self._collect_cfg()
+        live = {
+            "frame_stride",
+            "min_det_conf",
+            "face_thresh",
+            "reid_thresh",
+            "combine",
+            "match_mode",
+            "only_best",
+            "min_sharpness",
+            "min_gap_sec",
+            "min_box_pixels",
+            "auto_crop_borders",
+            "border_threshold",
+            "score_margin",
+            "iou_gate",
+            "preview_every",
+            "require_face_if_visible",
+            "prefer_face_when_available",
+            "suppress_negatives",
+            "neg_tolerance",
+            "max_negatives",
+            "log_interval_sec",
+            "lock_after_hits",
+            "lock_face_thresh",
+            "lock_reid_thresh",
+            "lock_momentum",
+            "allow_faceless_when_locked",
+            "drop_reid_if_any_face_match",
+            "faceless_reid_thresh",
+            "faceless_iou_min",
+            "faceless_persist_frames",
+            "faceless_min_area_frac",
+            "faceless_max_area_frac",
+            "faceless_center_max_frac",
+            "faceless_min_motion_frac",
+            "crop_face_side_margin_frac",
+            "crop_top_headroom_max_frac",
+            "crop_bottom_min_face_heights",
+            "crop_penalty_weight",
+            "face_anchor_down_frac",
+            "face_max_frac_in_crop",
+            "face_min_frac_in_crop",
+            "crop_min_height_frac",
+            "face_visible_uses_quality",
+            "face_quality_min",
+            "face_det_conf",
+            "face_det_pad",
+        }
+        delta = {}
+        for k in live:
+            if hasattr(self._worker.cfg, k) and hasattr(new, k):
+                ov = getattr(self._worker.cfg, k)
+                nv = getattr(new, k)
+                if ov != nv:
+                    delta[k] = nv
+        if delta:
+            self._worker.update_cfg(delta)
+            self._log(f"Applied live: {sorted(delta.keys())}")
+            self._save_qsettings()
 
     def _collect_cfg(self) -> SessionConfig:
         cfg = SessionConfig(
@@ -2471,19 +2598,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.face_det_conf_spin.setValue(float(s.value("face_det_conf", 0.15)))
         self.face_det_pad_spin.setValue(float(s.value("face_det_pad", 0.08)))
         self.face_quality_spin.setValue(float(s.value("face_quality_min", 70.0)))
-        self.face_vis_quality_check.setChecked(bool(s.value("face_visible_uses_quality", True)))
+        self.face_vis_quality_check.setChecked(
+            s.value("face_visible_uses_quality", True, type=bool)
+        )
         self.reid_thr_spin.setValue(float(s.value("reid_thresh", 0.38)))
         self.combine_combo.setCurrentText(s.value("combine", "min"))
         self.match_mode_combo.setCurrentText(s.value("match_mode", "either"))
-        self.only_best_check.setChecked(bool(s.value("only_best", True)))
+        self.only_best_check.setChecked(s.value("only_best", True, type=bool))
         self.min_sharp_spin.setValue(float(s.value("min_sharpness", 0.0)))
         self.min_gap_spin.setValue(float(s.value("min_gap_sec", 1.5)))
         self.min_box_pix_spin.setValue(int(s.value("min_box_pixels", 5000)))
-        self.auto_crop_check.setChecked(bool(s.value("auto_crop_borders", False)))
+        self.auto_crop_check.setChecked(s.value("auto_crop_borders", False, type=bool))
         self.border_thr_spin.setValue(int(s.value("border_threshold", 10)))
-        self.require_face_check.setChecked(bool(s.value("require_face_if_visible", True)))
+        self.require_face_check.setChecked(
+            s.value("require_face_if_visible", True, type=bool)
+        )
         self.lock_mom_spin.setValue(float(s.value("lock_momentum", 0.7)))
-        self.suppress_neg_check.setChecked(bool(s.value("suppress_negatives", False)))
+        self.suppress_neg_check.setChecked(
+            s.value("suppress_negatives", False, type=bool)
+        )
         self.neg_tol_spin.setValue(float(s.value("neg_tolerance", 0.35)))
         self.max_neg_spin.setValue(int(s.value("max_negatives", 5)))
         self.log_every_spin.setValue(float(s.value("log_interval_sec", 1.0)))
@@ -2492,17 +2625,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lock_reid_spin.setValue(float(s.value("lock_reid_thresh", 0.30)))
         self.margin_spin.setValue(float(s.value("score_margin", 0.03)))
         self.iou_gate_spin.setValue(float(s.value("iou_gate", 0.05)))
-        self.use_arc_check.setChecked(bool(s.value("use_arcface", True)))
+        self.use_arc_check.setChecked(s.value("use_arcface", True, type=bool))
         self.device_combo.setCurrentText(s.value("device", "cuda"))
         self.yolo_edit.setText(s.value("yolo_model", "yolov8n.pt"))
         self.face_yolo_edit.setText(s.value("face_model", "yolov8n-face.pt"))
-        self.annot_check.setChecked(bool(s.value("save_annot", False)))
+        self.annot_check.setChecked(s.value("save_annot", False, type=bool))
         self.preview_every_spin.setValue(int(s.value("preview_every", 30)))
         if hasattr(self, 'faceless_allow_check'):
-            self.faceless_allow_check.setChecked(bool(s.value("allow_faceless_when_locked", self.cfg.allow_faceless_when_locked)))
+            self.faceless_allow_check.setChecked(
+                s.value(
+                    "allow_faceless_when_locked",
+                    self.cfg.allow_faceless_when_locked,
+                    type=bool,
+                )
+            )
         if hasattr(self, 'drop_reid_if_any_face_match_check'):
             self.drop_reid_if_any_face_match_check.setChecked(
-                bool(s.value("drop_reid_if_any_face_match", self.cfg.drop_reid_if_any_face_match))
+                s.value(
+                    "drop_reid_if_any_face_match",
+                    self.cfg.drop_reid_if_any_face_match,
+                    type=bool,
+                )
             )
         if hasattr(self, 'faceless_reid_spin'):
             self.faceless_reid_spin.setValue(float(s.value("faceless_reid_thresh", self.cfg.faceless_reid_thresh)))
@@ -2552,19 +2695,20 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         # Face-first defaults if controls not present
         if hasattr(self, 'pref_face_check'):
-            self.pref_face_check.setChecked(bool(s.value("prefer_face_when_available", True)))
+            self.pref_face_check.setChecked(
+                s.value("prefer_face_when_available", True, type=bool)
+            )
         # Use existing controls to hold thresholds for convenience
         if hasattr(self, 'face_quality_spin'):
             self.face_quality_spin.setValue(float(s.value("face_quality_min", 70.0)))
         if hasattr(self, 'face_vis_quality_check'):
-            self.face_vis_quality_check.setChecked(bool(s.value("face_visible_uses_quality", True)))
+            self.face_vis_quality_check.setChecked(
+                s.value("face_visible_uses_quality", True, type=bool)
+            )
         if hasattr(self, 'face_det_conf_spin'):
             self.face_det_conf_spin.setValue(float(s.value("face_det_conf", 0.15)))
         if hasattr(self, 'face_det_pad_spin'):
             self.face_det_pad_spin.setValue(float(s.value("face_det_pad", 0.08)))
-        if hasattr(self, 'margin_spin'):
-            self.margin_spin.setValue(float(s.value("face_margin_min", 0.05)))
-
     def _save_qsettings(self):
         s = QtCore.QSettings(APP_ORG, APP_NAME)
         cfg = self._collect_cfg()
