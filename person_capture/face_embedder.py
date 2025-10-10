@@ -234,8 +234,23 @@ class FaceEmbedder:
                 so.add_session_config_entry("session.disable_fallback", "1")
                 # Tag logs
                 so.add_session_config_entry("session.logid", "arcface_trt")
+                cache_env = os.getenv("PERSON_CAPTURE_TRT_CACHE")
+                cache_dir = (
+                    Path(cache_env).expanduser()
+                    if cache_env
+                    else Path.home() / ".cache" / "person_capture" / "trt"
+                )
+                try:
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                except OSError as e:
+                    raise RuntimeError(f"Unable to create TensorRT cache dir {cache_dir}: {e}")
                 providers = ['TensorrtExecutionProvider']
-                provider_options = [{}]
+                provider_options = [{
+                    "trt_fp16_enable": "1",
+                    "trt_engine_cache_enable": "1",
+                    "trt_engine_cache_path": str(cache_dir),
+                    "trt_timing_cache_enable": "1",
+                }]
                 self.arc_sess = ort.InferenceSession(
                     onnx_path, sess_options=so, providers=providers, provider_options=provider_options
                 )
