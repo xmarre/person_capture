@@ -453,6 +453,82 @@ class FaceEmbedder:
             return cv2.resize(bgr, (112, 112), interpolation=interp)
         return cv2.warpAffine(bgr, M, (112,112), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
+    def _redetect_align_on_rotations(self, face_bgr: np.ndarray) -> Optional[np.ndarray]:
+        """If landmarks are missing, try YOLOv8-face on rotated crops and align."""
+        if face_bgr is None or face_bgr.size == 0:
+            return None
+        h, w = face_bgr.shape[:2]
+        if h < 32 or w < 32:
+            return None
+        # Use a tolerant conf for the tiny crop
+        conf = 0.05
+        # Prefer sideways hypotheses first; only 180° if those miss.
+        for rot in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180):
+            img = cv2.rotate(face_bgr, rot)
+            try:
+                res = self.det.predict(img, conf=conf, imgsz=320, verbose=False, device=self.device)[0]
+            except Exception:
+                continue
+            kps = self._try_keypoints(res)
+            if kps is None or len(kps) == 0:
+                continue
+            best_i = 0
+            try:
+                boxes = getattr(res, "boxes", None)
+                if boxes is not None:
+                    xywh = getattr(boxes, "xywh", None)
+                    confs = getattr(boxes, "conf", None)
+                    if xywh is not None:
+                        centers = xywh
+                        if hasattr(centers, "detach"):
+                            centers = centers.detach()
+                        if hasattr(centers, "cpu"):
+                            centers = centers.cpu()
+                        centers = np.asarray(centers)
+                        if centers.ndim == 1:
+                            centers = centers.reshape(1, -1)
+                        if centers.size >= 2 and centers.shape[-1] >= 2:
+                            centers = centers.reshape(-1, centers.shape[-1])
+                            center_xy = centers[:, :2]
+                            cx, cy = img.shape[1] / 2.0, img.shape[0] / 2.0
+                            dist2 = (center_xy[:, 0] - cx) ** 2 + (center_xy[:, 1] - cy) ** 2
+                            if dist2.size:
+                                best_i = int(np.argmin(dist2))
+                            if confs is not None and dist2.size:
+                                conf_arr = confs
+                                if hasattr(conf_arr, "detach"):
+                                    conf_arr = conf_arr.detach()
+                                if hasattr(conf_arr, "cpu"):
+                                    conf_arr = conf_arr.cpu()
+                                conf_arr = np.asarray(conf_arr).reshape(-1)
+                                if conf_arr.size:
+                                    diag = math.hypot(img.shape[1], img.shape[0])
+                                    dist_norm = np.sqrt(dist2[: conf_arr.size])
+                                    if diag > 0:
+                                        dist_norm = dist_norm / diag
+                                    else:
+                                        dist_norm = np.zeros_like(dist_norm)
+                                    min_len = min(conf_arr.size, dist_norm.size)
+                                    if min_len > 0:
+                                        scores = 0.7 * conf_arr[:min_len] - 0.3 * dist_norm[:min_len]
+                                        idx = int(np.argmax(scores))
+                                        if 0 <= idx < len(kps):
+                                            best_i = idx
+                                        else:
+                                            best_i = max(0, min(len(kps) - 1, idx))
+            except Exception:
+                pass
+            pts5 = kps[best_i][:5, :2].astype(np.float32)
+            pts5[:, 0] = np.clip(pts5[:, 0], 0, img.shape[1] - 1)
+            pts5[:, 1] = np.clip(pts5[:, 1], 0, img.shape[0] - 1)
+            canon = self._canon_5pts(pts5)
+            if canon is None:
+                continue
+            chip = self._align_by_5pts(img, canon)
+            if chip is not None:
+                return chip
+        return None
+
     def _upright_by_eye_roll(self, bgr: np.ndarray, pts5: np.ndarray) -> np.ndarray:
         if bgr is None or bgr.size == 0:
             return bgr
@@ -591,7 +667,13 @@ class FaceEmbedder:
                     pts[:, 1] -= float(y1)
                     chip = self._upright_by_eye_roll(face_bgr, pts)
             else:
-                chip = cv2.resize(face_bgr, (112, 112), interpolation=cv2.INTER_LINEAR) if self.use_arcface else face_bgr
+                # No landmarks: try re-detecting on ±90° rotated crops, then fall back.
+                chip = None
+                if self.use_arcface:
+                    chip = self._redetect_align_on_rotations(face_bgr)
+                if chip is None:
+                    interp = cv2.INTER_AREA if max(face_bgr.shape[:2]) > 112 else cv2.INTER_LINEAR
+                    chip = cv2.resize(face_bgr, (112, 112), interpolation=interp)
             faces.append((x1,y1,x2,y2, chip, self._face_quality(chip)))
             crops.append(chip)
 
