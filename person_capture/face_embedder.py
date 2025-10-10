@@ -150,6 +150,7 @@ class FaceEmbedder:
                 "Heavy dependencies not installed; install requirements.txt to run face embedding."
             ) from e
 
+        self.progress = progress
         self._torch = _torch
         self.det = _YOLO(yolo_path)
         self.use_arcface = bool(use_arcface)
@@ -447,8 +448,88 @@ class FaceEmbedder:
         if M is None:
             M, _ = cv2.estimateAffinePartial2D(pts5[:3], self._ARC_DST[:3], method=cv2.LMEDS)
         if M is None:
-            return cv2.resize(bgr, (112,112), interpolation=cv2.INTER_LINEAR)
+            h, w = bgr.shape[:2]
+            interp = cv2.INTER_AREA if max(h, w) > 112 else cv2.INTER_LINEAR
+            return cv2.resize(bgr, (112, 112), interpolation=interp)
         return cv2.warpAffine(bgr, M, (112,112), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+
+    def _upright_by_eye_roll(self, bgr: np.ndarray, pts5: np.ndarray) -> np.ndarray:
+        if bgr is None or bgr.size == 0:
+            return bgr
+
+        h, w = bgr.shape[:2]
+        if h == 0 or w == 0:
+            return bgr
+
+        def _resize_for_arc(img: np.ndarray) -> np.ndarray:
+            ih, iw = img.shape[:2]
+            interp = cv2.INTER_AREA if max(ih, iw) > 112 else cv2.INTER_LINEAR
+            return cv2.resize(img, (112, 112), interpolation=interp)
+
+        pts = np.asarray(pts5, dtype=np.float32)
+        if pts.ndim != 2 or pts.shape[0] < 5 or pts.shape[1] < 2:
+            return _resize_for_arc(bgr)
+
+        if not np.isfinite(pts[:5, :2]).all():
+            return _resize_for_arc(bgr)
+
+        coords = pts[:5, :2].copy()
+        if not np.isfinite(coords).all():
+            return _resize_for_arc(bgr)
+
+        coords[:, 0] = np.clip(coords[:, 0], 0.0, max(0, w - 1))
+        coords[:, 1] = np.clip(coords[:, 1], 0.0, max(0, h - 1))
+
+        eye_vec = coords[1] - coords[0]
+        if float(np.hypot(eye_vec[0], eye_vec[1])) >= 1e-3:
+            vec = eye_vec
+        else:
+            mouth_vec = coords[4] - coords[3]
+            if float(np.hypot(mouth_vec[0], mouth_vec[1])) >= 1e-3:
+                vec = mouth_vec
+            else:
+                return _resize_for_arc(bgr)
+
+        if float(np.hypot(vec[0], vec[1])) < 1e-3:
+            return _resize_for_arc(bgr)
+
+        angle = math.degrees(math.atan2(float(vec[1]), float(vec[0])))
+        if angle < -90.0:
+            angle += 180.0
+        elif angle > 90.0:
+            angle -= 180.0
+
+        if abs(angle) < 8.0:
+            return _resize_for_arc(bgr)
+        if angle > 80.0:
+            angle = 90.0
+        elif angle < -80.0:
+            angle = -90.0
+
+        best_side = max(h, w)
+        scale = 1.0 if best_side <= 256 else 256.0 / float(best_side)
+        center = (w / 2.0, h / 2.0)
+        if hasattr(self, "progress") and callable(self.progress):
+            self.progress(f"roll-fallback: angle={angle:.1f}°, scale={scale:.3f}")
+        M = cv2.getRotationMatrix2D(center, -angle, scale)
+        rotated = cv2.warpAffine(
+            bgr,
+            M,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT,
+        )
+        pts_h = np.hstack([pts[:5, :2], np.ones((5, 1), dtype=np.float32)])
+        pts_rot = (M @ pts_h.T).T.astype(np.float32)
+
+        canon = self._canon_5pts(pts_rot)
+        if canon is not None:
+            return self._align_by_5pts(rotated, canon.astype(np.float32))
+
+        # fallback if still not canonical
+        ih, iw = rotated.shape[:2]
+        interp = cv2.INTER_AREA if max(ih, iw) > 112 else cv2.INTER_LINEAR
+        return cv2.resize(rotated, (112, 112), interpolation=interp)
 
     def _clip_encode(self, bgr_list):
         if not bgr_list:
@@ -505,7 +586,10 @@ class FaceEmbedder:
                     pts[:, 1] = np.clip(pts[:, 1], 0.0, max(0, face_bgr.shape[0] - 1))
                     chip = self._align_by_5pts(face_bgr, pts)
                 else:
-                    chip = cv2.resize(face_bgr, (112, 112), interpolation=cv2.INTER_LINEAR)
+                    pts = pts[:5].copy()
+                    pts[:, 0] -= float(x1)
+                    pts[:, 1] -= float(y1)
+                    chip = self._upright_by_eye_roll(face_bgr, pts)
             else:
                 chip = cv2.resize(face_bgr, (112, 112), interpolation=cv2.INTER_LINEAR) if self.use_arcface else face_bgr
             faces.append((x1,y1,x2,y2, chip, self._face_quality(chip)))
