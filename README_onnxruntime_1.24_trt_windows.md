@@ -8,7 +8,7 @@
 
 ## Quick start
 
-1. **Activate your venv** (named `env`):
+1. **Activate your venv** (`env`):
    ```bat
    cd /d C:\Users\marre\source\repos\person_capture
    call env\Scripts\activate
@@ -20,10 +20,10 @@
    pip install -U <path-to-wheel>\onnxruntime*.whl
    ```
 
-3. **Point the app to TensorRT 10.13.3.9:**
-   - Download and extract TensorRT 10.13.3.9 (see section below).
-   - In **PersonCapture** GUI: **Settings → Backends → TensorRT folder** → select your extracted folder, e.g. `D:\tensorrt\TensorRT-10.13.3.9`.
-   - The app will use that folder to locate `nvinfer*.dll` at runtime.
+3. **Tell the app where TensorRT is:**
+   - **Preferred:** Download the NVIDIA ZIP for **TensorRT 10.13.3.9**, extract to e.g. `D:\tensorrt\TensorRT-10.13.3.9`, then in **PersonCapture** GUI set **Settings → Backends → TensorRT folder** to that path.
+   - **Alternative:** Install NVIDIA’s **pip wheel** for TensorRT and point the GUI to your venv’s `...\Lib\site-packages\tensorrt\lib` folder.
+   - **Note:** The pip-wheel route is **untested by the author**. In all cases, keep TensorRT **exactly** at **10.13.3.9** to match the ORT build.
 
 4. **Run the app:**
    ```bat
@@ -43,13 +43,13 @@
 ## Versions
 
 - **ORT:** `1.24.0` (development snapshot)
-- **TensorRT:** `10.13.3.9`
+- **TensorRT:** `10.13.3.9` (pin this exact version)
 - **CUDA Toolkit:** `12.8`
 - **cuDNN:** `9.x` for CUDA 12.x
 - **Python:** `3.12`
 - **OS:** Windows 10/11 x64
 
-> Note: ABI and behavior may change before an official `v1.24.0` tag. Pin commit SHA if rebuilding.
+> ABI and behavior may change before an official `v1.24.0` tag. Pin commit SHA if rebuilding.
 
 ---
 
@@ -58,7 +58,6 @@
 ```bat
 python -c "import onnxruntime as ort; print('ORT', ort.__version__); print('providers', ort.get_available_providers())"
 ```
-
 Expected:
 ```
 ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
@@ -71,15 +70,18 @@ python -c "import onnxruntime.capi._pybind_state as C; print(C.get_build_info())
 
 ---
 
-## Get TensorRT 10.13.3.9 (Windows)
+## TensorRT sources
 
-1. Create or sign in to an NVIDIA Developer account.
-2. Open: https://developer.nvidia.com/tensorrt/download/10x
-3. Download **TensorRT 10.13.3.9** for **Windows x86_64** (CUDA 12.8 build).
-4. **Extract the ZIP** to a fixed path, e.g. `D:\tensorrt\TensorRT-10.13.3.9`.
-5. In **PersonCapture** GUI set **Settings → Backends → TensorRT folder** to that path. Done.
+**A) NVIDIA ZIP (recommended, tested)**  
+1) Create/sign in to an NVIDIA Developer account.  
+2) https://developer.nvidia.com/tensorrt/download/10x → download **TensorRT 10.13.3.9** for **Windows x86_64** (CUDA 12.8).  
+3) Extract to e.g. `D:\tensorrt\TensorRT-10.13.3.9`.  
+4) In **PersonCapture** GUI set **TensorRT folder** to that path.
 
-> You do **not** need to run shell commands for PATH if you point the GUI to the folder.
+**B) NVIDIA pip wheel (optional, untested by author)**  
+- Install TensorRT from pip.  
+- In **PersonCapture** GUI set **TensorRT folder** to your venv’s `...\Lib\site-packages\tensorrt\lib`.  
+- Ensure the installed wheel version is **10.13.3.9**, to match this ORT build.
 
 ---
 
@@ -121,6 +123,6 @@ dir build\Windows\Release\dist
 
 ## Troubleshooting
 
-- **`nvinfer.dll not found`**: Ensure the GUI’s **TensorRT folder** points to the extracted directory containing `lib\nvinfer*.dll`.
-- **`no available providers`**: Verify CUDA driver is up to date and Python is 3.12. Reinstall the wheel in a clean venv.
+- **`nvinfer.dll not found`**: In the GUI, set **TensorRT folder** to the directory containing `lib\nvinfer*.dll`.
+- **`no available providers`**: Update NVIDIA driver and use Python 3.12. Reinstall the wheel in a clean venv.
 - **Crashes on load**: Version mismatch between CUDA/cuDNN/TRT. Align to the versions listed above.
