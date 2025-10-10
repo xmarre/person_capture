@@ -194,8 +194,13 @@ class Processor(QtCore.QObject):
         active = False
         start = 0
         neg_run = 0
+        total_samples = max(1, (total_frames + stride - 1) // stride)
+        progress_step = max(1, total_samples // 50)
+        next_progress_sample = 0
+        preview_step = max(stride, int(getattr(cfg, "preview_every", 30)))
+        last_preview_idx = -preview_step
         # fast pass
-        for idx in range(0, total_frames, stride):
+        for sample_idx, idx in enumerate(range(0, total_frames, stride)):
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ok, frame = cap.read()
             if not ok or frame is None:
@@ -213,11 +218,28 @@ class Processor(QtCore.QObject):
                 d = 1.0 - float(np.dot(f["feat"], ref_feat))
                 if d < best:
                     best = d
+            if sample_idx >= next_progress_sample:
+                pct = min(100.0, (idx + stride) / max(1.0, float(total_frames)) * 100.0)
+                self._status(
+                    f"Pre-scan {pct:.1f}% ({idx}/{total_frames})",
+                    key="prescan_progress",
+                    interval=0.25,
+                )
+                try:
+                    self.progress.emit(int(min(idx, max(total_frames - 1, 0))))
+                except Exception:
+                    pass
+                next_progress_sample = sample_idx + progress_step
+            emit_preview = False
+            if idx - last_preview_idx >= preview_step:
+                emit_preview = True
+                last_preview_idx = idx
             if best <= enter:
                 if not active:
                     active = True
                     start = idx
                 neg_run = 0
+                emit_preview = True
             else:
                 if active:
                     neg_run += 1
@@ -233,6 +255,23 @@ class Processor(QtCore.QObject):
                                 spans.append((s, e))
                         active = False
                         neg_run = 0
+            if emit_preview:
+                try:
+                    vis = frame.copy()
+                    color = (0, 200, 0) if best <= enter else (0, 0, 200)
+                    cv2.putText(
+                        vis,
+                        f"Pre-scan fd={best:.2f} f={idx}",
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.75,
+                        color,
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    self.preview.emit(self._cv_bgr_to_qimage(vis))
+                except Exception:
+                    pass
         if active:
             s = max(0, start - pad)
             e = total_frames - 1
@@ -257,6 +296,15 @@ class Processor(QtCore.QObject):
         # restore
         face.conf = old_face_conf
         cap.set(cv2.CAP_PROP_POS_FRAMES, pos0)
+        try:
+            self.progress.emit(max(0, total_frames - 1))
+        except Exception:
+            pass
+        self._status(
+            f"Pre-scan 100% ({total_frames}/{total_frames}) • segments={len(spans)}",
+            key="prescan_progress",
+            interval=0.1,
+        )
         return spans
 
     @staticmethod
@@ -795,6 +843,11 @@ class Processor(QtCore.QObject):
             self._total_frames = int(total_frames)
             keep_spans = []
             span_i = 0
+            self.setup.emit(total_frames, float(fps))
+            try:
+                self.progress.emit(0)
+            except Exception:
+                pass
             if bool(getattr(cfg, "prescan_enable", True)) and total_frames > 0:
                 self._status("Pre-scan...", key="phase", interval=2.0)
                 keep_spans = self._prescan(cap, int(round(fps)), total_frames, face, ref_face_feat, cfg)
@@ -808,8 +861,6 @@ class Processor(QtCore.QObject):
             else:
                 keep_spans = []
                 span_i = 0
-            self.setup.emit(total_frames, float(fps))
-
             ratios = [r.strip() for r in str(cfg.ratio).split(',') if r.strip()]
             if not ratios:
                 ratios = ["2:3"]
