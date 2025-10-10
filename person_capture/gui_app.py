@@ -180,6 +180,11 @@ class SessionConfig:
     prescan_min_segment_sec: float = 1.0
     prescan_pad_sec: float = 2.0
     prescan_bridge_gap_sec: float = 1.0    # merge spans separated by short gaps
+    # --- pre-scan bank management ---
+    prescan_bank_max: int = 64                 # target size
+    prescan_diversity_dedup_cos: float = 0.968 # ≥ skip as duplicate
+    prescan_replace_margin: float = 0.010      # new score must beat worst by this
+    prescan_weights: Tuple[float, float, float] = (0.70, 0.25, 0.05)  # (anchor, diversity, quality)
     # --- runtime paths ---
     trt_lib_dir: str = ""                  # preferred TensorRT lib directory
 
@@ -227,6 +232,83 @@ class Processor(QtCore.QObject):
             return 9.0
         return 1.0 - float(np.max(sims))
 
+    @staticmethod
+    def _prescan_weights(cfg) -> Tuple[float, float, float]:
+        weights = getattr(cfg, "prescan_weights", (0.70, 0.25, 0.05))
+        if not isinstance(weights, (list, tuple)) or len(weights) < 3:
+            return 0.70, 0.25, 0.05
+        try:
+            wa, wd, wq = (float(weights[0]), float(weights[1]), float(weights[2]))
+        except Exception:
+            return 0.70, 0.25, 0.05
+        return wa, wd, wq
+
+    def _stream_ref_bank_update(
+        self,
+        ref_bank_list: List[np.ndarray],
+        ref_face_feat: Optional[np.ndarray],
+        vec_new: Optional[np.ndarray],
+        quality_val: float,
+        cfg: SessionConfig,
+    ) -> Tuple[Optional[np.ndarray], str, Optional[int]]:
+        if vec_new is None:
+            return ref_face_feat, "skip", None
+        try:
+            cap = max(1, int(getattr(cfg, "prescan_bank_max", 64)))
+        except Exception:
+            cap = 64
+        try:
+            dedup_cos = float(getattr(cfg, "prescan_diversity_dedup_cos", 0.968))
+        except Exception:
+            dedup_cos = 0.968
+        try:
+            rep_margin = float(getattr(cfg, "prescan_replace_margin", 0.010))
+        except Exception:
+            rep_margin = 0.010
+        w_anchor, w_div, w_q = self._prescan_weights(cfg)
+        v = np.asarray(vec_new, dtype=np.float32).reshape(-1)
+        norm = float(np.linalg.norm(v))
+        if norm <= 1e-6:
+            return ref_face_feat, "skip", None
+        v = v / norm
+        if ref_face_feat is not None:
+            bank = np.asarray(ref_face_feat, dtype=np.float32)
+        else:
+            bank = np.asarray(ref_bank_list, dtype=np.float32)
+        if bank.ndim == 1:
+            bank = bank.reshape(1, -1)
+        if bank.size == 0:
+            ref_bank_list.append(v)
+            ref_face_feat = np.vstack(ref_bank_list).astype(np.float32)
+            return ref_face_feat, "added", None
+        sims = bank @ v
+        if sims.size > 0 and float(sims.max()) >= dedup_cos:
+            return ref_face_feat, "dup", None
+        anchor = bank[0]
+        cos_anchor = float(np.dot(anchor, v))
+        cos_anchor = max(-1.0, min(1.0, cos_anchor))
+        fd_anchor = float(np.sqrt(max(0.0, 2.0 - 2.0 * cos_anchor)))
+        nn_sim = float(sims.max()) if sims.size else 0.0
+        q_term = float(min(max(quality_val or 0.0, 0.0), 1000.0) / 300.0)
+        s_new = w_anchor * (1.0 - fd_anchor) + w_div * (1.0 - nn_sim) + w_q * q_term
+        if len(ref_bank_list) < cap:
+            ref_bank_list.append(v)
+            ref_face_feat = np.vstack(ref_bank_list).astype(np.float32)
+            return ref_face_feat, "added", None
+        bank_sims = bank @ bank.T
+        np.fill_diagonal(bank_sims, -1.0)
+        nn_sim_each = bank_sims.max(axis=1)
+        cos_anchor_each = bank @ anchor
+        cos_anchor_each = np.clip(cos_anchor_each, -1.0, 1.0)
+        fd_anchor_each = np.sqrt(np.maximum(0.0, 2.0 - 2.0 * cos_anchor_each))
+        s_bank = w_anchor * (1.0 - fd_anchor_each) + w_div * (1.0 - nn_sim_each)
+        worst_idx = int(np.argmin(s_bank))
+        if s_new > float(s_bank[worst_idx]) + rep_margin:
+            ref_bank_list[worst_idx] = v
+            ref_face_feat = np.vstack(ref_bank_list).astype(np.float32)
+            return ref_face_feat, "replaced", worst_idx
+        return ref_face_feat, "skip", None
+
     def _span_index_for(self, f, spans):
         # return index of span containing f, else next span index
         for i, (s, e) in enumerate(spans):
@@ -266,10 +348,6 @@ class Processor(QtCore.QObject):
         fd_add = float(getattr(cfg, "prescan_fd_add", enter))
         old_face_conf = getattr(face, "conf", 0.15)
         face.conf = float(cfg.prescan_face_conf)
-        bank_dedup_cos = 0.968
-        bank_max = 64
-        effective_bank_max = max(bank_max, initial_bank_len + 8)
-        learned_cap = max(0, effective_bank_max - initial_bank_len)
         add_cooldown_samples = int(
             getattr(
                 cfg,
@@ -388,32 +466,31 @@ class Processor(QtCore.QObject):
                     and f.get("quality", 1e9) >= cfg.face_quality_min
                 ):
                     try:
-                        vec = _np.asarray(feat, dtype=_np.float32).reshape(-1)
-                        n = float(_np.linalg.norm(vec))
-                        if n > 1e-6:
-                            vec = vec / n
-                            add_vec = True
-                            if ref_feat_local is not None:
-                                bank_arr = _np.asarray(ref_feat_local, dtype=_np.float32)
-                                if bank_arr.ndim == 1:
-                                    bank_arr = bank_arr.reshape(1, -1)
-                                sims = bank_arr @ vec
-                                if sims.size > 0 and float(sims.max()) >= bank_dedup_cos:
-                                    add_vec = False
-                            if add_vec:
-                                ref_bank_list.append(vec)
-                                added_vecs += 1
-                                if (len(ref_bank_list) - initial_bank_len) > learned_cap:
-                                    ref_bank_list.pop(initial_bank_len)
-                                last_add_sample = sample_idx
-                                ref_feat_local = _np.vstack(ref_bank_list).astype(_np.float32)
-                                self._status(
-                                    f"Pre-scan ref bank +1 (size={len(ref_bank_list)}) fd={fd:.3f}",
-                                    key="prescan_bank",
-                                    interval=2.0,
-                                )
+                        quality_val = float(f.get("quality", 0.0))
                     except Exception:
-                        pass
+                        quality_val = 0.0
+                    ref_feat_local, action, idx_info = self._stream_ref_bank_update(
+                        ref_bank_list,
+                        ref_feat_local,
+                        feat,
+                        quality_val,
+                        cfg,
+                    )
+                    if action in {"added", "replaced"}:
+                        last_add_sample = sample_idx
+                        if action == "added":
+                            added_vecs += 1
+                            self._status(
+                                f"Pre-scan ref bank +1 (size={len(ref_bank_list)}) fd={fd:.3f}",
+                                key="prescan_bank",
+                                interval=2.0,
+                            )
+                        elif action == "replaced":
+                            self._status(
+                                f"Pre-scan replaced #{idx_info} with better ref (score↑)",
+                                key="prescan_bank",
+                                interval=2.0,
+                            )
             if sample_idx >= next_progress_sample:
                 pct = min(100.0, (idx + stride) / max(1.0, float(total_frames)) * 100.0)
                 self._status(
@@ -986,7 +1063,7 @@ class Processor(QtCore.QObject):
             self._status("Preparing reference features...", key="phase", interval=5.0)
             ref_bank_list: List[np.ndarray] = []
             ref_img_primary = None
-            bank_dedup_cos = 0.95
+            ref_face_feat_initial = np.vstack(ref_bank_list).astype(np.float32) if ref_bank_list else None
             for rp in ref_paths_existing:
                 img = cv2.imread(rp, cv2.IMREAD_COLOR)
                 if img is None:
@@ -1006,19 +1083,17 @@ class Processor(QtCore.QObject):
                     faces = face.extract(aug)
                     bf = FaceEmbedder.best_face(faces)
                     if bf and bf.get("feat") is not None:
-                        feat_vec = np.asarray(bf["feat"], dtype=np.float32).reshape(-1)
-                        norm = float(np.linalg.norm(feat_vec))
-                        if norm <= 1e-6:
-                            continue
-                        feat_vec = feat_vec / norm
-                        add_vec = True
-                        if ref_bank_list:
-                            bank_arr = np.asarray(ref_bank_list, dtype=np.float32)
-                            sims = bank_arr @ feat_vec
-                            if sims.size > 0 and float(np.max(sims)) >= bank_dedup_cos:
-                                add_vec = False
-                        if add_vec:
-                            ref_bank_list.append(feat_vec)
+                        try:
+                            quality_val = float(bf.get("quality", 0.0))
+                        except Exception:
+                            quality_val = 0.0
+                        ref_face_feat_initial, _, _ = self._stream_ref_bank_update(
+                            ref_bank_list,
+                            ref_face_feat_initial,
+                            bf["feat"],
+                            quality_val,
+                            cfg,
+                        )
 
             if ref_img_primary is None:
                 raise RuntimeError("Cannot read reference image(s)")
@@ -1052,9 +1127,6 @@ class Processor(QtCore.QObject):
                 bank_fd_thresh = 0.38
             else:
                 bank_fd_thresh = min(0.38, bank_fd_thresh)
-            bank_dedup_cos = 0.95
-            bank_max = 64
-
             ref_reid_feat = None
             if reid is not None:
                 ref_persons = det.detect(ref_img_primary, conf=0.1)
@@ -1655,26 +1727,28 @@ class Processor(QtCore.QObject):
                                 and quality_ok
                                 and cooldown_ok
                             ):
-                                vec_new = np.asarray(face_feat_curr, dtype=np.float32).reshape(-1)
-                                norm = float(np.linalg.norm(vec_new))
-                                if norm > 1e-6:
-                                    vec_new = vec_new / norm
-                                    add_vec = True
-                                    if ref_face_feat is not None:
-                                        bank_arr = np.asarray(ref_face_feat, dtype=np.float32)
-                                        if bank_arr.ndim == 1:
-                                            bank_arr = bank_arr.reshape(1, -1)
-                                        sims = bank_arr @ vec_new
-                                        if sims.size > 0 and float(sims.max()) >= bank_dedup_cos:
-                                            add_vec = False
-                                    if add_vec:
-                                        ref_bank_list.append(vec_new)
-                                        if len(ref_bank_list) > bank_max:
-                                            ref_bank_list.pop(0)
-                                        ref_face_feat = np.vstack(ref_bank_list).astype(np.float32)
-                                        self._runtime_last_bank_add_idx = idx
+                                try:
+                                    quality_val_f = float(quality_val) if quality_val is not None else 0.0
+                                except Exception:
+                                    quality_val_f = 0.0
+                                ref_face_feat, action, idx_info = self._stream_ref_bank_update(
+                                    ref_bank_list,
+                                    ref_face_feat,
+                                    face_feat_curr,
+                                    quality_val_f,
+                                    cfg,
+                                )
+                                if action in {"added", "replaced"}:
+                                    self._runtime_last_bank_add_idx = idx
+                                    if action == "added":
                                         self._status(
                                             f"Ref bank +1 (size={len(ref_bank_list)}) fd={fd_val_f:.3f}",
+                                            key="ref_bank",
+                                            interval=5.0,
+                                        )
+                                    else:
+                                        self._status(
+                                            f"Ref bank replaced #{idx_info} with better ref (score↑)",
                                             key="ref_bank",
                                             interval=5.0,
                                         )
@@ -2263,9 +2337,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # Pre-scan controls
         self.chk_prescan = QtWidgets.QCheckBox("Enable pre-scan")
         self.chk_prescan.setChecked(bool(self.cfg.prescan_enable))
+        self.chk_prescan.setToolTip("bool: prescan_enable")
+        self.chk_prescan.toggled.connect(self._on_ui_change)
         self.spin_prescan_stride = QtWidgets.QSpinBox()
-        self.spin_prescan_stride.setRange(1, 60)
+        self.spin_prescan_stride.setRange(1, 600)
         self.spin_prescan_stride.setValue(int(self.cfg.prescan_stride))
+        self.spin_prescan_stride.setToolTip("int: prescan_stride")
+        self.spin_prescan_stride.valueChanged.connect(self._on_ui_change)
         self.spin_prescan_fd_add = QtWidgets.QDoubleSpinBox()
         self.spin_prescan_fd_add.setDecimals(3)
         self.spin_prescan_fd_add.setRange(0.0, 2.0)
@@ -2273,6 +2351,77 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_prescan_fd_add.setValue(float(self.cfg.prescan_fd_add))
         self.spin_prescan_fd_add.setToolTip("float: prescan_fd_add")
         self.spin_prescan_fd_add.valueChanged.connect(self._on_ui_change)
+        self.spin_prescan_max_width = QtWidgets.QSpinBox()
+        self.spin_prescan_max_width.setRange(64, 8192)
+        self.spin_prescan_max_width.setValue(int(self.cfg.prescan_max_width))
+        self.spin_prescan_max_width.setToolTip("int: prescan_max_width")
+        self.spin_prescan_max_width.valueChanged.connect(self._on_ui_change)
+        self.spin_prescan_face_conf = QtWidgets.QDoubleSpinBox()
+        self.spin_prescan_face_conf.setDecimals(3)
+        self.spin_prescan_face_conf.setRange(0.0, 1.0)
+        self.spin_prescan_face_conf.setSingleStep(0.01)
+        self.spin_prescan_face_conf.setValue(float(self.cfg.prescan_face_conf))
+        self.spin_prescan_face_conf.setToolTip("float: prescan_face_conf")
+        self.spin_prescan_face_conf.valueChanged.connect(self._on_ui_change)
+        self.spin_prescan_fd_enter = QtWidgets.QDoubleSpinBox()
+        self.spin_prescan_fd_enter.setDecimals(3)
+        self.spin_prescan_fd_enter.setRange(0.0, 2.0)
+        self.spin_prescan_fd_enter.setSingleStep(0.01)
+        self.spin_prescan_fd_enter.setValue(float(self.cfg.prescan_fd_enter))
+        self.spin_prescan_fd_enter.setToolTip("float: prescan_fd_enter")
+        self.spin_prescan_fd_enter.valueChanged.connect(self._on_ui_change)
+        self.spin_prescan_fd_exit = QtWidgets.QDoubleSpinBox()
+        self.spin_prescan_fd_exit.setDecimals(3)
+        self.spin_prescan_fd_exit.setRange(0.0, 2.0)
+        self.spin_prescan_fd_exit.setSingleStep(0.01)
+        self.spin_prescan_fd_exit.setValue(float(self.cfg.prescan_fd_exit))
+        self.spin_prescan_fd_exit.setToolTip("float: prescan_fd_exit")
+        self.spin_prescan_fd_exit.valueChanged.connect(self._on_ui_change)
+        self.spin_prescan_add_cooldown = QtWidgets.QSpinBox()
+        self.spin_prescan_add_cooldown.setRange(0, 100)
+        self.spin_prescan_add_cooldown.setValue(int(self.cfg.prescan_add_cooldown_samples))
+        self.spin_prescan_add_cooldown.setToolTip("int: prescan_add_cooldown_samples")
+        self.spin_prescan_add_cooldown.valueChanged.connect(self._on_ui_change)
+        self.spin_prescan_min_segment = QtWidgets.QDoubleSpinBox()
+        self.spin_prescan_min_segment.setDecimals(2)
+        self.spin_prescan_min_segment.setRange(0.0, 120.0)
+        self.spin_prescan_min_segment.setSingleStep(0.1)
+        self.spin_prescan_min_segment.setValue(float(self.cfg.prescan_min_segment_sec))
+        self.spin_prescan_min_segment.setToolTip("float: prescan_min_segment_sec")
+        self.spin_prescan_min_segment.valueChanged.connect(self._on_ui_change)
+        self.spin_prescan_pad = QtWidgets.QDoubleSpinBox()
+        self.spin_prescan_pad.setDecimals(2)
+        self.spin_prescan_pad.setRange(0.0, 120.0)
+        self.spin_prescan_pad.setSingleStep(0.1)
+        self.spin_prescan_pad.setValue(float(self.cfg.prescan_pad_sec))
+        self.spin_prescan_pad.setToolTip("float: prescan_pad_sec")
+        self.spin_prescan_pad.valueChanged.connect(self._on_ui_change)
+        self.spin_prescan_bridge = QtWidgets.QDoubleSpinBox()
+        self.spin_prescan_bridge.setDecimals(2)
+        self.spin_prescan_bridge.setRange(0.0, 120.0)
+        self.spin_prescan_bridge.setSingleStep(0.1)
+        self.spin_prescan_bridge.setValue(float(self.cfg.prescan_bridge_gap_sec))
+        self.spin_prescan_bridge.setToolTip("float: prescan_bridge_gap_sec")
+        self.spin_prescan_bridge.valueChanged.connect(self._on_ui_change)
+        self.spin_prescan_bank_max = QtWidgets.QSpinBox()
+        self.spin_prescan_bank_max.setRange(8, 4096)
+        self.spin_prescan_bank_max.setValue(int(self.cfg.prescan_bank_max))
+        self.spin_prescan_bank_max.setToolTip("int: prescan_bank_max")
+        self.spin_prescan_bank_max.valueChanged.connect(self._on_ui_change)
+        self.spin_prescan_dedup = QtWidgets.QDoubleSpinBox()
+        self.spin_prescan_dedup.setDecimals(3)
+        self.spin_prescan_dedup.setRange(0.5, 1.0)
+        self.spin_prescan_dedup.setSingleStep(0.001)
+        self.spin_prescan_dedup.setValue(float(self.cfg.prescan_diversity_dedup_cos))
+        self.spin_prescan_dedup.setToolTip("float: prescan_diversity_dedup_cos")
+        self.spin_prescan_dedup.valueChanged.connect(self._on_ui_change)
+        self.spin_prescan_margin = QtWidgets.QDoubleSpinBox()
+        self.spin_prescan_margin.setDecimals(3)
+        self.spin_prescan_margin.setRange(0.0, 0.1)
+        self.spin_prescan_margin.setSingleStep(0.001)
+        self.spin_prescan_margin.setValue(float(self.cfg.prescan_replace_margin))
+        self.spin_prescan_margin.setToolTip("float: prescan_replace_margin")
+        self.spin_prescan_margin.valueChanged.connect(self._on_ui_change)
         # TensorRT path controls
         self.trt_edit = QtWidgets.QLineEdit(self.cfg.trt_lib_dir or r"D:\\tensorrt\\TensorRT-10.13.3.9")
         self.trt_btn = QtWidgets.QPushButton("Browse…")
@@ -2385,6 +2534,17 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Enable pre-scan", self.chk_prescan),
             ("Pre-scan stride (frames)", self.spin_prescan_stride),
             ("Pre-scan bank add dist ≤", self.spin_prescan_fd_add),
+            ("Pre-scan max width (px)", self.spin_prescan_max_width),
+            ("Pre-scan face det conf", self.spin_prescan_face_conf),
+            ("Pre-scan ENTER dist ≤", self.spin_prescan_fd_enter),
+            ("Pre-scan EXIT dist ≥", self.spin_prescan_fd_exit),
+            ("Pre-scan add cooldown (samples)", self.spin_prescan_add_cooldown),
+            ("Pre-scan min segment sec", self.spin_prescan_min_segment),
+            ("Pre-scan pad sec", self.spin_prescan_pad),
+            ("Pre-scan bridge gap sec", self.spin_prescan_bridge),
+            ("Pre-scan bank max", self.spin_prescan_bank_max),
+            ("Pre-scan dedup cos ≥", self.spin_prescan_dedup),
+            ("Pre-scan replace margin", self.spin_prescan_margin),
             ("TensorRT lib dir", self._trt_row_widget),
             ("Min sharpness", self.min_sharp_spin),
             ("Min seconds between hits", self.min_gap_spin),
@@ -3040,6 +3200,22 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._worker:
             return
         new = self._collect_cfg()
+        prescan_live = {
+            "prescan_enable",
+            "prescan_stride",
+            "prescan_max_width",
+            "prescan_face_conf",
+            "prescan_fd_enter",
+            "prescan_fd_add",
+            "prescan_fd_exit",
+            "prescan_add_cooldown_samples",
+            "prescan_min_segment_sec",
+            "prescan_pad_sec",
+            "prescan_bridge_gap_sec",
+            "prescan_bank_max",
+            "prescan_diversity_dedup_cos",
+            "prescan_replace_margin",
+        }
         live = {
             "frame_stride",
             "min_det_conf",
@@ -3090,7 +3266,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "face_det_pad",
         }
         delta = {}
-        for k in live:
+        for k in prescan_live | live:
             if hasattr(self._worker.cfg, k) and hasattr(new, k):
                 ov = getattr(self._worker.cfg, k)
                 nv = getattr(new, k)
@@ -3120,6 +3296,17 @@ class MainWindow(QtWidgets.QMainWindow):
             prescan_enable=bool(self.chk_prescan.isChecked()) if hasattr(self, "chk_prescan") else True,
             prescan_stride=int(self.spin_prescan_stride.value()) if hasattr(self, "spin_prescan_stride") else 16,
             prescan_fd_add=float(self.spin_prescan_fd_add.value()) if hasattr(self, "spin_prescan_fd_add") else 0.22,
+            prescan_max_width=int(self.spin_prescan_max_width.value()) if hasattr(self, "spin_prescan_max_width") else 416,
+            prescan_face_conf=float(self.spin_prescan_face_conf.value()) if hasattr(self, "spin_prescan_face_conf") else 0.25,
+            prescan_fd_enter=float(self.spin_prescan_fd_enter.value()) if hasattr(self, "spin_prescan_fd_enter") else 0.45,
+            prescan_fd_exit=float(self.spin_prescan_fd_exit.value()) if hasattr(self, "spin_prescan_fd_exit") else 0.52,
+            prescan_add_cooldown_samples=int(self.spin_prescan_add_cooldown.value()) if hasattr(self, "spin_prescan_add_cooldown") else 5,
+            prescan_min_segment_sec=float(self.spin_prescan_min_segment.value()) if hasattr(self, "spin_prescan_min_segment") else 1.0,
+            prescan_pad_sec=float(self.spin_prescan_pad.value()) if hasattr(self, "spin_prescan_pad") else 2.0,
+            prescan_bridge_gap_sec=float(self.spin_prescan_bridge.value()) if hasattr(self, "spin_prescan_bridge") else 1.0,
+            prescan_bank_max=int(self.spin_prescan_bank_max.value()) if hasattr(self, "spin_prescan_bank_max") else 64,
+            prescan_diversity_dedup_cos=float(self.spin_prescan_dedup.value()) if hasattr(self, "spin_prescan_dedup") else 0.968,
+            prescan_replace_margin=float(self.spin_prescan_margin.value()) if hasattr(self, "spin_prescan_margin") else 0.01,
             trt_lib_dir=self.trt_edit.text().strip() if hasattr(self, "trt_edit") else "",
             min_sharpness=float(self.min_sharp_spin.value()),
             min_gap_sec=float(self.min_gap_spin.value()),
@@ -3197,6 +3384,28 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spin_prescan_stride.setValue(int(cfg.prescan_stride))
         if hasattr(self, 'spin_prescan_fd_add'):
             self.spin_prescan_fd_add.setValue(float(cfg.prescan_fd_add))
+        if hasattr(self, 'spin_prescan_max_width'):
+            self.spin_prescan_max_width.setValue(int(cfg.prescan_max_width))
+        if hasattr(self, 'spin_prescan_face_conf'):
+            self.spin_prescan_face_conf.setValue(float(cfg.prescan_face_conf))
+        if hasattr(self, 'spin_prescan_fd_enter'):
+            self.spin_prescan_fd_enter.setValue(float(cfg.prescan_fd_enter))
+        if hasattr(self, 'spin_prescan_fd_exit'):
+            self.spin_prescan_fd_exit.setValue(float(cfg.prescan_fd_exit))
+        if hasattr(self, 'spin_prescan_add_cooldown'):
+            self.spin_prescan_add_cooldown.setValue(int(cfg.prescan_add_cooldown_samples))
+        if hasattr(self, 'spin_prescan_min_segment'):
+            self.spin_prescan_min_segment.setValue(float(cfg.prescan_min_segment_sec))
+        if hasattr(self, 'spin_prescan_pad'):
+            self.spin_prescan_pad.setValue(float(cfg.prescan_pad_sec))
+        if hasattr(self, 'spin_prescan_bridge'):
+            self.spin_prescan_bridge.setValue(float(cfg.prescan_bridge_gap_sec))
+        if hasattr(self, 'spin_prescan_bank_max'):
+            self.spin_prescan_bank_max.setValue(int(cfg.prescan_bank_max))
+        if hasattr(self, 'spin_prescan_dedup'):
+            self.spin_prescan_dedup.setValue(float(cfg.prescan_diversity_dedup_cos))
+        if hasattr(self, 'spin_prescan_margin'):
+            self.spin_prescan_margin.setValue(float(cfg.prescan_replace_margin))
         if hasattr(self, 'trt_edit'):
             self.trt_edit.setText(cfg.trt_lib_dir or r"D:\\tensorrt\\TensorRT-10.13.3.9")
         self.min_sharp_spin.setValue(cfg.min_sharpness)
@@ -3568,6 +3777,28 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spin_prescan_stride.setValue(int(s.value("prescan_stride", self.cfg.prescan_stride)))
         if hasattr(self, 'spin_prescan_fd_add'):
             self.spin_prescan_fd_add.setValue(float(s.value("prescan_fd_add", self.cfg.prescan_fd_add)))
+        if hasattr(self, 'spin_prescan_max_width'):
+            self.spin_prescan_max_width.setValue(int(s.value("prescan_max_width", self.cfg.prescan_max_width)))
+        if hasattr(self, 'spin_prescan_face_conf'):
+            self.spin_prescan_face_conf.setValue(float(s.value("prescan_face_conf", self.cfg.prescan_face_conf)))
+        if hasattr(self, 'spin_prescan_fd_enter'):
+            self.spin_prescan_fd_enter.setValue(float(s.value("prescan_fd_enter", self.cfg.prescan_fd_enter)))
+        if hasattr(self, 'spin_prescan_fd_exit'):
+            self.spin_prescan_fd_exit.setValue(float(s.value("prescan_fd_exit", self.cfg.prescan_fd_exit)))
+        if hasattr(self, 'spin_prescan_add_cooldown'):
+            self.spin_prescan_add_cooldown.setValue(int(s.value("prescan_add_cooldown_samples", self.cfg.prescan_add_cooldown_samples)))
+        if hasattr(self, 'spin_prescan_min_segment'):
+            self.spin_prescan_min_segment.setValue(float(s.value("prescan_min_segment_sec", self.cfg.prescan_min_segment_sec)))
+        if hasattr(self, 'spin_prescan_pad'):
+            self.spin_prescan_pad.setValue(float(s.value("prescan_pad_sec", self.cfg.prescan_pad_sec)))
+        if hasattr(self, 'spin_prescan_bridge'):
+            self.spin_prescan_bridge.setValue(float(s.value("prescan_bridge_gap_sec", self.cfg.prescan_bridge_gap_sec)))
+        if hasattr(self, 'spin_prescan_bank_max'):
+            self.spin_prescan_bank_max.setValue(int(s.value("prescan_bank_max", self.cfg.prescan_bank_max)))
+        if hasattr(self, 'spin_prescan_dedup'):
+            self.spin_prescan_dedup.setValue(float(s.value("prescan_diversity_dedup_cos", self.cfg.prescan_diversity_dedup_cos)))
+        if hasattr(self, 'spin_prescan_margin'):
+            self.spin_prescan_margin.setValue(float(s.value("prescan_replace_margin", self.cfg.prescan_replace_margin)))
         self.min_sharp_spin.setValue(float(s.value("min_sharpness", 0.0)))
         self.min_gap_spin.setValue(float(s.value("min_gap_sec", 1.5)))
         self.min_box_pix_spin.setValue(int(s.value("min_box_pixels", 5000)))
