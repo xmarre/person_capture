@@ -15,7 +15,7 @@ from __future__ import annotations
 import os, sys, math, csv, json, hashlib
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import cv2
@@ -224,11 +224,15 @@ class Item:
 # --------- curator ---------
 
 class Curator:
-    def __init__(self, ref_image: str, device: str="cuda", trt_lib_dir: Optional[str]=None):
+    def __init__(self, ref_image: str, device: str="cuda",
+                 trt_lib_dir: Optional[str]=None,
+                 progress: Optional[Callable[[str,int,int], None]]=None):
         self.device = device
+        self._progress = progress
         self.face = FaceEmbedder(ctx=device, use_arcface=True, progress=None, trt_lib_dir=trt_lib_dir)
         # CLIP used for diversity (background/pose). Reuse ReIDEmbedder for whole image embeddings.
         self.reid = ReIDEmbedder(device=device)
+
         # Build a small bank from the ref image
         ref_bgr = cv2.imread(ref_image, cv2.IMREAD_COLOR)
         assert ref_bgr is not None, f"Cannot read ref image: {ref_image}"
@@ -239,6 +243,12 @@ class Curator:
             # take top-1 quality face
             rbest = max(rfaces, key=lambda f: f.get("quality",0.0))
             self.ref_feat = rbest.get("feat")
+
+    def _emit_progress(self, phase: str, done: int, total: int, *, force: bool=False) -> None:
+        if self._progress is not None:
+            self._progress(phase, done, total)
+        elif force or total > 0:
+            print(f"[curator] {phase}: {done}/{total}")
 
     def _fd_min(self, feat: Optional[np.ndarray]) -> float:
         if feat is None or self.ref_feat is None:
@@ -535,17 +545,29 @@ class Curator:
 
     # ---- run end-to-end on a folder ----
 
-    def run(self, pool_dir: str, out_dir: str, max_images: int = 200, quotas: Optional[Dict[str, Tuple[int,int]]] = None) -> str:
-        paths = []
-        for ext in ("*.jpg","*.jpeg","*.png","*.webp","*.bmp"):
+    def run(self, pool_dir: str, out_dir: str, max_images: int = 200,
+            quotas: Optional[Dict[str, Tuple[int,int]]] = None) -> str:
+        paths: List[str] = []
+        for ext in ("*.jpg","*.jpeg","*.png","*.webp","*.bmp",
+                    "*.JPG","*.JPEG","*.PNG","*.WEBP","*.BMP"):
             paths.extend([str(p) for p in Path(pool_dir).glob(ext)])
         paths.sort()
+        total = len(paths)
+        self._emit_progress("scan", 0, total, force=True)
         items: List[Item] = []
-        for p in paths:
+        for i, p in enumerate(paths, 1):
             it = self.describe(p)
             if it is not None:
                 items.append(it)
+            if (i % 25 == 0) or (i == total):
+                self._emit_progress("scan", i, total, force=True)
         sel = self.select(items, max_images=max_images, quotas=quotas)
+        if not items:
+            self._emit_progress("select", 0, 0, force=True)
+        elif not sel:
+            self._emit_progress("select", 0, len(items), force=True)
+        else:
+            self._emit_progress("select", len(sel), len(items), force=True)
         # write manifest and copy hardlinks
         os.makedirs(out_dir, exist_ok=True)
         man_csv = os.path.join(out_dir, "dataset_manifest.csv")
@@ -556,6 +578,7 @@ class Curator:
                 w.writerow([i+1, it.path, it.face_fd, it.sharpness, it.exposure, it.face_frac, it.yaw, it.roll, it.ratio, it.quality_score,
                             "profile" if abs(it.yaw)>=50.0 else ""])
         # materialize numbered copies for LoRA trainer
+        self._emit_progress("write", 0, len(sel), force=True)
         for i, it in enumerate(sel, start=1):
             name = f"{i:04d}.jpg"
             dst = os.path.join(out_dir, name)
@@ -571,10 +594,27 @@ class Curator:
                 # fallback to copy
                 img = cv2.imread(it.path, cv2.IMREAD_COLOR)
                 cv2.imwrite(dst, img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            if (i % 20 == 0) or (i == len(sel)):
+                self._emit_progress("write", i, len(sel), force=True)
         # also write JSON with per-image metrics for UI
         metrics_json = os.path.join(out_dir, "metrics.json")
+
+        def _serial(it: Item) -> Dict[str, Any]:
+            d = asdict(it)
+            v = d.get("bg_clip")
+            if isinstance(v, np.ndarray):
+                d["bg_clip"] = v.tolist()
+            v = d.get("kps5")
+            if isinstance(v, np.ndarray):
+                d["kps5"] = v.tolist()
+            m = d.get("meta")
+            if isinstance(m, dict):
+                d["meta"] = {k: (float(x) if isinstance(x, (np.generic, int, float)) else x)
+                             for k, x in m.items()}
+            return d
+
         with open(metrics_json, "w", encoding="utf-8") as f:
-            json.dump([asdict(it) for it in sel], f, indent=2)
+            json.dump([_serial(it) for it in sel], f, indent=2)
         return out_dir
 
 

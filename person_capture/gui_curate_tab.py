@@ -21,7 +21,7 @@ Curator = _imp()
 
 
 class CurateWorker(QtCore.QObject):
-    progress = QtCore.Signal(int, int)   # done, total
+    progress = QtCore.Signal(str, int, int)   # phase, done, total
     finished = QtCore.Signal(str, list)  # out_dir, manifest rows
     failed = QtCore.Signal(str)
 
@@ -36,7 +36,8 @@ class CurateWorker(QtCore.QObject):
     @QtCore.Slot()
     def run(self):
         try:
-            cur = Curator(ref_image=self.ref_path, device=self.device)
+            cur = Curator(ref_image=self.ref_path, device=self.device,
+                          progress=lambda phase, done, total: self.progress.emit(phase, done, total))
             out = cur.run(self.pool_dir, self.out_dir, max_images=self.max_images)
             # read manifest for UI
             rows = []
@@ -95,6 +96,10 @@ class CurateTab(QtWidgets.QWidget):
         self.btnRun = QtWidgets.QPushButton("Score + Build Dataset")
         self.btnRun.clicked.connect(self._start)
         L.addRow(self.btnRun)
+        self.prog = QtWidgets.QProgressBar()
+        self.prog.setRange(0, 100)
+        self.prog.setValue(0)
+        L.addRow(self.prog)
 
         self.table = QtWidgets.QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(["#", "file", "fd", "sharp", "face_frac", "ratio"])
@@ -133,6 +138,7 @@ class CurateTab(QtWidgets.QWidget):
             self._set_status("Invalid output folder")
             return
         self.btnRun.setEnabled(False)
+        self.prog.setValue(0)
         self._set_status("Running…")
 
         self._thread = QtCore.QThread(self)
@@ -141,6 +147,7 @@ class CurateTab(QtWidgets.QWidget):
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._done)
         self._worker.failed.connect(self._fail)
+        self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._thread.quit)
         self._worker.failed.connect(self._thread.quit)
         self._thread.finished.connect(self._thread.deleteLater)
@@ -148,6 +155,7 @@ class CurateTab(QtWidgets.QWidget):
 
     def _done(self, out_dir: str, rows: list):
         self._set_status(f"Done → {out_dir}")
+        self.prog.setValue(100)
         self.btnRun.setEnabled(True)
         self.table.setRowCount(0)
         for i, parts in enumerate(rows, 0):
@@ -163,10 +171,17 @@ class CurateTab(QtWidgets.QWidget):
 
     def _fail(self, msg: str):
         self._set_status(f"Failed: {msg}")
+        self.prog.setValue(0)
         self.btnRun.setEnabled(True)
 
     def _set_status(self, s: str):
         self.status.setText(s)
+
+    @QtCore.Slot(str, int, int)
+    def _on_progress(self, phase: str, done: int, total: int):
+        pct = 0 if total <= 0 else int(round(100.0 * done / max(1, total)))
+        self.prog.setValue(max(0, min(100, pct)))
+        self._set_status(f"{phase}: {done}/{total}")
 
 
 def add_tab_to(main_window, default_pool:str="", default_ref:str=""):
