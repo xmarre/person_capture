@@ -135,6 +135,7 @@ class SessionConfig:
     face_margin_min: float = 0.05
     require_face_if_visible: bool = True
     drop_reid_if_any_face_match: bool = True
+    learn_bank_runtime: bool = False            # learn into face bank during normal runtime (off by default)
     # --- crop placement heuristics ---
     crop_face_side_margin_frac: float = 0.30     # min(side margin) >= this * face_w
     crop_top_headroom_max_frac: float = 0.15     # max(top margin / crop_h)
@@ -765,6 +766,7 @@ class Processor(QtCore.QObject):
         self._fps: Optional[float] = None
         self._total_frames: Optional[int] = None
         self._seek_cooldown_frames: int = 0  # disable lock/IoU for a few frames after seek
+        self._runtime_last_bank_add_idx: int = -10**9  # cooldown anchor for runtime bank adds
         # Target lock state for faceless fallback
         self._lock_active: bool = False
         self._lock_last_bbox: Optional[Tuple[int, int, int, int]] = None  # x,y,w,h in frame coords
@@ -1249,6 +1251,7 @@ class Processor(QtCore.QObject):
                                 "lock_reid_thresh",
                                 "lock_momentum",
                                 "allow_faceless_when_locked",
+                                "learn_bank_runtime",
                                 "drop_reid_if_any_face_match",
                                 "faceless_reid_thresh",
                                 "faceless_iou_min",
@@ -1642,33 +1645,39 @@ class Processor(QtCore.QObject):
                             or quality_threshold <= 0
                             or float(quality_val) >= quality_threshold
                         )
-                        if (
-                            fd_val_f is not None
-                            and fd_val_f <= bank_fd_thresh
-                            and quality_ok
-                        ):
-                            vec_new = np.asarray(face_feat_curr, dtype=np.float32).reshape(-1)
-                            norm = float(np.linalg.norm(vec_new))
-                            if norm > 1e-6:
-                                vec_new = vec_new / norm
-                                add_vec = True
-                                if ref_face_feat is not None:
-                                    bank_arr = np.asarray(ref_face_feat, dtype=np.float32)
-                                    if bank_arr.ndim == 1:
-                                        bank_arr = bank_arr.reshape(1, -1)
-                                    sims = bank_arr @ vec_new
-                                    if sims.size > 0 and float(sims.max()) >= bank_dedup_cos:
-                                        add_vec = False
-                                if add_vec:
-                                    ref_bank_list.append(vec_new)
-                                    if len(ref_bank_list) > bank_max:
-                                        ref_bank_list.pop(0)
-                                    ref_face_feat = np.vstack(ref_bank_list).astype(np.float32)
-                                    self._status(
-                                        f"Ref bank +1 (size={len(ref_bank_list)}) fd={fd_val_f:.3f}",
-                                        key="ref_bank",
-                                        interval=5.0,
-                                    )
+                        if getattr(cfg, "learn_bank_runtime", False):
+                            rt_fd_thresh = float(getattr(cfg, "prescan_fd_add", 0.22))
+                            cooldown_frames = int(getattr(cfg, "prescan_add_cooldown_samples", 5)) * max(1, int(getattr(cfg, "frame_stride", 1)))
+                            cooldown_ok = (idx - getattr(self, "_runtime_last_bank_add_idx", -10**9)) >= cooldown_frames
+                            if (
+                                fd_val_f is not None
+                                and fd_val_f <= rt_fd_thresh
+                                and quality_ok
+                                and cooldown_ok
+                            ):
+                                vec_new = np.asarray(face_feat_curr, dtype=np.float32).reshape(-1)
+                                norm = float(np.linalg.norm(vec_new))
+                                if norm > 1e-6:
+                                    vec_new = vec_new / norm
+                                    add_vec = True
+                                    if ref_face_feat is not None:
+                                        bank_arr = np.asarray(ref_face_feat, dtype=np.float32)
+                                        if bank_arr.ndim == 1:
+                                            bank_arr = bank_arr.reshape(1, -1)
+                                        sims = bank_arr @ vec_new
+                                        if sims.size > 0 and float(sims.max()) >= bank_dedup_cos:
+                                            add_vec = False
+                                    if add_vec:
+                                        ref_bank_list.append(vec_new)
+                                        if len(ref_bank_list) > bank_max:
+                                            ref_bank_list.pop(0)
+                                        ref_face_feat = np.vstack(ref_bank_list).astype(np.float32)
+                                        self._runtime_last_bank_add_idx = idx
+                                        self._status(
+                                            f"Ref bank +1 (size={len(ref_bank_list)}) fd={fd_val_f:.3f}",
+                                            key="ref_bank",
+                                            interval=5.0,
+                                        )
                     if c.get("reid_feat") is not None:
                         lr_prev = locked_reid
                         locked_reid = self._ema(lr_prev, c["reid_feat"], float(cfg.lock_momentum))
@@ -2064,6 +2073,7 @@ class Processor(QtCore.QObject):
                                 "faceless_max_area_frac": float(cfg.faceless_max_area_frac),
                                 "faceless_center_max_frac": float(cfg.faceless_center_max_frac),
                                 "faceless_min_motion_frac": float(cfg.faceless_min_motion_frac),
+                                "learn_bank_runtime": bool(cfg.learn_bank_runtime),
                                 "drop_reid_if_any_face_match": bool(cfg.drop_reid_if_any_face_match),
                             },
                             "candidates": [
@@ -2318,6 +2328,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.faceless_allow_check = QtWidgets.QCheckBox()
         self.faceless_allow_check.setChecked(bool(self.cfg.allow_faceless_when_locked))
         self.faceless_allow_check.setToolTip("bool: allow_faceless_when_locked")
+        self.learn_bank_runtime_check = QtWidgets.QCheckBox()
+        self.learn_bank_runtime_check.setChecked(bool(self.cfg.learn_bank_runtime))
+        self.learn_bank_runtime_check.setToolTip("bool: learn_bank_runtime")
         self.drop_reid_if_any_face_match_check = QtWidgets.QCheckBox()
         self.drop_reid_if_any_face_match_check.setChecked(bool(self.cfg.drop_reid_if_any_face_match))
         self.drop_reid_if_any_face_match_check.setToolTip("bool: drop_reid_if_any_face_match")
@@ -2397,6 +2410,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Preview every N frames", self.preview_every_spin),
             ("", self.annot_check),
             ("allow_faceless_when_locked", self.faceless_allow_check),
+            ("learn_bank_runtime", self.learn_bank_runtime_check),
             ("drop_reid_if_any_face_match", self.drop_reid_if_any_face_match_check),
             ("faceless_reid_thresh", self.faceless_reid_spin),
             ("faceless_iou_min", self.faceless_iou_spin),
@@ -3053,6 +3067,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "lock_reid_thresh",
             "lock_momentum",
             "allow_faceless_when_locked",
+            "learn_bank_runtime",
             "drop_reid_if_any_face_match",
             "faceless_reid_thresh",
             "faceless_iou_min",
@@ -3135,6 +3150,7 @@ class MainWindow(QtWidgets.QMainWindow):
             face_det_pad=float(self.face_det_pad_spin.value()) if hasattr(self, "face_det_pad_spin") else 0.08,
             face_margin_min=float(getattr(self, 'margin_spin', QtWidgets.QDoubleSpinBox()).value()) if hasattr(self, 'margin_spin') else 0.05,
             allow_faceless_when_locked=bool(self.faceless_allow_check.isChecked()) if hasattr(self, "faceless_allow_check") else True,
+            learn_bank_runtime=bool(self.learn_bank_runtime_check.isChecked()) if hasattr(self, "learn_bank_runtime_check") else False,
             drop_reid_if_any_face_match=bool(self.drop_reid_if_any_face_match_check.isChecked()) if hasattr(self, "drop_reid_if_any_face_match_check") else True,
             faceless_reid_thresh=float(self.faceless_reid_spin.value()) if hasattr(self, "faceless_reid_spin") else 0.40,
             faceless_iou_min=float(self.faceless_iou_spin.value()) if hasattr(self, "faceless_iou_spin") else 0.30,
@@ -3219,6 +3235,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.margin_spin.setValue(cfg.face_margin_min)
         if hasattr(self, 'faceless_allow_check'):
             self.faceless_allow_check.setChecked(cfg.allow_faceless_when_locked)
+        if hasattr(self, 'learn_bank_runtime_check'):
+            self.learn_bank_runtime_check.setChecked(cfg.learn_bank_runtime)
         if hasattr(self, 'drop_reid_if_any_face_match_check'):
             self.drop_reid_if_any_face_match_check.setChecked(cfg.drop_reid_if_any_face_match)
         if hasattr(self, 'faceless_reid_spin'):
@@ -3584,6 +3602,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     type=bool,
                 )
             )
+        if hasattr(self, 'learn_bank_runtime_check'):
+            self.learn_bank_runtime_check.setChecked(
+                s.value(
+                    "learn_bank_runtime",
+                    self.cfg.learn_bank_runtime,
+                    type=bool,
+                )
+            )
         if hasattr(self, 'drop_reid_if_any_face_match_check'):
             self.drop_reid_if_any_face_match_check.setChecked(
                 s.value(
@@ -3667,6 +3693,21 @@ class MainWindow(QtWidgets.QMainWindow):
             s.setValue("disable_reid", self.disable_reid_check.isChecked())
         if hasattr(self, 'face_fullframe_check'):
             s.setValue("face_fullframe_when_missed", self.face_fullframe_check.isChecked())
+        if hasattr(self, 'faceless_allow_check'):
+            s.setValue(
+                "allow_faceless_when_locked",
+                bool(self.faceless_allow_check.isChecked()),
+            )
+        if hasattr(self, 'learn_bank_runtime_check'):
+            s.setValue(
+                "learn_bank_runtime",
+                bool(self.learn_bank_runtime_check.isChecked()),
+            )
+        if hasattr(self, 'drop_reid_if_any_face_match_check'):
+            s.setValue(
+                "drop_reid_if_any_face_match",
+                bool(self.drop_reid_if_any_face_match_check.isChecked()),
+            )
         s.sync()
 
 
