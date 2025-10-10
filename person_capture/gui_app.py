@@ -10,6 +10,8 @@ Run:
   python gui_app.py
 """
 
+from __future__ import annotations
+
 import sys, os, json, time, csv, traceback
 import subprocess
 import bisect
@@ -127,6 +129,16 @@ class SessionConfig:
     faceless_max_area_frac: float = 0.55    # max area vs frame
     faceless_center_max_frac: float = 0.12  # max center drift vs diag
     faceless_min_motion_frac: float = 0.02  # min moving pixels in ROI
+    # --- pre-scan ---
+    prescan_enable: bool = True
+    prescan_stride: int = 6                # sample every N frames
+    prescan_max_width: int = 640           # downscale for prescan
+    prescan_face_conf: float = 0.25        # YOLO-face conf during prescan
+    prescan_fd_enter: float = 0.45         # ArcFace dist to ENTER (looser)
+    prescan_fd_exit: float = 0.52          # ArcFace dist to EXIT  (hysteresis)
+    prescan_min_segment_sec: float = 1.0
+    prescan_pad_sec: float = 1.0
+    prescan_bridge_gap_sec: float = 0.75   # merge spans separated by short gaps
 
     def to_json(self, include_paths: bool = False) -> str:
         d = asdict(self)
@@ -155,6 +167,95 @@ class Processor(QtCore.QObject):
         if prev is None:
             return new
         return (m * prev + (1.0 - m) * new) if isinstance(prev, np.ndarray) else new
+
+    def _span_index_for(self, f, spans):
+        # return index of span containing f, else next span index
+        for i, (s, e) in enumerate(spans):
+            if s <= f <= e:
+                return i
+            if f < s:
+                return i
+        return len(spans)
+
+    def _prescan(self, cap, fps, total_frames, face: "FaceEmbedder", ref_feat, cfg):
+        if ref_feat is None:
+            return []
+        stride = max(1, int(cfg.prescan_stride))
+        pad = int(round(cfg.prescan_pad_sec * fps))
+        min_len = int(round(cfg.prescan_min_segment_sec * fps))
+        pos0 = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+        Wmax = int(cfg.prescan_max_width)
+        enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
+        old_face_conf = getattr(face, "conf", 0.15)
+        face.conf = float(cfg.prescan_face_conf)
+        spans = []
+        active = False
+        start = 0
+        neg_run = 0
+        # fast pass
+        for idx in range(0, total_frames, stride):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            h, w = frame.shape[:2]
+            if w > Wmax:
+                nh = int(round(h * (Wmax / float(w))))
+                frame = cv2.resize(frame, (Wmax, nh), interpolation=cv2.INTER_AREA)
+            faces = face.extract(frame)
+            # best ArcFace distance on this sample
+            best = 9.0
+            for f in faces:
+                if f.get("feat") is None:
+                    continue
+                d = 1.0 - float(np.dot(f["feat"], ref_feat))
+                if d < best:
+                    best = d
+            if best <= enter:
+                if not active:
+                    active = True
+                    start = idx
+                neg_run = 0
+            else:
+                if active:
+                    neg_run += 1
+                    if neg_run * stride >= int(0.5 * fps) or best >= exit_:
+                        end = idx
+                        # pad, clamp, merge
+                        s = max(0, start - pad)
+                        e = min(total_frames - 1, end + pad)
+                        if e - s + 1 >= min_len:
+                            if spans and s <= spans[-1][1] + 1:
+                                spans[-1] = (spans[-1][0], max(spans[-1][1], e))
+                            else:
+                                spans.append((s, e))
+                        active = False
+                        neg_run = 0
+        if active:
+            s = max(0, start - pad)
+            e = total_frames - 1
+            if e - s + 1 >= min_len:
+                if spans and s <= spans[-1][1] + 1:
+                    spans[-1] = (spans[-1][0], max(spans[-1][1], e))
+                else:
+                    spans.append((s, e))
+        # bridge tiny gaps
+        if spans and getattr(cfg, "prescan_bridge_gap_sec", 0) > 0:
+            bridged = []
+            gap = int(round(cfg.prescan_bridge_gap_sec * fps))
+            cs, ce = spans[0]
+            for s, e in spans[1:]:
+                if s - ce <= gap:
+                    ce = max(ce, e)
+                else:
+                    bridged.append((cs, ce))
+                    cs, ce = s, e
+            bridged.append((cs, ce))
+            spans = bridged
+        # restore
+        face.conf = old_face_conf
+        cap.set(cv2.CAP_PROP_POS_FRAMES, pos0)
+        return spans
 
     @staticmethod
     def _clip_to_frame(x1: float, y1: float, x2: float, y2: float, frame_w: int, frame_h: int) -> Tuple[int, int, int, int]:
@@ -671,13 +772,39 @@ class Processor(QtCore.QObject):
             face_only_pipeline = (base_match_mode == "face_only")
 
             # Video
-            cap = cv2.VideoCapture(cfg.video)
+            try:
+                os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
+                cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
+                try:
+                    cap.set(cv2.CAP_PROP_HW_ACCELERATION, 1)
+                except Exception:
+                    pass
+                if not cap.isOpened():
+                    cap.release()
+                    cap = cv2.VideoCapture(cfg.video)
+            except Exception:
+                cap = cv2.VideoCapture(cfg.video)
             if not cap.isOpened():
                 raise RuntimeError(f"Cannot open video: {cfg.video}")
             fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
             self._fps = float(fps)
             self._total_frames = int(total_frames)
+            keep_spans = []
+            span_i = 0
+            if bool(getattr(cfg, "prescan_enable", True)) and total_frames > 0:
+                self._status("Pre-scan...", key="phase", interval=2.0)
+                keep_spans = self._prescan(cap, int(round(fps)), total_frames, face, ref_face_feat, cfg)
+                if keep_spans:
+                    s0 = keep_spans[0][0]
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, s0)
+                    frame_idx = s0
+                    self._status(f"Pre-scan segments: {len(keep_spans)}", key="prescan", interval=30.0)
+                else:
+                    self._status("Pre-scan found no matches; full scan", key="prescan", interval=30.0)
+            else:
+                keep_spans = []
+                span_i = 0
             self.setup.emit(total_frames, float(fps))
 
             ratios = [r.strip() for r in str(cfg.ratio).split(',') if r.strip()]
@@ -696,6 +823,8 @@ class Processor(QtCore.QObject):
             locked_reid = None
             prev_box = None
             frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+            if keep_spans:
+                span_i = self._span_index_for(frame_idx, keep_spans)
             last_preview_emit = -999999
             self._seek_cooldown_frames = 0
 
@@ -715,6 +844,14 @@ class Processor(QtCore.QObject):
                             cap.set(cv2.CAP_PROP_POS_FRAMES, tgt)
                             frame_idx = tgt
                             self.progress.emit(frame_idx)
+                            # Fast preroll: decode a few frames to flush decoder, no inference
+                            preroll = min(12, int((self._fps or 30) // 3))
+                            for _ in range(preroll):
+                                if not cap.grab():
+                                    break
+                                if self._total_frames is not None and frame_idx >= self._total_frames - 1:
+                                    break
+                                frame_idx += 1
                             force_process = True
                             # --- reset temporal gating so scrolling back works ---
                             lock_hits = 0
@@ -732,6 +869,8 @@ class Processor(QtCore.QObject):
                                 key="seek_reset",
                                 interval=0.5,
                             )
+                            if keep_spans:
+                                span_i = self._span_index_for(frame_idx, keep_spans)
                         elif cmd == "pause":
                             self._paused = True
                         elif cmd == "play":
@@ -763,6 +902,8 @@ class Processor(QtCore.QObject):
                                     key="seek_reset",
                                     interval=0.5,
                                 )
+                            if keep_spans:
+                                span_i = self._span_index_for(frame_idx, keep_spans)
                         elif cmd == "speed":
                             try:
                                 self._speed = max(0.1, min(4.0, float(arg)))
@@ -825,7 +966,27 @@ class Processor(QtCore.QObject):
                 except queue.Empty:
                     pass
 
-                if self._pause:
+                # segment gate (auto-skip regions with no target)
+                if keep_spans:
+                    if span_i >= len(keep_spans):
+                        break
+                    s, e = keep_spans[span_i]
+                    if frame_idx < s:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, s)
+                        frame_idx = s
+                        self._seek_cooldown_frames = int(max(2, (self._fps or 30) * 0.25))
+                        continue
+                    if frame_idx > e:
+                        span_i += 1
+                        if span_i >= len(keep_spans):
+                            break
+                        s2, _ = keep_spans[span_i]
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, s2)
+                        frame_idx = s2
+                        self._seek_cooldown_frames = int(max(2, (self._fps or 30) * 0.25))
+                        continue
+
+                if self._paused:
                     self._paused = True
                 if self._paused and not force_process:
                     time.sleep(0.01)
