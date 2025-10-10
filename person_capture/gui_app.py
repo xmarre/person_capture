@@ -12,8 +12,8 @@ Run:
 
 from __future__ import annotations
 
-import sys, os, json, time, csv, traceback
-import subprocess
+import os, sys, subprocess
+import json, time, csv, traceback
 import bisect
 import queue
 import math
@@ -49,6 +49,36 @@ import cv2
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtWidgets import QDockWidget
+
+
+class FileList(QtWidgets.QListWidget):
+    filesDropped = QtCore.Signal(list)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event: QtGui.QDragMoveEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event: QtGui.QDropEvent) -> None:
+        if event.mimeData().hasUrls():
+            self.filesDropped.emit([url.toLocalFile() for url in event.mimeData().urls()])
+            event.acceptProposedAction()
+            return
+        if event.source() is self and event.proposedAction() == QtCore.Qt.CopyAction:
+            event.setDropAction(QtCore.Qt.MoveAction)
+        super().dropEvent(event)
 
 APP_ORG = "PersonCapture"
 APP_NAME = "PersonCapture GUI"
@@ -1983,6 +2013,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_idx: int = 0
 
         self.cfg = SessionConfig()
+        self._updating_refs = False
         self._build_ui()
         self._load_qsettings()
         self.statusbar = self.statusBar()
@@ -2021,9 +2052,42 @@ class MainWindow(QtWidgets.QMainWindow):
         file_layout.addWidget(self.ref_edit, 1, 1)
         file_layout.addWidget(ref_btn, 1, 2)
 
-        file_layout.addWidget(QtWidgets.QLabel("Output directory"), 2, 0)
-        file_layout.addWidget(self.out_edit, 2, 1)
-        file_layout.addWidget(out_btn, 2, 2)
+        # --- Reference list UI (bank) ---
+        self.ref_list = FileList()
+        self.ref_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.ref_list.setDragDropMode(QtWidgets.QAbstractItemView.DragDrop)
+        self.ref_list.setDefaultDropAction(QtCore.Qt.CopyAction)
+        self.ref_list.setDragDropOverwriteMode(False)
+        self.ref_list.setDragEnabled(True)
+        self.ref_list.setUniformItemSizes(True)
+        self.ref_list.setAlternatingRowColors(True)
+        self.ref_list.setMinimumHeight(90)
+        self.ref_list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+
+        ref_toolbar = QtWidgets.QWidget()
+        rt = QtWidgets.QHBoxLayout(ref_toolbar)
+        rt.setContentsMargins(0, 0, 0, 0)
+        self.btn_ref_add = QtWidgets.QPushButton("Add…")
+        self.btn_ref_remove = QtWidgets.QPushButton("Remove selected")
+        self.btn_ref_clear = QtWidgets.QPushButton("Clear")
+        rt.addWidget(self.btn_ref_add)
+        rt.addWidget(self.btn_ref_remove)
+        rt.addStretch(1)
+        rt.addWidget(self.btn_ref_clear)
+
+        ref_v = QtWidgets.QVBoxLayout()
+        ref_v.setContentsMargins(0, 0, 0, 0)
+        ref_v.addWidget(self.ref_list)
+        ref_v.addWidget(ref_toolbar)
+        ref_cell = QtWidgets.QWidget()
+        ref_cell.setLayout(ref_v)
+
+        file_layout.addWidget(QtWidgets.QLabel("Reference bank"), 2, 0)
+        file_layout.addWidget(ref_cell, 2, 1, 1, 2)
+
+        file_layout.addWidget(QtWidgets.QLabel("Output directory"), 3, 0)
+        file_layout.addWidget(self.out_edit, 3, 1)
+        file_layout.addWidget(out_btn, 3, 2)
 
         # Params
         param_group = QtWidgets.QGroupBox("Parameters")
@@ -2375,8 +2439,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Wire
         vid_btn.clicked.connect(lambda: self._pick_file(self.video_edit, "Video (*.mp4 *.mov *.mkv *.avi *.webm);;All files (*)"))
-        ref_btn.clicked.connect(lambda: self._pick_file(self.ref_edit, "Images (*.jpg *.jpeg *.png *.bmp *.webp);;All files (*)"))
+        ref_btn.clicked.connect(self._browse_refs_from_line)
         out_btn.clicked.connect(lambda: self._pick_dir(self.out_edit))
+        self.btn_ref_add.clicked.connect(self._browse_refs_multi)
+        self.btn_ref_remove.clicked.connect(self._remove_selected_refs)
+        self.btn_ref_clear.clicked.connect(self._clear_refs)
+        self.ref_edit.editingFinished.connect(self._sync_from_line)
+        self.ref_edit.returnPressed.connect(self._sync_from_line)
+        self.ref_list.model().rowsMoved.connect(self._on_ref_rows_moved)
+        self.ref_list.filesDropped.connect(self._handle_ref_files_dropped)
+        self.ref_list.customContextMenuRequested.connect(self._show_ref_context_menu)
+        self.ref_list.itemDoubleClicked.connect(lambda _: self._open_selected_refs())
+        QtWidgets.QShortcut(QtGui.QKeySequence.Delete, self.ref_list, activated=self._remove_selected_refs)
         self.start_btn.clicked.connect(self.on_start)
         self.stop_btn.clicked.connect(self.on_stop)
         self.pause_btn.clicked.connect(lambda: self._pause(True))
@@ -2385,6 +2459,202 @@ class MainWindow(QtWidgets.QMainWindow):
         self.apply_live_btn.clicked.connect(self._apply_live_cfg)
 
         self._update_buttons(state="idle")
+
+    # ---- Ref list helpers ----
+    def _filter_images(self, paths: list[str]) -> list[str]:
+        exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+        collected: list[str] = []
+        max_depth = 5
+        for path in paths:
+            candidate = path.strip() if isinstance(path, str) else path
+            if not candidate:
+                continue
+            try:
+                if os.path.isdir(candidate):
+                    try:
+                        base_depth = len(Path(candidate).resolve().parts)
+                    except Exception:
+                        base_depth = len(Path(candidate).parts)
+                    for root, dirs, files in os.walk(candidate):
+                        try:
+                            root_depth = len(Path(root).resolve().parts)
+                        except Exception:
+                            root_depth = len(Path(root).parts)
+                        depth = root_depth - base_depth
+                        if max_depth >= 0 and depth >= max_depth:
+                            dirs[:] = []
+                        else:
+                            dirs[:] = [d for d in dirs if not d.startswith('.')]
+                        for name in files:
+                            if name.startswith('.'):
+                                continue
+                            if os.path.splitext(name)[1].lower() in exts:
+                                collected.append(os.path.join(root, name))
+                elif os.path.isfile(candidate):
+                    name = os.path.basename(candidate)
+                    if name.startswith('.'):
+                        continue
+                    if os.path.splitext(candidate)[1].lower() in exts:
+                        collected.append(candidate)
+            except Exception:
+                continue
+
+        unique: list[str] = []
+        seen: set[str] = set()
+        for path in collected:
+            try:
+                resolved = os.path.normpath(os.path.abspath(path))
+                key = os.path.normcase(resolved)
+                display_path = resolved
+            except Exception:
+                display_path = path
+                key = path
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(display_path)
+        return unique
+
+    def _set_ref_paths(self, paths: list[str]) -> None:
+        self._updating_refs = True
+        self.ref_list.clear()
+        seen: set[str] = set()
+        for path in paths:
+            raw = path.strip()
+            if not raw:
+                continue
+            try:
+                display_path = os.path.normpath(os.path.abspath(raw))
+                key = os.path.normcase(display_path)
+            except Exception:
+                display_path = raw
+                key = raw
+            if key in seen:
+                continue
+            self.ref_list.addItem(display_path)
+            item = self.ref_list.item(self.ref_list.count() - 1)
+            if item is not None:
+                item.setToolTip(display_path)
+            seen.add(key)
+        self._updating_refs = False
+        self._sync_ref_edit_from_list()
+
+    def _get_ref_paths(self) -> list[str]:
+        return [self.ref_list.item(i).text().strip() for i in range(self.ref_list.count())]
+
+    def _get_selected_ref_paths(self) -> list[str]:
+        return [item.text().strip() for item in self.ref_list.selectedItems() if item.text().strip()]
+
+    def _sync_ref_edit_from_list(self) -> None:
+        if self._updating_refs:
+            return
+        self._updating_refs = True
+        self.ref_edit.setText("; ".join(self._get_ref_paths()))
+        self._updating_refs = False
+
+    def _browse_refs_multi(self) -> None:
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self,
+            "Select reference images",
+            "",
+            "Images (*.jpg *.jpeg *.png *.bmp *.webp)",
+        )
+        if files:
+            self._set_ref_paths(self._get_ref_paths() + self._filter_images(list(files)))
+            self._save_qsettings()
+
+    def _remove_selected_refs(self) -> None:
+        for item in self.ref_list.selectedItems():
+            self.ref_list.takeItem(self.ref_list.row(item))
+        self._set_ref_paths(self._get_ref_paths())
+        self._save_qsettings()
+
+    def _clear_refs(self) -> None:
+        self.ref_list.clear()
+        self._set_ref_paths([])
+        self._save_qsettings()
+
+    def _browse_refs_from_line(self) -> None:
+        self._browse_refs_multi()
+
+    def _sync_from_line(self) -> None:
+        if self._updating_refs:
+            return
+        text = self.ref_edit.text()
+        paths = self._filter_images([part.strip() for part in text.split(';') if part.strip()])
+        self._set_ref_paths(paths)
+        self._save_qsettings()
+
+    def _handle_ref_files_dropped(self, files: list[str]) -> None:
+        filtered = self._filter_images(list(files))
+        if not filtered:
+            return
+        self._set_ref_paths(self._get_ref_paths() + filtered)
+        self._save_qsettings()
+
+    def _on_ref_rows_moved(self, *args) -> None:
+        self._sync_ref_edit_from_list()
+        try:
+            self._save_qsettings()
+        except Exception:
+            pass
+
+    def _show_ref_context_menu(self, pos: QtCore.QPoint) -> None:
+        menu = QtWidgets.QMenu(self)
+        open_action = menu.addAction("Open")
+        if sys.platform == "darwin":
+            reveal_label = "Reveal in Finder"
+        elif sys.platform.startswith("win"):
+            reveal_label = "Reveal in Explorer"
+        else:
+            reveal_label = "Show in Folder"
+        reveal_action = menu.addAction(reveal_label)
+        menu.addSeparator()
+        remove_action = menu.addAction("Remove selected")
+
+        has_selection = bool(self.ref_list.selectedItems())
+        open_action.setEnabled(has_selection)
+        reveal_action.setEnabled(has_selection)
+        remove_action.setEnabled(has_selection)
+
+        action = menu.exec(self.ref_list.mapToGlobal(pos))
+        if action == open_action:
+            self._open_selected_refs()
+        elif action == reveal_action:
+            self._reveal_selected_refs()
+        elif action == remove_action:
+            self._remove_selected_refs()
+
+    def _open_selected_refs(self) -> None:
+        for path in self._get_selected_ref_paths():
+            try:
+                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path))
+            except Exception:
+                pass
+
+    def _reveal_selected_refs(self) -> None:
+        paths = self._get_selected_ref_paths()
+        if not paths:
+            return
+        target = paths[0]
+        if not os.path.exists(target):
+            target = os.path.dirname(target)
+        if not target:
+            return
+        try:
+            if sys.platform.startswith("win"):
+                path = os.path.normpath(target)
+                if os.path.isdir(path):
+                    subprocess.Popen(["explorer", path])
+                else:
+                    subprocess.Popen(["explorer", "/select,", path])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", target])
+            else:
+                folder = target if os.path.isdir(target) else os.path.dirname(target)
+                subprocess.Popen(["xdg-open", folder or os.getcwd()])
+        except Exception:
+            pass
 
     def _build_menu(self):
         bar = self.menuBar()
@@ -2639,9 +2909,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._save_qsettings()
 
     def _collect_cfg(self) -> SessionConfig:
+        ref_join = "; ".join(self._get_ref_paths()) or self.ref_edit.text().strip()
         cfg = SessionConfig(
             video=self.video_edit.text().strip(),
-            ref=self.ref_edit.text().strip(),
+            ref=ref_join,
             out_dir=self.out_edit.text().strip() or "output",
             ratio=self.ratio_edit.text().strip() or "2:3",
             frame_stride=int(self.stride_spin.value()),
@@ -2706,7 +2977,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_cfg(self, cfg: SessionConfig):
         self.video_edit.setText(cfg.video)
-        self.ref_edit.setText(cfg.ref)
+        paths = [part.strip() for part in (cfg.ref or "").split(';') if part.strip()]
+        self._set_ref_paths(paths)
         self.out_edit.setText(cfg.out_dir)
         self.ratio_edit.setText(cfg.ratio)
         self.stride_spin.setValue(cfg.frame_stride)
@@ -3069,7 +3341,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _load_qsettings(self):
         s = QtCore.QSettings(APP_ORG, APP_NAME)
         self.video_edit.setText(s.value("video", ""))
-        self.ref_edit.setText(s.value("ref", ""))
+        refs = s.value("ref", "", type=str)
+        paths = self._filter_images([part.strip() for part in refs.split(';') if part.strip()])
+        self._set_ref_paths(paths)
         self.out_edit.setText(s.value("out_dir", "output"))
         self.ratio_edit.setText(s.value("ratio", "2:3"))
         self.stride_spin.setValue(int(s.value("frame_stride", 2)))
@@ -3196,7 +3470,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _save_qsettings(self):
         s = QtCore.QSettings(APP_ORG, APP_NAME)
         cfg = self._collect_cfg()
-        for k, v in asdict(cfg).items():
+        cfg_dict = asdict(cfg)
+        cfg_dict["ref"] = "; ".join(self._get_ref_paths())
+        for k, v in cfg_dict.items():
             s.setValue(k, v)
         if hasattr(self, 'disable_reid_check'):
             s.setValue("disable_reid", self.disable_reid_check.isChecked())
