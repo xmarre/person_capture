@@ -47,6 +47,14 @@ def _imp():
         return PersonDetector, FaceEmbedder, ReIDEmbedder, ensure_dir, parse_ratio, expand_box_to_ratio
 
 PersonDetector, FaceEmbedder, ReIDEmbedder, ensure_dir, parse_ratio, expand_box_to_ratio = _imp()
+# Optional Curate tab
+try:
+    from .gui_curate_tab import CurateTab  # type: ignore
+except Exception:
+    try:
+        from gui_curate_tab import CurateTab  # type: ignore
+    except Exception:
+        CurateTab = None  # type: ignore
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtWidgets import QDockWidget
 
@@ -2549,6 +2557,22 @@ class MainWindow(QtWidgets.QMainWindow):
         tab_params_l.addWidget(param_group, 1); tab_params_l.addStretch(0)
         self.tabs.addTab(tab_files, "Files")
         self.tabs.addTab(tab_params, "Parameters")
+        # Curate tab
+        if "CurateTab" in globals() and CurateTab is not None:
+            try:
+                default_pool = self.out_edit.text().strip() if hasattr(self, "out_edit") else getattr(self, "cfg", None).out_dir
+            except Exception:
+                default_pool = "output"
+            try:
+                default_ref = self.ref_edit.text().strip() if hasattr(self, "ref_edit") else getattr(self, "cfg", None).ref
+            except Exception:
+                default_ref = ""
+            try:
+                self.curate_tab = CurateTab(self.tabs, default_pool=default_pool, default_ref=default_ref)
+                self.tabs.addTab(self.curate_tab, "Curate")
+            except Exception as _e:
+                # Non-fatal if curate tab cannot load
+                pass
         controls_layout.addWidget(self.tabs, 1)
         controls_layout.addLayout(ctrl_layout)
         controls_layout.addLayout(prog_layout)
