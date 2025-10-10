@@ -165,8 +165,9 @@ class SessionConfig:
     prescan_max_width: int = 416           # downscale for prescan
     prescan_face_conf: float = 0.25        # YOLO-face conf during prescan
     prescan_fd_enter: float = 0.45         # ArcFace dist to ENTER (looser)
-    prescan_fd_add: float = 0.42           # ArcFace dist to add to bank (tighter)
+    prescan_fd_add: float = 0.22           # ArcFace dist to add to bank (tighter)
     prescan_fd_exit: float = 0.52          # ArcFace dist to EXIT  (hysteresis)
+    prescan_add_cooldown_samples: int = 5  # add at most every N prescan samples
     prescan_min_segment_sec: float = 1.0
     prescan_pad_sec: float = 2.0
     prescan_bridge_gap_sec: float = 1.0    # merge spans separated by short gaps
@@ -256,8 +257,18 @@ class Processor(QtCore.QObject):
         fd_add = float(getattr(cfg, "prescan_fd_add", enter))
         old_face_conf = getattr(face, "conf", 0.15)
         face.conf = float(cfg.prescan_face_conf)
-        bank_dedup_cos = 0.95
+        bank_dedup_cos = 0.968
         bank_max = 64
+        effective_bank_max = max(bank_max, initial_bank_len + 8)
+        learned_cap = max(0, effective_bank_max - initial_bank_len)
+        add_cooldown_samples = int(
+            getattr(
+                cfg,
+                "prescan_add_cooldown_samples",
+                getattr(cfg, "prescan_add_cooldown_frames", 5),
+            )
+        )
+        last_add_sample = -10**9
         spans = []
         active = False
         start = 0
@@ -320,6 +331,13 @@ class Processor(QtCore.QObject):
                             fd_add = float(getattr(cfg, "prescan_fd_add", enter))
                             Wmax = int(cfg.prescan_max_width)
                             face.conf = float(cfg.prescan_face_conf)
+                            add_cooldown_samples = int(
+                                getattr(
+                                    cfg,
+                                    "prescan_add_cooldown_samples",
+                                    getattr(cfg, "prescan_add_cooldown_frames", 5),
+                                )
+                            )
                         except Exception:
                             pass
             except queue.Empty:
@@ -355,7 +373,11 @@ class Processor(QtCore.QObject):
                 # current best vs live bank
                 fd = self._fd_min(feat, ref_feat_local)
                 best = min(best, fd)
-                if fd <= fd_add:
+                if (
+                    fd <= fd_add
+                    and (sample_idx - last_add_sample) >= add_cooldown_samples
+                    and f.get("quality", 1e9) >= cfg.face_quality_min
+                ):
                     try:
                         vec = _np.asarray(feat, dtype=_np.float32).reshape(-1)
                         n = float(_np.linalg.norm(vec))
@@ -372,8 +394,9 @@ class Processor(QtCore.QObject):
                             if add_vec:
                                 ref_bank_list.append(vec)
                                 added_vecs += 1
-                                if len(ref_bank_list) > bank_max:
-                                    ref_bank_list.pop(0)
+                                if (len(ref_bank_list) - initial_bank_len) > learned_cap:
+                                    ref_bank_list.pop(initial_bank_len)
+                                last_add_sample = sample_idx
                                 ref_feat_local = _np.vstack(ref_bank_list).astype(_np.float32)
                                 self._status(
                                     f"Pre-scan ref bank +1 (size={len(ref_bank_list)}) fd={fd:.3f}",
@@ -3063,7 +3086,7 @@ class MainWindow(QtWidgets.QMainWindow):
             only_best=bool(self.only_best_check.isChecked()),
             prescan_enable=bool(self.chk_prescan.isChecked()) if hasattr(self, "chk_prescan") else True,
             prescan_stride=int(self.spin_prescan_stride.value()) if hasattr(self, "spin_prescan_stride") else 16,
-            prescan_fd_add=float(self.spin_prescan_fd_add.value()) if hasattr(self, "spin_prescan_fd_add") else 0.42,
+            prescan_fd_add=float(self.spin_prescan_fd_add.value()) if hasattr(self, "spin_prescan_fd_add") else 0.22,
             trt_lib_dir=self.trt_edit.text().strip() if hasattr(self, "trt_edit") else "",
             min_sharpness=float(self.min_sharp_spin.value()),
             min_gap_sec=float(self.min_gap_spin.value()),
