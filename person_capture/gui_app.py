@@ -13,7 +13,10 @@ Run:
 from __future__ import annotations
 
 import os, sys, subprocess
-import json, time, csv, traceback
+import json, csv, traceback
+import time
+import cv2
+import numpy as np
 import bisect
 import queue
 import math
@@ -44,9 +47,6 @@ def _imp():
         return PersonDetector, FaceEmbedder, ReIDEmbedder, ensure_dir, parse_ratio, expand_box_to_ratio
 
 PersonDetector, FaceEmbedder, ReIDEmbedder, ensure_dir, parse_ratio, expand_box_to_ratio = _imp()
-
-import cv2
-import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtWidgets import QDockWidget
 
@@ -165,6 +165,7 @@ class SessionConfig:
     prescan_max_width: int = 416           # downscale for prescan
     prescan_face_conf: float = 0.25        # YOLO-face conf during prescan
     prescan_fd_enter: float = 0.45         # ArcFace dist to ENTER (looser)
+    prescan_fd_add: float = 0.42           # ArcFace dist to add to bank (tighter)
     prescan_fd_exit: float = 0.52          # ArcFace dist to EXIT  (hysteresis)
     prescan_min_segment_sec: float = 1.0
     prescan_pad_sec: float = 2.0
@@ -226,16 +227,37 @@ class Processor(QtCore.QObject):
         return len(spans)
 
     def _prescan(self, cap, fps, total_frames, face: "FaceEmbedder", ref_feat, cfg):
+        """
+        Fast pass to find keep-spans. Now:
+          - obeys play/pause/seek/step/speed from _cmd_q
+          - grows ref face bank on confident matches (dedup + cap)
+        Returns: (spans, updated_ref_feat)
+        """
+        import numpy as _np
+        # seed bank
         if ref_feat is None:
-            return []
+            ref_bank_list = []
+        else:
+            arr = _np.asarray(ref_feat, dtype=_np.float32)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            norms = _np.linalg.norm(arr, axis=1, keepdims=True)
+            arr = arr / _np.maximum(norms, 1e-6)
+            ref_bank_list = [row.copy() for row in arr]
+        initial_bank_len = len(ref_bank_list)
+        ref_feat_local = _np.vstack(ref_bank_list).astype(_np.float32) if ref_bank_list else None
+        added_vecs = 0
         stride = max(1, int(cfg.prescan_stride))
         pad = int(round(cfg.prescan_pad_sec * fps))
         min_len = int(round(cfg.prescan_min_segment_sec * fps))
         pos0 = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
         Wmax = int(cfg.prescan_max_width)
         enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
+        fd_add = float(getattr(cfg, "prescan_fd_add", enter))
         old_face_conf = getattr(face, "conf", 0.15)
         face.conf = float(cfg.prescan_face_conf)
+        bank_dedup_cos = 0.95
+        bank_max = 64
         spans = []
         active = False
         start = 0
@@ -250,6 +272,63 @@ class Processor(QtCore.QObject):
         i = 0
         # fast pass
         while i < total_frames:
+            # ---- handle UI commands during pre-scan ----
+            try:
+                while True:
+                    cmd, arg = self._cmd_q.get_nowait()
+                    if cmd == "pause":
+                        self._paused = True
+                    elif cmd == "play":
+                        self._paused = False
+                    elif cmd == "seek":
+                        tgt = max(0, min(total_frames - 1, int(arg)))
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, tgt)
+                        # align to stride
+                        i = (tgt // stride) * stride
+                        processed_samples = i // stride
+                        active = False
+                        neg_run = 0
+                        try:
+                            self.progress.emit(i)
+                        except Exception:
+                            pass
+                    elif cmd == "step":
+                        stepn = int(arg) if arg is not None else 1
+                        tgt = max(0, min(total_frames - 1, i + stepn))
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, tgt)
+                        i = (tgt // stride) * stride
+                        processed_samples = i // stride
+                        self._paused = True
+                        try:
+                            self.progress.emit(i)
+                        except Exception:
+                            pass
+                    elif cmd == "speed":
+                        try:
+                            self._speed = max(0.1, min(4.0, float(arg)))
+                        except Exception:
+                            pass
+                    elif cmd == "cfg":
+                        # allow live edits to prescan_* fields if sent
+                        try:
+                            ch = dict(arg or {})
+                            for k, v in ch.items():
+                                if k.startswith("prescan_"):
+                                    setattr(cfg, k, v)
+                            stride = max(1, int(cfg.prescan_stride))
+                            enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
+                            fd_add = float(getattr(cfg, "prescan_fd_add", enter))
+                            Wmax = int(cfg.prescan_max_width)
+                            face.conf = float(cfg.prescan_face_conf)
+                        except Exception:
+                            pass
+            except queue.Empty:
+                pass
+            if self._abort:
+                break
+            if self._paused:
+                time.sleep(0.02)
+                continue
             if not cap.grab():
                 break
             if i % stride != 0:
@@ -273,7 +352,36 @@ class Processor(QtCore.QObject):
                 feat = f.get("feat")
                 if feat is None:
                     continue
-                best = min(best, self._fd_min(feat, ref_feat))
+                # current best vs live bank
+                fd = self._fd_min(feat, ref_feat_local)
+                best = min(best, fd)
+                if fd <= fd_add:
+                    try:
+                        vec = _np.asarray(feat, dtype=_np.float32).reshape(-1)
+                        n = float(_np.linalg.norm(vec))
+                        if n > 1e-6:
+                            vec = vec / n
+                            add_vec = True
+                            if ref_feat_local is not None:
+                                bank_arr = _np.asarray(ref_feat_local, dtype=_np.float32)
+                                if bank_arr.ndim == 1:
+                                    bank_arr = bank_arr.reshape(1, -1)
+                                sims = bank_arr @ vec
+                                if sims.size > 0 and float(sims.max()) >= bank_dedup_cos:
+                                    add_vec = False
+                            if add_vec:
+                                ref_bank_list.append(vec)
+                                added_vecs += 1
+                                if len(ref_bank_list) > bank_max:
+                                    ref_bank_list.pop(0)
+                                ref_feat_local = _np.vstack(ref_bank_list).astype(_np.float32)
+                                self._status(
+                                    f"Pre-scan ref bank +1 (size={len(ref_bank_list)}) fd={fd:.3f}",
+                                    key="prescan_bank",
+                                    interval=2.0,
+                                )
+                    except Exception:
+                        pass
             if sample_idx >= next_progress_sample:
                 pct = min(100.0, (idx + stride) / max(1.0, float(total_frames)) * 100.0)
                 self._status(
@@ -362,7 +470,12 @@ class Processor(QtCore.QObject):
             key="prescan_progress",
             interval=0.1,
         )
-        return spans
+        self._status(
+            f"Pre-scan ref bank added {added_vecs} vector(s); size={len(ref_bank_list)} (start={initial_bank_len})",
+            key="prescan_bank_summary",
+            interval=0.5,
+        )
+        return spans, (ref_feat_local if ref_feat_local is not None else ref_feat)
 
     @staticmethod
     def _clip_to_frame(x1: float, y1: float, x2: float, y2: float, frame_w: int, frame_h: int) -> Tuple[int, int, int, int]:
@@ -966,8 +1079,10 @@ class Processor(QtCore.QObject):
             except Exception:
                 pass
             if bool(getattr(cfg, "prescan_enable", True)) and total_frames > 0:
-                self._status("Pre-scan...", key="phase", interval=2.0)
-                keep_spans = self._prescan(cap, int(round(fps)), total_frames, face, ref_face_feat, cfg)
+                self._status("Pre-scan.", key="phase", interval=2.0)
+                keep_spans, ref_face_feat = self._prescan(
+                    cap, int(round(fps)), total_frames, face, ref_face_feat, cfg
+                )
                 if keep_spans:
                     s0 = keep_spans[0][0]
                     cap.set(cv2.CAP_PROP_POS_FRAMES, s0)
@@ -2116,6 +2231,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_prescan_stride = QtWidgets.QSpinBox()
         self.spin_prescan_stride.setRange(1, 60)
         self.spin_prescan_stride.setValue(int(self.cfg.prescan_stride))
+        self.spin_prescan_fd_add = QtWidgets.QDoubleSpinBox()
+        self.spin_prescan_fd_add.setDecimals(3)
+        self.spin_prescan_fd_add.setRange(0.0, 2.0)
+        self.spin_prescan_fd_add.setSingleStep(0.01)
+        self.spin_prescan_fd_add.setValue(float(self.cfg.prescan_fd_add))
+        self.spin_prescan_fd_add.setToolTip("float: prescan_fd_add")
+        self.spin_prescan_fd_add.valueChanged.connect(self._on_ui_change)
         # TensorRT path controls
         self.trt_edit = QtWidgets.QLineEdit(self.cfg.trt_lib_dir or r"D:\\tensorrt\\TensorRT-10.13.3.9")
         self.trt_btn = QtWidgets.QPushButton("Browse…")
@@ -2224,6 +2346,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Only best", self.only_best_check),
             ("Enable pre-scan", self.chk_prescan),
             ("Pre-scan stride (frames)", self.spin_prescan_stride),
+            ("Pre-scan bank add dist ≤", self.spin_prescan_fd_add),
             ("TensorRT lib dir", self._trt_row_widget),
             ("Min sharpness", self.min_sharp_spin),
             ("Min seconds between hits", self.min_gap_spin),
@@ -2741,6 +2864,20 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    def _on_ui_change(self, *_args) -> None:
+        if getattr(self, "_in_ui_change", False):
+            return
+        self._in_ui_change = True
+        try:
+            if self._worker:
+                self._apply_live_cfg()
+            else:
+                self._save_qsettings()
+        except Exception:
+            pass
+        finally:
+            self._in_ui_change = False
+
     # ------------- Actions -------------
 
     def _pick_file(self, line: QtWidgets.QLineEdit, filt: str):
@@ -2926,6 +3063,7 @@ class MainWindow(QtWidgets.QMainWindow):
             only_best=bool(self.only_best_check.isChecked()),
             prescan_enable=bool(self.chk_prescan.isChecked()) if hasattr(self, "chk_prescan") else True,
             prescan_stride=int(self.spin_prescan_stride.value()) if hasattr(self, "spin_prescan_stride") else 16,
+            prescan_fd_add=float(self.spin_prescan_fd_add.value()) if hasattr(self, "spin_prescan_fd_add") else 0.42,
             trt_lib_dir=self.trt_edit.text().strip() if hasattr(self, "trt_edit") else "",
             min_sharpness=float(self.min_sharp_spin.value()),
             min_gap_sec=float(self.min_gap_spin.value()),
@@ -3000,6 +3138,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.chk_prescan.setChecked(cfg.prescan_enable)
         if hasattr(self, 'spin_prescan_stride'):
             self.spin_prescan_stride.setValue(int(cfg.prescan_stride))
+        if hasattr(self, 'spin_prescan_fd_add'):
+            self.spin_prescan_fd_add.setValue(float(cfg.prescan_fd_add))
         if hasattr(self, 'trt_edit'):
             self.trt_edit.setText(cfg.trt_lib_dir or r"D:\\tensorrt\\TensorRT-10.13.3.9")
         self.min_sharp_spin.setValue(cfg.min_sharpness)
@@ -3363,6 +3503,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'face_fullframe_check'):
             self.face_fullframe_check.setChecked(s.value("face_fullframe_when_missed", True, type=bool))
         self.only_best_check.setChecked(s.value("only_best", True, type=bool))
+        if hasattr(self, 'chk_prescan'):
+            self.chk_prescan.setChecked(s.value("prescan_enable", True, type=bool))
+        if hasattr(self, 'spin_prescan_stride'):
+            self.spin_prescan_stride.setValue(int(s.value("prescan_stride", self.cfg.prescan_stride)))
+        if hasattr(self, 'spin_prescan_fd_add'):
+            self.spin_prescan_fd_add.setValue(float(s.value("prescan_fd_add", self.cfg.prescan_fd_add)))
         self.min_sharp_spin.setValue(float(s.value("min_sharpness", 0.0)))
         self.min_gap_spin.setValue(float(s.value("min_gap_sec", 1.5)))
         self.min_box_pix_spin.setValue(int(s.value("min_box_pixels", 5000)))
@@ -3474,6 +3620,8 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg_dict["ref"] = "; ".join(self._get_ref_paths())
         for k, v in cfg_dict.items():
             s.setValue(k, v)
+        if hasattr(self, 'spin_prescan_fd_add'):
+            s.setValue("prescan_fd_add", float(self.spin_prescan_fd_add.value()))
         if hasattr(self, 'disable_reid_check'):
             s.setValue("disable_reid", self.disable_reid_check.isChecked())
         if hasattr(self, 'face_fullframe_check'):
