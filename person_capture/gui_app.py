@@ -2450,7 +2450,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ref_list.filesDropped.connect(self._handle_ref_files_dropped)
         self.ref_list.customContextMenuRequested.connect(self._show_ref_context_menu)
         self.ref_list.itemDoubleClicked.connect(lambda _: self._open_selected_refs())
-        QtWidgets.QShortcut(QtGui.QKeySequence.Delete, self.ref_list, activated=self._remove_selected_refs)
+        QtGui.QShortcut(QtGui.QKeySequence.Delete, self.ref_list, activated=self._remove_selected_refs)
         self.start_btn.clicked.connect(self.on_start)
         self.stop_btn.clicked.connect(self.on_stop)
         self.pause_btn.clicked.connect(lambda: self._pause(True))
