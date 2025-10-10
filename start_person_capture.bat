@@ -6,6 +6,11 @@ set "VENV=%REPO%env"
 set "TRT_LIB_DIR=D:\tensorrt\TensorRT-10.13.3.9\lib"
 set "LOG=%REPO%last_run.log"
 
+set ORT_DISABLE_ALL_DEFAULT_EP=1
+set ORT_LOG_SEVERITY_LEVEL=0
+set ORT_TENSORRT_VERBOSE_LOGGING=1
+set ORT_TENSORRT_DUMP_SUBGRAPHS=1
+
 > "%LOG%" echo ==== PersonCapture %DATE% %TIME% ====
 
 rem --- venv ---
@@ -20,22 +25,19 @@ set "PATH=%TRT_LIB_DIR%;%VENV%\Lib\site-packages\torch\lib;%PATH%"
 for %%D in (cublas cudnn cuda_runtime cuda_nvrtc cufft curand cusolver cusparse) do (
   if exist "%VENV%\Lib\site-packages\nvidia\%%D\bin" set "PATH=%VENV%\Lib\site-packages\nvidia\%%D\bin;%PATH%"
 )
-if exist "%VENV%\Lib\site-packages\tensorrt"      set "PATH=%VENV%\Lib\site-packages\tensorrt;%PATH%"
-if exist "%VENV%\Lib\site-packages\tensorrt_libs" set "PATH=%VENV%\Lib\site-packages\tensorrt_libs;%PATH%"
-
 rem --- conservative TensorRT defaults ---
-set ORT_LOG_SEVERITY_LEVEL=0
-set ORT_TENSORRT_VERBOSE_LOGGING=1
 set PC_TRT_FP16=0
 set PC_TRT_OPT=3
 set PC_TRT_WS=4294967296
 
 rem --- must-have TRT DLLs ---
-for %%F in (nvinfer.dll nvinfer_plugin.dll nvonnxparser.dll) do (
-  if not exist "%TRT_LIB_DIR%\%%F" (
-    if not "%%F"=="nvonnxparser.dll" goto FAIL_MISS
-    if not exist "%TRT_LIB_DIR%\nvonnxparser_10.dll" goto FAIL_MISS
-  )
+for %%F in (nvinfer.dll nvinfer_plugin.dll) do (
+  if not exist "%TRT_LIB_DIR%\%%F" goto FAIL_MISS
+)
+
+rem --- optional (log if present, but do not fail) ---
+for %%F in (nvonnxparser.dll nvonnxparser_10.dll) do (
+  if exist "%TRT_LIB_DIR%\%%F" echo found %%F>>"%LOG%"
 )
 
 rem --- ORT must expose TensorrtExecutionProvider ---
