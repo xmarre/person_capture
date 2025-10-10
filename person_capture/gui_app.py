@@ -64,7 +64,7 @@ class SessionConfig:
     face_thresh: float = 0.45
     reid_thresh: float = 0.42
     combine: str = "min"            # min | avg | face_priority
-    match_mode: str = "either"        # either | both | face_only | reid_only
+    match_mode: str = "face_only"        # either | both | face_only | reid_only
     only_best: bool = True
     min_sharpness: float = 0.0
     min_gap_sec: float = 1.5
@@ -105,6 +105,9 @@ class SessionConfig:
     face_max_frac_in_crop: float = 0.42          # face_h / crop_h ≤ this
     face_min_frac_in_crop: float = 0.18          # optional lower bound to avoid face too small
     crop_min_height_frac: float = 0.28           # crop_h ≥ this * frame_h
+    # Face-only controls
+    disable_reid: bool = True                    # force no ReID usage
+    face_fullframe_when_missed: bool = True      # try full-frame face detect if per-person face=0
 
     # Debug/diagnostics
     debug_dump: bool = True
@@ -610,7 +613,15 @@ class Processor(QtCore.QObject):
                 clip_pretrained=cfg.clip_face_pretrained,
                 progress=self.status.emit,
             )
-            reid = ReIDEmbedder(device=cfg.device, model_name=cfg.reid_backbone, pretrained=cfg.reid_pretrained, progress=self.status.emit)
+            reid = None
+            if not (getattr(cfg, "disable_reid", False) or getattr(cfg, "match_mode", "") == "face_only"):
+                reid = ReIDEmbedder(
+                    device=cfg.device,
+                    model_name=cfg.reid_backbone,
+                    pretrained=cfg.reid_pretrained,
+                    progress=self.status.emit,
+                )
+            self.reid = reid
 
             # Reference
             self._status("Preparing reference features...", key="phase", interval=5.0)
@@ -635,19 +646,29 @@ class Processor(QtCore.QObject):
                     interval=60.0,
                 )
 
-            ref_persons = det.detect(ref_img, conf=0.1)
-            if ref_persons:
-                ref_persons.sort(key=lambda d: (d['xyxy'][2]-d['xyxy'][0])*(d['xyxy'][3]-d['xyxy'][1]), reverse=True)
-                rx1, ry1, rx2, ry2 = [int(v) for v in ref_persons[0]['xyxy']]
-                ref_crop = ref_img[ry1:ry2, rx1:rx2]
-                ref_reid_feat = reid.extract([ref_crop])[0]
-            else:
-                ref_reid_feat = reid.extract([ref_img])[0]
+            ref_reid_feat = None
+            if reid is not None:
+                ref_persons = det.detect(ref_img, conf=0.1)
+                if ref_persons:
+                    ref_persons.sort(key=lambda d: (d['xyxy'][2]-d['xyxy'][0])*(d['xyxy'][3]-d['xyxy'][1]), reverse=True)
+                    rx1, ry1, rx2, ry2 = [int(v) for v in ref_persons[0]['xyxy']]
+                    ref_crop = ref_img[ry1:ry2, rx1:rx2]
+                    ref_reid_feat = reid.extract([ref_crop])[0]
+                else:
+                    ref_reid_feat = reid.extract([ref_img])[0]
             self._status(
-                f"Ref ReID: {'ok' if ref_reid_feat is not None else 'missing'}",
+                f"Ref ReID: {'ok' if ref_reid_feat is not None else 'skipped'}",
                 key="ref_reid",
                 interval=60.0,
             )
+
+            # Effective matching mode after refs known
+            base_match_mode = getattr(cfg, "match_mode", "face_only")
+            if ref_face_feat is None and base_match_mode in ("both", "face_only"):
+                base_match_mode = "reid_only"
+            if ref_reid_feat is None and base_match_mode in ("both", "reid_only"):
+                base_match_mode = "face_only"
+            face_only_pipeline = (base_match_mode == "face_only")
 
             # Video
             cap = cv2.VideoCapture(cfg.video)
@@ -863,7 +884,7 @@ class Processor(QtCore.QObject):
                     crop = frame_for_det[y1:y2, x1:x2]
                     crops.append(crop); boxes.append((x1,y1,x2,y2))
 
-                reid_feats = reid.extract(crops) if crops else []
+                reid_feats = (reid.extract(crops) if (reid is not None and crops) else [None] * len(crops))
 
                 face_debug_boxes = []  # [(x1,y1,x2,y2,q,fd)]
                 faces_detected = 0
@@ -952,7 +973,7 @@ class Processor(QtCore.QObject):
                 for i, feat in enumerate(reid_feats):
                     cand_reason = []
                     rd = None
-                    if ref_reid_feat is not None:
+                    if ref_reid_feat is not None and feat is not None:
                         f = feat / max(np.linalg.norm(feat), 1e-9)
                         r = ref_reid_feat / max(np.linalg.norm(ref_reid_feat), 1e-9)
                         rd = 1.0 - float(np.dot(f, r))
@@ -978,7 +999,7 @@ class Processor(QtCore.QObject):
                     face_ok = (fd is not None and fd <= float(cfg.face_thresh))
                     reid_ok = (rd is not None and rd <= float(cfg.reid_thresh))
 
-                    eff_mode = cfg.match_mode
+                    eff_mode = base_match_mode
                     # If reference features are missing, degrade mode
                     if ref_face_feat is None and eff_mode in ("both", "face_only"):
                         eff_mode = "reid_only"
@@ -1158,8 +1179,64 @@ class Processor(QtCore.QObject):
 
                 fallback_candidate = None
                 if not candidates:
+                    # Face-only global fallback: per-person search yielded no faces.
                     if (
-                        cfg.allow_faceless_when_locked
+                        face_only_pipeline
+                        and getattr(cfg, "face_fullframe_when_missed", True)
+                        and faces_detected == 0
+                        and ref_face_feat is not None
+                    ):
+                        gfaces = face.extract(frame_for_det)
+                        gbest = FaceEmbedder.best_face(gfaces)
+                        if gbest is not None and gbest.get("feat") is not None:
+                            gfd = 1.0 - float(np.dot(gbest["feat"], ref_face_feat))
+                            if gfd <= float(cfg.face_thresh):
+                                fx1, fy1, fx2, fy2 = [int(v) for v in gbest["bbox"]]
+                                acx = (fx1 + fx2) / 2.0
+                                acy = (fy1 + fy2) / 2.0
+                                face_box_abs = (fx1, fy1, fx2, fy2)
+                                (ex1, ey1, ex2, ey2), chosen_ratio = self._choose_best_ratio(
+                                    face_box_abs, ratios, W2, H2, anchor=(acx, acy), face_box=face_box_abs
+                                )
+                                ex1, ey1, ex2, ey2 = self._enforce_scale_and_margins(
+                                    (ex1, ey1, ex2, ey2),
+                                    chosen_ratio,
+                                    W2,
+                                    H2,
+                                    face_box=face_box_abs,
+                                    anchor=(acx, acy),
+                                )
+                                ox1, oy1, ox2, oy2 = ex1 + off_x, ey1 + off_y, ex2 + off_x, ey2 + off_y
+                                ox1 = max(0, min(W - 1, int(round(ox1))))
+                                oy1 = max(0, min(H - 1, int(round(oy1))))
+                                ox2 = max(ox1 + 1, min(W, int(round(ox2))))
+                                oy2 = max(oy1 + 1, min(H, int(round(oy2))))
+                                if ox2 > ox1 + 2 and oy2 > oy1 + 2:
+                                    crop_img = frame[oy1:oy2, ox1:ox2]
+                                    sharp = self._calc_sharpness(crop_img)
+                                    sfx1 = max(0, min(W - 1, int(round(fx1 + off_x))))
+                                    sfy1 = max(0, min(H - 1, int(round(fy1 + off_y))))
+                                    sfx2 = max(sfx1 + 1, min(W, int(round(fx2 + off_x))))
+                                    sfy2 = max(sfy1 + 1, min(H, int(round(fy2 + off_y))))
+                                    fallback_candidate = dict(
+                                        score=gfd,
+                                        fd=gfd,
+                                        rd=None,
+                                        sharp=sharp,
+                                        box=(ox1, oy1, ox2, oy2),
+                                        area=(ox2 - ox1) * (oy2 - oy1),
+                                        show_box=(sfx1, sfy1, sfx2, sfy2),
+                                        face_feat=gbest["feat"],
+                                        reid_feat=None,
+                                        ratio=chosen_ratio,
+                                        reasons=["global_face"],
+                                        face_quality=float(gbest.get("quality", 0.0)),
+                                    )
+
+                    if (
+                        fallback_candidate is None
+                        and (not face_only_pipeline)
+                        and cfg.allow_faceless_when_locked
                         and self._lock_active
                         and lock_hits >= int(cfg.lock_after_hits)
                         and self._seek_cooldown_frames <= 0
@@ -1174,8 +1251,9 @@ class Processor(QtCore.QObject):
                         locked_feat = self._locked_reid_feat
                         reid_feats_fb = []
                         try:
-                            if hasattr(self, "reid") and persons_xywh:
-                                reid_feats_fb = [self.reid.embed(frame, b) for b in persons_xywh]
+                            reid_inst = getattr(self, "reid", None)
+                            if reid_inst is not None and persons_xywh:
+                                reid_feats_fb = [reid_inst.embed(frame, b) for b in persons_xywh]
                         except Exception:
                             reid_feats_fb = []
                         pick, why = self._faceless_pick_from_persons(persons_xywh, reid_feats_fb, locked_feat)
@@ -1226,64 +1304,67 @@ class Processor(QtCore.QObject):
                                                 face_quality=None,
                                                 accept_pre=True,
                                             )
-                        if (
-                            fallback_candidate is None
-                            and self._lock_last_bbox is not None
-                            and (current_idx - self._lock_last_seen_idx)
-                            <= int(cfg.faceless_persist_frames)
-                        ):
-                            lx, ly, lw, lh = self._lock_last_bbox
-                            x1 = max(0, min(W - 1, int(round(lx))))
-                            y1 = max(0, min(H - 1, int(round(ly))))
-                            x2 = max(x1 + 1, min(W, int(round(lx + lw))))
-                            y2 = max(y1 + 1, min(H, int(round(ly + lh))))
-                            if x2 > x1 + 2 and y2 > y1 + 2:
-                                (ex1, ey1, ex2, ey2), chosen_ratio = self._choose_best_ratio(
-                                    (x1, y1, x2, y2), ratios, W, H, anchor=None
-                                )
-                                ex1, ey1, ex2, ey2 = self._enforce_scale_and_margins(
-                                    (ex1, ey1, ex2, ey2),
-                                    chosen_ratio,
-                                    W,
-                                    H,
-                                    face_box=None,
-                                    anchor=None,
-                                )
-                                ex1 = max(0, min(W - 1, int(round(ex1))))
-                                ey1 = max(0, min(H - 1, int(round(ey1))))
-                                ex2 = max(ex1 + 1, min(W, int(round(ex2))))
-                                ey2 = max(ey1 + 1, min(H, int(round(ey2))))
-                                if ex2 > ex1 + 2 and ey2 > ey1 + 2:
-                                    valid, _why = self._faceless_validate((ex1, ey1, ex2, ey2), frame.shape, gray)
-                                    if valid:
-                                        crop_img = frame[ey1:ey2, ex1:ex2]
-                                        sharp = self._calc_sharpness(crop_img)
-                                        if float(cfg.min_sharpness) <= 0 or sharp >= float(cfg.min_sharpness):
-                                            fallback_candidate = dict(
-                                                score=None,
-                                                fd=None,
-                                                rd=None,
-                                                sharp=sharp,
-                                                box=(ex1, ey1, ex2, ey2),
-                                                area=(ex2 - ex1) * (ey2 - ey1),
-                                                show_box=(x1, y1, x2, y2),
-                                                face_feat=None,
-                                                reid_feat=None,
-                                                ratio=chosen_ratio,
-                                                reasons=["faceless_carry"],
-                                                face_quality=None,
-                                                accept_pre=True,
-                                            )
-                    if fallback_candidate is not None:
-                        candidates = [fallback_candidate]
-                    else:
-                        self._status(
-                            f"No match. persons={diag_persons} faces={faces_detected} pass_q={faces_passing_quality} "
-                            f"visible={any_face_visible} best_fd_qonly={best_face_dist if best_face_dist is not None else 'n/a'} "
-                            f"min_fd_all={min_fd_all if min_fd_all is not None else 'n/a'}",
-                            key="no_match",
-                            interval=1.0,
-                        )
+
+                    if (
+                        fallback_candidate is None
+                        and (not face_only_pipeline)
+                        and self._lock_last_bbox is not None
+                        and (current_idx - self._lock_last_seen_idx) <= int(cfg.faceless_persist_frames)
+                    ):
+                        lx, ly, lw, lh = self._lock_last_bbox
+                        x1 = max(0, min(W - 1, int(round(lx))))
+                        y1 = max(0, min(H - 1, int(round(ly))))
+                        x2 = max(x1 + 1, min(W, int(round(lx + lw))))
+                        y2 = max(y1 + 1, min(H, int(round(ly + lh))))
+                        if x2 > x1 + 2 and y2 > y1 + 2:
+                            (ex1, ey1, ex2, ey2), chosen_ratio = self._choose_best_ratio(
+                                (x1, y1, x2, y2), ratios, W, H, anchor=None
+                            )
+                            ex1, ey1, ex2, ey2 = self._enforce_scale_and_margins(
+                                (ex1, ey1, ex2, ey2),
+                                chosen_ratio,
+                                W,
+                                H,
+                                face_box=None,
+                                anchor=None,
+                            )
+                            ex1 = max(0, min(W - 1, int(round(ex1))))
+                            ey1 = max(0, min(H - 1, int(round(ey1))))
+                            ex2 = max(ex1 + 1, min(W, int(round(ex2))))
+                            ey2 = max(ey1 + 1, min(H, int(round(ey2))))
+                            if ex2 > ex1 + 2 and ey2 > ey1 + 2:
+                                valid, _why = self._faceless_validate((ex1, ey1, ex2, ey2), frame.shape, gray)
+                                if valid:
+                                    crop_img = frame[ey1:ey2, ex1:ex2]
+                                    sharp = self._calc_sharpness(crop_img)
+                                    if float(cfg.min_sharpness) <= 0 or sharp >= float(cfg.min_sharpness):
+                                        fallback_candidate = dict(
+                                            score=None,
+                                            fd=None,
+                                            rd=None,
+                                            sharp=sharp,
+                                            box=(ex1, ey1, ex2, ey2),
+                                            area=(ex2 - ex1) * (ey2 - ey1),
+                                            show_box=(x1, y1, x2, y2),
+                                            face_feat=None,
+                                            reid_feat=None,
+                                            ratio=chosen_ratio,
+                                            reasons=["faceless_carry"],
+                                            face_quality=None,
+                                            accept_pre=True,
+                                        )
+
+                if fallback_candidate is not None:
+                    candidates = [fallback_candidate]
+                else:
+                    extra_note = " (face-only mode; faceless fallback disabled)" if face_only_pipeline else ""
+                    self._status(
+                        f"No match. persons={diag_persons} faces={faces_detected} pass_q={faces_passing_quality} "
+                        f"visible={any_face_visible} best_fd_qonly={best_face_dist if best_face_dist is not None else 'n/a'} "
+                        f"min_fd_all={min_fd_all if min_fd_all is not None else 'n/a'}{extra_note}",
+                        key="no_match",
+                        interval=1.0,
+                    )
                 chosen = None
                 if candidates:
                     # Lock-aware scoring
@@ -1614,6 +1695,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reid_thr_spin = QtWidgets.QDoubleSpinBox(); self.reid_thr_spin.setDecimals(3); self.reid_thr_spin.setRange(0.0, 2.0); self.reid_thr_spin.setSingleStep(0.01); self.reid_thr_spin.setValue(0.38)
         self.combine_combo = QtWidgets.QComboBox(); self.combine_combo.addItems(["min","avg","face_priority"])
         self.match_mode_combo = QtWidgets.QComboBox(); self.match_mode_combo.addItems(["either","both","face_only","reid_only"])
+        self.disable_reid_check = QtWidgets.QCheckBox("Disable ReID")
+        self.disable_reid_check.setChecked(True)
+        self.face_fullframe_check = QtWidgets.QCheckBox("Full-frame face fallback when missed")
+        self.face_fullframe_check.setChecked(True)
         self.only_best_check = QtWidgets.QCheckBox("Only best per frame")
         self.only_best_check.setChecked(True)
         self.min_sharp_spin = QtWidgets.QDoubleSpinBox(); self.min_sharp_spin.setRange(0.0, 5000.0); self.min_sharp_spin.setValue(0.0)
@@ -1704,6 +1789,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ("ReID max dist", self.reid_thr_spin),
             ("Combine", self.combine_combo),
             ("Match mode", self.match_mode_combo),
+            ("Disable ReID", self.disable_reid_check),
+            ("Face fallback when missed", self.face_fullframe_check),
             ("Only best", self.only_best_check),
             ("Min sharpness", self.min_sharp_spin),
             ("Min seconds between hits", self.min_gap_spin),
@@ -2194,6 +2281,8 @@ class MainWindow(QtWidgets.QMainWindow):
             reid_thresh=float(self.reid_thr_spin.value()),
             combine=self.combine_combo.currentText(),
             match_mode=self.match_mode_combo.currentText(),
+            disable_reid=bool(self.disable_reid_check.isChecked()) if hasattr(self, "disable_reid_check") else True,
+            face_fullframe_when_missed=bool(self.face_fullframe_check.isChecked()) if hasattr(self, "face_fullframe_check") else True,
             only_best=bool(self.only_best_check.isChecked()),
             min_sharpness=float(self.min_sharp_spin.value()),
             min_gap_sec=float(self.min_gap_spin.value()),
@@ -2258,6 +2347,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reid_thr_spin.setValue(cfg.reid_thresh)
         self.combine_combo.setCurrentText(cfg.combine)
         self.match_mode_combo.setCurrentText(cfg.match_mode)
+        if hasattr(self, 'disable_reid_check'):
+            self.disable_reid_check.setChecked(cfg.disable_reid)
+        if hasattr(self, 'face_fullframe_check'):
+            self.face_fullframe_check.setChecked(cfg.face_fullframe_when_missed)
         self.only_best_check.setChecked(cfg.only_best)
         self.min_sharp_spin.setValue(cfg.min_sharpness)
         self.min_gap_spin.setValue(cfg.min_gap_sec)
@@ -2612,7 +2705,11 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.reid_thr_spin.setValue(float(s.value("reid_thresh", 0.38)))
         self.combine_combo.setCurrentText(s.value("combine", "min"))
-        self.match_mode_combo.setCurrentText(s.value("match_mode", "either"))
+        self.match_mode_combo.setCurrentText(s.value("match_mode", "face_only"))
+        if hasattr(self, 'disable_reid_check'):
+            self.disable_reid_check.setChecked(s.value("disable_reid", True, type=bool))
+        if hasattr(self, 'face_fullframe_check'):
+            self.face_fullframe_check.setChecked(s.value("face_fullframe_when_missed", True, type=bool))
         self.only_best_check.setChecked(s.value("only_best", True, type=bool))
         self.min_sharp_spin.setValue(float(s.value("min_sharpness", 0.0)))
         self.min_gap_spin.setValue(float(s.value("min_gap_sec", 1.5)))
@@ -2723,6 +2820,10 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg = self._collect_cfg()
         for k, v in asdict(cfg).items():
             s.setValue(k, v)
+        if hasattr(self, 'disable_reid_check'):
+            s.setValue("disable_reid", self.disable_reid_check.isChecked())
+        if hasattr(self, 'face_fullframe_check'):
+            s.setValue("face_fullframe_when_missed", self.face_fullframe_check.isChecked())
         s.sync()
 
 
