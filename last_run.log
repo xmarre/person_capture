@@ -1,3 +1,0 @@
-==== PersonCapture 09.10.2025 16:05:12,56 ====
-ORT providers: ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
-OK 
