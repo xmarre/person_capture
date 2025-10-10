@@ -256,8 +256,6 @@ class FaceEmbedder:
                     except Exception as e:
                         _logd(f"tensorrt import failed: {e!r}")
                     try:
-                        import ctypes
-
                         # Probe common DLLs for TRT 8/10 and CUDA 11/12
                         dlls = [
                             "nvinfer.dll",
