@@ -999,8 +999,11 @@ class Processor(QtCore.QObject):
                     else:
                         accept = face_ok or reid_ok
 
+                    # Respect match_mode: allow ReID when faces are present in 'either'/'reid_only'
+                    allow_reid_when_faces_present = eff_mode in ("either", "reid_only")
                     if (
                         getattr(cfg, "drop_reid_if_any_face_match", True)
+                        and not allow_reid_when_faces_present
                         and any_face_match
                         and not face_ok
                         and accept
@@ -1015,6 +1018,7 @@ class Processor(QtCore.QObject):
                         cfg.require_face_if_visible
                         and any_face_visible
                         and (ref_face_feat is not None)
+                        and eff_mode in ("both", "face_only")
                     ):
                         if (
                             bf is None
@@ -1023,7 +1027,12 @@ class Processor(QtCore.QObject):
                         ):
                             accept = False
                             cand_reason.append("hard_gate_face_required")
-                    elif cfg.prefer_face_when_available and any_face_visible and (bf is None):
+                    elif (
+                        cfg.prefer_face_when_available
+                        and any_face_visible
+                        and (bf is None)
+                        and eff_mode in ("both", "face_only")
+                    ):
                         cand_reason.append("soft_pref_face_missing")
 
                     if not accept:
