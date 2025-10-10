@@ -991,14 +991,8 @@ class Processor(QtCore.QObject):
                     continue
                 if ref_img_primary is None:
                     ref_img_primary = img
-                aug_images: List[np.ndarray] = []
-                aug_images.append(img)
-                try:
-                    aug_images.append(cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE))
-                    aug_images.append(cv2.rotate(img, cv2.ROTATE_180))
-                    aug_images.append(cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE))
-                except Exception:
-                    pass
+                # Rotation augments removed: keep only the original image.
+                aug_images: List[np.ndarray] = [img]
                 aug_with_flips: List[np.ndarray] = []
                 for aug in aug_images:
                     aug_with_flips.append(aug)
