@@ -44,6 +44,8 @@
   "face_max_frac_in_crop": 0.42,
   "face_min_frac_in_crop": 0.18,
   "crop_min_height_frac": 0.28,
+  "disable_reid": true,
+  "face_fullframe_when_missed": true,
   "debug_dump": true,
   "debug_dir": "debug",
   "overlay_scores": true,
