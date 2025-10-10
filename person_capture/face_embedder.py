@@ -251,16 +251,6 @@ class FaceEmbedder:
                     except Exception as e:
                         if progress: progress(f"ORT preload_dlls note: {e!r}")
                 # === TensorRT ONLY ===
-                def _trt_cache_dir() -> str:
-                    base = (
-                        os.environ.get("LOCALAPPDATA")
-                        or os.environ.get("XDG_CACHE_HOME")
-                        or str(Path.home() / ".cache")
-                    )
-                    d = Path(base).expanduser() / "PersonCapture" / "trt_cache"
-                    d.mkdir(parents=True, exist_ok=True)
-                    return str(d)
-
                 avail = list(ort.get_available_providers())
                 if 'TensorrtExecutionProvider' not in avail:
                     raise RuntimeError(f"TensorRT EP not available in ORT. avail={avail}")
@@ -276,23 +266,15 @@ class FaceEmbedder:
                 so.add_session_config_entry("session.disable_fallback", "1")
                 # Tag logs
                 so.add_session_config_entry("session.logid", "arcface_trt")
-                cache_dir = _trt_cache_dir()
                 # Python TRT bindings not required for ORT TRT-EP; skip strict check.
                 providers = ['TensorrtExecutionProvider']
-                provider_options = [{
-                    'trt_fp16_enable': '1',
-                    'trt_engine_cache_enable': '1',
-                    'trt_engine_cache_path': cache_dir,
-                    'trt_timing_cache_enable': '1',
-                    'trt_max_workspace_size': str(8 * 1024 * 1024 * 1024),
-                }]
+                provider_options = [{'trt_fp16_enable': '1'}]
                 self.arc_sess = ort.InferenceSession(
                     onnx_path, sess_options=so, providers=providers, provider_options=provider_options
                 )
                 sess_prov = self.arc_sess.get_providers()
                 if sess_prov[:1] != ['TensorrtExecutionProvider']:
-                    opts = getattr(self.arc_sess, "get_provider_options", lambda: {})()
-                    raise RuntimeError(f"TensorRT not bound. avail={avail} bound={sess_prov} opts={opts}")
+                    raise RuntimeError(f"TRT not bound. bound={sess_prov}")
                 self.arc_input = self.arc_sess.get_inputs()[0].name
                 self.backend = 'arcface'
                 if progress:
