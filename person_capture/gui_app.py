@@ -139,6 +139,8 @@ class SessionConfig:
     prescan_min_segment_sec: float = 1.0
     prescan_pad_sec: float = 1.0
     prescan_bridge_gap_sec: float = 0.75   # merge spans separated by short gaps
+    # --- runtime paths ---
+    trt_lib_dir: str = ""                  # preferred TensorRT lib directory
 
     def to_json(self, include_paths: bool = False) -> str:
         d = asdict(self)
@@ -713,6 +715,7 @@ class Processor(QtCore.QObject):
                 clip_model_name=cfg.clip_face_backbone,
                 clip_pretrained=cfg.clip_face_pretrained,
                 progress=self.status.emit,
+                trt_lib_dir=(cfg.trt_lib_dir or None),
             )
             reid = None
             if not (getattr(cfg, "disable_reid", False) or getattr(cfg, "match_mode", "") == "face_only"):
@@ -1862,6 +1865,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.face_fullframe_check.setChecked(True)
         self.only_best_check = QtWidgets.QCheckBox("Only best per frame")
         self.only_best_check.setChecked(True)
+        # Pre-scan controls
+        self.chk_prescan = QtWidgets.QCheckBox("Enable pre-scan")
+        self.chk_prescan.setChecked(bool(self.cfg.prescan_enable))
+        self.spin_prescan_stride = QtWidgets.QSpinBox()
+        self.spin_prescan_stride.setRange(1, 60)
+        self.spin_prescan_stride.setValue(int(self.cfg.prescan_stride))
+        # TensorRT path controls
+        self.trt_edit = QtWidgets.QLineEdit(self.cfg.trt_lib_dir or r"D:\\tensorrt\\TensorRT-10.13.3.9")
+        self.trt_btn = QtWidgets.QPushButton("Browse…")
+
+        def _pick_trt():
+            d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select TensorRT lib folder", self.trt_edit.text() or "")
+            if d:
+                self.trt_edit.setText(d)
+
+        self.trt_btn.clicked.connect(_pick_trt)
+        self._trt_row_widget = QtWidgets.QWidget()
+        trt_row_layout = QtWidgets.QHBoxLayout(self._trt_row_widget)
+        trt_row_layout.setContentsMargins(0, 0, 0, 0)
+        trt_row_layout.addWidget(self.trt_edit, 1)
+        trt_row_layout.addWidget(self.trt_btn)
         self.min_sharp_spin = QtWidgets.QDoubleSpinBox(); self.min_sharp_spin.setRange(0.0, 5000.0); self.min_sharp_spin.setValue(0.0)
         self.min_gap_spin = QtWidgets.QDoubleSpinBox(); self.min_gap_spin.setDecimals(2); self.min_gap_spin.setRange(0.0, 30.0); self.min_gap_spin.setValue(1.5)
         self.min_box_pix_spin = QtWidgets.QSpinBox(); self.min_box_pix_spin.setRange(0, 5000000); self.min_box_pix_spin.setValue(5000)
@@ -1953,6 +1977,9 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Disable ReID", self.disable_reid_check),
             ("Face fallback when missed", self.face_fullframe_check),
             ("Only best", self.only_best_check),
+            ("Enable pre-scan", self.chk_prescan),
+            ("Pre-scan stride (frames)", self.spin_prescan_stride),
+            ("TensorRT lib dir", self._trt_row_widget),
             ("Min sharpness", self.min_sharp_spin),
             ("Min seconds between hits", self.min_gap_spin),
             ("Min box area (px)", self.min_box_pix_spin),
@@ -2445,6 +2472,9 @@ class MainWindow(QtWidgets.QMainWindow):
             disable_reid=bool(self.disable_reid_check.isChecked()) if hasattr(self, "disable_reid_check") else True,
             face_fullframe_when_missed=bool(self.face_fullframe_check.isChecked()) if hasattr(self, "face_fullframe_check") else True,
             only_best=bool(self.only_best_check.isChecked()),
+            prescan_enable=bool(self.chk_prescan.isChecked()) if hasattr(self, "chk_prescan") else True,
+            prescan_stride=int(self.spin_prescan_stride.value()) if hasattr(self, "spin_prescan_stride") else 6,
+            trt_lib_dir=self.trt_edit.text().strip() if hasattr(self, "trt_edit") else "",
             min_sharpness=float(self.min_sharp_spin.value()),
             min_gap_sec=float(self.min_gap_spin.value()),
             min_box_pixels=int(self.min_box_pix_spin.value()),
@@ -2513,6 +2543,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'face_fullframe_check'):
             self.face_fullframe_check.setChecked(cfg.face_fullframe_when_missed)
         self.only_best_check.setChecked(cfg.only_best)
+        if hasattr(self, 'chk_prescan'):
+            self.chk_prescan.setChecked(cfg.prescan_enable)
+        if hasattr(self, 'spin_prescan_stride'):
+            self.spin_prescan_stride.setValue(int(cfg.prescan_stride))
+        if hasattr(self, 'trt_edit'):
+            self.trt_edit.setText(cfg.trt_lib_dir or r"D:\\tensorrt\\TensorRT-10.13.3.9")
         self.min_sharp_spin.setValue(cfg.min_sharpness)
         self.min_gap_spin.setValue(cfg.min_gap_sec)
         self.min_box_pix_spin.setValue(cfg.min_box_pixels)

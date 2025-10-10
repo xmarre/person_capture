@@ -135,7 +135,7 @@ class FaceEmbedder:
                  use_arcface: bool = True,
                  clip_model_name: str = 'ViT-L-14',
                  clip_pretrained: str = 'laion2b_s32b_b82k',
-                 progress=None):
+                 progress=None, trt_lib_dir: Optional[str] = None):
         # Auto-download face detector weights if a bare filename is given
         yolo_path = yolo_model
         if not os.path.isabs(yolo_path) and os.path.basename(yolo_path).startswith("yolov8") and yolo_path.endswith(".pt"):
@@ -171,77 +171,45 @@ class FaceEmbedder:
                 # Ensure CUDA/cuDNN/TensorRT DLLs are discoverable on Windows
                 if os.name == 'nt':
                     from pathlib import Path as _P
-                    TRT_DIR = os.environ.get("TRT_LIB_DIR")
-                    TRT_HINTS = [TRT_DIR, os.environ.get("TENSORRT_DIR"), os.environ.get("TENSORRT_HOME")]
 
-                    def _add(p):
-                        if p and p.exists():
-                            os.add_dll_directory(str(p))
-                            if progress:
-                                progress(f"Added DLL dir: {p}")
+                    def _add_dir(p):
+                        try:
+                            if p and p.exists():
+                                os.add_dll_directory(str(p))
+                                if progress:
+                                    progress(f"Added DLL dir: {p}")
+                        except Exception:
+                            pass
 
-                    _add(_P(_torch.__file__).parent / "lib")
-                    if not TRT_DIR:
-                        raise RuntimeError("TRT_LIB_DIR not set; set it to your TensorRT\\lib directory.")
-                    _add(_P(TRT_DIR))
-                    # CUDA/cuDNN from wheels are fine to add; do NOT add any tensorrt* wheel dirs when TRT_LIB_DIR is set.
-                    for root in ([_P(p) for p in site.getsitepackages()] + [_P(site.getusersitepackages())]):
-                        for pat in ("**/nvidia/**/bin/*.dll", "**/nvidia/**/lib/*.dll"):
-                            for hit in glob.glob(str(root / pat), recursive=True):
-                                _add(_P(hit).parent)
-
-                    # Load TRT DLLs strictly from TRT_LIB_DIR first; avoid site-packages tensorrt*.
-                    def _try_load(base: str, allow_alt: bool = True) -> bool:
-                        # 1) Hinted directories, try versioned names first.
-                        names = [f"{base}.dll", f"{base}_10.dll", f"{base}_9.dll", f"{base}_8.dll"]
-                        stubs = []
-                        hint_list = []
-                        if allow_alt:
-                            hint_list = [h for h in TRT_HINTS if h]
-                        elif TRT_DIR:
-                            hint_list = [TRT_DIR]
-                        for hp in hint_list:
-                            d = _P(hp)
-                            stubs += sorted(d.glob(f"{base}*.dll"), key=lambda p: -p.stat().st_size)
-                            for nm in names:
-                                stubs.append(d / nm)
-                        # Attempt loads
-                        tried = set()
-                        for hit in stubs:
-                            try:
-                                h = str(hit)
-                                if h in tried: continue
-                                tried.add(h)
-                                ctypes.WinDLL(h)
-                                return True
-                            except OSError:
-                                continue
-                        # Final plain-name attempt (only when alternate hints allowed)
-                        if allow_alt:
-                            try:
-                                ctypes.WinDLL(base + ".dll")
-                                return True
-                            except OSError:
-                                pass
-                        return False
-                    # Required cores (must come from TRT_LIB_DIR)
-                    for base in ("nvinfer", "nvinfer_plugin"):
-                        if not _try_load(base, allow_alt=False):
-                            raise RuntimeError(f"Missing TensorRT runtime DLL for base '{base}'")
-                    # Optional extras (OK to try site-packages too)
-                    def _try_optional(base: str):
-                        if _try_load(base):
-                            return True
-                        for root in ([_P(p) for p in site.getsitepackages()] + [_P(site.getusersitepackages())]):
-                            for hit in glob.glob(str(root / f"**/{base}*.dll"), recursive=True):
-                                try:
-                                    ctypes.WinDLL(str(hit)); return True
-                                except OSError:
-                                    pass
-                        if progress: progress(f"Note: optional TensorRT DLL not found: {base}*.dll")
-                        return False
-                    for base in ("nvonnxparser", "nvonnxparser_runtime", "nvinfer_builder_resource", "nvinfer_lean", "nvinfer_dispatch"):
-                        _try_optional(base)
+                    # Always add PyTorch CUDA/cuDNN bin
+                    _add_dir(_P(_torch.__file__).parent / "lib")
+                    # Priority: GUI -> env -> fallback
+                    trt_root = (
+                        trt_lib_dir
+                        or os.environ.get("TRT_LIB_DIR")
+                        or os.environ.get("TENSORRT_DIR")
+                        or os.environ.get("TENSORRT_HOME")
+                        or r"D:\tensorrt\TensorRT-10.13.3.9"
+                    )
+                    trt_root_p = _P(trt_root)
+                    # Typical layouts: <root>\lib or the root already is lib
+                    trt_lib_p = trt_root_p / "lib" if (trt_root_p / "lib").exists() else trt_root_p
+                    _add_dir(trt_lib_p)
+                    if progress:
+                        progress(f"Using TensorRT dir: {trt_lib_p}")
+                    # Hard sanity check so we fail fast if the wrong dir is used
+                    try:
+                        ctypes.WinDLL("nvinfer.dll")
+                        ctypes.WinDLL("nvinfer_plugin.dll")
+                    except OSError as e:
+                        raise RuntimeError(f"TensorRT core DLLs not loadable from {trt_lib_p}: {e}")
+                    # Parser is optional for ORT TRT-EP, but load if present
+                    for opt in ("nvonnxparser.dll", "nvonnxparser_runtime.dll"):
+                        try:
+                            ctypes.WinDLL(opt)
+                            break
+                        except OSError:
+                            pass
                 # Import ORT only after DLL dirs are set
                 global ort
                 import onnxruntime as ort  # noqa
@@ -262,23 +230,22 @@ class FaceEmbedder:
                     level = getattr(go, "ORT_ENABLE_ALL", None)
                     if level is not None:
                         so.graph_optimization_level = level
-                # Do not allow fallback to any other EP
+                # Request no fallback
                 so.add_session_config_entry("session.disable_fallback", "1")
                 # Tag logs
                 so.add_session_config_entry("session.logid", "arcface_trt")
-                # Python TRT bindings not required for ORT TRT-EP; skip strict check.
                 providers = ['TensorrtExecutionProvider']
-                provider_options = [{'trt_fp16_enable': '1'}]
+                provider_options = [{}]
                 self.arc_sess = ort.InferenceSession(
                     onnx_path, sess_options=so, providers=providers, provider_options=provider_options
                 )
-                sess_prov = self.arc_sess.get_providers()
-                if sess_prov[:1] != ['TensorrtExecutionProvider']:
-                    raise RuntimeError(f"TRT not bound. bound={sess_prov}")
+                bound = self.arc_sess.get_providers()
+                if bound[:1] != ['TensorrtExecutionProvider']:
+                    raise RuntimeError(f"TRT not bound. bound={bound}")
                 self.arc_input = self.arc_sess.get_inputs()[0].name
                 self.backend = 'arcface'
                 if progress:
-                    progress(f"ArcFace(TRT): bound={sess_prov} file={onnx_path}")
+                    progress(f"ArcFace(TRT): bound={bound} file={onnx_path}")
                 # sanity: output embedding should be 512-D
                 out0 = self.arc_sess.get_outputs()[0]
                 if hasattr(out0, "shape") and (out0.shape is not None) and (out0.shape[-1] not in (512,)):
