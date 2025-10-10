@@ -1,6 +1,6 @@
-
-import math
 import os
+from typing import Iterable
+
 import cv2
 import numpy as np
 
@@ -19,23 +19,41 @@ def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
-    cur = new_w / new_h
-    if abs(cur - target) > 1e-4:
-        if cur < target:
-            # grow width if possible
-            pad = (target * new_h - new_w) * 0.5
-            nx1 = _clamp(nx1 - pad, 0, frame_w - 1)
-            nx2 = _clamp(nx2 + pad, 0, frame_w - 1)
-        else:
-            pad = (new_w / target - new_h) * 0.5
-            ny1 = _clamp(ny1 - pad, 0, frame_h - 1)
-            ny2 = _clamp(ny2 + pad, 0, frame_h - 1)
-
-    return int(round(nx1)), int(round(ny1)), int(round(nx2)), int(round(ny2))
-
 def crop_img(frame, box):
-    x1,y1,x2,y2 = [int(v) for v in box]
+    x1, y1, x2, y2 = [int(v) for v in box]
     return frame[y1:y2, x1:x2]
+
+
+def _phash_bits(img: np.ndarray, hash_size: int = 8) -> int:
+    """Compute a DCT-based perceptual hash for a BGR image."""
+
+    if img is None or img.size == 0:
+        return 0
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA)
+    dct = cv2.dct(np.float32(gray))
+    block = dct[:hash_size, :hash_size]
+    median = float(np.median(block))
+    bits = 0
+    bit_idx = 0
+    for r in range(hash_size):
+        for c in range(hash_size):
+            if block[r, c] > median:
+                bits |= 1 << bit_idx
+            bit_idx += 1
+    return int(bits)
+
+
+def phash_similarity(h1: int, h2: int, nbits: int = 64) -> float:
+    """Return similarity score in [0, 1] based on Hamming distance."""
+
+    total_bits = max(1, int(nbits))
+    diff = int(h1) ^ int(h2)
+    try:
+        distance = diff.bit_count()
+    except AttributeError:  # pragma: no cover
+        distance = bin(diff).count("1")
+    return 1.0 - float(distance) / float(total_bits)
 
 def detect_black_borders(bgr, thr=10, max_scan=None):
     """
@@ -143,3 +161,14 @@ def expand_box_to_ratio(x1, y1, x2, y2, ratio_w, ratio_h, frame_w, frame_h, anch
         ny2 = _clamp(ny2, 0, frame_h - 1)
 
     return int(round(nx1)), int(round(ny1)), int(round(nx2)), int(round(ny2))
+
+
+def cosine_distance(a: Iterable[float], b: Iterable[float]) -> float:
+    """Return cosine distance (1 - cosine similarity) for the two vectors."""
+
+    vec_a = np.asarray(list(a), dtype=np.float32).reshape(-1)
+    vec_b = np.asarray(list(b), dtype=np.float32).reshape(-1)
+    norm_a = float(np.linalg.norm(vec_a)) + 1e-9
+    norm_b = float(np.linalg.norm(vec_b)) + 1e-9
+    similarity = float(np.dot(vec_a / norm_a, vec_b / norm_b))
+    return 1.0 - similarity
