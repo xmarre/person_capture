@@ -230,8 +230,6 @@ class FaceEmbedder:
                     level = getattr(go, "ORT_ENABLE_ALL", None)
                     if level is not None:
                         so.graph_optimization_level = level
-                # Request no fallback
-                so.add_session_config_entry("session.disable_fallback", "1")
                 # Tag logs
                 so.add_session_config_entry("session.logid", "arcface_trt")
 
@@ -281,54 +279,34 @@ class FaceEmbedder:
                     except Exception as e:
                         _logd(f"ctypes probe error: {e!r}")
 
-                # Provider options: keep FP16 only by default.
-                prov = ['TensorrtExecutionProvider']
-                fp16_opts = {"trt_fp16_enable": "1"}
+                # Build provider chain: TRT -> CUDA -> CPU with **no fp16, no cache**, default opts
+                prov = []
+                if 'TensorrtExecutionProvider' in avail:
+                    prov.append('TensorrtExecutionProvider')
+                if 'CUDAExecutionProvider' in avail:
+                    prov.append('CUDAExecutionProvider')
+                prov.append('CPUExecutionProvider')
 
-                # Optional engine/timing cache only if user opted-in
-                cache_dir = None
-                cache_env = os.getenv("PERSON_CAPTURE_TRT_CACHE", "").strip()
-                if cache_env:
-                    cache_dir = (Path(cache_env).expanduser())
-                    try:
-                        cache_dir.mkdir(parents=True, exist_ok=True)
-                        _cache_opts = {
-                            "trt_engine_cache_enable": "1",
-                            "trt_engine_cache_path": str(cache_dir),
-                        }
-                    except Exception as e:
-                        _logd(f"Cache dir unusable ({cache_env}): {e!r}")
-                        _cache_opts = {}
-                else:
-                    _cache_opts = {}
-
-                attempts = [
-                    ("fp16+cache" if _cache_opts else "fp16", {**fp16_opts, **_cache_opts}),
-                ]
-                # If cache was requested, also try fp16-only as a fallback for better diagnostics
-                if _cache_opts:
-                    attempts.append(("fp16-only", {**fp16_opts}))
+                prov_opts: list[dict] = [{} for _ in prov]
 
                 last_err = None
                 bound = []
-                for name, opts in attempts:
+                try:
+                    _logd(f"Trying TRT session providers={prov} (no fp16, no cache)")
+                    self.arc_sess = ort.InferenceSession(
+                        onnx_path, sess_options=so, providers=prov, provider_options=prov_opts
+                    )
+                    bound = self.arc_sess.get_providers()
+                    if bound[:1] != ['TensorrtExecutionProvider']:
+                        raise RuntimeError(f"TRT not bound. bound={bound}")
                     try:
-                        _logd(f"Trying TRT session with opts={opts}")
-                        self.arc_sess = ort.InferenceSession(
-                            onnx_path, sess_options=so, providers=prov, provider_options=[opts]
-                        )
-                        bound = self.arc_sess.get_providers()
-                        if bound[:1] != ['TensorrtExecutionProvider']:
-                            raise RuntimeError(f"TRT not bound. bound={bound}")
-                        try:
-                            _logd(f"Resolved provider options: {self.arc_sess.get_provider_options()}")
-                        except Exception:
-                            pass
-                        _logd(f"ArcFace(TRT): bound={bound} file={onnx_path}")
-                        break
-                    except Exception as e:
-                        last_err = e
-                        _logd(f"Attempt '{name}' failed: {e!r}")
+                        _logd(f"Resolved provider options: {self.arc_sess.get_provider_options()}")
+                    except Exception:
+                        pass
+                    _logd(f"ArcFace(TRT): bound={bound} file={onnx_path}")
+                except Exception as e:
+                    last_err = e
+                    _logd(f"Attempt failed: {e!r}")
 
                 if bound[:1] != ['TensorrtExecutionProvider']:
                     # Hard fail with full debug trail
