@@ -234,33 +234,110 @@ class FaceEmbedder:
                 so.add_session_config_entry("session.disable_fallback", "1")
                 # Tag logs
                 so.add_session_config_entry("session.logid", "arcface_trt")
-                cache_env = os.getenv("PERSON_CAPTURE_TRT_CACHE")
-                cache_dir = (
-                    Path(cache_env).expanduser()
-                    if cache_env
-                    else Path.home() / ".cache" / "person_capture" / "trt"
-                )
-                try:
-                    cache_dir.mkdir(parents=True, exist_ok=True)
-                except OSError as e:
-                    raise RuntimeError(f"Unable to create TensorRT cache dir {cache_dir}: {e}")
-                providers = ['TensorrtExecutionProvider']
-                provider_options = [{
-                    "trt_fp16_enable": "1",
-                    "trt_engine_cache_enable": "1",
-                    "trt_engine_cache_path": str(cache_dir),
-                    "trt_timing_cache_enable": "1",
-                }]
-                self.arc_sess = ort.InferenceSession(
-                    onnx_path, sess_options=so, providers=providers, provider_options=provider_options
-                )
-                bound = self.arc_sess.get_providers()
+
+                # ---- Debug & options -------------------------------------------------
+                debug_lines: list[str] = []
+
+                def _logd(msg: str) -> None:
+                    debug_lines.append(msg)
+                    if progress:
+                        try:
+                            progress(msg)
+                        except Exception:
+                            pass
+
+                if os.getenv("PERSON_CAPTURE_TRT_DEBUG", "0") not in ("0", "", "false", "False"):
+                    _logd(
+                        f"onnxruntime {getattr(ort, '__version__', '?')} file={getattr(ort, '__file__', '?')} avail={avail}"
+                    )
+                    try:
+                        import tensorrt as _trt
+                        _logd(f"tensorrt python module: {_trt.__version__}")
+                    except Exception as e:
+                        _logd(f"tensorrt import failed: {e!r}")
+                    try:
+                        import ctypes
+
+                        # Probe common DLLs for TRT 8/10 and CUDA 11/12
+                        dlls = [
+                            "nvinfer.dll",
+                            "nvinfer_plugin.dll",
+                            "nvonnxparser.dll",
+                            "cudart64_12.dll",
+                            "cudart64_110.dll",
+                            "cudart64_111.dll",
+                            "cudart64_112.dll",
+                        ]
+                        for d in dlls:
+                            try:
+                                ctypes.WinDLL(d)
+                                _logd(f"Loaded {d}")
+                            except Exception as ee:
+                                _logd(f"Load failed {d}: {ee!r}")
+                        _logd(
+                            f"PATH has TensorRT? {any('tensorrt' in p.lower() for p in os.getenv('PATH', '').split(os.pathsep))}"
+                        )
+                        _logd(
+                            f"PATH has CUDA bin? {any(os.path.basename(p).lower() == 'bin' and 'cuda' in p.lower() for p in os.getenv('PATH', '').split(os.pathsep))}"
+                        )
+                    except Exception as e:
+                        _logd(f"ctypes probe error: {e!r}")
+
+                # Provider options: keep FP16 only by default.
+                prov = ['TensorrtExecutionProvider']
+                fp16_opts = {"trt_fp16_enable": "1"}
+
+                # Optional engine/timing cache only if user opted-in
+                cache_dir = None
+                cache_env = os.getenv("PERSON_CAPTURE_TRT_CACHE", "").strip()
+                if cache_env:
+                    cache_dir = (Path(cache_env).expanduser())
+                    try:
+                        cache_dir.mkdir(parents=True, exist_ok=True)
+                        _cache_opts = {
+                            "trt_engine_cache_enable": "1",
+                            "trt_engine_cache_path": str(cache_dir),
+                        }
+                    except Exception as e:
+                        _logd(f"Cache dir unusable ({cache_env}): {e!r}")
+                        _cache_opts = {}
+                else:
+                    _cache_opts = {}
+
+                attempts = [
+                    ("fp16+cache" if _cache_opts else "fp16", {**fp16_opts, **_cache_opts}),
+                ]
+                # If cache was requested, also try fp16-only as a fallback for better diagnostics
+                if _cache_opts:
+                    attempts.append(("fp16-only", {**fp16_opts}))
+
+                last_err = None
+                bound = []
+                for name, opts in attempts:
+                    try:
+                        _logd(f"Trying TRT session with opts={opts}")
+                        self.arc_sess = ort.InferenceSession(
+                            onnx_path, sess_options=so, providers=prov, provider_options=[opts]
+                        )
+                        bound = self.arc_sess.get_providers()
+                        if bound[:1] != ['TensorrtExecutionProvider']:
+                            raise RuntimeError(f"TRT not bound. bound={bound}")
+                        try:
+                            _logd(f"Resolved provider options: {self.arc_sess.get_provider_options()}")
+                        except Exception:
+                            pass
+                        _logd(f"ArcFace(TRT): bound={bound} file={onnx_path}")
+                        break
+                    except Exception as e:
+                        last_err = e
+                        _logd(f"Attempt '{name}' failed: {e!r}")
+
                 if bound[:1] != ['TensorrtExecutionProvider']:
-                    raise RuntimeError(f"TRT not bound. bound={bound}")
+                    # Hard fail with full debug trail
+                    raise RuntimeError("TRT binding failed.\n" + "\n".join(debug_lines)) from last_err
+
                 self.arc_input = self.arc_sess.get_inputs()[0].name
                 self.backend = 'arcface'
-                if progress:
-                    progress(f"ArcFace(TRT): bound={bound} file={onnx_path}")
                 # sanity: output embedding should be 512-D
                 out0 = self.arc_sess.get_outputs()[0]
                 if hasattr(out0, "shape") and (out0.shape is not None) and (out0.shape[-1] not in (512,)):
