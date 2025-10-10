@@ -1,49 +1,111 @@
-# PersonCapture: Target-person finder and 2:3 crops from video
+# PersonCapture — target‑person crops from video
 
-Pipeline:
-- Detect persons in video frames (YOLOv8).
-- Compute two identity signals per candidate:
-  - Face embedding when a face is visible (InsightFace).
-  - Full-body person ReID embedding (TorchReID OSNet).
-- Compare to a reference image you supply.
-- Save crops around matches at a fixed aspect ratio (e.g., 2:3).
+**Purpose:** Find one specific person in a video and auto‑save clean, framed crops at fixed ratios (e.g., 2:3) for downstream editing.
 
-## Quick start (Windows + Visual Studio 2022)
+## Key points
 
-1) Install Python 3.10 or 3.11 (64‑bit). In Visual Studio Installer, add the **Python development** workload.
-2) Install a CUDA runtime if you want GPU (NVIDIA). CUDA 12.x is typical for RTX 40/50 series.
-3) Create and select a virtual environment from VS or PowerShell:
+- **Intended mode:** Use **ArcFace** for identity and turn ReID off. This gives the strongest identity precision when a face is visible. In the GUI this is the default: `Match mode = face_only`, `Use ArcFace = on`, `Disable ReID = on`.
+- **Backends:** Face detection uses YOLOv8‑face. Identity uses ArcFace ONNX by default. The app can run on CPU or CUDA. Optional: ONNX Runtime TensorRT EP for speed on NVIDIA.
+- **Outputs:** Crops to `output/crops`, optional annotated previews to `output/annot`, index CSV with timestamps and scores.
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\activate
-pip install --upgrade pip
-pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio  # GPU
-pip install -r requirements.txt
+## Quick start (Windows, Python 3.12, venv named `env`)
+
+1. Open a terminal in your repo folder.
+2. Create and activate the venv:
+   ```bat
+   py -3.12 -m venv env
+   call env\Scripts\activate
+   python -m pip install -U pip
+   pip install -r requirements.txt
+   ```
+3. Run the GUI:
+   ```bat
+   python person_capture\gui_app.py
+   ```
+
+> Tip: You can also run the CLI tool if you prefer batch mode. See **CLI** below.
+
+## Recommended identity setup (ArcFace‑only)
+
+Use ArcFace as the single identity signal and gate crops on face presence/quality.
+
+- **GUI → Settings → Matching**
+  - **Match mode:** `face_only`
+  - **Use ArcFace:** `on`
+  - **Disable ReID:** `on`
+  - **Face threshold:** start at `0.28–0.38` (lower is stricter). The app clamps to a safe maximum internally.
+- **Reference image(s):** Provide one or more clear frontal shots of the target. Multiple refs help robustness. The app builds a small deduplicated feature bank.
+- **When no face is visible:** The default behavior is to **skip** to avoid false crops. If you need continuity on profile/occluded frames, enable the optional “faceless fallback” in advanced settings, but this is not the intended best‑ID mode.
+
+## Performance: ONNX Runtime 1.24 + TensorRT (optional)
+
+For RTX 50‑series or newer NVIDIA GPUs you can accelerate ArcFace ONNX with ONNX Runtime’s TensorRT Execution Provider.
+
+- Read: **`README_onnxruntime_1.24_trt_windows.md`** in this repo for the wheel and exact steps.
+- After installing that wheel, download **TensorRT 10.13.3.9** from NVIDIA and **extract** it.
+- In the GUI set **Settings → Backends → TensorRT folder** to your extracted directory, e.g. `D:\tensorrt\TensorRT-10.13.3.9`. No PATH edits required.
+
+## Typical workflow
+
+1. **Load video** and **reference image(s)** of the person.
+2. Set **ratio list** (default `2:3,1:1,3:2`). The cropper chooses the best framing per hit with penalties to avoid half‑faces or excess headroom.
+3. Start processing. Use the timeline and seek controls to review. Prescan can limit work to relevant segments.
+4. Collect results from `output/crops`. Optional previews in `output/annot`. Debug JSONL in `output/debug/debug.jsonl` if enabled.
+
+## Controls that matter
+
+- **Frame stride:** Analyze every Nth frame. Higher is faster but may miss brief moments.
+- **Min detection conf:** YOLO person threshold.
+- **Face visible gate:** Require a solid face detection before considering a match.
+- **Ratio list:** Comma‑separated e.g. `2:3,1:1,3:2`.
+- **Crop placement:** Heuristics keep side margins, cap headroom, and bias downward to include torso. Anti‑over‑zoom guards keep the face from filling the whole crop.
+
+## CLI (optional)
+
+```bat
+python -m person_capture.main ^
+  --video path\to\video.mp4 ^
+  --ref path\to\person.jpg ^
+  --out out_dir ^
+  --ratio 2:3 ^
+  --frame-stride 2 ^
+  --min-det-conf 0.35 ^
+  --face-thresh 0.32 ^
+  --device cuda
 ```
 
-4) Open **Visual Studio 2022** → *Open a project or solution* → select this folder.
-   - Add a **Python Application** project if VS asks. Set `person_capture/main.py` as startup.
-5) Run:
+Notes:
+- The GUI and CLI share the same detection and identity code paths.
+- Thresholds are data‑dependent. Tighten or loosen based on your material.
 
-```powershell
-python -m person_capture.main --video path\to\video.mp4 --ref path\to\person.jpg --out out_dir --ratio 2:3
-```
+## Troubleshooting
 
-Optional flags:
-```
---frame-stride 3            # analyze every 3rd frame
---min-det-conf 0.35         # YOLO confidence threshold
---face-thresh 0.32          # cosine distance for face match (lower is stricter)
---reid-thresh 0.38          # cosine distance for reid match (lower is stricter)
---combine 'min'             # combine scores: min | avg | face_priority
---device cuda               # cuda | cpu
---save-annot                # also save annotated frames
-```
+- **`nvinfer.dll not found`** when using TensorRT EP: In the GUI set **TensorRT folder** to the directory that contains `lib\nvinfer*.dll` (e.g., `D:\tensorrt\TensorRT-10.13.3.9`). No manual PATH edits needed.
+- **Providers show CPU‑only:** Ensure you installed the ORT wheel with CUDA/TRT EP support and a matching NVIDIA driver. See the ORT+TRT README.
+- **ArcFace model download failed:** The app tries multiple mirrors. Check connectivity or place `arcface_r100.onnx` next to the executable.
+- **Startup warnings about unused initializers (ORT logs):** Benign graph‑clean messages from ONNX Runtime.
 
-Outputs: crops in `out_dir/crops` and an index CSV with timestamps and scores.
+## Files and architecture (high level)
 
-## Notes
-- Reference image can be a frame grab. If it has a clear face, face matching will dominate.
-- When face is not visible, ReID keeps tracking using clothes/shape cues.
-- Thresholds are dataset dependent. Start with defaults, then tighten/loosen as needed.
+- Person detection: `person_capture/detectors.py` (YOLOv8 persons).
+- Face identity: `person_capture/face_embedder.py` (YOLOv8‑face + ArcFace ONNX; optional ORT TensorRT path).
+- ReID identity (optional): `person_capture/reid_embedder.py` (OpenCLIP). Disabled in intended mode.
+- GUI and pipeline: `person_capture/gui_app.py` (processing thread, prescan, cropping, heuristics).
+- Utilities: `person_capture/utils.py` (ratio math, black‑border detect, etc.).
+
+## Legal
+
+- You are responsible for the content you process.
+- InsightFace, ONNX Runtime, TensorRT, CUDA, and YOLO models are licensed by their respective owners.
+- Do not redistribute NVIDIA binaries. Download them from NVIDIA.
+
+
+
+## Performance: ONNX Runtime 1.24 + TensorRT (optional)
+
+For RTX 50-series or newer NVIDIA GPUs you can accelerate ArcFace ONNX with ONNX Runtime’s TensorRT Execution Provider.
+
+- Read: **`README_onnxruntime_1.24_trt_windows.md`** in this repo for the wheel and exact steps.
+- **TensorRT source:** Prefer the NVIDIA ZIP for **10.13.3.9** and just **extract** it.
+- **Alternative:** NVIDIA’s **TensorRT pip wheel** may work. If used, point the GUI to your venv’s `...\Lib\site-packages\tensorrt\lib` folder. **Untested by the author.**
+- In the GUI set **Settings → Backends → TensorRT folder** to the chosen directory, e.g. `D:\tensorrt\TensorRT-10.13.3.9`. No PATH edits required.
