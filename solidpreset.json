@@ -5,7 +5,7 @@
   "face_thresh": 0.45,
   "reid_thresh": 0.25,
   "combine": "face_priority",
-  "match_mode": "either",
+  "match_mode": "face_only",
   "only_best": true,
   "min_sharpness": 0.0,
   "min_gap_sec": 0.25,
