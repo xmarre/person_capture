@@ -2,7 +2,7 @@
 
 **Summary:** Unofficial ONNX Runtime `1.24.0` snapshot built from source with **TensorRT 10.13.3.9**, **CUDA 12.8**, **cuDNN 9**, **Python 3.12**, on **Windows 10/11**, tested on **RTX 5090**. Includes CUDA and TensorRT execution providers. This is **not** an official Microsoft release.
 
-> Download wheel: _to be added by author_
+> Download wheel: https://pixeldrain.com/u/SFVVf9KU
 
 ---
 
@@ -17,7 +17,7 @@
 2. **Install the wheel** (remove conflicting packages first):
    ```bat
    pip uninstall -y onnxruntime onnxruntime-gpu onnxruntime-gpu-tensorrt
-   pip install -U <path-to-wheel>\onnxruntime*.whl
+   pip install -U <path-to-wheel>\onnxruntime\build\Windows\Release\Release\dist\onnxruntime_gpu-1.24.0-cp312-cp312-win_amd64.whl
    ```
 
 3. **Tell the app where TensorRT is:**
