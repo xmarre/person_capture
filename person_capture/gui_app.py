@@ -35,7 +35,10 @@ def _imp():
         from detectors import PersonDetector  # type: ignore
         from face_embedder import FaceEmbedder  # type: ignore
         from reid_embedder import ReIDEmbedder  # type: ignore
-        from utils import ensure_dir, parse_ratio, expand_box_to_ratio
+        try:
+            from .utils import ensure_dir, parse_ratio, expand_box_to_ratio  # type: ignore
+        except Exception:
+            from utils import ensure_dir, parse_ratio, expand_box_to_ratio  # type: ignore
         return PersonDetector, FaceEmbedder, ReIDEmbedder, ensure_dir, parse_ratio, expand_box_to_ratio
 
 PersonDetector, FaceEmbedder, ReIDEmbedder, ensure_dir, parse_ratio, expand_box_to_ratio = _imp()
@@ -307,7 +310,11 @@ class Processor(QtCore.QObject):
         return variance / (mean_intensity * mean_intensity + 1e-6)
 
     def _autocrop_borders(self, frame, thr):
-        from utils import detect_black_borders
+        # Package-safe import (supports both module and flat execution)
+        try:
+            from .utils import detect_black_borders  # type: ignore
+        except Exception:
+            from utils import detect_black_borders  # type: ignore
         x1,y1,x2,y2 = detect_black_borders(frame, thr=int(thr))
         return frame[y1:y2, x1:x2], (x1,y1)
 
@@ -323,7 +330,10 @@ class Processor(QtCore.QObject):
         return inter/union
 
     def _expand_to_ratio(self, box, ratio_w, ratio_h, frame_w, frame_h, anchor=None):
-        from utils import expand_box_to_ratio
+        try:
+            from .utils import expand_box_to_ratio  # type: ignore
+        except Exception:
+            from utils import expand_box_to_ratio  # type: ignore
         x1,y1,x2,y2 = box
         ex1,ey1,ex2,ey2 = expand_box_to_ratio(x1,y1,x2,y2, ratio_w, ratio_h, frame_w, frame_h, anchor=anchor, head_bias=0.12)
         return ex1,ey1,ex2,ey2
