@@ -1,8 +1,8 @@
 {
   "ratio": "1:1,2:3,3:2",
   "frame_stride": 2,
-  "min_det_conf": 0.22,
-  "face_thresh": 0.22,
+  "min_det_conf": 0.21,
+  "face_thresh": 0.21,
   "reid_thresh": 0.25,
   "combine": "face_priority",
   "match_mode": "face_only",
@@ -36,6 +36,7 @@
   "face_margin_min": 0.3,
   "require_face_if_visible": false,
   "drop_reid_if_any_face_match": false,
+  "learn_bank_runtime": false,
   "crop_face_side_margin_frac": 0.3,
   "crop_top_headroom_max_frac": 0.15,
   "crop_bottom_min_face_heights": 1.5,
@@ -62,16 +63,41 @@
   "faceless_max_area_frac": 0.55,
   "faceless_center_max_frac": 0.12,
   "faceless_min_motion_frac": 0.02,
-  "prescan_enable": false,
+  "prescan_enable": true,
   "prescan_stride": 24,
   "prescan_max_width": 416,
-  "prescan_face_conf": 0.25,
+  "prescan_face_conf": 0.21,
   "prescan_fd_enter": 0.45,
-  "prescan_fd_add": 0.22,
+  "prescan_fd_add": 0.21,
   "prescan_fd_exit": 0.52,
   "prescan_add_cooldown_samples": 5,
   "prescan_min_segment_sec": 1.0,
   "prescan_pad_sec": 2.0,
   "prescan_bridge_gap_sec": 1.0,
-  "trt_lib_dir": "D:\\\\tensorrt\\\\TensorRT-10.13.3.9"
+  "prescan_bank_max": 64,
+  "prescan_diversity_dedup_cos": 0.968,
+  "prescan_replace_margin": 0.01,
+  "prescan_weights": [
+    0.7,
+    0.25,
+    0.05
+  ],
+  "trt_lib_dir": "D:\\\\tensorrt\\\\TensorRT-10.13.3.9",
+  "curate_enable": true,
+  "curate_max_images": 200,
+  "curate_fd_gate": 0.45,
+  "curate_cos_face_dedup": 0.985,
+  "curate_phash_dedup": 0.92,
+  "curate_lambda": 0.7,
+  "curate_weights": [
+    0.6,
+    0.35,
+    0.05
+  ],
+  "curate_bucket_quota": [
+    0.5,
+    0.25,
+    0.25
+  ],
+  "curate_use_yaw_quota": true
 }
