@@ -88,7 +88,7 @@ class SessionConfig:
     yolo_model: str = "yolov8n.pt"
     face_model: str = "yolov8n-face.pt"
     save_annot: bool = False
-    preview_every: int = 30
+    preview_every: int = 120
     prefer_face_when_available: bool = True
     face_quality_min: float = 70.0
     face_visible_uses_quality: bool = True      # if False, any detected face counts as "visible"
@@ -131,14 +131,14 @@ class SessionConfig:
     faceless_min_motion_frac: float = 0.02  # min moving pixels in ROI
     # --- pre-scan ---
     prescan_enable: bool = True
-    prescan_stride: int = 6                # sample every N frames
-    prescan_max_width: int = 640           # downscale for prescan
+    prescan_stride: int = 24               # sample every N frames
+    prescan_max_width: int = 416           # downscale for prescan
     prescan_face_conf: float = 0.25        # YOLO-face conf during prescan
     prescan_fd_enter: float = 0.45         # ArcFace dist to ENTER (looser)
     prescan_fd_exit: float = 0.52          # ArcFace dist to EXIT  (hysteresis)
     prescan_min_segment_sec: float = 1.0
-    prescan_pad_sec: float = 1.0
-    prescan_bridge_gap_sec: float = 0.75   # merge spans separated by short gaps
+    prescan_pad_sec: float = 2.0
+    prescan_bridge_gap_sec: float = 1.0    # merge spans separated by short gaps
     # --- runtime paths ---
     trt_lib_dir: str = ""                  # preferred TensorRT lib directory
 
@@ -170,6 +170,22 @@ class Processor(QtCore.QObject):
             return new
         return (m * prev + (1.0 - m) * new) if isinstance(prev, np.ndarray) else new
 
+    @staticmethod
+    def _fd_min(feat, ref_bank):
+        if feat is None or ref_bank is None:
+            return 9.0
+        vec = np.asarray(feat, dtype=np.float32).reshape(-1)
+        vec = vec / max(float(np.linalg.norm(vec)), 1e-6)
+        bank = np.asarray(ref_bank, dtype=np.float32)
+        if bank.ndim == 1:
+            return 1.0 - float(np.dot(vec, bank))
+        if bank.size == 0:
+            return 9.0
+        sims = bank @ vec
+        if sims.size == 0:
+            return 9.0
+        return 1.0 - float(np.max(sims))
+
     def _span_index_for(self, f, spans):
         # return index of span containing f, else next span index
         for i, (s, e) in enumerate(spans):
@@ -197,14 +213,25 @@ class Processor(QtCore.QObject):
         total_samples = max(1, (total_frames + stride - 1) // stride)
         progress_step = max(1, total_samples // 50)
         next_progress_sample = 0
-        preview_step = max(stride, int(getattr(cfg, "preview_every", 30)))
+        preview_step = max(stride, int(getattr(cfg, "preview_every", 120)))
         last_preview_idx = -preview_step
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        processed_samples = 0
+        i = 0
         # fast pass
-        for sample_idx, idx in enumerate(range(0, total_frames, stride)):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ok, frame = cap.read()
-            if not ok or frame is None:
+        while i < total_frames:
+            if not cap.grab():
+                break
+            if i % stride != 0:
+                i += 1
                 continue
+            ok, frame = cap.retrieve()
+            if not ok or frame is None:
+                i += 1
+                continue
+            idx = i
+            sample_idx = processed_samples
+            processed_samples += 1
             h, w = frame.shape[:2]
             if w > Wmax:
                 nh = int(round(h * (Wmax / float(w))))
@@ -213,11 +240,10 @@ class Processor(QtCore.QObject):
             # best ArcFace distance on this sample
             best = 9.0
             for f in faces:
-                if f.get("feat") is None:
+                feat = f.get("feat")
+                if feat is None:
                     continue
-                d = 1.0 - float(np.dot(f["feat"], ref_feat))
-                if d < best:
-                    best = d
+                best = min(best, self._fd_min(feat, ref_feat))
             if sample_idx >= next_progress_sample:
                 pct = min(100.0, (idx + stride) / max(1.0, float(total_frames)) * 100.0)
                 self._status(
@@ -272,6 +298,7 @@ class Processor(QtCore.QObject):
                     self.preview.emit(self._cv_bgr_to_qimage(vis))
                 except Exception:
                     pass
+            i += 1
         if active:
             s = max(0, start - pad)
             e = total_frames - 1
@@ -709,7 +736,11 @@ class Processor(QtCore.QObject):
             self._prev_gray = None
             if not os.path.isfile(cfg.video):
                 raise FileNotFoundError(f"Video not found: {cfg.video}")
-            if not os.path.isfile(cfg.ref):
+            ref_paths = [p.strip() for p in str(cfg.ref).split(';') if p.strip()]
+            if not ref_paths:
+                raise FileNotFoundError(f"Reference image not found: {cfg.ref}")
+            ref_paths_existing = [rp for rp in ref_paths if os.path.isfile(rp)]
+            if not ref_paths_existing:
                 raise FileNotFoundError(f"Reference image not found: {cfg.ref}")
 
             ensure_dir(cfg.out_dir)
@@ -777,37 +808,93 @@ class Processor(QtCore.QObject):
 
             # Reference
             self._status("Preparing reference features...", key="phase", interval=5.0)
-            ref_img = cv2.imread(cfg.ref, cv2.IMREAD_COLOR)
-            if ref_img is None:
-                raise RuntimeError("Cannot read reference image")
+            ref_bank_list: List[np.ndarray] = []
+            ref_img_primary = None
+            bank_dedup_cos = 0.95
+            for rp in ref_paths_existing:
+                img = cv2.imread(rp, cv2.IMREAD_COLOR)
+                if img is None:
+                    continue
+                if ref_img_primary is None:
+                    ref_img_primary = img
+                aug_images: List[np.ndarray] = []
+                aug_images.append(img)
+                try:
+                    aug_images.append(cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE))
+                    aug_images.append(cv2.rotate(img, cv2.ROTATE_180))
+                    aug_images.append(cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE))
+                except Exception:
+                    pass
+                aug_with_flips: List[np.ndarray] = []
+                for aug in aug_images:
+                    aug_with_flips.append(aug)
+                    try:
+                        aug_with_flips.append(cv2.flip(aug, 1))
+                    except Exception:
+                        pass
+                for aug in aug_with_flips:
+                    faces = face.extract(aug)
+                    bf = FaceEmbedder.best_face(faces)
+                    if bf and bf.get("feat") is not None:
+                        feat_vec = np.asarray(bf["feat"], dtype=np.float32).reshape(-1)
+                        norm = float(np.linalg.norm(feat_vec))
+                        if norm <= 1e-6:
+                            continue
+                        feat_vec = feat_vec / norm
+                        add_vec = True
+                        if ref_bank_list:
+                            bank_arr = np.asarray(ref_bank_list, dtype=np.float32)
+                            sims = bank_arr @ feat_vec
+                            if sims.size > 0 and float(np.max(sims)) >= bank_dedup_cos:
+                                add_vec = False
+                        if add_vec:
+                            ref_bank_list.append(feat_vec)
 
-            ref_faces = face.extract(ref_img)
-            ref_face = FaceEmbedder.best_face(ref_faces)
-            ref_face_feat = ref_face['feat'] if ref_face else None
+            if ref_img_primary is None:
+                raise RuntimeError("Cannot read reference image(s)")
+
+            ref_face_feat = np.vstack(ref_bank_list).astype(np.float32) if ref_bank_list else None
             if ref_face_feat is not None:
-                ref_norm = float(np.linalg.norm(ref_face_feat))
+                bank_arr = np.asarray(ref_face_feat, dtype=np.float32)
+                if bank_arr.ndim == 1:
+                    bank_arr = bank_arr.reshape(1, -1)
+                norms = [float(np.linalg.norm(row)) for row in bank_arr]
+                preview = ", ".join(f"{n:.3f}" for n in norms[:3])
+                if len(norms) > 3:
+                    preview += ", …"
                 self._status(
-                    f"Ref face: ok | ||ref||={ref_norm:.3f} backend={getattr(face, 'backend', None)}",
+                    f"Ref face bank: {len(norms)} feats from {len(ref_paths_existing)} refs | norms={preview} backend={getattr(face, 'backend', None)}",
                     key="ref",
                     interval=60.0,
                 )
             else:
                 self._status(
-                    "Ref face: missing",
+                    f"Ref face: missing (checked {len(ref_paths_existing)} refs)",
                     key="ref",
                     interval=60.0,
                 )
 
+            try:
+                bank_fd_thresh = float(getattr(cfg, "face_thresh", 0.38))
+            except Exception:
+                bank_fd_thresh = 0.38
+            if bank_fd_thresh <= 0:
+                bank_fd_thresh = 0.38
+            else:
+                bank_fd_thresh = min(0.38, bank_fd_thresh)
+            bank_dedup_cos = 0.95
+            bank_max = 64
+
             ref_reid_feat = None
             if reid is not None:
-                ref_persons = det.detect(ref_img, conf=0.1)
+                ref_persons = det.detect(ref_img_primary, conf=0.1)
                 if ref_persons:
                     ref_persons.sort(key=lambda d: (d['xyxy'][2]-d['xyxy'][0])*(d['xyxy'][3]-d['xyxy'][1]), reverse=True)
                     rx1, ry1, rx2, ry2 = [int(v) for v in ref_persons[0]['xyxy']]
-                    ref_crop = ref_img[ry1:ry2, rx1:rx2]
+                    ref_crop = ref_img_primary[ry1:ry2, rx1:rx2]
                     ref_reid_feat = reid.extract([ref_crop])[0]
                 else:
-                    ref_reid_feat = reid.extract([ref_img])[0]
+                    ref_reid_feat = reid.extract([ref_img_primary])[0]
             self._status(
                 f"Ref ReID: {'ok' if ref_reid_feat is not None else 'skipped'}",
                 key="ref_reid",
@@ -1135,8 +1222,9 @@ class Processor(QtCore.QObject):
                     for f in ffaces:
                         bx1, by1, bx2, by2 = [int(round(v)) for v in f["bbox"]]
                         fd_all = None
-                        if ref_face_feat is not None and f.get("feat") is not None:
-                            fd_all = 1.0 - float(np.dot(f["feat"], ref_face_feat))
+                        feat_vec = f.get("feat")
+                        if ref_face_feat is not None and feat_vec is not None:
+                            fd_all = self._fd_min(feat_vec, ref_face_feat)
                             min_fd_all = fd_all if min_fd_all is None else min(min_fd_all, fd_all)
                         face_debug_boxes.append(
                             (
@@ -1153,7 +1241,7 @@ class Processor(QtCore.QObject):
                         if faces_with_feat:
                             bestf = min(
                                 faces_with_feat,
-                                key=lambda f: 1.0 - float(np.dot(f["feat"], ref_face_feat)),
+                                key=lambda f: self._fd_min(f["feat"], ref_face_feat),
                             )
                         else:
                             bestf = FaceEmbedder.best_face(ffaces)
@@ -1174,7 +1262,7 @@ class Processor(QtCore.QObject):
                 for bf in faces_local.values():
                     if bf is None or bf.get("feat") is None or ref_face_feat is None:
                         continue
-                    fd_tmp = 1.0 - float(np.dot(bf["feat"], ref_face_feat))
+                    fd_tmp = self._fd_min(bf["feat"], ref_face_feat)
                     face_dists_all.append(fd_tmp)
                     if bf.get("quality", 0.0) >= float(cfg.face_quality_min):
                         face_dists_quality.append(fd_tmp)
@@ -1199,8 +1287,8 @@ class Processor(QtCore.QObject):
 
                     bf = faces_local.get(i, None)
                     fd = None
-                    if bf is not None and ref_face_feat is not None:
-                        fd = 1.0 - float(np.dot(bf["feat"], ref_face_feat))
+                    if bf is not None and bf.get("feat") is not None and ref_face_feat is not None:
+                        fd = self._fd_min(bf["feat"], ref_face_feat)
                     if bf is None:
                         cand_reason.append("no_face_in_crop")
                     if ref_face_feat is None:
@@ -1332,7 +1420,7 @@ class Processor(QtCore.QObject):
 
                 # Choose best and save with cadence + lock + margin + IoU gate
                 def save_hit(c, idx):
-                    nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box
+                    nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box, ref_face_feat, ref_bank_list
                     crop_img_path = os.path.join(crops_dir, f"f{idx:08d}.jpg")
                     cx1,cy1,cx2,cy2 = c["box"]
                      # final ratio enforcement
@@ -1369,8 +1457,48 @@ class Processor(QtCore.QObject):
                     )
                     self.hit.emit(crop_img_path)
                     # update lock source
-                    if c.get("face_feat") is not None:
-                        locked_face = c["face_feat"]
+                    face_feat_curr = c.get("face_feat")
+                    if face_feat_curr is not None:
+                        locked_face = face_feat_curr
+                        fd_val = c.get("fd")
+                        quality_val = c.get("face_quality")
+                        quality_threshold = float(cfg.face_quality_min)
+                        try:
+                            fd_val_f = float(fd_val) if fd_val is not None else None
+                        except Exception:
+                            fd_val_f = None
+                        quality_ok = (
+                            quality_val is None
+                            or quality_threshold <= 0
+                            or float(quality_val) >= quality_threshold
+                        )
+                        if (
+                            fd_val_f is not None
+                            and fd_val_f <= bank_fd_thresh
+                            and quality_ok
+                        ):
+                            vec_new = np.asarray(face_feat_curr, dtype=np.float32).reshape(-1)
+                            norm = float(np.linalg.norm(vec_new))
+                            if norm > 1e-6:
+                                vec_new = vec_new / norm
+                                add_vec = True
+                                if ref_face_feat is not None:
+                                    bank_arr = np.asarray(ref_face_feat, dtype=np.float32)
+                                    if bank_arr.ndim == 1:
+                                        bank_arr = bank_arr.reshape(1, -1)
+                                    sims = bank_arr @ vec_new
+                                    if sims.size > 0 and float(sims.max()) >= bank_dedup_cos:
+                                        add_vec = False
+                                if add_vec:
+                                    ref_bank_list.append(vec_new)
+                                    if len(ref_bank_list) > bank_max:
+                                        ref_bank_list.pop(0)
+                                    ref_face_feat = np.vstack(ref_bank_list).astype(np.float32)
+                                    self._status(
+                                        f"Ref bank +1 (size={len(ref_bank_list)}) fd={fd_val_f:.3f}",
+                                        key="ref_bank",
+                                        interval=5.0,
+                                    )
                     if c.get("reid_feat") is not None:
                         lr_prev = locked_reid
                         locked_reid = self._ema(lr_prev, c["reid_feat"], float(cfg.lock_momentum))
@@ -1404,7 +1532,7 @@ class Processor(QtCore.QObject):
                         gfaces = face.extract(frame_for_det)
                         gbest = FaceEmbedder.best_face(gfaces)
                         if gbest is not None and gbest.get("feat") is not None:
-                            gfd = 1.0 - float(np.dot(gbest["feat"], ref_face_feat))
+                            gfd = self._fd_min(gbest["feat"], ref_face_feat)
                             if gfd <= float(cfg.face_thresh):
                                 fx1, fy1, fx2, fy2 = [int(v) for v in gbest["bbox"]]
                                 acx = (fx1 + fx2) / 2.0
@@ -1877,6 +2005,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.video_edit = QtWidgets.QLineEdit()
         self.ref_edit = QtWidgets.QLineEdit()
+        self.ref_edit.setPlaceholderText("C:\\ref1.jpg; C:\\ref2.jpg")
+        self.ref_edit.setToolTip("Reference image paths; separate multiple entries with ';'")
         self.out_edit = QtWidgets.QLineEdit("output")
 
         vid_btn = QtWidgets.QPushButton("Browse...")
@@ -1887,7 +2017,7 @@ class MainWindow(QtWidgets.QMainWindow):
         file_layout.addWidget(self.video_edit, 0, 1)
         file_layout.addWidget(vid_btn, 0, 2)
 
-        file_layout.addWidget(QtWidgets.QLabel("Reference image"), 1, 0)
+        file_layout.addWidget(QtWidgets.QLabel("Reference image(s)"), 1, 0)
         file_layout.addWidget(self.ref_edit, 1, 1)
         file_layout.addWidget(ref_btn, 1, 2)
 
@@ -1963,7 +2093,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.yolo_edit = QtWidgets.QLineEdit("yolov8n.pt")
         self.face_yolo_edit = QtWidgets.QLineEdit("yolov8n-face.pt")
         self.annot_check = QtWidgets.QCheckBox("Save annotated frames")
-        self.preview_every_spin = QtWidgets.QSpinBox(); self.preview_every_spin.setRange(0, 5000); self.preview_every_spin.setValue(30)
+        self.preview_every_spin = QtWidgets.QSpinBox(); self.preview_every_spin.setRange(0, 5000); self.preview_every_spin.setValue(120)
 
         def _mk_fspin(minv: float, maxv: float, step: float, decimals: int, tooltip: str) -> QtWidgets.QDoubleSpinBox:
             sb = QtWidgets.QDoubleSpinBox()
@@ -2524,7 +2654,7 @@ class MainWindow(QtWidgets.QMainWindow):
             face_fullframe_when_missed=bool(self.face_fullframe_check.isChecked()) if hasattr(self, "face_fullframe_check") else True,
             only_best=bool(self.only_best_check.isChecked()),
             prescan_enable=bool(self.chk_prescan.isChecked()) if hasattr(self, "chk_prescan") else True,
-            prescan_stride=int(self.spin_prescan_stride.value()) if hasattr(self, "spin_prescan_stride") else 6,
+            prescan_stride=int(self.spin_prescan_stride.value()) if hasattr(self, "spin_prescan_stride") else 16,
             trt_lib_dir=self.trt_edit.text().strip() if hasattr(self, "trt_edit") else "",
             min_sharpness=float(self.min_sharp_spin.value()),
             min_gap_sec=float(self.min_gap_spin.value()),
@@ -2984,7 +3114,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.yolo_edit.setText(s.value("yolo_model", "yolov8n.pt"))
         self.face_yolo_edit.setText(s.value("face_model", "yolov8n-face.pt"))
         self.annot_check.setChecked(s.value("save_annot", False, type=bool))
-        self.preview_every_spin.setValue(int(s.value("preview_every", 30)))
+        self.preview_every_spin.setValue(int(s.value("preview_every", 120)))
         if hasattr(self, 'faceless_allow_check'):
             self.faceless_allow_check.setChecked(
                 s.value(
