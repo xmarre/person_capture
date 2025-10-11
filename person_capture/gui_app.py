@@ -183,6 +183,7 @@ class SessionConfig:
     # Face-only controls
     disable_reid: bool = True                    # force no ReID usage
     face_fullframe_when_missed: bool = True      # try full-frame face detect if per-person face=0
+    face_fullframe_imgsz: int = 896              # full-frame face detector size (0/None -> default)
 
     # Debug/diagnostics
     debug_dump: bool = True
@@ -1821,120 +1822,270 @@ class Processor(QtCore.QObject):
                 else:
                     H2, W2 = H, W
 
-                persons = det.detect(frame_for_det, conf=float(cfg.min_det_conf))
-                if not persons and cfg.auto_crop_borders:
-                    # Fallback to full frame if border-cropped frame yields nothing
-                    persons = det.detect(frame, conf=float(cfg.min_det_conf))
-                    frame_for_det = frame
-                    off_x, off_y = 0, 0
-                    H2, W2 = H, W
-                    self._status("Border-crop yielded no detections. Fallback to full frame.", key="fallback", interval=2.0)
                 candidates = []
-                diag_persons = len(persons)
-                crops = []
-                boxes = []
                 faces_local = {}
-
-                # Build candidate list
-                for p in persons:
-                    x1,y1,x2,y2 = [int(v) for v in p["xyxy"]]
-                    x1 = max(0, x1); y1 = max(0, y1); x2 = min(W2-1, x2); y2 = min(H2-1, y2)
-                    if x2 <= x1+2 or y2 <= y1+2:
-                        continue
-                    area = (x2-x1)*(y2-y1)
-                    if area < int(cfg.min_box_pixels):
-                        continue
-                    ar = (y2-y1) / max(1, (x2-x1))
-                    if ar < 0.7 or ar > 4.0:  # extreme aspect -> likely false
-                        continue
-                    crop = frame_for_det[y1:y2, x1:x2]
-                    crops.append(crop); boxes.append((x1,y1,x2,y2))
-
-                reid_feats = (reid.extract(crops) if (reid is not None and crops) else [None] * len(crops))
-
-                face_debug_boxes = []  # [(x1,y1,x2,y2,q,fd)]
+                reid_feats = []
+                face_debug_boxes = []
+                diag_persons = 0
                 faces_detected = 0
                 faces_passing_quality = 0
-                min_fd_all = None
-
-                # Face features per person
-                for i, crop in enumerate(crops):
-                    x1, y1, x2, y2 = boxes[i]
-                    ffaces = face.extract(crop)
-                    if not ffaces and float(cfg.face_det_pad) > 0.0:
-                        pw = int(round((x2 - x1) * float(cfg.face_det_pad)))
-                        ph = int(round((y2 - y1) * float(cfg.face_det_pad)))
-                        if pw > 0 or ph > 0:
-                            px1 = max(0, x1 - pw)
-                            py1 = max(0, y1 - ph)
-                            px2 = min(W2, x2 + pw)
-                            py2 = min(H2, y2 + ph)
-                            if px2 > px1 and py2 > py1:
-                                big = frame_for_det[py1:py2, px1:px2]
-                                ff2 = face.extract(big)
-                                remap = []
-                                dx, dy = (x1 - px1), (y1 - py1)
-                                for f in ff2:
-                                    bb = f["bbox"].copy()
-                                    bb[0] -= dx
-                                    bb[2] -= dx
-                                    bb[1] -= dy
-                                    bb[3] -= dy
-                                    remap.append({"bbox": bb, "feat": f.get("feat"), "quality": f.get("quality", 0.0)})
-                                ffaces = remap
-                    faces_detected += len(ffaces)
-                    for f in ffaces:
-                        bx1, by1, bx2, by2 = [int(round(v)) for v in f["bbox"]]
-                        fd_all = None
-                        feat_vec = f.get("feat")
-                        if ref_face_feat is not None and feat_vec is not None:
-                            fd_all = self._fd_min(feat_vec, ref_face_feat)
-                            min_fd_all = fd_all if min_fd_all is None else min(min_fd_all, fd_all)
-                        face_debug_boxes.append(
-                            (
-                                max(0, x1 + bx1 + off_x),
-                                max(0, y1 + by1 + off_y),
-                                min(W - 1, x1 + bx2 + off_x),
-                                min(H - 1, y1 + by2 + off_y),
-                                float(f.get("quality", 0.0)),
-                                fd_all,
-                            )
-                        )
-                    if ref_face_feat is not None and ffaces:
-                        faces_with_feat = [f for f in ffaces if f.get("feat") is not None]
-                        if faces_with_feat:
-                            bestf = min(
-                                faces_with_feat,
-                                key=lambda f: self._fd_min(f["feat"], ref_face_feat),
-                            )
-                        else:
-                            bestf = FaceEmbedder.best_face(ffaces)
-                    else:
-                        bestf = FaceEmbedder.best_face(ffaces)
-                    faces_local[i] = bestf
-                    if bestf is not None and bestf.get("quality", 0.0) >= float(cfg.face_quality_min):
-                        faces_passing_quality += 1
-
-                any_face_detected = faces_detected > 0
-                any_face_match = False
-                any_face_visible = (
-                    faces_passing_quality > 0 if bool(cfg.face_visible_uses_quality) else any_face_detected
-                )
-
                 face_dists_all = []
                 face_dists_quality = []
-                for bf in faces_local.values():
-                    if bf is None or bf.get("feat") is None or ref_face_feat is None:
-                        continue
-                    fd_tmp = self._fd_min(bf["feat"], ref_face_feat)
-                    face_dists_all.append(fd_tmp)
-                    if bf.get("quality", 0.0) >= float(cfg.face_quality_min):
-                        face_dists_quality.append(fd_tmp)
-                    if fd_tmp <= float(cfg.face_thresh):
-                        any_face_match = True
-                best_face_dist = min(face_dists_quality) if face_dists_quality else None
-                if min_fd_all is None and face_dists_all:
-                    min_fd_all = min(face_dists_all)
+                min_fd_all = None
+                best_face_dist = None
+                any_face_match = False
+                any_face_visible = False
+                any_face_detected = False
+                short_circuit_candidate = None
+                persons = []
+                fullframe_imgsz = getattr(cfg, "face_fullframe_imgsz", None)
+                if fullframe_imgsz is not None:
+                    try:
+                        fullframe_imgsz = int(fullframe_imgsz)
+                    except (TypeError, ValueError):
+                        fullframe_imgsz = None
+
+                face_short_ok = (
+                    ref_face_feat is not None
+                    and face is not None
+                    and getattr(cfg, "face_fullframe_when_missed", True)
+                    and (face_only_pipeline or self._lock_last_bbox is not None)
+                )
+                if face_short_ok:
+                    try:
+                        gfaces = face.extract(frame_for_det, imgsz=fullframe_imgsz)
+                    except Exception:
+                        gfaces = []
+                    if gfaces:
+                        quality_min = float(cfg.face_quality_min)
+                        use_quality_vis = bool(cfg.face_visible_uses_quality)
+                        tmp_faces_detected = len(gfaces)
+                        tmp_faces_passing_quality = sum(
+                            1 for gf in gfaces if float(gf.get("quality", 0.0)) >= quality_min
+                        )
+                        tmp_dists_all = []
+                        tmp_dists_quality = []
+                        gbest = FaceEmbedder.best_face(gfaces)
+                        for gf in gfaces:
+                            bbox = gf.get("bbox")
+                            if bbox is None or len(bbox) != 4:
+                                continue
+                            fx1, fy1, fx2, fy2 = [int(round(v)) for v in bbox]
+                            fx1 = max(0, min(W2 - 1, fx1))
+                            fy1 = max(0, min(H2 - 1, fy1))
+                            fx2 = max(fx1 + 1, min(W2, int(round(fx2))))
+                            fy2 = max(fy1 + 1, min(H2, int(round(fy2))))
+                            q = float(gf.get("quality", 0.0))
+                            feat_vec = gf.get("feat")
+                            fd_val = None
+                            if feat_vec is not None and ref_face_feat is not None:
+                                fd_val = self._fd_min(feat_vec, ref_face_feat)
+                                tmp_dists_all.append(fd_val)
+                                if (not use_quality_vis) or q >= quality_min:
+                                    tmp_dists_quality.append(fd_val)
+                            face_debug_boxes.append(
+                                (
+                                    max(0, min(W - 1, fx1 + off_x)),
+                                    max(0, min(H - 1, fy1 + off_y)),
+                                    max(0, min(W - 1, fx2 + off_x)),
+                                    max(0, min(H - 1, fy2 + off_y)),
+                                    q,
+                                    fd_val,
+                                )
+                            )
+
+                        if (
+                            gbest
+                            and gbest.get("feat") is not None
+                            and gbest.get("bbox") is not None
+                            and len(gbest.get("bbox")) == 4
+                        ):
+                            gbbox = gbest.get("bbox")
+                            fx1, fy1, fx2, fy2 = [int(round(v)) for v in gbbox]
+                            fx1 = max(0, min(W2 - 1, fx1))
+                            fy1 = max(0, min(H2 - 1, fy1))
+                            fx2 = max(fx1 + 1, min(W2, int(round(fx2))))
+                            fy2 = max(fy1 + 1, min(H2, int(round(fy2))))
+                            face_box_abs = (fx1, fy1, fx2, fy2)
+                            acx = (fx1 + fx2) / 2.0
+                            acy = (fy1 + fy2) / 2.0
+                            fd_val = self._fd_min(gbest["feat"], ref_face_feat)
+                            if fd_val <= float(cfg.face_thresh):
+                                (ex1, ey1, ex2, ey2), chosen_ratio = self._choose_best_ratio(
+                                    face_box_abs, ratios, W2, H2, anchor=(acx, acy), face_box=face_box_abs
+                                )
+                                ex1, ey1, ex2, ey2 = self._enforce_scale_and_margins(
+                                    (ex1, ey1, ex2, ey2),
+                                    chosen_ratio,
+                                    W2,
+                                    H2,
+                                    face_box=face_box_abs,
+                                    anchor=(acx, acy),
+                                )
+                                ox1, oy1, ox2, oy2 = ex1 + off_x, ey1 + off_y, ex2 + off_x, ey2 + off_y
+                                ox1 = max(0, min(W - 1, int(round(ox1))))
+                                oy1 = max(0, min(H - 1, int(round(oy1))))
+                                ox2 = max(ox1 + 1, min(W, int(round(ox2))))
+                                oy2 = max(oy1 + 1, min(H, int(round(oy2))))
+                                if ox2 > ox1 + 1 and oy2 > oy1 + 1:
+                                    crop_img = frame[oy1:oy2, ox1:ox2]
+                                    sharp = self._calc_sharpness(crop_img)
+                                    short_circuit_candidate = dict(
+                                        score=fd_val,
+                                        fd=fd_val,
+                                        rd=None,
+                                        sharp=sharp,
+                                        box=(ox1, oy1, ox2, oy2),
+                                        area=(ox2 - ox1) * (oy2 - oy1),
+                                        show_box=(
+                                            max(0, min(W - 1, fx1 + off_x)),
+                                            max(0, min(H - 1, fy1 + off_y)),
+                                            max(0, min(W - 1, fx2 + off_x)),
+                                            max(0, min(H - 1, fy2 + off_y)),
+                                        ),
+                                        face_feat=gbest["feat"],
+                                        reid_feat=None,
+                                        ratio=chosen_ratio,
+                                        reasons=["face_short_circuit"],
+                                        face_quality=float(gbest.get("quality", 0.0)),
+                                        accept_pre=True,
+                                    )
+                                    candidates = [short_circuit_candidate]
+                                    diag_persons = 0
+                                    reid_feats = []
+                                    faces_local = {}
+                                    faces_detected = tmp_faces_detected
+                                    faces_passing_quality = tmp_faces_passing_quality
+                                    face_dists_all = tmp_dists_all
+                                    face_dists_quality = tmp_dists_quality
+                                    any_face_detected = tmp_faces_detected > 0
+                                    any_face_visible = (
+                                        tmp_faces_passing_quality > 0 if use_quality_vis else any_face_detected
+                                    )
+                                    any_face_match = True
+                                    min_fd_all = min(tmp_dists_all) if tmp_dists_all else None
+                                    best_face_dist = min(tmp_dists_quality) if tmp_dists_quality else None
+                if short_circuit_candidate is None:
+                    persons = det.detect(frame_for_det, conf=float(cfg.min_det_conf))
+                    if not persons and cfg.auto_crop_borders:
+                        # Fallback to full frame if border-cropped frame yields nothing
+                        persons = det.detect(frame, conf=float(cfg.min_det_conf))
+                        frame_for_det = frame
+                        off_x, off_y = 0, 0
+                        H2, W2 = H, W
+                        self._status(
+                            "Border-crop yielded no detections. Fallback to full frame.",
+                            key="fallback",
+                            interval=2.0,
+                        )
+                    candidates = []
+                    diag_persons = len(persons)
+                    crops = []
+                    boxes = []
+                    faces_local = {}
+
+                    # Build candidate list
+                    for p in persons:
+                        x1,y1,x2,y2 = [int(v) for v in p["xyxy"]]
+                        x1 = max(0, x1); y1 = max(0, y1); x2 = min(W2-1, x2); y2 = min(H2-1, y2)
+                        if x2 <= x1+2 or y2 <= y1+2:
+                            continue
+                        area = (x2-x1)*(y2-y1)
+                        if area < int(cfg.min_box_pixels):
+                            continue
+                        ar = (y2-y1) / max(1, (x2-x1))
+                        if ar < 0.7 or ar > 4.0:  # extreme aspect -> likely false
+                            continue
+                        crop = frame_for_det[y1:y2, x1:x2]
+                        crops.append(crop); boxes.append((x1,y1,x2,y2))
+
+                    reid_feats = (
+                        reid.extract(crops) if (reid is not None and crops) else [None] * len(crops)
+                    )
+
+                    face_debug_boxes = []  # [(x1,y1,x2,y2,q,fd)]
+                    faces_detected = 0
+                    faces_passing_quality = 0
+                    min_fd_all = None
+
+                    # Face features per person
+                    for i, crop in enumerate(crops):
+                        x1, y1, x2, y2 = boxes[i]
+                        ffaces = face.extract(crop)
+                        if not ffaces and float(cfg.face_det_pad) > 0.0:
+                            pw = int(round((x2 - x1) * float(cfg.face_det_pad)))
+                            ph = int(round((y2 - y1) * float(cfg.face_det_pad)))
+                            if pw > 0 or ph > 0:
+                                px1 = max(0, x1 - pw)
+                                py1 = max(0, y1 - ph)
+                                px2 = min(W2, x2 + pw)
+                                py2 = min(H2, y2 + ph)
+                                if px2 > px1 and py2 > py1:
+                                    big = frame_for_det[py1:py2, px1:px2]
+                                    ff2 = face.extract(big)
+                                    remap = []
+                                    dx, dy = (x1 - px1), (y1 - py1)
+                                    for f in ff2:
+                                        bb = f["bbox"].copy()
+                                        bb[0] -= dx
+                                        bb[2] -= dx
+                                        bb[1] -= dy
+                                        bb[3] -= dy
+                                        remap.append({"bbox": bb, "feat": f.get("feat"), "quality": f.get("quality", 0.0)})
+                                    ffaces = remap
+                        faces_detected += len(ffaces)
+                        for f in ffaces:
+                            bx1, by1, bx2, by2 = [int(round(v)) for v in f["bbox"]]
+                            fd_all = None
+                            feat_vec = f.get("feat")
+                            if ref_face_feat is not None and feat_vec is not None:
+                                fd_all = self._fd_min(feat_vec, ref_face_feat)
+                                min_fd_all = fd_all if min_fd_all is None else min(min_fd_all, fd_all)
+                            face_debug_boxes.append(
+                                (
+                                    max(0, x1 + bx1 + off_x),
+                                    max(0, y1 + by1 + off_y),
+                                    min(W - 1, x1 + bx2 + off_x),
+                                    min(H - 1, y1 + by2 + off_y),
+                                    float(f.get("quality", 0.0)),
+                                    fd_all,
+                                )
+                            )
+                        if ref_face_feat is not None and ffaces:
+                            faces_with_feat = [f for f in ffaces if f.get("feat") is not None]
+                            if faces_with_feat:
+                                bestf = min(
+                                    faces_with_feat,
+                                    key=lambda f: self._fd_min(f["feat"], ref_face_feat),
+                                )
+                            else:
+                                bestf = FaceEmbedder.best_face(ffaces)
+                        else:
+                            bestf = FaceEmbedder.best_face(ffaces)
+                        faces_local[i] = bestf
+                        if bestf is not None and bestf.get("quality", 0.0) >= float(cfg.face_quality_min):
+                            faces_passing_quality += 1
+
+                    any_face_detected = faces_detected > 0
+                    any_face_match = False
+                    any_face_visible = (
+                        faces_passing_quality > 0 if bool(cfg.face_visible_uses_quality) else any_face_detected
+                    )
+
+                    face_dists_all = []
+                    face_dists_quality = []
+                    for bf in faces_local.values():
+                        if bf is None or bf.get("feat") is None or ref_face_feat is None:
+                            continue
+                        fd_tmp = self._fd_min(bf["feat"], ref_face_feat)
+                        face_dists_all.append(fd_tmp)
+                        if bf.get("quality", 0.0) >= float(cfg.face_quality_min):
+                            face_dists_quality.append(fd_tmp)
+                        if fd_tmp <= float(cfg.face_thresh):
+                            any_face_match = True
+                    best_face_dist = min(face_dists_quality) if face_dists_quality else None
+                    if min_fd_all is None and face_dists_all:
+                        min_fd_all = min(face_dists_all)
 
                 # Evaluate candidates
                 for i, feat in enumerate(reid_feats):
@@ -2201,7 +2352,7 @@ class Processor(QtCore.QObject):
                         and faces_detected == 0
                         and ref_face_feat is not None
                     ):
-                        gfaces = face.extract(frame_for_det)
+                        gfaces = face.extract(frame_for_det, imgsz=fullframe_imgsz)
                         gbest = FaceEmbedder.best_face(gfaces)
                         if gbest is not None and gbest.get("feat") is not None:
                             gfd = self._fd_min(gbest["feat"], ref_face_feat)
