@@ -16,7 +16,6 @@ if TYPE_CHECKING:  # pragma: no cover - import only for type checking
     import torch
     from ultralytics import YOLO as YOLOType
     import open_clip as open_clip_type
-    from insightface.app import FaceAnalysis as FaceAnalysisType
 
 ort = None  # import after DLL dirs are added
 Y8F_DEFAULT = "yolov8l-face.pt"  # default remains; pass "scrfd_10g_bnkps" to switch backends
@@ -36,6 +35,16 @@ Y8F_URLS = {
     "yolov8x-face.pt": [
         "https://huggingface.co/MonsterZero/yolov8-face/resolve/main/yolov8x-face.pt",
         "https://huggingface.co/vipermu/yolov8-face/resolve/main/yolov8x-face.pt",
+    ],
+}
+
+SCRFD_URLS = {
+    "scrfd_10g_bnkps.onnx": [
+        "https://github.com/deepinsight/insightface/releases/download/0.7.3/scrfd_10g_bnkps.onnx",
+        "https://github.com/deepinsight/insightface/releases/download/0.7.2/scrfd_10g_bnkps.onnx",
+    ],
+    "scrfd_2.5g_bnkps.onnx": [
+        "https://github.com/deepinsight/insightface/releases/download/0.7.3/scrfd_2.5g_bnkps.onnx"
     ],
 }
 
@@ -151,7 +160,7 @@ class FaceEmbedder:
         self.detector_backend = "yolov8"
         self.det = None
         self.scrfd = None
-        self.insight_app: Optional["FaceAnalysisType"] = None  # FaceAnalysis fallback that auto-downloads models
+        self.insight_app: Optional[object] = None  # FaceAnalysis fallback that auto-downloads models
         self.conf = float(conf)
         yolo_path = yolo_model
         if isinstance(yolo_model, str) and yolo_model.lower().startswith("scrfd"):
@@ -171,17 +180,6 @@ class FaceEmbedder:
             if self.detector_backend == "yolov8":
                 from ultralytics import YOLO as _YOLO
             import open_clip as _open_clip
-            _get_scrfd = None
-            _FaceAnalysis = None
-            if self.detector_backend == "scrfd":
-                try:
-                    from insightface.model_zoo import get_model as _get_scrfd
-                except Exception:
-                    _get_scrfd = None
-                try:
-                    from insightface.app import FaceAnalysis as _FaceAnalysis
-                except Exception:
-                    _FaceAnalysis = None
         except Exception as e:  # pragma: no cover - executed only when deps missing
             raise RuntimeError(
                 "Heavy dependencies not installed; install requirements.txt to run face embedding."
@@ -192,29 +190,30 @@ class FaceEmbedder:
         if self.detector_backend == "yolov8":
             self.det = _YOLO(yolo_path)
         else:
-            ctx_id = 0 if (ctx.startswith('cuda') and _torch.cuda.is_available()) else -1
-            if _get_scrfd is not None:
-                try:
-                    self.scrfd = _get_scrfd(yolo_model)
-                except Exception:
-                    self.scrfd = None
-            if self.scrfd is None and _FaceAnalysis is not None:
-                try:
-                    self.insight_app = _FaceAnalysis(name='buffalo_l')
-                except Exception as e:
-                    raise RuntimeError(
-                        "InsightFace found but could not initialize FaceAnalysis. Update the 'insightface' package."
-                    ) from e
             try:
-                if self.scrfd is not None:
-                    self.scrfd.prepare(ctx_id=ctx_id, det_size=(640, 640))
-                elif self.insight_app is not None:
-                    self.insight_app.prepare(ctx_id=ctx_id, det_size=(640, 640))
-                    self.insight_app.det_thresh = float(self.conf)
-                else:
-                    raise RuntimeError("SCRFD unavailable. Install 'insightface' and retry.")
-            except AttributeError as e:
-                raise RuntimeError("SCRFD backend failed to prepare. Update 'insightface'.") from e
+                from insightface.model_zoo.scrfd import SCRFD as _SCRFD
+            except Exception as e:
+                raise RuntimeError(
+                    "SCRFD backend requires 'insightface'. Install or update the package and retry."
+                ) from e
+            ctx_id = 0 if (ctx.startswith('cuda') and _torch.cuda.is_available()) else -1
+            mdl = yolo_model if isinstance(yolo_model, str) else ""
+            if not mdl or not mdl.lower().startswith("scrfd"):
+                mdl = "scrfd_10g_bnkps.onnx"
+            if mdl.lower().startswith("scrfd") and not mdl.lower().endswith(".onnx"):
+                mdl = mdl + ".onnx"
+            if not os.path.isabs(mdl) or not os.path.exists(mdl):
+                mirrors = SCRFD_URLS.get(os.path.basename(mdl))
+                if mirrors:
+                    mdl = _ensure_file(os.path.basename(mdl), mirrors, progress=self.progress)
+            self.scrfd = _SCRFD(mdl)
+            try:
+                self.scrfd.prepare(ctx_id=ctx_id, det_size=(640, 640))
+            except Exception:
+                if callable(self.progress):
+                    self.progress("SCRFD CUDA init failed; falling back to CPU")
+                self.scrfd.prepare(ctx_id=-1, det_size=(640, 640))
+            self.insight_app = None  # avoid RetinaFace/FaceAnalysis to prevent CUDA provider issues
         self.use_arcface = bool(use_arcface)
         # Keep ArcFace enabled; we'll align by 5pts only if keypoints are available at inference time.
         self.device = 'cuda' if (ctx.startswith('cuda') and _torch.cuda.is_available()) else 'cpu'
