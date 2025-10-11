@@ -28,7 +28,7 @@
   "use_arcface": true,
   "device": "cuda",
   "yolo_model": "yolov8x.pt",
-  "face_model": "yolov8n-face.pt",
+  "face_model": "yolov8l-face.pt",
   "save_annot": true,
   "preview_every": 30,
   "prefer_face_when_available": true,

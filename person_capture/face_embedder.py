@@ -18,15 +18,25 @@ if TYPE_CHECKING:  # pragma: no cover - import only for type checking
     import open_clip as open_clip_type
 
 ort = None  # import after DLL dirs are added
-Y8F_DEFAULT = "yolov8n-face.pt"
+Y8F_DEFAULT = "yolov8l-face.pt"
 
-# Candidate mirrors for yolov8n-face weights
-Y8F_URLS = [
-    "https://github.com/lindevs/yolov8-face/releases/download/1.0.1/yolov8n-face.pt",
-    "https://github.com/lindevs/yolov8-face/releases/download/1.0.0/yolov8n-face.pt",
-    "https://github.com/derronqi/yolov8-face/raw/main/weights/yolov8n-face.pt",
-    "https://huggingface.co/junjiang/GestureFace/resolve/main/yolov8n-face.pt",
-]
+# Candidate mirrors for YOLOv8-face weights (keyed by filename)
+Y8F_URLS = {
+    "yolov8n-face.pt": [
+        "https://github.com/lindevs/yolov8-face/releases/download/1.0.1/yolov8n-face.pt",
+        "https://github.com/lindevs/yolov8-face/releases/download/1.0.0/yolov8n-face.pt",
+        "https://github.com/derronqi/yolov8-face/raw/main/weights/yolov8n-face.pt",
+        "https://huggingface.co/junjiang/GestureFace/resolve/main/yolov8n-face.pt",
+    ],
+    "yolov8l-face.pt": [
+        "https://huggingface.co/MonsterZero/yolov8-face/resolve/main/yolov8l-face.pt",
+        "https://huggingface.co/vipermu/yolov8-face/resolve/main/yolov8l-face.pt",
+    ],
+    "yolov8x-face.pt": [
+        "https://huggingface.co/MonsterZero/yolov8-face/resolve/main/yolov8x-face.pt",
+        "https://huggingface.co/vipermu/yolov8-face/resolve/main/yolov8x-face.pt",
+    ],
+}
 
 # Recognition ONNX target path we write to (keep filename stable for the app).
 ARCFACE_ONNX = "arcface_r100.onnx"
@@ -139,7 +149,13 @@ class FaceEmbedder:
         # Auto-download face detector weights if a bare filename is given
         yolo_path = yolo_model
         if not os.path.isabs(yolo_path) and os.path.basename(yolo_path).startswith("yolov8") and yolo_path.endswith(".pt"):
-            yolo_path = _ensure_file(yolo_path, Y8F_URLS, progress=progress)
+            mirrors = Y8F_URLS.get(os.path.basename(yolo_path))
+            if mirrors:
+                yolo_path = _ensure_file(yolo_path, mirrors, progress=progress)
+            elif callable(progress):
+                progress(
+                    f"Skipping auto-download for {os.path.basename(yolo_path)}; no mirrors configured"
+                )
 
         try:
             import torch as _torch
@@ -734,6 +750,14 @@ class FaceEmbedder:
 
         if not boxes:
             # Bootstrap with rotated full-frame when detector misses
+            fullframe_sizes = []
+            for base in (max(dyn_imgsz, 1280), max(dyn_imgsz, 1536)):
+                base = ((int(base) + 31) // 32) * 32
+                if base not in fullframe_sizes:
+                    fullframe_sizes.append(base)
+            if not fullframe_sizes:
+                fullframe_sizes = [max(dyn_imgsz, 896)]
+
             def _map_pts_back(xr, yr, rot):
                 # inverse mappings from rotated -> original
                 if rot == cv2.ROTATE_90_CLOCKWISE:         # x_o = y_r, y_o = H0-1-x_r
@@ -757,30 +781,39 @@ class FaceEmbedder:
                 cv2.ROTATE_180,
             ):
                 img_r = cv2.rotate(bgr_img, rot)
-                try:
-                    res_r = self.det.predict(
-                        img_r,
-                        conf=min(self.conf, 0.10),
-                        imgsz=max(dyn_imgsz, 896),
-                        verbose=False,
-                        device=self.device,
-                        max_det=80,
-                        iou=0.30,
-                        augment=True,
-                    )[0]
-                except Exception:
+                res_r = None
+                for det_size in fullframe_sizes:
                     try:
                         res_r = self.det.predict(
                             img_r,
                             conf=min(self.conf, 0.10),
-                            imgsz=max(dyn_imgsz, 896),
+                            imgsz=det_size,
                             verbose=False,
                             device=self.device,
                             max_det=80,
                             iou=0.30,
+                            augment=True,
                         )[0]
                     except Exception:
-                        continue
+                        try:
+                            res_r = self.det.predict(
+                                img_r,
+                                conf=min(self.conf, 0.10),
+                                imgsz=det_size,
+                                verbose=False,
+                                device=self.device,
+                                max_det=80,
+                                iou=0.30,
+                            )[0]
+                        except Exception:
+                            res_r = None
+                            continue
+                    bxs_r = getattr(res_r, "boxes", None)
+                    if bxs_r is not None and len(bxs_r) > 0:
+                        break
+                    res_r = None
+                if res_r is None:
+                    continue
                 bxs_r = getattr(res_r, "boxes", None)
                 if bxs_r is None or len(bxs_r) == 0:
                     continue
@@ -822,6 +855,8 @@ class FaceEmbedder:
                 y1o = max(0, min(H0 - 1, y1o))
                 x2o = max(x1o + 1, min(W0, x2o))
                 y2o = max(y1o + 1, min(H0, y2o))
+                if (x2o - x1o) * (y2o - y1o) < 32 * 32:
+                    continue
                 feats = (
                     self._arcface_encode([chip])
                     if self.use_arcface
@@ -834,6 +869,110 @@ class FaceEmbedder:
                         "quality": float(self._face_quality(chip)),
                     }
                 ]
+
+            # Try arbitrary angles via affine rotation (±45°, ±135°)
+            def _affine_rotate(img, angle_deg):
+                h, w = img.shape[:2]
+                M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle_deg, 1.0)
+                r = cv2.warpAffine(
+                    img,
+                    M,
+                    (w, h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=(114, 114, 114),
+                )
+                return r, M
+
+            def _map_box_back_affine(x1, y1, x2, y2, M):
+                A = np.vstack([M, [0, 0, 1]]).astype(np.float32)
+                Minv = np.linalg.inv(A)[:2, :]
+                pts = np.array([[x1, y1, 1], [x2, y1, 1], [x2, y2, 1], [x1, y2, 1]], dtype=np.float32).T
+                back = Minv @ pts
+                xs, ys = back[0], back[1]
+                x1o, y1o = int(np.floor(xs.min())), int(np.floor(ys.min()))
+                x2o, y2o = int(np.ceil(xs.max())), int(np.ceil(ys.max()))
+                return x1o, y1o, x2o, y2o
+
+            for ang in (45, -45, 135, -135):
+                img_r, M = _affine_rotate(bgr_img, ang)
+                res_r = None
+                for det_size in fullframe_sizes:
+                    try:
+                        res_r = self.det.predict(
+                            img_r,
+                            conf=min(self.conf, 0.10),
+                            imgsz=det_size,
+                            verbose=False,
+                            device=self.device,
+                            max_det=80,
+                            iou=0.30,
+                            augment=True,
+                        )[0]
+                    except Exception:
+                        try:
+                            res_r = self.det.predict(
+                                img_r,
+                                conf=min(self.conf, 0.10),
+                                imgsz=det_size,
+                                verbose=False,
+                                device=self.device,
+                                max_det=80,
+                                iou=0.30,
+                            )[0]
+                        except Exception:
+                            res_r = None
+                            continue
+                    bxs_r = getattr(res_r, "boxes", None)
+                    if bxs_r is not None and len(bxs_r) > 0:
+                        break
+                    res_r = None
+                if res_r is None:
+                    continue
+                bxs_r = getattr(res_r, "boxes", None)
+                if bxs_r is None or len(bxs_r) == 0:
+                    continue
+                kps_r = self._try_keypoints(res_r)
+                idx = 0
+                try:
+                    confs = getattr(bxs_r, "conf", None)
+                    if confs is not None and len(confs) > 0:
+                        idx = int(confs.argmax().item())
+                except Exception:
+                    pass
+                bx = bxs_r.xyxy[idx].tolist()
+                x1r, y1r, x2r, y2r = [int(v) for v in bx]
+                x1r = max(0, min(img_r.shape[1] - 1, x1r))
+                y1r = max(0, min(img_r.shape[0] - 1, y1r))
+                x2r = max(x1r + 1, min(img_r.shape[1], x2r))
+                y2r = max(y1r + 1, min(img_r.shape[0], y2r))
+
+                chip = None
+                if kps_r is not None and len(kps_r) > idx:
+                    pts5 = kps_r[idx][:5, :2].astype(np.float32)
+                    pts5[:, 0] = np.clip(pts5[:, 0], 0, img_r.shape[1] - 1)
+                    pts5[:, 1] = np.clip(pts5[:, 1], 0, img_r.shape[0] - 1)
+                    canon = self._canon_5pts(pts5)
+                    if canon is not None:
+                        chip = self._align_by_5pts(img_r, canon)
+                if chip is None:
+                    crop_r = img_r[y1r:y2r, x1r:x2r]
+                    if crop_r.size == 0:
+                        continue
+                    interp = cv2.INTER_AREA if max(crop_r.shape[:2]) > 112 else cv2.INTER_LINEAR
+                    chip = cv2.resize(crop_r, (112, 112), interpolation=interp)
+
+                x1o, y1o, x2o, y2o = _map_box_back_affine(x1r, y1r, x2r, y2r, M)
+                x1o = max(0, min(W0 - 1, x1o)); y1o = max(0, min(H0 - 1, y1o))
+                x2o = max(x1o + 1, min(W0, x2o)); y2o = max(y1o + 1, min(H0, y2o))
+                if (x2o - x1o) * (y2o - y1o) < 32 * 32:
+                    continue
+                feats = self._arcface_encode([chip]) if self.use_arcface else self._clip_encode([chip])
+                return [{
+                    "bbox": np.array([x1o, y1o, x2o, y2o], dtype=np.int32),
+                    "feat": feats[0],
+                    "quality": float(self._face_quality(chip)),
+                }]
 
             return []
 
