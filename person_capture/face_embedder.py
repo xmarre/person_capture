@@ -38,13 +38,17 @@ Y8F_URLS = {
     ],
 }
 
+# Verified mirrors for SCRFD ONNX (Hugging Face "resolve" endpoints).
+# 10g model is preferred; 2.5g is a smaller fallback.
 SCRFD_URLS = {
     "scrfd_10g_bnkps.onnx": [
-        "https://github.com/deepinsight/insightface/releases/download/0.7.3/scrfd_10g_bnkps.onnx",
-        "https://github.com/deepinsight/insightface/releases/download/0.7.2/scrfd_10g_bnkps.onnx",
+        "https://huggingface.co/ByteDance/InfiniteYou/resolve/main/supports/insightface/models/antelopev2/scrfd_10g_bnkps.onnx",
+        "https://huggingface.co/Aitrepreneur/models-moved/resolve/main/antelopev2/scrfd_10g_bnkps.onnx",
+        "https://huggingface.co/Charles-Elena/antelopev2/resolve/main/scrfd_10g_bnkps.onnx",
     ],
     "scrfd_2.5g_bnkps.onnx": [
-        "https://github.com/deepinsight/insightface/releases/download/0.7.3/scrfd_2.5g_bnkps.onnx"
+        "https://huggingface.co/MonsterMMORPG/files1/resolve/main/scrfd_2.5g_bnkps.onnx",
+        "https://huggingface.co/OwlMaster/AllFilesRope/resolve/main/models/insightface/models/buffalo_l/scrfd_2.5g_bnkps.onnx",
     ],
 }
 
