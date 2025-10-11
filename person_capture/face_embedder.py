@@ -191,6 +191,16 @@ class FaceEmbedder:
 
         self.progress = progress
         self._torch = _torch
+        # --- adaptive rotation controls (speed-up on empty scenes) ---
+        self._frame_idx: int = 0
+        self._no_face_streak: int = 0
+        self._last_face_idx: int = -10**9
+        # Do rotation passes only occasionally when we have not seen faces recently.
+        # Tunables; expose in GUI later if desired.
+        self.rot_adaptive: bool = True       # set False to force rotations every frame
+        self.rot_every_n: int = 12           # run rotations every N frames while empty
+        self.rot_after_hit_frames: int = 8   # after a hit, allow rotations for this many frames
+        self.fast_no_face_imgsz: int = 512   # shrink 0° pass when streak >= 3
         if self.detector_backend == "yolov8":
             self.det = _YOLO(yolo_path)
         else:
@@ -1150,6 +1160,9 @@ class FaceEmbedder:
         raise RuntimeError("SCRFD not initialized.")
 
     def _extract_with_scrfd_raw(self, bgr_img: np.ndarray, *, imgsz: Optional[int] = None):
+        # bump frame counter
+        self._frame_idx += 1
+
         def _rot_img(img, deg):
             if deg == 90:   return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
             if deg == 180:  return cv2.rotate(img, cv2.ROTATE_180)
@@ -1179,7 +1192,11 @@ class FaceEmbedder:
                         return self.scrfd.detect(img, (dyn, dyn))
 
         H0, W0 = bgr_img.shape[:2]
-        dyn = int(imgsz) if (imgsz is not None and imgsz > 0) else 640
+        dyn_req = int(imgsz) if (imgsz is not None and imgsz > 0) else 640
+        dyn = dyn_req
+        # speed-up: during a no-face streak, use a smaller first-pass size
+        if self._no_face_streak >= 3:
+            dyn = min(dyn_req, self.fast_no_face_imgsz)
         dyn = max(320, min(1920, ((dyn + 31) // 32) * 32))
 
         # 1) Try 0° first
@@ -1218,15 +1235,35 @@ class FaceEmbedder:
             for i, bb in enumerate(bboxes):
                 kp = None if (kpss is None or i >= len(kpss)) else kpss[i]
                 _accumulate(bb, kp, 0)
-        # 2) If empty, try rotated views: 90, 270, then 180
+        # decide whether to run rotations
+        need_rot = False
         if not dets:
+            # empty this frame
+            self._no_face_streak += 1
+            # adaptive policy: rotate only occasionally while empty
+            if self.rot_adaptive:
+                if (self._frame_idx - self._last_face_idx) <= self.rot_after_hit_frames:
+                    need_rot = True  # just after a hit, allow rotations
+                elif (self._frame_idx % self.rot_every_n) == 0:
+                    need_rot = True  # periodic probe
+            else:
+                need_rot = True      # always rotate if configured so
+        else:
+            # we have faces; reset streak and remember index
+            self._no_face_streak = 0
+            self._last_face_idx = self._frame_idx
+
+        # 2) If requested, try rotated views: 90, 270, then 180
+        if (not dets) and need_rot:
             for deg in (90, 270, 180):
                 rimg = _rot_img(bgr_img, deg)
                 # pad to avoid losing faces near borders after rotation
                 pad = 24
                 rimg = cv2.copyMakeBorder(rimg, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
                 L = max(H0, W0)
+                # rotation uses slightly larger input, but cap by requested imgsz
                 dyn_rot = max(dyn, 896)
+                dyn_rot = min(dyn_rot, max(896, dyn_req))
                 if deg in (90, 270):
                     if L >= 2160:
                         dyn_rot = max(dyn_rot, 1280)
@@ -1296,6 +1333,7 @@ class FaceEmbedder:
             ),
             reverse=True,
         )
+        # if still empty, streak already incremented; otherwise it's reset above
         return out
 
     @staticmethod
