@@ -16,6 +16,7 @@ if TYPE_CHECKING:  # pragma: no cover - import only for type checking
     import torch
     from ultralytics import YOLO as YOLOType
     import open_clip as open_clip_type
+    from insightface.app import FaceAnalysis as FaceAnalysisType
 
 ort = None  # import after DLL dirs are added
 Y8F_DEFAULT = "yolov8l-face.pt"  # default remains; pass "scrfd_10g_bnkps" to switch backends
@@ -150,6 +151,8 @@ class FaceEmbedder:
         self.detector_backend = "yolov8"
         self.det = None
         self.scrfd = None
+        self.insight_app: Optional["FaceAnalysisType"] = None  # FaceAnalysis fallback that auto-downloads models
+        self.conf = float(conf)
         yolo_path = yolo_model
         if isinstance(yolo_model, str) and yolo_model.lower().startswith("scrfd"):
             self.detector_backend = "scrfd"
@@ -169,13 +172,16 @@ class FaceEmbedder:
                 from ultralytics import YOLO as _YOLO
             import open_clip as _open_clip
             _get_scrfd = None
+            _FaceAnalysis = None
             if self.detector_backend == "scrfd":
                 try:
                     from insightface.model_zoo import get_model as _get_scrfd
-                except Exception as e:
-                    raise RuntimeError(
-                        "SCRFD selected but `insightface` is not installed. Run: pip install insightface onnxruntime-gpu"
-                    ) from e
+                except Exception:
+                    _get_scrfd = None
+                try:
+                    from insightface.app import FaceAnalysis as _FaceAnalysis
+                except Exception:
+                    _FaceAnalysis = None
         except Exception as e:  # pragma: no cover - executed only when deps missing
             raise RuntimeError(
                 "Heavy dependencies not installed; install requirements.txt to run face embedding."
@@ -186,14 +192,32 @@ class FaceEmbedder:
         if self.detector_backend == "yolov8":
             self.det = _YOLO(yolo_path)
         else:
-            self.scrfd = _get_scrfd(yolo_model)
             ctx_id = 0 if (ctx.startswith('cuda') and _torch.cuda.is_available()) else -1
-            # det_size acts as an upper bound; specific input_size is passed per-call
-            self.scrfd.prepare(ctx_id=ctx_id, det_size=(640, 640))
+            if _get_scrfd is not None:
+                try:
+                    self.scrfd = _get_scrfd(yolo_model)
+                except Exception:
+                    self.scrfd = None
+            if self.scrfd is None and _FaceAnalysis is not None:
+                try:
+                    self.insight_app = _FaceAnalysis(name='buffalo_l')
+                except Exception as e:
+                    raise RuntimeError(
+                        "InsightFace found but could not initialize FaceAnalysis. Update the 'insightface' package."
+                    ) from e
+            try:
+                if self.scrfd is not None:
+                    self.scrfd.prepare(ctx_id=ctx_id, det_size=(640, 640))
+                elif self.insight_app is not None:
+                    self.insight_app.prepare(ctx_id=ctx_id, det_size=(640, 640))
+                    self.insight_app.det_thresh = float(self.conf)
+                else:
+                    raise RuntimeError("SCRFD unavailable. Install 'insightface' and retry.")
+            except AttributeError as e:
+                raise RuntimeError("SCRFD backend failed to prepare. Update 'insightface'.") from e
         self.use_arcface = bool(use_arcface)
         # Keep ArcFace enabled; we'll align by 5pts only if keypoints are available at inference time.
         self.device = 'cuda' if (ctx.startswith('cuda') and _torch.cuda.is_available()) else 'cpu'
-        self.conf = float(conf)
         self.backend = None
         self.arc_sess = None
         self.arc_input = None
@@ -1056,6 +1080,68 @@ class FaceEmbedder:
         return out
 
     def _extract_with_scrfd(self, bgr_img: np.ndarray, *, imgsz: Optional[int] = None):
+        if self.scrfd is not None:
+            return self._extract_with_scrfd_raw(bgr_img, imgsz=imgsz)
+        if self.insight_app is not None:
+            H0, W0 = bgr_img.shape[:2]
+            faces = self.insight_app.get(bgr_img)
+            if not faces:
+                return []
+            kept = []
+            for f in faces:
+                if hasattr(f, "det_score") and float(f.det_score) < float(self.conf):
+                    continue
+                x1, y1, x2, y2 = [int(v) for v in f.bbox.astype(int)]
+                x1 = max(0, min(W0 - 1, x1))
+                y1 = max(0, min(H0 - 1, y1))
+                x2 = max(x1 + 1, min(W0, x2))
+                y2 = max(y1 + 1, min(H0, y2))
+                pts = None
+                if hasattr(f, "kps") and f.kps is not None:
+                    pts = np.asarray(f.kps, dtype=np.float32)
+                    if pts.ndim == 2 and pts.shape[0] >= 5:
+                        pts = pts[:5]
+                        pts[:, 0] = np.clip(pts[:, 0] - x1, 0, max(0, (x2 - x1) - 1))
+                        pts[:, 1] = np.clip(pts[:, 1] - y1, 0, max(0, (y2 - y1) - 1))
+                    else:
+                        pts = None
+                kept.append(((x1, y1, x2, y2), pts))
+            crops = []
+            metas = []
+            for (x1, y1, x2, y2), kps in kept:
+                face_bgr = bgr_img[y1:y2, x1:x2]
+                if self.use_arcface and kps is not None:
+                    canon = self._canon_5pts(kps)
+                    chip = (
+                        self._align_by_5pts(face_bgr, canon)
+                        if canon is not None
+                        else self._upright_by_eye_roll(face_bgr, kps)
+                    )
+                else:
+                    interp = cv2.INTER_AREA if max(face_bgr.shape[:2]) > 112 else cv2.INTER_LINEAR
+                    chip = cv2.resize(face_bgr, (112, 112), interpolation=interp)
+                crops.append(chip)
+                metas.append((x1, y1, x2, y2, float(self._face_quality(chip))))
+            feats = self._arcface_encode(crops) if self.use_arcface else self._clip_encode(crops)
+            out = [
+                {
+                    'bbox': np.array([m[0], m[1], m[2], m[3]], dtype=np.int32),
+                    'feat': feats[i],
+                    'quality': m[4],
+                }
+                for i, m in enumerate(metas)
+            ]
+            out.sort(
+                key=lambda f: (
+                    f['quality'],
+                    (f['bbox'][2] - f['bbox'][0]) * (f['bbox'][3] - f['bbox'][1]),
+                ),
+                reverse=True,
+            )
+            return out
+        raise RuntimeError("SCRFD not initialized.")
+
+    def _extract_with_scrfd_raw(self, bgr_img: np.ndarray, *, imgsz: Optional[int] = None):
         H0, W0 = bgr_img.shape[:2]
         dyn = int(imgsz) if (imgsz is not None and imgsz > 0) else 640
         dyn = max(320, min(1920, ((dyn + 31) // 32) * 32))
