@@ -645,32 +645,101 @@ class FaceEmbedder:
     def extract(self, bgr_img: np.ndarray, *, imgsz: Optional[int] = None):
         if bgr_img is None or bgr_img.size == 0:
             return []
+        H0, W0 = bgr_img.shape[:2]
 
         # YOLOv8-face detection
         dyn_imgsz = int(imgsz) if (imgsz is not None and imgsz > 0) else 640
-        res = self.det.predict(
-            bgr_img,
-            conf=self.conf,
-            verbose=False,
-            device=self.device,
-            max_det=60,
-            imgsz=dyn_imgsz,
-        )[0]
+        dyn_imgsz = max(320, dyn_imgsz)
+        dyn_imgsz = ((dyn_imgsz + 31) // 32) * 32  # divisible by 32
+        try:
+            res = self.det.predict(
+                bgr_img,
+                conf=self.conf,
+                verbose=False,
+                device=self.device,
+                max_det=60,
+                imgsz=dyn_imgsz,
+                iou=0.30,
+                augment=True,
+            )[0]
+        except Exception:
+            res = self.det.predict(
+                bgr_img,
+                conf=self.conf,
+                verbose=False,
+                device=self.device,
+                max_det=60,
+                imgsz=dyn_imgsz,
+                iou=0.30,
+            )[0]
         boxes = []
         for b in res.boxes:
             x1, y1, x2, y2 = [int(v.item()) for v in b.xyxy[0]]
             boxes.append((x1, y1, x2, y2))
 
         if not boxes:
-            # Bootstrap with rotated full-frame when detector misses
-            H0, W0 = bgr_img.shape[:2]
+            # multi-scale TTA before rot-fallback
+            for s in (1.25, 1.5):
+                img_s = cv2.resize(bgr_img, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
+                imgsz_s = max(320, int(dyn_imgsz * s))
+                imgsz_s = ((imgsz_s + 31) // 32) * 32
+                try:
+                    res_s = self.det.predict(
+                        img_s,
+                        conf=min(self.conf, 0.10),
+                        verbose=False,
+                        device=self.device,
+                        max_det=80,
+                        imgsz=imgsz_s,
+                        iou=0.30,
+                        augment=True,
+                    )[0]
+                except Exception:
+                    try:
+                        res_s = self.det.predict(
+                            img_s,
+                            conf=min(self.conf, 0.10),
+                            verbose=False,
+                            device=self.device,
+                            max_det=80,
+                            imgsz=imgsz_s,
+                            iou=0.30,
+                        )[0]
+                    except Exception:
+                        continue
+                bxs_s = getattr(res_s, "boxes", None)
+                if bxs_s is None or len(bxs_s) == 0:
+                    continue
+                confs_s = getattr(bxs_s, "conf", None)
+                for j, b in enumerate(bxs_s):
+                    confv = 1.0
+                    if confs_s is not None and len(confs_s) > j:
+                        try:
+                            confv = float(confs_s[j].item())
+                        except Exception:
+                            try:
+                                confv = float(confs_s[j])
+                            except Exception:
+                                confv = 1.0
+                    if confv < 0.05:
+                        continue
+                    x1s, y1s, x2s, y2s = [v.item() for v in b.xyxy[0]]
+                    x1 = max(0, min(W0 - 1, int(round(x1s / s))))
+                    y1 = max(0, min(H0 - 1, int(round(y1s / s))))
+                    x2 = max(x1 + 1, min(W0, int(round(x2s / s))))
+                    y2 = max(y1 + 1, min(H0, int(round(y2s / s))))
+                    boxes.append((x1, y1, x2, y2))
+                if boxes:
+                    break
 
+        if not boxes:
+            # Bootstrap with rotated full-frame when detector misses
             def _map_pts_back(xr, yr, rot):
                 # inverse mappings from rotated -> original
-                if rot == cv2.ROTATE_90_CLOCKWISE:  # x_o = W0-1-y_r, y_o = x_r
-                    return (W0 - 1 - yr, xr)
-                if rot == cv2.ROTATE_90_COUNTERCLOCKWISE:  # x_o = y_r, y_o = H0-1-x_r
+                if rot == cv2.ROTATE_90_CLOCKWISE:         # x_o = y_r, y_o = H0-1-x_r
                     return (yr, H0 - 1 - xr)
+                if rot == cv2.ROTATE_90_COUNTERCLOCKWISE:  # x_o = W0-1-y_r, y_o = x_r
+                    return (W0 - 1 - yr, xr)
                 # 180 rotation
                 return (W0 - 1 - xr, H0 - 1 - yr)
 
@@ -695,10 +764,23 @@ class FaceEmbedder:
                         imgsz=max(dyn_imgsz, 896),
                         verbose=False,
                         device=self.device,
-                        max_det=60,
+                        max_det=80,
+                        iou=0.30,
+                        augment=True,
                     )[0]
                 except Exception:
-                    continue
+                    try:
+                        res_r = self.det.predict(
+                            img_r,
+                            conf=min(self.conf, 0.10),
+                            imgsz=max(dyn_imgsz, 896),
+                            verbose=False,
+                            device=self.device,
+                            max_det=80,
+                            iou=0.30,
+                        )[0]
+                    except Exception:
+                        continue
                 bxs_r = getattr(res_r, "boxes", None)
                 if bxs_r is None or len(bxs_r) == 0:
                     continue
@@ -736,8 +818,10 @@ class FaceEmbedder:
                     )
                     chip = cv2.resize(crop_r, (112, 112), interpolation=interp)
                 x1o, y1o, x2o, y2o = _map_box_back(x1r, y1r, x2r, y2r, rot)
-                x1o = max(0, min(W0 - 1, x1o)); y1o = max(0, min(H0 - 1, y1o))
-                x2o = max(x1o + 1, min(W0, x2o)); y2o = max(y1o + 1, min(H0, y2o))
+                x1o = max(0, min(W0 - 1, x1o))
+                y1o = max(0, min(H0 - 1, y1o))
+                x2o = max(x1o + 1, min(W0, x2o))
+                y2o = max(y1o + 1, min(H0, y2o))
                 feats = (
                     self._arcface_encode([chip])
                     if self.use_arcface
@@ -752,6 +836,8 @@ class FaceEmbedder:
                 ]
 
             return []
+
+        boxes = self._nms_boxes(boxes, iou_thr=0.45)
 
         faces: List[Tuple[int, int, int, int, np.ndarray, float]] = []
         crops: List[np.ndarray] = []
@@ -805,6 +891,26 @@ class FaceEmbedder:
         # Sort by quality then area
         out.sort(key=lambda f: (f['quality'], (f['bbox'][2]-f['bbox'][0])*(f['bbox'][3]-f['bbox'][1])), reverse=True)
         return out
+
+    @staticmethod
+    def _iou(a, b):
+        x1 = max(a[0], b[0])
+        y1 = max(a[1], b[1])
+        x2 = min(a[2], b[2])
+        y2 = min(a[3], b[3])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+        area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+        denom = area_a + area_b - inter
+        return inter / denom if denom > 0 else 0.0
+
+    @staticmethod
+    def _nms_boxes(boxes, iou_thr=0.5):
+        kept = []
+        for b in sorted(boxes, key=lambda t: (t[2] - t[0]) * (t[3] - t[1]), reverse=True):
+            if all(FaceEmbedder._iou(b, k) < iou_thr for k in kept):
+                kept.append(b)
+        return kept
 
     @staticmethod
     def best_face(faces):
