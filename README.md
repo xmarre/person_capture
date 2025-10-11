@@ -2,7 +2,7 @@
 
 **Goal:** Build clean image datasets of **one specific person** from video. Best identity precision is with **ArcFace‑only**.
 
-- **Intended mode:** `Match mode = face_only`, **ArcFace = on**, **Disable ReID = on`.
+- **Intended mode:** `Match mode = face_only`, **ArcFace = on**, **Disable ReID = on**.
 - **Acceleration (optional):** ONNX Runtime 1.24 + TensorRT EP. See `README_onnxruntime_1.24_trt_windows.md`. A TensorRT **ZIP** install is preferred; a **pip** TensorRT may also work (untested here).
 
 ---
@@ -23,7 +23,8 @@ Outputs:
 
 ### Detection
 - **Person detector**: YOLOv8 persons. Controls: `min_det_conf`, device (CPU/CUDA). Half precision is used on CUDA when safe.
-- **Face detector**: YOLOv8‑face inside each person ROI. Controls: `face_det_conf`, `face_det_pad` (padding so the jawline is not cut).
+- **Face detector**: InsightFace SCRFD (default) or YOLOv8‑face inside each person ROI. Controls: `face_det_conf` (default 0.5), `face_det_pad` (padding so the jawline is not cut).
+  > On the first run, InsightFace auto-downloads SCRFD and ArcFace models into its cache directory. YOLOv8-face runs typically use `face_det_conf` in the **0.15–0.30** range.
 
 ### Identity (intended best‑ID path)
 - **ArcFace ONNX** embeddings compared by cosine distance against a **normalized reference bank**.
@@ -81,8 +82,11 @@ py -3.12 -m venv env
 call env\Scripts\activate
 python -m pip install -U pip
 pip install -r requirements.txt
+pip install <path-to-wheel>\onnxruntime\build\Windows\Release\Release\dist\onnxruntime_gpu-1.24.0-cp312-cp312-win_amd64.whl
 python person_capture\gui_app.py
 ```
+
+> Replace `<path-to-wheel>` with the folder from `README_onnxruntime_1.24_trt_windows.md` after downloading the packaged build.
 
 CLI example:
 ```bat

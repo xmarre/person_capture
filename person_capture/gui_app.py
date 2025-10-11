@@ -158,13 +158,13 @@ class SessionConfig:
     use_arcface: bool = True
     device: str = "cuda"            # cuda | cpu
     yolo_model: str = "yolov8n.pt"
-    face_model: str = "yolov8l-face.pt"
+    face_model: str = "scrfd_10g_bnkps"
     save_annot: bool = False
     preview_every: int = 120
     prefer_face_when_available: bool = True
     face_quality_min: float = 70.0
     face_visible_uses_quality: bool = True      # if False, any detected face counts as "visible"
-    face_det_conf: float = 0.15                 # YOLOv8-face confidence
+    face_det_conf: float = 0.5                  # Face detector confidence
     face_det_pad: float = 0.08                  # expand person box before face detect (fraction of w/h)
     face_margin_min: float = 0.05
     require_face_if_visible: bool = True
@@ -207,7 +207,7 @@ class SessionConfig:
     prescan_enable: bool = True
     prescan_stride: int = 24               # sample every N frames
     prescan_max_width: int = 416           # downscale for prescan
-    prescan_face_conf: float = 0.25        # YOLO-face conf during prescan
+    prescan_face_conf: float = 0.5         # face detector confidence during prescan
     prescan_fd_enter: float = 0.45         # ArcFace dist to ENTER (looser)
     prescan_fd_add: float = 0.22           # ArcFace dist to add to bank (tighter)
     prescan_fd_exit: float = 0.52          # ArcFace dist to EXIT  (hysteresis)
@@ -391,229 +391,230 @@ class Processor(QtCore.QObject):
         Wmax = int(cfg.prescan_max_width)
         enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
         fd_add = float(getattr(cfg, "prescan_fd_add", enter))
-        old_face_conf = getattr(face, "conf", 0.15)
+        old_face_conf = getattr(face, "conf", 0.5)
         face.conf = float(cfg.prescan_face_conf)
-        add_cooldown_samples = int(
-            getattr(
-                cfg,
-                "prescan_add_cooldown_samples",
-                getattr(cfg, "prescan_add_cooldown_frames", 5),
-            )
-        )
-        last_add_sample = -10**9
-        spans = []
-        active = False
-        start = 0
-        neg_run = 0
-        total_samples = max(1, (total_frames + stride - 1) // stride)
-        progress_step = max(1, total_samples // 50)
-        next_progress_sample = 0
-        preview_step = max(stride, int(getattr(cfg, "preview_every", 120)))
-        last_preview_idx = -preview_step
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        processed_samples = 0
-        i = 0
-        # fast pass
-        while i < total_frames:
-            # ---- handle UI commands during pre-scan ----
-            try:
-                while True:
-                    cmd, arg = self._cmd_q.get_nowait()
-                    if cmd == "pause":
-                        self._paused = True
-                    elif cmd == "play":
-                        self._paused = False
-                    elif cmd == "seek":
-                        tgt = max(0, min(total_frames - 1, int(arg)))
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, tgt)
-                        # align to stride
-                        i = (tgt // stride) * stride
-                        processed_samples = i // stride
-                        active = False
-                        neg_run = 0
-                        try:
-                            self.progress.emit(i)
-                        except Exception:
-                            pass
-                    elif cmd == "step":
-                        stepn = int(arg) if arg is not None else 1
-                        tgt = max(0, min(total_frames - 1, i + stepn))
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, tgt)
-                        i = (tgt // stride) * stride
-                        processed_samples = i // stride
-                        self._paused = True
-                        try:
-                            self.progress.emit(i)
-                        except Exception:
-                            pass
-                    elif cmd == "speed":
-                        try:
-                            self._speed = max(0.1, min(4.0, float(arg)))
-                        except Exception:
-                            pass
-                    elif cmd == "cfg":
-                        # allow live edits to prescan_* fields if sent
-                        try:
-                            ch = dict(arg or {})
-                            for k, v in ch.items():
-                                if k.startswith("prescan_"):
-                                    setattr(cfg, k, v)
-                            stride = max(1, int(cfg.prescan_stride))
-                            enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
-                            fd_add = float(getattr(cfg, "prescan_fd_add", enter))
-                            Wmax = int(cfg.prescan_max_width)
-                            face.conf = float(cfg.prescan_face_conf)
-                            add_cooldown_samples = int(
-                                getattr(
-                                    cfg,
-                                    "prescan_add_cooldown_samples",
-                                    getattr(cfg, "prescan_add_cooldown_frames", 5),
-                                )
-                            )
-                        except Exception:
-                            pass
-            except queue.Empty:
-                pass
-            if self._abort:
-                break
-            if self._paused:
-                time.sleep(0.02)
-                continue
-            if not cap.grab():
-                break
-            if i % stride != 0:
-                i += 1
-                continue
-            ok, frame = cap.retrieve()
-            if not ok or frame is None:
-                i += 1
-                continue
-            idx = i
-            sample_idx = processed_samples
-            processed_samples += 1
-            h, w = frame.shape[:2]
-            if w > Wmax:
-                nh = int(round(h * (Wmax / float(w))))
-                frame = cv2.resize(frame, (Wmax, nh), interpolation=cv2.INTER_AREA)
-            faces = face.extract(frame)
-            # best ArcFace distance on this sample
-            best = 9.0
-            for f in faces:
-                feat = f.get("feat")
-                if feat is None:
-                    continue
-                # current best vs live bank
-                fd = self._fd_min(feat, ref_feat_local)
-                best = min(best, fd)
-                if (
-                    fd <= fd_add
-                    and (sample_idx - last_add_sample) >= add_cooldown_samples
-                    and f.get("quality", 1e9) >= cfg.face_quality_min
-                ):
-                    try:
-                        quality_val = float(f.get("quality", 0.0))
-                    except Exception:
-                        quality_val = 0.0
-                    ref_feat_local, action, idx_info = self._stream_ref_bank_update(
-                        ref_bank_list,
-                        ref_feat_local,
-                        feat,
-                        quality_val,
-                        cfg,
-                    )
-                    if action in {"added", "replaced"}:
-                        last_add_sample = sample_idx
-                        if action == "added":
-                            added_vecs += 1
-                            self._status(
-                                f"Pre-scan ref bank +1 (size={len(ref_bank_list)}) fd={fd:.3f}",
-                                key="prescan_bank",
-                                interval=2.0,
-                            )
-                        elif action == "replaced":
-                            self._status(
-                                f"Pre-scan replaced #{idx_info} with better ref (score↑)",
-                                key="prescan_bank",
-                                interval=2.0,
-                            )
-            if sample_idx >= next_progress_sample:
-                pct = min(100.0, (idx + stride) / max(1.0, float(total_frames)) * 100.0)
-                self._status(
-                    f"Pre-scan {pct:.1f}% ({idx}/{total_frames})",
-                    key="prescan_progress",
-                    interval=0.25,
+        try:
+            add_cooldown_samples = int(
+                getattr(
+                    cfg,
+                    "prescan_add_cooldown_samples",
+                    getattr(cfg, "prescan_add_cooldown_frames", 5),
                 )
+            )
+            last_add_sample = -10**9
+            spans = []
+            active = False
+            start = 0
+            neg_run = 0
+            total_samples = max(1, (total_frames + stride - 1) // stride)
+            progress_step = max(1, total_samples // 50)
+            next_progress_sample = 0
+            preview_step = max(stride, int(getattr(cfg, "preview_every", 120)))
+            last_preview_idx = -preview_step
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            processed_samples = 0
+            i = 0
+            # fast pass
+            while i < total_frames:
+                # ---- handle UI commands during pre-scan ----
                 try:
-                    self.progress.emit(int(min(idx, max(total_frames - 1, 0))))
-                except Exception:
+                    while True:
+                        cmd, arg = self._cmd_q.get_nowait()
+                        if cmd == "pause":
+                            self._paused = True
+                        elif cmd == "play":
+                            self._paused = False
+                        elif cmd == "seek":
+                            tgt = max(0, min(total_frames - 1, int(arg)))
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, tgt)
+                            # align to stride
+                            i = (tgt // stride) * stride
+                            processed_samples = i // stride
+                            active = False
+                            neg_run = 0
+                            try:
+                                self.progress.emit(i)
+                            except Exception:
+                                pass
+                        elif cmd == "step":
+                            stepn = int(arg) if arg is not None else 1
+                            tgt = max(0, min(total_frames - 1, i + stepn))
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, tgt)
+                            i = (tgt // stride) * stride
+                            processed_samples = i // stride
+                            self._paused = True
+                            try:
+                                self.progress.emit(i)
+                            except Exception:
+                                pass
+                        elif cmd == "speed":
+                            try:
+                                self._speed = max(0.1, min(4.0, float(arg)))
+                            except Exception:
+                                pass
+                        elif cmd == "cfg":
+                            # allow live edits to prescan_* fields if sent
+                            try:
+                                ch = dict(arg or {})
+                                for k, v in ch.items():
+                                    if k.startswith("prescan_"):
+                                        setattr(cfg, k, v)
+                                stride = max(1, int(cfg.prescan_stride))
+                                enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
+                                fd_add = float(getattr(cfg, "prescan_fd_add", enter))
+                                Wmax = int(cfg.prescan_max_width)
+                                face.conf = float(cfg.prescan_face_conf)
+                                add_cooldown_samples = int(
+                                    getattr(
+                                        cfg,
+                                        "prescan_add_cooldown_samples",
+                                        getattr(cfg, "prescan_add_cooldown_frames", 5),
+                                    )
+                                )
+                            except Exception:
+                                pass
+                except queue.Empty:
                     pass
-                next_progress_sample = sample_idx + progress_step
-            emit_preview = False
-            if idx - last_preview_idx >= preview_step:
-                emit_preview = True
-                last_preview_idx = idx
-            if best <= enter:
-                if not active:
-                    active = True
-                    start = idx
-                neg_run = 0
-                emit_preview = True
-            else:
-                if active:
-                    neg_run += 1
-                    if neg_run * stride >= int(0.5 * fps) or best >= exit_:
-                        end = idx
-                        # pad, clamp, merge
-                        s = max(0, start - pad)
-                        e = min(total_frames - 1, end + pad)
-                        if e - s + 1 >= min_len:
-                            if spans and s <= spans[-1][1] + 1:
-                                spans[-1] = (spans[-1][0], max(spans[-1][1], e))
-                            else:
-                                spans.append((s, e))
-                        active = False
-                        neg_run = 0
-            if emit_preview:
-                try:
-                    vis = frame.copy()
-                    color = (0, 200, 0) if best <= enter else (0, 0, 200)
-                    cv2.putText(
-                        vis,
-                        f"Pre-scan fd={best:.2f} f={idx}",
-                        (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.75,
-                        color,
-                        2,
-                        cv2.LINE_AA,
+                if self._abort:
+                    break
+                if self._paused:
+                    time.sleep(0.02)
+                    continue
+                if not cap.grab():
+                    break
+                if i % stride != 0:
+                    i += 1
+                    continue
+                ok, frame = cap.retrieve()
+                if not ok or frame is None:
+                    i += 1
+                    continue
+                idx = i
+                sample_idx = processed_samples
+                processed_samples += 1
+                h, w = frame.shape[:2]
+                if w > Wmax:
+                    nh = int(round(h * (Wmax / float(w))))
+                    frame = cv2.resize(frame, (Wmax, nh), interpolation=cv2.INTER_AREA)
+                faces = face.extract(frame)
+                # best ArcFace distance on this sample
+                best = 9.0
+                for f in faces:
+                    feat = f.get("feat")
+                    if feat is None:
+                        continue
+                    # current best vs live bank
+                    fd = self._fd_min(feat, ref_feat_local)
+                    best = min(best, fd)
+                    if (
+                        fd <= fd_add
+                        and (sample_idx - last_add_sample) >= add_cooldown_samples
+                        and f.get("quality", 1e9) >= cfg.face_quality_min
+                    ):
+                        try:
+                            quality_val = float(f.get("quality", 0.0))
+                        except Exception:
+                            quality_val = 0.0
+                        ref_feat_local, action, idx_info = self._stream_ref_bank_update(
+                            ref_bank_list,
+                            ref_feat_local,
+                            feat,
+                            quality_val,
+                            cfg,
+                        )
+                        if action in {"added", "replaced"}:
+                            last_add_sample = sample_idx
+                            if action == "added":
+                                added_vecs += 1
+                                self._status(
+                                    f"Pre-scan ref bank +1 (size={len(ref_bank_list)}) fd={fd:.3f}",
+                                    key="prescan_bank",
+                                    interval=2.0,
+                                )
+                            elif action == "replaced":
+                                self._status(
+                                    f"Pre-scan replaced #{idx_info} with better ref (score↑)",
+                                    key="prescan_bank",
+                                    interval=2.0,
+                                )
+                if sample_idx >= next_progress_sample:
+                    pct = min(100.0, (idx + stride) / max(1.0, float(total_frames)) * 100.0)
+                    self._status(
+                        f"Pre-scan {pct:.1f}% ({idx}/{total_frames})",
+                        key="prescan_progress",
+                        interval=0.25,
                     )
-                    self.preview.emit(self._cv_bgr_to_qimage(vis))
-                except Exception:
-                    pass
-            i += 1
-        if active:
-            s = max(0, start - pad)
-            e = total_frames - 1
-            if e - s + 1 >= min_len:
-                if spans and s <= spans[-1][1] + 1:
-                    spans[-1] = (spans[-1][0], max(spans[-1][1], e))
+                    try:
+                        self.progress.emit(int(min(idx, max(total_frames - 1, 0))))
+                    except Exception:
+                        pass
+                    next_progress_sample = sample_idx + progress_step
+                emit_preview = False
+                if idx - last_preview_idx >= preview_step:
+                    emit_preview = True
+                    last_preview_idx = idx
+                if best <= enter:
+                    if not active:
+                        active = True
+                        start = idx
+                    neg_run = 0
+                    emit_preview = True
                 else:
-                    spans.append((s, e))
-        # bridge tiny gaps
-        if spans and getattr(cfg, "prescan_bridge_gap_sec", 0) > 0:
-            bridged = []
-            gap = int(round(cfg.prescan_bridge_gap_sec * fps))
-            cs, ce = spans[0]
-            for s, e in spans[1:]:
-                if s - ce <= gap:
-                    ce = max(ce, e)
-                else:
-                    bridged.append((cs, ce))
-                    cs, ce = s, e
-            bridged.append((cs, ce))
-            spans = bridged
-        # restore
-        face.conf = old_face_conf
+                    if active:
+                        neg_run += 1
+                        if neg_run * stride >= int(0.5 * fps) or best >= exit_:
+                            end = idx
+                            # pad, clamp, merge
+                            s = max(0, start - pad)
+                            e = min(total_frames - 1, end + pad)
+                            if e - s + 1 >= min_len:
+                                if spans and s <= spans[-1][1] + 1:
+                                    spans[-1] = (spans[-1][0], max(spans[-1][1], e))
+                                else:
+                                    spans.append((s, e))
+                            active = False
+                            neg_run = 0
+                if emit_preview:
+                    try:
+                        vis = frame.copy()
+                        color = (0, 200, 0) if best <= enter else (0, 0, 200)
+                        cv2.putText(
+                            vis,
+                            f"Pre-scan fd={best:.2f} f={idx}",
+                            (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.75,
+                            color,
+                            2,
+                            cv2.LINE_AA,
+                        )
+                        self.preview.emit(self._cv_bgr_to_qimage(vis))
+                    except Exception:
+                        pass
+                i += 1
+            if active:
+                s = max(0, start - pad)
+                e = total_frames - 1
+                if e - s + 1 >= min_len:
+                    if spans and s <= spans[-1][1] + 1:
+                        spans[-1] = (spans[-1][0], max(spans[-1][1], e))
+                    else:
+                        spans.append((s, e))
+            # bridge tiny gaps
+            if spans and getattr(cfg, "prescan_bridge_gap_sec", 0) > 0:
+                bridged = []
+                gap = int(round(cfg.prescan_bridge_gap_sec * fps))
+                cs, ce = spans[0]
+                for s, e in spans[1:]:
+                    if s - ce <= gap:
+                        ce = max(ce, e)
+                    else:
+                        bridged.append((cs, ce))
+                        cs, ce = s, e
+                bridged.append((cs, ce))
+                spans = bridged
+        finally:
+            face.conf = old_face_conf
         cap.set(cv2.CAP_PROP_POS_FRAMES, pos0)
         try:
             self.progress.emit(max(0, total_frames - 1))
@@ -2893,7 +2894,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stride_spin = QtWidgets.QSpinBox(); self.stride_spin.setRange(1, 1000); self.stride_spin.setValue(2)
         self.det_conf_spin = QtWidgets.QDoubleSpinBox(); self.det_conf_spin.setDecimals(3); self.det_conf_spin.setRange(0.0, 1.0); self.det_conf_spin.setSingleStep(0.01); self.det_conf_spin.setValue(0.35)
         self.face_thr_spin = QtWidgets.QDoubleSpinBox(); self.face_thr_spin.setDecimals(3); self.face_thr_spin.setRange(0.0, 2.0); self.face_thr_spin.setSingleStep(0.01); self.face_thr_spin.setValue(0.45)
-        self.face_det_conf_spin = QtWidgets.QDoubleSpinBox(); self.face_det_conf_spin.setDecimals(3); self.face_det_conf_spin.setRange(0.0, 1.0); self.face_det_conf_spin.setSingleStep(0.01); self.face_det_conf_spin.setValue(0.15)
+        self.face_det_conf_spin = QtWidgets.QDoubleSpinBox(); self.face_det_conf_spin.setDecimals(3); self.face_det_conf_spin.setRange(0.0, 1.0); self.face_det_conf_spin.setSingleStep(0.01); self.face_det_conf_spin.setValue(0.5)
         self.face_det_pad_spin = QtWidgets.QDoubleSpinBox(); self.face_det_pad_spin.setDecimals(3); self.face_det_pad_spin.setRange(0.0, 1.0); self.face_det_pad_spin.setSingleStep(0.01); self.face_det_pad_spin.setValue(0.08)
         self.face_quality_spin = QtWidgets.QDoubleSpinBox(); self.face_quality_spin.setRange(0.0, 1000.0); self.face_quality_spin.setSingleStep(1.0); self.face_quality_spin.setValue(70.0)
         self.face_vis_quality_check = QtWidgets.QCheckBox(); self.face_vis_quality_check.setChecked(True)
@@ -3038,7 +3039,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.use_arc_check.setChecked(True)
         self.device_combo = QtWidgets.QComboBox(); self.device_combo.addItems(["cuda","cpu"])
         self.yolo_edit = QtWidgets.QLineEdit("yolov8n.pt")
-        self.face_yolo_edit = QtWidgets.QLineEdit("yolov8l-face.pt")
+        self.face_yolo_edit = QtWidgets.QLineEdit("scrfd_10g_bnkps")
         self.annot_check = QtWidgets.QCheckBox("Save annotated frames")
         self.preview_every_spin = QtWidgets.QSpinBox(); self.preview_every_spin.setRange(0, 5000); self.preview_every_spin.setValue(120)
 
@@ -3098,7 +3099,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Frame stride", self.stride_spin),
             ("YOLO min conf", self.det_conf_spin),
             ("Face max dist", self.face_thr_spin),
-            ("Face detector conf", self.face_det_conf_spin),
+            ("Face detector confidence", self.face_det_conf_spin),
             ("Face detector pad", self.face_det_pad_spin),
             ("Face quality min", self.face_quality_spin),
             ("Face visible uses quality", self.face_vis_quality_check),
@@ -3922,7 +3923,7 @@ class MainWindow(QtWidgets.QMainWindow):
             prescan_stride=int(self.spin_prescan_stride.value()) if hasattr(self, "spin_prescan_stride") else 16,
             prescan_fd_add=float(self.spin_prescan_fd_add.value()) if hasattr(self, "spin_prescan_fd_add") else 0.22,
             prescan_max_width=int(self.spin_prescan_max_width.value()) if hasattr(self, "spin_prescan_max_width") else 416,
-            prescan_face_conf=float(self.spin_prescan_face_conf.value()) if hasattr(self, "spin_prescan_face_conf") else 0.25,
+            prescan_face_conf=float(self.spin_prescan_face_conf.value()) if hasattr(self, "spin_prescan_face_conf") else 0.5,
             prescan_fd_enter=float(self.spin_prescan_fd_enter.value()) if hasattr(self, "spin_prescan_fd_enter") else 0.45,
             prescan_fd_exit=float(self.spin_prescan_fd_exit.value()) if hasattr(self, "spin_prescan_fd_exit") else 0.52,
             prescan_add_cooldown_samples=int(self.spin_prescan_add_cooldown.value()) if hasattr(self, "spin_prescan_add_cooldown") else 5,
@@ -3952,13 +3953,13 @@ class MainWindow(QtWidgets.QMainWindow):
             use_arcface=bool(self.use_arc_check.isChecked()),
             device=self.device_combo.currentText(),
             yolo_model=self.yolo_edit.text().strip() or "yolov8n.pt",
-            face_model=self.face_yolo_edit.text().strip() or "yolov8l-face.pt",
+            face_model=self.face_yolo_edit.text().strip() or "scrfd_10g_bnkps",
             save_annot=bool(self.annot_check.isChecked()),
             preview_every=int(self.preview_every_spin.value()),
             prefer_face_when_available=bool(self.pref_face_check.isChecked()) if hasattr(self, "pref_face_check") else True,
             face_quality_min=float(self.face_quality_spin.value()) if hasattr(self, "face_quality_spin") else 70.0,
             face_visible_uses_quality=bool(self.face_vis_quality_check.isChecked()) if hasattr(self, "face_vis_quality_check") else True,
-            face_det_conf=float(self.face_det_conf_spin.value()) if hasattr(self, "face_det_conf_spin") else 0.15,
+            face_det_conf=float(self.face_det_conf_spin.value()) if hasattr(self, "face_det_conf_spin") else 0.5,
             face_det_pad=float(self.face_det_pad_spin.value()) if hasattr(self, "face_det_pad_spin") else 0.08,
             face_fullframe_imgsz=int(self.face_fullframe_imgsz_spin.value()) if hasattr(self, "face_fullframe_imgsz_spin") else 1408,
             face_margin_min=float(getattr(self, 'margin_spin', QtWidgets.QDoubleSpinBox()).value()) if hasattr(self, 'margin_spin') else 0.05,
@@ -4385,7 +4386,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stride_spin.setValue(int(s.value("frame_stride", 2)))
         self.det_conf_spin.setValue(float(s.value("min_det_conf", 0.35)))
         self.face_thr_spin.setValue(float(s.value("face_thresh", 0.45)))
-        self.face_det_conf_spin.setValue(float(s.value("face_det_conf", 0.15)))
+        self.face_det_conf_spin.setValue(float(s.value("face_det_conf", 0.5)))
         self.face_det_pad_spin.setValue(float(s.value("face_det_pad", 0.08)))
         self.face_quality_spin.setValue(float(s.value("face_quality_min", 70.0)))
         self.face_vis_quality_check.setChecked(
@@ -4452,7 +4453,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.use_arc_check.setChecked(s.value("use_arcface", True, type=bool))
         self.device_combo.setCurrentText(s.value("device", "cuda"))
         self.yolo_edit.setText(s.value("yolo_model", "yolov8n.pt"))
-        self.face_yolo_edit.setText(s.value("face_model", "yolov8l-face.pt"))
+        self.face_yolo_edit.setText(s.value("face_model", "scrfd_10g_bnkps"))
         self.annot_check.setChecked(s.value("save_annot", False, type=bool))
         self.preview_every_spin.setValue(int(s.value("preview_every", 120)))
         if hasattr(self, 'faceless_allow_check'):
@@ -4538,7 +4539,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 s.value("face_visible_uses_quality", True, type=bool)
             )
         if hasattr(self, 'face_det_conf_spin'):
-            self.face_det_conf_spin.setValue(float(s.value("face_det_conf", 0.15)))
+            self.face_det_conf_spin.setValue(float(s.value("face_det_conf", 0.5)))
         if hasattr(self, 'face_det_pad_spin'):
             self.face_det_pad_spin.setValue(float(s.value("face_det_pad", 0.08)))
     def _save_qsettings(self):

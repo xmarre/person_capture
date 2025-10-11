@@ -2,7 +2,7 @@
   "ratio": "1:1,2:3,3:2",
   "frame_stride": 2,
   "min_det_conf": 0.22,
-  "face_det_conf": 0.15,
+  "face_det_conf": 0.25,
   "face_thresh": 0.45,
   "reid_thresh": 0.48,
   "combine": "min",
