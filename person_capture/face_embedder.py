@@ -18,7 +18,7 @@ if TYPE_CHECKING:  # pragma: no cover - import only for type checking
     import open_clip as open_clip_type
 
 ort = None  # import after DLL dirs are added
-Y8F_DEFAULT = "yolov8l-face.pt"
+Y8F_DEFAULT = "yolov8l-face.pt"  # default remains; pass "scrfd_10g_bnkps" to switch backends
 
 # Candidate mirrors for YOLOv8-face weights (keyed by filename)
 Y8F_URLS = {
@@ -136,7 +136,7 @@ def _ensure_from_zip(out_path: str, zip_urls, want_suffix="glintr100.onnx", prog
 
 class FaceEmbedder:
     """
-    Face detection: YOLOv8-face.
+    Face detection: YOLOv8-face or SCRFD via InsightFace.
     Face embedding: OpenCLIP (strong backbone) or ArcFace ONNX for identity.
     Returns list of dicts: {'bbox': np.int32[x1,y1,x2,y2], 'feat': np.float32[D], 'quality': float}
     """
@@ -147,8 +147,13 @@ class FaceEmbedder:
                  clip_pretrained: str = 'laion2b_s32b_b82k',
                  progress=None, trt_lib_dir: Optional[str] = None):
         # Auto-download face detector weights if a bare filename is given
+        self.detector_backend = "yolov8"
+        self.det = None
+        self.scrfd = None
         yolo_path = yolo_model
-        if not os.path.isabs(yolo_path) and os.path.basename(yolo_path).startswith("yolov8") and yolo_path.endswith(".pt"):
+        if isinstance(yolo_model, str) and yolo_model.lower().startswith("scrfd"):
+            self.detector_backend = "scrfd"
+        elif not os.path.isabs(yolo_path) and os.path.basename(yolo_path).startswith("yolov8") and yolo_path.endswith(".pt"):
             mirrors = Y8F_URLS.get(os.path.basename(yolo_path))
             if mirrors:
                 yolo_path = _ensure_file(yolo_path, mirrors, progress=progress)
@@ -159,8 +164,18 @@ class FaceEmbedder:
 
         try:
             import torch as _torch
-            from ultralytics import YOLO as _YOLO
+            _YOLO = None
+            if self.detector_backend == "yolov8":
+                from ultralytics import YOLO as _YOLO
             import open_clip as _open_clip
+            _get_scrfd = None
+            if self.detector_backend == "scrfd":
+                try:
+                    from insightface.model_zoo import get_model as _get_scrfd
+                except Exception as e:
+                    raise RuntimeError(
+                        "SCRFD selected but `insightface` is not installed. Run: pip install insightface onnxruntime-gpu"
+                    ) from e
         except Exception as e:  # pragma: no cover - executed only when deps missing
             raise RuntimeError(
                 "Heavy dependencies not installed; install requirements.txt to run face embedding."
@@ -168,7 +183,13 @@ class FaceEmbedder:
 
         self.progress = progress
         self._torch = _torch
-        self.det = _YOLO(yolo_path)
+        if self.detector_backend == "yolov8":
+            self.det = _YOLO(yolo_path)
+        else:
+            self.scrfd = _get_scrfd(yolo_model)
+            ctx_id = 0 if (ctx.startswith('cuda') and _torch.cuda.is_available()) else -1
+            # det_size acts as an upper bound; specific input_size is passed per-call
+            self.scrfd.prepare(ctx_id=ctx_id, det_size=(640, 640))
         self.use_arcface = bool(use_arcface)
         # Keep ArcFace enabled; we'll align by 5pts only if keypoints are available at inference time.
         self.device = 'cuda' if (ctx.startswith('cuda') and _torch.cuda.is_available()) else 'cpu'
@@ -663,6 +684,9 @@ class FaceEmbedder:
             return []
         H0, W0 = bgr_img.shape[:2]
 
+        if self.detector_backend == "scrfd":
+            return self._extract_with_scrfd(bgr_img, imgsz=imgsz)
+
         # YOLOv8-face detection
         dyn_imgsz = int(imgsz) if (imgsz is not None and imgsz > 0) else 640
         dyn_imgsz = max(320, dyn_imgsz)
@@ -1029,6 +1053,93 @@ class FaceEmbedder:
                         'quality': float(q)})
         # Sort by quality then area
         out.sort(key=lambda f: (f['quality'], (f['bbox'][2]-f['bbox'][0])*(f['bbox'][3]-f['bbox'][1])), reverse=True)
+        return out
+
+    def _extract_with_scrfd(self, bgr_img: np.ndarray, *, imgsz: Optional[int] = None):
+        H0, W0 = bgr_img.shape[:2]
+        dyn = int(imgsz) if (imgsz is not None and imgsz > 0) else 640
+        dyn = max(320, min(1920, ((dyn + 31) // 32) * 32))
+
+        bboxes, kpss = self.scrfd.detect(bgr_img, thresh=float(self.conf), input_size=(dyn, dyn))
+
+        pairs: List[Tuple[Tuple[int, int, int, int], int]] = []
+        if bboxes is not None and len(bboxes) > 0:
+            for idx, bb in enumerate(bboxes):
+                x1, y1, x2, y2 = [int(v) for v in bb[:4]]
+                x1 = max(0, min(W0 - 1, x1))
+                y1 = max(0, min(H0 - 1, y1))
+                x2 = max(x1 + 1, min(W0, x2))
+                y2 = max(y1 + 1, min(H0, y2))
+                if (x2 - x1) > 2 and (y2 - y1) > 2:
+                    pairs.append(((x1, y1, x2, y2), idx))
+        if not pairs:
+            return []
+
+        scored_pairs: List[Tuple[Tuple[int, int, int, int], int, float]] = [
+            (
+                box,
+                idx,
+                float(bboxes[idx][4]) if len(bboxes[idx]) > 4 else 1.0,
+            )
+            for box, idx in pairs
+        ]
+
+        kept: List[Tuple[Tuple[int, int, int, int], int]] = []
+        for box, idx, _score in sorted(
+            scored_pairs,
+            key=lambda t: (
+                t[2],
+                (t[0][2] - t[0][0]) * (t[0][3] - t[0][1]),
+            ),
+            reverse=True,
+        ):
+            if all(self._iou(box, kbox) < 0.45 for (kbox, _) in kept):
+                kept.append((box, idx))
+
+        faces: List[Tuple[int, int, int, int, np.ndarray, float]] = []
+        crops: List[np.ndarray] = []
+        use_kps = kpss is not None
+        for (x1, y1, x2, y2), idx in kept:
+            face_bgr = bgr_img[y1:y2, x1:x2]
+            chip = None
+            if (
+                self.use_arcface
+                and use_kps
+                and 0 <= idx < len(kpss)
+                and kpss[idx] is not None
+            ):
+                pts = np.asarray(kpss[idx], dtype=np.float32)
+                pts[:, 0] = np.clip(pts[:, 0] - x1, 0, max(0, face_bgr.shape[1] - 1))
+                pts[:, 1] = np.clip(pts[:, 1] - y1, 0, max(0, face_bgr.shape[0] - 1))
+                canon = self._canon_5pts(pts)
+                chip = (
+                    self._align_by_5pts(face_bgr, canon)
+                    if canon is not None
+                    else self._upright_by_eye_roll(face_bgr, pts)
+                )
+            if chip is None:
+                interp = cv2.INTER_AREA if max(face_bgr.shape[:2]) > 112 else cv2.INTER_LINEAR
+                chip = cv2.resize(face_bgr, (112, 112), interpolation=interp)
+            q = self._face_quality(chip)
+            faces.append((x1, y1, x2, y2, chip, q))
+            crops.append(chip)
+
+        feats = self._arcface_encode(crops) if self.use_arcface else self._clip_encode(crops)
+        out = [
+            {
+                'bbox': np.array([x1, y1, x2, y2], dtype=np.int32),
+                'feat': feats[i],
+                'quality': float(q),
+            }
+            for i, (x1, y1, x2, y2, _, q) in enumerate(faces)
+        ]
+        out.sort(
+            key=lambda f: (
+                f['quality'],
+                (f['bbox'][2] - f['bbox'][0]) * (f['bbox'][3] - f['bbox'][1]),
+            ),
+            reverse=True,
+        )
         return out
 
     @staticmethod
