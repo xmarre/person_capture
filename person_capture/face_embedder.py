@@ -461,12 +461,30 @@ class FaceEmbedder:
         if h < 32 or w < 32:
             return None
         # Use a tolerant conf for the tiny crop
-        conf = 0.05
+        conf = 0.03
         # Prefer sideways hypotheses first; only 180° if those miss.
         for rot in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180):
             img = cv2.rotate(face_bgr, rot)
             try:
-                res = self.det.predict(img, conf=conf, imgsz=320, verbose=False, device=self.device)[0]
+                H, W = img.shape[:2]
+                dyn = int(min(1280, max(320, max(H, W))))
+                if self.progress:
+                    angle = (
+                        "+90"
+                        if rot == cv2.ROTATE_90_CLOCKWISE
+                        else "-90"
+                        if rot == cv2.ROTATE_90_COUNTERCLOCKWISE
+                        else "180"
+                    )
+                    self.progress(f"roll-fallback: angle={angle}°, imgsz={dyn}")
+                res = self.det.predict(
+                    img,
+                    conf=conf,
+                    imgsz=dyn,
+                    verbose=False,
+                    device=self.device,
+                    max_det=60,
+                )[0]
             except Exception:
                 continue
             kps = self._try_keypoints(res)
@@ -526,6 +544,8 @@ class FaceEmbedder:
                 continue
             chip = self._align_by_5pts(img, canon)
             if chip is not None:
+                if self.progress:
+                    self.progress("roll-fallback: success on rotated crop")
                 return chip
         return None
 
@@ -622,12 +642,20 @@ class FaceEmbedder:
             feats = self._torch.nn.functional.normalize(feats, dim=1)
         return feats.detach().cpu().numpy().astype(np.float32)
 
-    def extract(self, bgr_img: np.ndarray):
+    def extract(self, bgr_img: np.ndarray, *, imgsz: Optional[int] = None):
         if bgr_img is None or bgr_img.size == 0:
             return []
 
         # YOLOv8-face detection
-        res = self.det.predict(bgr_img, conf=self.conf, verbose=False, device=self.device)[0]
+        dyn_imgsz = int(imgsz) if (imgsz is not None and imgsz > 0) else 640
+        res = self.det.predict(
+            bgr_img,
+            conf=self.conf,
+            verbose=False,
+            device=self.device,
+            max_det=60,
+            imgsz=dyn_imgsz,
+        )[0]
         boxes = []
         for b in res.boxes:
             x1, y1, x2, y2 = [int(v.item()) for v in b.xyxy[0]]
@@ -668,9 +696,7 @@ class FaceEmbedder:
                     chip = self._upright_by_eye_roll(face_bgr, pts)
             else:
                 # No landmarks: try re-detecting on ±90° rotated crops, then fall back.
-                chip = None
-                if self.use_arcface:
-                    chip = self._redetect_align_on_rotations(face_bgr)
+                chip = self._redetect_align_on_rotations(face_bgr)
                 if chip is None:
                     interp = cv2.INTER_AREA if max(face_bgr.shape[:2]) > 112 else cv2.INTER_LINEAR
                     chip = cv2.resize(face_bgr, (112, 112), interpolation=interp)

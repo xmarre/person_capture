@@ -54,7 +54,14 @@ class PersonDetector:
         try:
             # Ultralytics auto-handles dtype from model; ensure fp16 path on CUDA model
             res = self.model.predict(
-                frame, device=self.device, conf=float(conf), iou=0.45, classes=[0], verbose=False
+                frame,
+                device=self.device,
+                conf=float(conf),
+                iou=0.45,
+                classes=[0],
+                verbose=False,
+                max_det=40,
+                imgsz=640,
             )[0]
         except Exception:
             return []
