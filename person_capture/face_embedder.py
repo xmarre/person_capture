@@ -662,6 +662,95 @@ class FaceEmbedder:
             boxes.append((x1, y1, x2, y2))
 
         if not boxes:
+            # Bootstrap with rotated full-frame when detector misses
+            H0, W0 = bgr_img.shape[:2]
+
+            def _map_pts_back(xr, yr, rot):
+                # inverse mappings from rotated -> original
+                if rot == cv2.ROTATE_90_CLOCKWISE:  # x_o = W0-1-y_r, y_o = x_r
+                    return (W0 - 1 - yr, xr)
+                if rot == cv2.ROTATE_90_COUNTERCLOCKWISE:  # x_o = y_r, y_o = H0-1-x_r
+                    return (yr, H0 - 1 - xr)
+                # 180 rotation
+                return (W0 - 1 - xr, H0 - 1 - yr)
+
+            def _map_box_back(x1, y1, x2, y2, rot):
+                xs = [x1, x2, x2, x1]
+                ys = [y1, y1, y2, y2]
+                pts = [_map_pts_back(x, y, rot) for x, y in zip(xs, ys)]
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                return (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
+
+            for rot in (
+                cv2.ROTATE_90_CLOCKWISE,
+                cv2.ROTATE_90_COUNTERCLOCKWISE,
+                cv2.ROTATE_180,
+            ):
+                img_r = cv2.rotate(bgr_img, rot)
+                try:
+                    res_r = self.det.predict(
+                        img_r,
+                        conf=min(self.conf, 0.10),
+                        imgsz=max(dyn_imgsz, 896),
+                        verbose=False,
+                        device=self.device,
+                        max_det=60,
+                    )[0]
+                except Exception:
+                    continue
+                bxs_r = getattr(res_r, "boxes", None)
+                if bxs_r is None or len(bxs_r) == 0:
+                    continue
+                kps_r = self._try_keypoints(res_r)
+                idx = 0
+                try:
+                    confs = getattr(bxs_r, "conf", None)
+                    if confs is not None and len(confs) > 0:
+                        idx = int(confs.argmax().item())
+                except Exception:
+                    pass
+                bx = bxs_r.xyxy[idx].tolist()
+                x1r, y1r, x2r, y2r = [int(v) for v in bx]
+                Hr, Wr = img_r.shape[:2]
+                x1r = max(0, min(Wr - 1, x1r))
+                y1r = max(0, min(Hr - 1, y1r))
+                x2r = max(x1r + 1, min(Wr, x2r))
+                y2r = max(y1r + 1, min(Hr, y2r))
+                chip = None
+                if kps_r is not None and len(kps_r) > idx:
+                    pts5 = kps_r[idx][:5, :2].astype(np.float32)
+                    pts5[:, 0] = np.clip(pts5[:, 0], 0, img_r.shape[1] - 1)
+                    pts5[:, 1] = np.clip(pts5[:, 1], 0, img_r.shape[0] - 1)
+                    canon = self._canon_5pts(pts5)
+                    if canon is not None:
+                        chip = self._align_by_5pts(img_r, canon)
+                if chip is None:
+                    crop_r = img_r[y1r:y2r, x1r:x2r]
+                    if crop_r.size == 0:
+                        continue
+                    interp = (
+                        cv2.INTER_AREA
+                        if max(crop_r.shape[:2]) > 112
+                        else cv2.INTER_LINEAR
+                    )
+                    chip = cv2.resize(crop_r, (112, 112), interpolation=interp)
+                x1o, y1o, x2o, y2o = _map_box_back(x1r, y1r, x2r, y2r, rot)
+                x1o = max(0, min(W0 - 1, x1o)); y1o = max(0, min(H0 - 1, y1o))
+                x2o = max(x1o + 1, min(W0, x2o)); y2o = max(y1o + 1, min(H0, y2o))
+                feats = (
+                    self._arcface_encode([chip])
+                    if self.use_arcface
+                    else self._clip_encode([chip])
+                )
+                return [
+                    {
+                        "bbox": np.array([x1o, y1o, x2o, y2o], dtype=np.int32),
+                        "feat": feats[0],
+                        "quality": float(self._face_quality(chip)),
+                    }
+                ]
+
             return []
 
         faces: List[Tuple[int, int, int, int, np.ndarray, float]] = []

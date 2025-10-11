@@ -1764,6 +1764,7 @@ class Processor(QtCore.QObject):
                                 "face_quality_min",
                                 "face_det_conf",
                                 "face_det_pad",
+                                "face_fullframe_imgsz",
                             }
                             for k, v in (arg or {}).items():
                                 if k in LIVE and hasattr(self.cfg, k):
@@ -2903,6 +2904,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.disable_reid_check.setChecked(True)
         self.face_fullframe_check = QtWidgets.QCheckBox("Full-frame face fallback when missed")
         self.face_fullframe_check.setChecked(True)
+        self.face_fullframe_imgsz_spin = QtWidgets.QSpinBox()
+        self.face_fullframe_imgsz_spin.setRange(0, 4096)
+        self.face_fullframe_imgsz_spin.setSingleStep(32)
+        self.face_fullframe_imgsz_spin.setValue(int(self.cfg.face_fullframe_imgsz))
+        self.face_fullframe_imgsz_spin.setToolTip("int: face_fullframe_imgsz (0 disables override)")
         self.only_best_check = QtWidgets.QCheckBox("Only best per frame")
         self.only_best_check.setChecked(True)
         # Pre-scan controls
@@ -3101,6 +3107,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Match mode", self.match_mode_combo),
             ("Disable ReID", self.disable_reid_check),
             ("Face fallback when missed", self.face_fullframe_check),
+            ("Full-frame face size", self.face_fullframe_imgsz_spin),
             ("Only best", self.only_best_check),
             ("Enable pre-scan", self.chk_prescan),
             ("Pre-scan stride (frames)", self.spin_prescan_stride),
@@ -3953,6 +3960,7 @@ class MainWindow(QtWidgets.QMainWindow):
             face_visible_uses_quality=bool(self.face_vis_quality_check.isChecked()) if hasattr(self, "face_vis_quality_check") else True,
             face_det_conf=float(self.face_det_conf_spin.value()) if hasattr(self, "face_det_conf_spin") else 0.15,
             face_det_pad=float(self.face_det_pad_spin.value()) if hasattr(self, "face_det_pad_spin") else 0.08,
+            face_fullframe_imgsz=int(self.face_fullframe_imgsz_spin.value()) if hasattr(self, "face_fullframe_imgsz_spin") else 896,
             face_margin_min=float(getattr(self, 'margin_spin', QtWidgets.QDoubleSpinBox()).value()) if hasattr(self, 'margin_spin') else 0.05,
             allow_faceless_when_locked=bool(self.faceless_allow_check.isChecked()) if hasattr(self, "faceless_allow_check") else True,
             learn_bank_runtime=bool(self.learn_bank_runtime_check.isChecked()) if hasattr(self, "learn_bank_runtime_check") else False,
@@ -3995,6 +4003,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.disable_reid_check.setChecked(cfg.disable_reid)
         if hasattr(self, 'face_fullframe_check'):
             self.face_fullframe_check.setChecked(cfg.face_fullframe_when_missed)
+        if hasattr(self, 'face_fullframe_imgsz_spin'):
+            self.face_fullframe_imgsz_spin.setValue(int(cfg.face_fullframe_imgsz))
         self.only_best_check.setChecked(cfg.only_best)
         if hasattr(self, 'chk_prescan'):
             self.chk_prescan.setChecked(cfg.prescan_enable)
@@ -4388,6 +4398,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.disable_reid_check.setChecked(s.value("disable_reid", True, type=bool))
         if hasattr(self, 'face_fullframe_check'):
             self.face_fullframe_check.setChecked(s.value("face_fullframe_when_missed", True, type=bool))
+        if hasattr(self, 'face_fullframe_imgsz_spin'):
+            self.face_fullframe_imgsz_spin.setValue(int(s.value("face_fullframe_imgsz", self.cfg.face_fullframe_imgsz)))
         self.only_best_check.setChecked(s.value("only_best", True, type=bool))
         if hasattr(self, 'chk_prescan'):
             self.chk_prescan.setChecked(s.value("prescan_enable", True, type=bool))
