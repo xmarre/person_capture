@@ -103,7 +103,7 @@ people = det.detect(frame_bgr, conf=0.35)
 
 ```python
 from face_embedder import FaceEmbedder
-face = FaceEmbedder(ctx="cuda", yolo_model="yolov8n-face.pt", use_arcface=False)
+face = FaceEmbedder(ctx="cuda", yolo_model="yolov8l-face.pt", use_arcface=False)
 faces = face.extract(crop_bgr)
 best = FaceEmbedder.best_face(faces)
 ```

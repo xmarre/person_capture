@@ -158,7 +158,7 @@ class SessionConfig:
     use_arcface: bool = True
     device: str = "cuda"            # cuda | cpu
     yolo_model: str = "yolov8n.pt"
-    face_model: str = "yolov8n-face.pt"
+    face_model: str = "yolov8l-face.pt"
     save_annot: bool = False
     preview_every: int = 120
     prefer_face_when_available: bool = True
@@ -183,7 +183,7 @@ class SessionConfig:
     # Face-only controls
     disable_reid: bool = True                    # force no ReID usage
     face_fullframe_when_missed: bool = True      # try full-frame face detect if per-person face=0
-    face_fullframe_imgsz: int = 896              # full-frame face detector size (0/None -> default)
+    face_fullframe_imgsz: int = 1408             # full-frame face detector size (0/None -> default)
 
     # Debug/diagnostics
     debug_dump: bool = True
@@ -3038,7 +3038,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.use_arc_check.setChecked(True)
         self.device_combo = QtWidgets.QComboBox(); self.device_combo.addItems(["cuda","cpu"])
         self.yolo_edit = QtWidgets.QLineEdit("yolov8n.pt")
-        self.face_yolo_edit = QtWidgets.QLineEdit("yolov8n-face.pt")
+        self.face_yolo_edit = QtWidgets.QLineEdit("yolov8l-face.pt")
         self.annot_check = QtWidgets.QCheckBox("Save annotated frames")
         self.preview_every_spin = QtWidgets.QSpinBox(); self.preview_every_spin.setRange(0, 5000); self.preview_every_spin.setValue(120)
 
@@ -3952,7 +3952,7 @@ class MainWindow(QtWidgets.QMainWindow):
             use_arcface=bool(self.use_arc_check.isChecked()),
             device=self.device_combo.currentText(),
             yolo_model=self.yolo_edit.text().strip() or "yolov8n.pt",
-            face_model=self.face_yolo_edit.text().strip() or "yolov8n-face.pt",
+            face_model=self.face_yolo_edit.text().strip() or "yolov8l-face.pt",
             save_annot=bool(self.annot_check.isChecked()),
             preview_every=int(self.preview_every_spin.value()),
             prefer_face_when_available=bool(self.pref_face_check.isChecked()) if hasattr(self, "pref_face_check") else True,
@@ -3960,7 +3960,7 @@ class MainWindow(QtWidgets.QMainWindow):
             face_visible_uses_quality=bool(self.face_vis_quality_check.isChecked()) if hasattr(self, "face_vis_quality_check") else True,
             face_det_conf=float(self.face_det_conf_spin.value()) if hasattr(self, "face_det_conf_spin") else 0.15,
             face_det_pad=float(self.face_det_pad_spin.value()) if hasattr(self, "face_det_pad_spin") else 0.08,
-            face_fullframe_imgsz=int(self.face_fullframe_imgsz_spin.value()) if hasattr(self, "face_fullframe_imgsz_spin") else 896,
+            face_fullframe_imgsz=int(self.face_fullframe_imgsz_spin.value()) if hasattr(self, "face_fullframe_imgsz_spin") else 1408,
             face_margin_min=float(getattr(self, 'margin_spin', QtWidgets.QDoubleSpinBox()).value()) if hasattr(self, 'margin_spin') else 0.05,
             allow_faceless_when_locked=bool(self.faceless_allow_check.isChecked()) if hasattr(self, "faceless_allow_check") else True,
             learn_bank_runtime=bool(self.learn_bank_runtime_check.isChecked()) if hasattr(self, "learn_bank_runtime_check") else False,
@@ -4452,7 +4452,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.use_arc_check.setChecked(s.value("use_arcface", True, type=bool))
         self.device_combo.setCurrentText(s.value("device", "cuda"))
         self.yolo_edit.setText(s.value("yolo_model", "yolov8n.pt"))
-        self.face_yolo_edit.setText(s.value("face_model", "yolov8n-face.pt"))
+        self.face_yolo_edit.setText(s.value("face_model", "yolov8l-face.pt"))
         self.annot_check.setChecked(s.value("save_annot", False, type=bool))
         self.preview_every_spin.setValue(int(s.value("preview_every", 120)))
         if hasattr(self, 'faceless_allow_check'):
