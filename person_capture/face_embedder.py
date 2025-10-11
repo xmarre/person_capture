@@ -217,6 +217,11 @@ class FaceEmbedder:
                 if callable(self.progress):
                     self.progress("SCRFD CUDA init failed; falling back to CPU")
                 self.scrfd.prepare(ctx_id=-1, det_size=(640, 640))
+            # Align threshold handling across SCRFD API variants
+            try:
+                self.scrfd.det_thresh = float(self.conf)
+            except Exception:
+                pass
             self.insight_app = None  # avoid RetinaFace/FaceAnalysis to prevent CUDA provider issues
         self.use_arcface = bool(use_arcface)
         # Keep ArcFace enabled; we'll align by 5pts only if keypoints are available at inference time.
@@ -1149,7 +1154,26 @@ class FaceEmbedder:
         dyn = int(imgsz) if (imgsz is not None and imgsz > 0) else 640
         dyn = max(320, min(1920, ((dyn + 31) // 32) * 32))
 
-        bboxes, kpss = self.scrfd.detect(bgr_img, thresh=float(self.conf), input_size=(dyn, dyn))
+        # SCRFD APIs differ: some accept 'thresh', others 'det_thresh', others only use self.det_thresh.
+        bboxes, kpss = None, None
+        try:
+            # v0.6 style
+            bboxes, kpss = self.scrfd.detect(bgr_img, thresh=float(self.conf), input_size=(dyn, dyn))
+        except TypeError:
+            try:
+                # alt kw
+                bboxes, kpss = self.scrfd.detect(bgr_img, det_thresh=float(self.conf), input_size=(dyn, dyn))
+            except TypeError:
+                # attribute-based threshold
+                try:
+                    self.scrfd.det_thresh = float(self.conf)
+                except Exception:
+                    pass
+                # positional-only signature
+                try:
+                    bboxes, kpss = self.scrfd.detect(bgr_img, input_size=(dyn, dyn))
+                except TypeError:
+                    bboxes, kpss = self.scrfd.detect(bgr_img, (dyn, dyn))
 
         pairs: List[Tuple[Tuple[int, int, int, int], int]] = []
         if bboxes is not None and len(bboxes) > 0:
