@@ -1150,91 +1150,134 @@ class FaceEmbedder:
         raise RuntimeError("SCRFD not initialized.")
 
     def _extract_with_scrfd_raw(self, bgr_img: np.ndarray, *, imgsz: Optional[int] = None):
+        def _rot_img(img, deg):
+            if deg == 90:   return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+            if deg == 180:  return cv2.rotate(img, cv2.ROTATE_180)
+            if deg == 270:  return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            return img
+        def _map_xy_from_rot(xr: float, yr: float, deg: int, W0: int, H0: int):
+            if deg == 0:   return xr, yr
+            if deg == 90:  return yr, H0 - 1 - xr
+            if deg == 180: return W0 - 1 - xr, H0 - 1 - yr
+            if deg == 270: return W0 - 1 - yr, xr
+            return xr, yr
+        def _detect_once(img, dyn, conf: float):
+            # handle SCRFD API variants
+            try:
+                return self.scrfd.detect(img, thresh=float(conf), input_size=(dyn, dyn))
+            except TypeError:
+                try:
+                    return self.scrfd.detect(img, det_thresh=float(conf), input_size=(dyn, dyn))
+                except TypeError:
+                    try:
+                        self.scrfd.det_thresh = float(conf)
+                    except Exception:
+                        pass
+                    try:
+                        return self.scrfd.detect(img, input_size=(dyn, dyn))
+                    except TypeError:
+                        return self.scrfd.detect(img, (dyn, dyn))
+
         H0, W0 = bgr_img.shape[:2]
         dyn = int(imgsz) if (imgsz is not None and imgsz > 0) else 640
         dyn = max(320, min(1920, ((dyn + 31) // 32) * 32))
 
-        # SCRFD APIs differ: some accept 'thresh', others 'det_thresh', others only use self.det_thresh.
-        bboxes, kpss = None, None
-        try:
-            # v0.6 style
-            bboxes, kpss = self.scrfd.detect(bgr_img, thresh=float(self.conf), input_size=(dyn, dyn))
-        except TypeError:
-            try:
-                # alt kw
-                bboxes, kpss = self.scrfd.detect(bgr_img, det_thresh=float(self.conf), input_size=(dyn, dyn))
-            except TypeError:
-                # attribute-based threshold
-                try:
-                    self.scrfd.det_thresh = float(self.conf)
-                except Exception:
-                    pass
-                # positional-only signature
-                try:
-                    bboxes, kpss = self.scrfd.detect(bgr_img, input_size=(dyn, dyn))
-                except TypeError:
-                    bboxes, kpss = self.scrfd.detect(bgr_img, (dyn, dyn))
+        # 1) Try 0° first
+        bboxes, kpss = _detect_once(bgr_img, dyn, conf=float(self.conf))
 
-        pairs: List[Tuple[Tuple[int, int, int, int], int]] = []
+        dets = []  # list of (box, kps, score)
+        def _accumulate(bb, kp, deg):
+            x1, y1, x2, y2 = [int(v) for v in bb[:4]]
+            # map corners back to original
+            x1o, y1o = _map_xy_from_rot(x1, y1, deg, W0, H0)
+            x2o, y2o = _map_xy_from_rot(x2, y2, deg, W0, H0)
+            xa1, ya1 = min(x1o, x2o), min(y1o, y2o)
+            xa2, ya2 = max(x1o, x2o), max(y1o, y2o)
+            xa1 = max(0, min(W0 - 1, xa1)); ya1 = max(0, min(H0 - 1, ya1))
+            xa2 = max(xa1 + 1, min(W0, xa2)); ya2 = max(ya1 + 1, min(H0, ya2))
+            if xa2 - xa1 <= 2 or ya2 - ya1 <= 2:
+                return
+            pts = None
+            if kp is not None:
+                pts = np.asarray(kp, dtype=np.float32)
+                pts = pts.reshape(-1, 2)
+                pts_mapped = []
+                for (px, py) in pts:
+                    ox, oy = _map_xy_from_rot(float(px), float(py), deg, W0, H0)
+                    # convert to local crop coords for alignment step
+                    pts_mapped.append([float(ox - xa1), float(oy - ya1)])
+                if len(pts_mapped) >= 5:
+                    pts = np.asarray(pts_mapped[:5], dtype=np.float32)
+                else:
+                    pts = None
+            score = float(bb[4]) if len(bb) > 4 else 1.0
+            dets.append(((xa1, ya1, xa2, ya2), pts, score))
+
+        # collect 0°
         if bboxes is not None and len(bboxes) > 0:
-            for idx, bb in enumerate(bboxes):
-                x1, y1, x2, y2 = [int(v) for v in bb[:4]]
-                x1 = max(0, min(W0 - 1, x1))
-                y1 = max(0, min(H0 - 1, y1))
-                x2 = max(x1 + 1, min(W0, x2))
-                y2 = max(y1 + 1, min(H0, y2))
-                if (x2 - x1) > 2 and (y2 - y1) > 2:
-                    pairs.append(((x1, y1, x2, y2), idx))
-        if not pairs:
+            for i, bb in enumerate(bboxes):
+                kp = None if (kpss is None or i >= len(kpss)) else kpss[i]
+                _accumulate(bb, kp, 0)
+        # 2) If empty, try rotated views: 90, 270, then 180
+        if not dets:
+            for deg in (90, 270, 180):
+                rimg = _rot_img(bgr_img, deg)
+                # pad to avoid losing faces near borders after rotation
+                pad = 24
+                rimg = cv2.copyMakeBorder(rimg, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
+                L = max(H0, W0)
+                dyn_rot = max(dyn, 896)
+                if deg in (90, 270):
+                    if L >= 2160:
+                        dyn_rot = max(dyn_rot, 1280)
+                    elif L >= 1440:
+                        dyn_rot = max(dyn_rot, 1024)
+                conf_deg = max(0.10, float(self.conf) * (0.8 if deg in (90, 270) else 0.6))
+                rb, rk = _detect_once(rimg, dyn_rot, conf=conf_deg)
+                if rb is None or len(rb) == 0:
+                    continue
+                for i, bb in enumerate(rb):
+                    kp = None if (rk is None or i >= len(rk)) else rk[i]
+                    # remove padding offset before remap
+                    if bb is not None:
+                        bb = np.asarray(bb).copy()
+                        bb[:4] -= np.array([pad, pad, pad, pad], dtype=bb.dtype)
+                    if kp is not None:
+                        kp = np.asarray(kp)
+                        kp[..., 0] -= pad
+                        kp[..., 1] -= pad
+                    _accumulate(bb, kp, deg)
+                if dets:
+                    break
+
+        if not dets:
             return []
 
-        scored_pairs: List[Tuple[Tuple[int, int, int, int], int, float]] = [
-            (
-                box,
-                idx,
-                float(bboxes[idx][4]) if len(bboxes[idx]) > 4 else 1.0,
-            )
-            for box, idx in pairs
-        ]
-
-        kept: List[Tuple[Tuple[int, int, int, int], int]] = []
-        for box, idx, _score in sorted(
-            scored_pairs,
-            key=lambda t: (
-                t[2],
-                (t[0][2] - t[0][0]) * (t[0][3] - t[0][1]),
-            ),
-            reverse=True,
-        ):
-            if all(self._iou(box, kbox) < 0.45 for (kbox, _) in kept):
-                kept.append((box, idx))
+        # NMS across rotations, keep highest-score boxes
+        dets = sorted(dets, key=lambda t: (t[2], (t[0][2]-t[0][0])*(t[0][3]-t[0][1])), reverse=True)
+        kept = []
+        for box, pts, sc in dets:
+            if all(self._iou(box, k[0]) < 0.45 for k in kept):
+                kept.append((box, pts, sc))
 
         faces: List[Tuple[int, int, int, int, np.ndarray, float]] = []
         crops: List[np.ndarray] = []
-        use_kps = kpss is not None
-        for (x1, y1, x2, y2), idx in kept:
-            face_bgr = bgr_img[y1:y2, x1:x2]
+        for (x1, y1, x2, y2), kps, _sc in kept:
+            xi1 = max(0, min(W0 - 1, int(round(x1))))
+            yi1 = max(0, min(H0 - 1, int(round(y1))))
+            xi2 = max(xi1 + 1, min(W0,     int(round(x2))))
+            yi2 = max(yi1 + 1, min(H0,     int(round(y2))))
+            face_bgr = bgr_img[yi1:yi2, xi1:xi2]
             chip = None
-            if (
-                self.use_arcface
-                and use_kps
-                and 0 <= idx < len(kpss)
-                and kpss[idx] is not None
-            ):
-                pts = np.asarray(kpss[idx], dtype=np.float32)
-                pts[:, 0] = np.clip(pts[:, 0] - x1, 0, max(0, face_bgr.shape[1] - 1))
-                pts[:, 1] = np.clip(pts[:, 1] - y1, 0, max(0, face_bgr.shape[0] - 1))
+            if self.use_arcface and kps is not None:
+                pts = np.asarray(kps, dtype=np.float32)
                 canon = self._canon_5pts(pts)
-                chip = (
-                    self._align_by_5pts(face_bgr, canon)
-                    if canon is not None
-                    else self._upright_by_eye_roll(face_bgr, pts)
-                )
+                chip = self._align_by_5pts(face_bgr, canon) if canon is not None else self._upright_by_eye_roll(face_bgr, pts)
             if chip is None:
                 interp = cv2.INTER_AREA if max(face_bgr.shape[:2]) > 112 else cv2.INTER_LINEAR
                 chip = cv2.resize(face_bgr, (112, 112), interpolation=interp)
             q = self._face_quality(chip)
-            faces.append((x1, y1, x2, y2, chip, q))
+            faces.append((xi1, yi1, xi2, yi2, chip, q))
             crops.append(chip)
 
         feats = self._arcface_encode(crops) if self.use_arcface else self._clip_encode(crops)
