@@ -12,7 +12,7 @@ Run:
 
 from __future__ import annotations
 
-import os, sys, subprocess, shutil
+import os, sys, subprocess, shutil, threading
 import json, csv, traceback
 import time
 import cv2
@@ -216,8 +216,8 @@ class SessionConfig:
     prescan_fd_add: float = 0.22           # ArcFace dist to add to bank (tighter)
     prescan_fd_exit: float = 0.52          # ArcFace dist to EXIT  (hysteresis)
     prescan_add_cooldown_samples: int = 5  # add at most every N prescan samples
-    prescan_rot_probe_period: int = 3
-    prescan_probe_imgsz: int = 384
+    prescan_rot_probe_period: int = 1      # probe rotations every sample
+    prescan_probe_imgsz: int = 512         # slightly stronger probe
     prescan_probe_conf: float = 0.03
     prescan_heavy_90: int = 1536
     prescan_heavy_180: int = 1280
@@ -229,12 +229,16 @@ class SessionConfig:
     prescan_diversity_dedup_cos: float = 0.968 # ≥ skip as duplicate
     prescan_replace_margin: float = 0.010      # new score must beat worst by this
     # Early-out on empty frames: skip heavy work when last best fd≈9.00
-    prescan_fd9_skip: bool = True               # enable fd=9.0 skip-gate
+    prescan_fd9_skip: bool = False              # disable skip-gate to avoid misses
     prescan_fd9_grace: int = 1                  # start skipping after this many consecutive fd≈9 samples
     prescan_fd9_probe_period: int = 3           # while skipping, run a real probe every Nth sample
     prescan_weights: Tuple[float, float, float] = (0.70, 0.25, 0.05)  # (anchor, diversity, quality)
     # --- runtime paths ---
     trt_lib_dir: str = ""                  # preferred TensorRT lib directory
+    # --- I/O + runtime speed controls ---
+    async_save: bool = True                # write crops/CSV on a background thread
+    jpg_quality: int = 85                  # JPEG quality (lower = faster, smaller)
+    skip_yolo_when_faceonly: bool = True   # if any face is visible, skip YOLO in face_only
     # --- curator (MMR over crops) ---
     curate_enable: bool = True
     curate_max_images: int = 200
@@ -1754,6 +1758,42 @@ class Processor(QtCore.QObject):
             csv_f = open(csv_path, "w", newline="")
             writer = csv.writer(csv_f)
             writer.writerow(["frame","time_secs","score","face_dist","reid_dist","x1","y1","x2","y2","crop_path","sharpness","ratio"])
+            # If async saver is enabled, close this header handle now to prevent Windows write locks.
+            header_only_csv_handle = csv_f
+
+            # Async saver
+            save_q = None
+            saver_thread = None
+            jpg_q = int(getattr(cfg, "jpg_quality", 0))
+            if bool(getattr(cfg, "async_save", True)):
+                try:
+                    header_only_csv_handle.close()
+                except Exception:
+                    pass
+                writer = None
+                save_q = queue.Queue(maxsize=512)
+
+                def _saver():
+                    f = open(csv_path, "a", newline="")
+                    w = csv.writer(f)
+                    while True:
+                        item = save_q.get()
+                        if item is None:
+                            save_q.task_done()
+                            break
+                        img_path, img, row = item
+                        try:
+                            if jpg_q > 0:
+                                cv2.imwrite(img_path, img, [int(cv2.IMWRITE_JPEG_QUALITY), jpg_q])
+                            else:
+                                cv2.imwrite(img_path, img)
+                            w.writerow(row)
+                        finally:
+                            save_q.task_done()
+                    f.close()
+
+                saver_thread = threading.Thread(target=_saver, name="pc.saver", daemon=True)
+                saver_thread.start()
 
             hit_count = 0
             lock_hits = 0
@@ -2123,7 +2163,13 @@ class Processor(QtCore.QObject):
                                     min_fd_all = min(tmp_dists_all) if tmp_dists_all else None
                                     best_face_dist = min(tmp_dists_quality) if tmp_dists_quality else None
                 if short_circuit_candidate is None:
-                    persons = det.detect(frame_for_det, conf=float(cfg.min_det_conf))
+                    # Ensure defined even if no prior face pass ran this iteration
+                    any_face_detected = bool(locals().get("any_face_detected", False))
+                    run_persons = True
+                    # Face-only fast path: if any face is visible, skip YOLO
+                    if face_only_pipeline and bool(getattr(cfg, "skip_yolo_when_faceonly", True)):
+                        run_persons = not any_face_detected
+                    persons = det.detect(frame_for_det, conf=float(cfg.min_det_conf)) if run_persons else []
                     if not persons and cfg.auto_crop_borders:
                         # Fallback to full frame if border-cropped frame yields nothing
                         persons = det.detect(frame, conf=float(cfg.min_det_conf))
@@ -2414,8 +2460,31 @@ class Processor(QtCore.QObject):
                             dx = (w - new_w)//2
                             cx1 += dx; cx2 = cx1 + new_w
                     crop_img2 = frame[cy1:cy2, cx1:cx2]
-                    cv2.imwrite(crop_img_path, crop_img2)
-                    writer.writerow([idx, idx/float(fps), c.get("score"), c.get("fd"), c.get("rd"), cx1, cy1, cx2, cy2, crop_img_path, c.get("sharp"), c.get("ratio", "")])
+                    row = [
+                        idx,
+                        idx/float(fps),
+                        c.get("score"),
+                        c.get("fd"),
+                        c.get("rd"),
+                        cx1,
+                        cy1,
+                        cx2,
+                        cy2,
+                        crop_img_path,
+                        c.get("sharp"),
+                        c.get("ratio", ""),
+                    ]
+                    if save_q is not None:
+                        try:
+                            save_q.put_nowait((crop_img_path, crop_img2, row))
+                        except queue.Full:
+                            pass  # drop if saver is behind
+                    else:
+                        if jpg_q > 0:
+                            cv2.imwrite(crop_img_path, crop_img2, [int(cv2.IMWRITE_JPEG_QUALITY), jpg_q])
+                        else:
+                            cv2.imwrite(crop_img_path, crop_img2)
+                        writer.writerow(row)
                     reasons_list = c.get("reasons") or []
                     reasons = "|".join(reasons_list)
                     area = (cx2 - cx1) * (cy2 - cy1)
@@ -2890,6 +2959,15 @@ class Processor(QtCore.QObject):
                         }
                     )
 
+            # drain saver
+            if "save_q" in locals() and save_q is not None:
+                try:
+                    save_q.put(None)
+                    save_q.join()
+                    if saver_thread is not None:
+                        saver_thread.join(timeout=2.0)
+                except Exception:
+                    pass
             cap.release()
             # finalize CSV
             csv_f.close()
@@ -3216,6 +3294,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.annot_check = QtWidgets.QCheckBox("Save annotated frames")
         self.preview_every_spin = QtWidgets.QSpinBox(); self.preview_every_spin.setRange(0, 5000); self.preview_every_spin.setValue(120)
 
+        # --- Speed / I/O controls ---
+        self.skip_yolo_faceonly_check = QtWidgets.QCheckBox()
+        self.skip_yolo_faceonly_check.setChecked(True)
+        self.skip_yolo_faceonly_check.setToolTip("bool: skip_yolo_when_faceonly")
+        self.skip_yolo_faceonly_check.stateChanged.connect(self._on_ui_change)
+
+        self.async_save_check = QtWidgets.QCheckBox()
+        self.async_save_check.setChecked(True)
+        self.async_save_check.setToolTip("bool: async_save")
+        self.async_save_check.stateChanged.connect(self._on_ui_change)
+
+        self.jpg_quality_spin = QtWidgets.QSpinBox()
+        self.jpg_quality_spin.setRange(1, 100)
+        self.jpg_quality_spin.setValue(85)
+        self.jpg_quality_spin.setToolTip("int: jpg_quality")
+        self.jpg_quality_spin.valueChanged.connect(self._on_ui_change)
+
         def _mk_fspin(minv: float, maxv: float, step: float, decimals: int, tooltip: str) -> QtWidgets.QDoubleSpinBox:
             sb = QtWidgets.QDoubleSpinBox()
             sb.setRange(minv, maxv)
@@ -3324,6 +3419,9 @@ class MainWindow(QtWidgets.QMainWindow):
             ("YOLO model", self.yolo_edit),
             ("Face YOLO model", self.face_yolo_edit),
             ("Preview every N frames", self.preview_every_spin),
+            ("Skip YOLO when faces visible (face-only)", self.skip_yolo_faceonly_check),
+            ("Async save crops/CSV", self.async_save_check),
+            ("JPEG quality", self.jpg_quality_spin),
             ("", self.annot_check),
             ("allow_faceless_when_locked", self.faceless_allow_check),
             ("learn_bank_runtime", self.learn_bank_runtime_check),
@@ -4146,6 +4244,10 @@ class MainWindow(QtWidgets.QMainWindow):
             face_det_conf=float(self.face_det_conf_spin.value()) if hasattr(self, "face_det_conf_spin") else 0.5,
             face_det_pad=float(self.face_det_pad_spin.value()) if hasattr(self, "face_det_pad_spin") else 0.08,
             face_fullframe_imgsz=int(self.face_fullframe_imgsz_spin.value()) if hasattr(self, "face_fullframe_imgsz_spin") else 1408,
+            # speed / I/O
+            skip_yolo_when_faceonly=bool(self.skip_yolo_faceonly_check.isChecked()) if hasattr(self, "skip_yolo_faceonly_check") else True,
+            async_save=bool(self.async_save_check.isChecked()) if hasattr(self, "async_save_check") else True,
+            jpg_quality=int(self.jpg_quality_spin.value()) if hasattr(self, "jpg_quality_spin") else 85,
             rot_adaptive=bool(self.rot_adaptive_check.isChecked()) if hasattr(self, "rot_adaptive_check") else True,
             rot_every_n=int(self.rot_every_spin.value()) if hasattr(self, "rot_every_spin") else 12,
             rot_after_hit_frames=int(self.rot_after_hit_spin.value()) if hasattr(self, "rot_after_hit_spin") else 8,
@@ -4202,6 +4304,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.rot_after_hit_spin.setValue(int(cfg.rot_after_hit_frames))
         if hasattr(self, 'fast_no_face_spin'):
             self.fast_no_face_spin.setValue(int(cfg.fast_no_face_imgsz))
+        # speed / I/O
+        if hasattr(self, 'skip_yolo_faceonly_check'):
+            self.skip_yolo_faceonly_check.setChecked(bool(getattr(cfg, 'skip_yolo_when_faceonly', True)))
+        if hasattr(self, 'async_save_check'):
+            self.async_save_check.setChecked(bool(getattr(cfg, 'async_save', True)))
+        if hasattr(self, 'jpg_quality_spin'):
+            self.jpg_quality_spin.setValue(int(getattr(cfg, 'jpg_quality', 85)))
         self.only_best_check.setChecked(cfg.only_best)
         if hasattr(self, 'chk_prescan'):
             self.chk_prescan.setChecked(cfg.prescan_enable)
