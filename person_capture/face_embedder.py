@@ -257,6 +257,8 @@ class FaceEmbedder:
         self._arc_fixed_batch = False
         self.arc_input = None
         self._arc_scratch: Optional[np.ndarray] = None  # reused fixed-batch buffer for TRT
+        self._arc_fixed_batch_len: Optional[int] = None
+        self._arc_feat_dim: Optional[int] = None
         if self.use_arcface:
             try:
                 try:
@@ -410,17 +412,39 @@ class FaceEmbedder:
                     # Hard fail with full debug trail
                     raise RuntimeError("TRT binding failed.\n" + "\n".join(debug_lines)) from last_err
 
-                self.arc_input = self.arc_sess.get_inputs()[0].name
+                inp0 = self.arc_sess.get_inputs()[0]
+                self.arc_input = inp0.name
+                try:
+                    shape0 = getattr(inp0, "shape", None)
+                    dim0 = shape0[0] if isinstance(shape0, (list, tuple)) and shape0 else None
+                    if isinstance(dim0, int) and dim0 > 0:
+                        self._arc_fixed_batch_len = dim0
+                except Exception:
+                    self._arc_fixed_batch_len = None
                 self.backend = 'arcface'
                 # sanity: output embedding should be 512-D
                 out0 = self.arc_sess.get_outputs()[0]
-                if hasattr(out0, "shape") and (out0.shape is not None) and (out0.shape[-1] not in (512,)):
-                    raise RuntimeError(f"Unexpected ArcFace output dim: {out0.shape}")
+                feat_dim = None
+                try:
+                    shape = getattr(out0, "shape", None)
+                    if isinstance(shape, (list, tuple)) and shape and isinstance(shape[-1], int) and shape[-1] > 0:
+                        feat_dim = int(shape[-1])
+                except Exception:
+                    feat_dim = None
+                if feat_dim is None:
+                    feat_dim = 512
+                self._arc_feat_dim = feat_dim
                 try:
                     provs = [p.lower() for p in self.arc_sess.get_providers()]
                     self._arc_fixed_batch = any("tensorrt" in p for p in provs)
                 except Exception:
                     self._arc_fixed_batch = False
+                if self._arc_fixed_batch:
+                    if not self._arc_fixed_batch_len:
+                        self._arc_fixed_batch_len = 32
+                else:
+                    self._arc_fixed_batch_len = None
+                    self._arc_scratch = None
             except Exception as _e:
                 # Hard fail so the real reason is visible
                 raise RuntimeError(f"ArcFace download/init failed: {_e!r}")
@@ -508,7 +532,7 @@ class FaceEmbedder:
             return []
 
         m = len(bgr_list)
-        do_flip = not getattr(self, "_fast_prescan", False)
+        do_flip = (not getattr(self, "_fast_prescan", False)) or getattr(self, "_prescan_escalate", False)
         pairs: List[np.ndarray] = list(bgr_list)
         if do_flip:
             pairs.extend(cv2.flip(b, 1) for b in bgr_list)
@@ -523,19 +547,37 @@ class FaceEmbedder:
 
         X = np.ascontiguousarray(X, dtype=np.float32)
         if getattr(self, "_arc_fixed_batch", False):
-            FIX = 32
+            FIX = max(1, int(self._arc_fixed_batch_len or 32))
             if self._arc_scratch is None or self._arc_scratch.shape[0] != FIX:
-                self._arc_scratch = np.zeros((FIX, 3, 112, 112), dtype=np.float32)
-            batch = self._arc_scratch
-            batch[: len(pairs)] = X
-            feats = self.arc_sess.run(None, {self.arc_input: batch})[0][: len(pairs)]
+                self._arc_scratch = np.zeros((FIX, 3, 112, 112), dtype=np.float32, order="C")
+                assert self._arc_scratch.flags["C_CONTIGUOUS"]
+            feat_dim = int(self._arc_feat_dim or 512)
+            feats = np.empty((X.shape[0], feat_dim), dtype=np.float32)
+            run = self.arc_sess.run
+            inp = self.arc_input
+            for start in range(0, X.shape[0], FIX):
+                end = min(start + FIX, X.shape[0])
+                n = end - start
+                if n == FIX:
+                    np.copyto(self._arc_scratch, X[start:end], casting="no")
+                else:
+                    self._arc_scratch.fill(0.0)
+                    self._arc_scratch[:n] = X[start:end]
+                out = run(None, {inp: self._arc_scratch})[0]
+                feats[start:end] = out[:n]
         else:
             feats = self.arc_sess.run(None, {self.arc_input: X})[0]
 
-        f = feats[:m] + feats[m:2 * m] if do_flip else feats[:m]
-        norms = np.linalg.norm(f, axis=1, keepdims=True)
-        f = f / np.maximum(norms, 1e-6)
-        return f.astype(np.float32)
+        if feats.shape[0] != X.shape[0]:
+            raise RuntimeError(f"ArcFace rows {feats.shape[0]} != input {X.shape[0]}")
+
+        f = feats[:m].copy()
+        if do_flip:
+            f += feats[m:2 * m]
+        norms = np.linalg.norm(f, axis=1, keepdims=True).astype(np.float32, copy=False)
+        np.maximum(norms, 1e-6, out=norms)
+        f /= norms
+        return f.astype(np.float32, copy=False)
 
     def _try_keypoints(self, res) -> Optional[np.ndarray]:
         kps = getattr(res, "keypoints", None)
