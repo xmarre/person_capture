@@ -398,6 +398,15 @@ class Processor(QtCore.QObject):
         old_face_conf = getattr(face, "conf", 0.5)
         face.conf = float(cfg.prescan_face_conf)
         try:
+            try:
+                face.set_prescan_fast(True, mode="rr")
+                face.set_prescan_hint(escalate=False)
+                # Quick sideways recall overrides for high-res tilted faces.
+                face._probe_conf = 0.03
+                face._high_90 = 1536
+                face._high_180 = 1280
+            except Exception:
+                pass
             add_cooldown_samples = int(
                 getattr(
                     cfg,
@@ -500,6 +509,12 @@ class Processor(QtCore.QObject):
                 if w > Wmax:
                     nh = int(round(h * (Wmax / float(w))))
                     frame = cv2.resize(frame, (Wmax, nh), interpolation=cv2.INTER_AREA)
+                # While a segment is active, widen angles and escalate heavy per-rotation pass.
+                face._prescan_rr_mode = "full" if active else "rr"
+                try:
+                    face.set_prescan_hint(escalate=active)
+                except Exception:
+                    pass
                 faces = face.extract(frame)
                 # best ArcFace distance on this sample
                 best = 9.0
@@ -618,6 +633,11 @@ class Processor(QtCore.QObject):
                 bridged.append((cs, ce))
                 spans = bridged
         finally:
+            try:
+                face.set_prescan_fast(False)
+                face.set_prescan_hint(escalate=False)
+            except Exception:
+                pass
             face.conf = old_face_conf
         cap.set(cv2.CAP_PROP_POS_FRAMES, pos0)
         try:
