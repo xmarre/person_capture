@@ -1,9 +1,17 @@
-import argparse
 import os
-import cv2
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+import argparse
 import csv
+import cv2
 import numpy as np
 from tqdm import tqdm
+
+cv2.setNumThreads(1)
 
 
 def _clip_to_frame(x1, y1, x2, y2, W, H):

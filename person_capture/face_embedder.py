@@ -226,7 +226,69 @@ class FaceEmbedder:
                 raise RuntimeError(
                     "SCRFD backend requires 'insightface'. Install or update the package and retry."
                 ) from e
-            ctx_id = 0 if (ctx.startswith('cuda') and _torch.cuda.is_available()) else -1
+            # --- Force TensorRT for SCRFD (GPU-only) ---
+            if not ctx.startswith('cuda'):
+                raise RuntimeError("SCRFD requires a CUDA device (use device='cuda' or 'cuda:N').")
+            if _torch is None:
+                raise RuntimeError("PyTorch not importable; CUDA device resolution required.")
+            if not _torch.cuda.is_available():
+                raise RuntimeError("CUDA not available to PyTorch; check drivers and torch build.")
+            try:
+                ctx_id = int(ctx.split(':', 1)[1]) if (':' in ctx) else _torch.cuda.current_device()
+            except Exception:
+                ctx_id = 0
+
+            # Prepare ONNX Runtime so any session created by SCRFD uses TensorRT EP
+            try:
+                import onnxruntime as ort  # type: ignore
+            except Exception as e:
+                raise RuntimeError(f"onnxruntime not importable for SCRFD/TRT: {e!r}")
+            avail = list(getattr(ort, "get_available_providers", lambda: [])())
+            if 'TensorrtExecutionProvider' not in avail:
+                raise RuntimeError(f"TensorRT EP not available in onnxruntime. avail={avail}")
+
+            _default_so = getattr(ort, "SessionOptions")()
+            _gopt = getattr(ort, "GraphOptimizationLevel", None)
+            if _gopt is not None:
+                level = getattr(_gopt, "ORT_ENABLE_ALL", None)
+                if level is not None:
+                    _default_so.graph_optimization_level = level
+            _default_so.add_session_config_entry("session.logid", "scrfd_trt")
+
+            _providers = ['TensorrtExecutionProvider', 'CUDAExecutionProvider']
+            _prov_opts = [
+                {"device_id": str(ctx_id)},
+                {"device_id": str(ctx_id)},
+            ]
+            # keep ORT CPU threads low; TRT runs on GPU
+            _default_so.intra_op_num_threads = 1
+            _default_so.inter_op_num_threads = 1
+            if not hasattr(ort, "_pc_trt_patched"):
+                _orig_IS = ort.InferenceSession
+
+                def _pc_InferenceSession(model_path, sess_options=None, providers=None, provider_options=None, *a, **kw):
+                    try:
+                        import os
+                        mp = (os.fspath(model_path)).lower() if model_path is not None else ""
+                    except Exception:
+                        mp = ""
+                    is_scrfd = ("scrfd" in mp)
+                    if is_scrfd:
+                        _p  = providers or _providers
+                        _po = provider_options or _prov_opts
+                        s = _orig_IS(model_path, sess_options or _default_so, providers=_p, provider_options=_po, *a, **kw)
+                        provs = tuple(s.get_providers())
+                        if 'TensorrtExecutionProvider' not in provs:
+                            raise RuntimeError(f"SCRFD expected TRT EP; got {provs}")
+                        if callable(self.progress):
+                            self.progress(f"SCRFD providers={provs}")
+                        return s
+                    # Non-SCRFD sessions: do not touch providers or options.
+                    return _orig_IS(model_path, sess_options, providers=providers, provider_options=provider_options, *a, **kw)
+
+                ort.InferenceSession = _pc_InferenceSession  # type: ignore
+                ort._pc_trt_patched = True  # type: ignore
+
             mdl = yolo_model if isinstance(yolo_model, str) else ""
             if not mdl or not mdl.lower().startswith("scrfd"):
                 mdl = "scrfd_10g_bnkps.onnx"
@@ -237,12 +299,23 @@ class FaceEmbedder:
                 if mirrors:
                     mdl = _ensure_file(os.path.basename(mdl), mirrors, progress=self.progress)
             self.scrfd = _SCRFD(mdl)
-            try:
-                self.scrfd.prepare(ctx_id=ctx_id, det_size=(640, 640))
-            except Exception:
-                if callable(self.progress):
-                    self.progress("SCRFD CUDA init failed; falling back to CPU")
-                self.scrfd.prepare(ctx_id=-1, det_size=(640, 640))
+            # Robust TRT init on the chosen GPU. Retry smaller det_size once. Then warm up.
+            _last_err = None
+            for _det_size in ((640, 640), (512, 512)):
+                try:
+                    self.scrfd.prepare(ctx_id=ctx_id, det_size=_det_size)
+                    if callable(self.progress):
+                        self.progress(f"SCRFD(TRT) ready on cuda:{ctx_id} det={_det_size}")
+                    try:
+                        _dummy = np.zeros((_det_size[1], _det_size[0], 3), dtype=np.uint8)
+                        _ = self.scrfd.detect(_dummy, threshold=max(self.conf, 0.30))
+                    except Exception:
+                        pass
+                    break
+                except Exception as e:
+                    _last_err = e
+            else:
+                raise RuntimeError(f"SCRFD(TRT) init failed on cuda:{ctx_id}: {_last_err!r}")
             # Align threshold handling across SCRFD API variants
             try:
                 self.scrfd.det_thresh = float(self.conf)
@@ -396,6 +469,11 @@ class FaceEmbedder:
                     self.arc_sess = ort.InferenceSession(
                         onnx_path, sess_options=so, providers=prov, provider_options=prov_opts
                     )
+                    if callable(self.progress):
+                        try:
+                            self.progress(f"ArcFace providers={tuple(self.arc_sess.get_providers())}")
+                        except Exception:
+                            pass
                     bound = self.arc_sess.get_providers()
                     if bound[:1] != ['TensorrtExecutionProvider']:
                         raise RuntimeError(f"TRT not bound. bound={bound}")
