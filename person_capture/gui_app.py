@@ -184,6 +184,10 @@ class SessionConfig:
     disable_reid: bool = True                    # force no ReID usage
     face_fullframe_when_missed: bool = True      # try full-frame face detect if per-person face=0
     face_fullframe_imgsz: int = 1408             # full-frame face detector size (0/None -> default)
+    rot_adaptive: bool = True                    # gate rotated SCRFD passes when empty
+    rot_every_n: int = 12                        # check rotated views every N frames in empty streaks
+    rot_after_hit_frames: int = 8                # allow rotations for this many frames after a hit
+    fast_no_face_imgsz: int = 512                # shrink 0° pass to this size during long streaks
 
     # Debug/diagnostics
     debug_dump: bool = True
@@ -394,6 +398,15 @@ class Processor(QtCore.QObject):
         old_face_conf = getattr(face, "conf", 0.5)
         face.conf = float(cfg.prescan_face_conf)
         try:
+            try:
+                face.set_prescan_fast(True, mode="rr")
+                face.set_prescan_hint(escalate=False)
+                # Quick sideways recall overrides for high-res tilted faces.
+                face._probe_conf = 0.03
+                face._high_90 = 1536
+                face._high_180 = 1280
+            except Exception:
+                pass
             add_cooldown_samples = int(
                 getattr(
                     cfg,
@@ -496,6 +509,12 @@ class Processor(QtCore.QObject):
                 if w > Wmax:
                     nh = int(round(h * (Wmax / float(w))))
                     frame = cv2.resize(frame, (Wmax, nh), interpolation=cv2.INTER_AREA)
+                # While a segment is active, widen angles and escalate heavy per-rotation pass.
+                face._prescan_rr_mode = "full" if active else "rr"
+                try:
+                    face.set_prescan_hint(escalate=active)
+                except Exception:
+                    pass
                 faces = face.extract(frame)
                 # best ArcFace distance on this sample
                 best = 9.0
@@ -614,6 +633,11 @@ class Processor(QtCore.QObject):
                 bridged.append((cs, ce))
                 spans = bridged
         finally:
+            try:
+                face.set_prescan_fast(False)
+                face.set_prescan_hint(escalate=False)
+            except Exception:
+                pass
             face.conf = old_face_conf
         cap.set(cv2.CAP_PROP_POS_FRAMES, pos0)
         try:
@@ -1126,6 +1150,12 @@ class Processor(QtCore.QObject):
                 self._status(f"Curator: ReID embedder init failed: {exc}", key="curate", interval=5.0)
                 return
         face_embed = self._cur_face
+        face_embed.configure_rotation_strategy(
+            adaptive=getattr(cfg, "rot_adaptive", True),
+            every_n=getattr(cfg, "rot_every_n", 12),
+            after_hit_frames=getattr(cfg, "rot_after_hit_frames", 8),
+            fast_no_face_imgsz=getattr(cfg, "fast_no_face_imgsz", 512),
+        )
         reid_embed = self._cur_reid
 
         ref_candidates = [p.strip() for p in str(cfg.ref or "").split(";") if p.strip()]
@@ -1470,6 +1500,12 @@ class Processor(QtCore.QObject):
                 progress=self.status.emit,
                 trt_lib_dir=(cfg.trt_lib_dir or None),
             )
+            face.configure_rotation_strategy(
+                adaptive=getattr(cfg, "rot_adaptive", True),
+                every_n=getattr(cfg, "rot_every_n", 12),
+                after_hit_frames=getattr(cfg, "rot_after_hit_frames", 8),
+                fast_no_face_imgsz=getattr(cfg, "fast_no_face_imgsz", 512),
+            )
             reid = None
             if not (getattr(cfg, "disable_reid", False) or getattr(cfg, "match_mode", "") == "face_only"):
                 reid = ReIDEmbedder(
@@ -1766,10 +1802,33 @@ class Processor(QtCore.QObject):
                                 "face_det_conf",
                                 "face_det_pad",
                                 "face_fullframe_imgsz",
+                                "rot_adaptive",
+                                "rot_every_n",
+                                "rot_after_hit_frames",
+                                "fast_no_face_imgsz",
                             }
+                            rot_keys = {
+                                "rot_adaptive",
+                                "rot_every_n",
+                                "rot_after_hit_frames",
+                                "fast_no_face_imgsz",
+                            }
+                            rot_changed = False
                             for k, v in (arg or {}).items():
                                 if k in LIVE and hasattr(self.cfg, k):
                                     setattr(self.cfg, k, v)
+                                    if k in rot_keys:
+                                        rot_changed = True
+                            if rot_changed:
+                                try:
+                                    face.configure_rotation_strategy(
+                                        adaptive=getattr(self.cfg, "rot_adaptive", True),
+                                        every_n=getattr(self.cfg, "rot_every_n", 12),
+                                        after_hit_frames=getattr(self.cfg, "rot_after_hit_frames", 8),
+                                        fast_no_face_imgsz=getattr(self.cfg, "fast_no_face_imgsz", 512),
+                                    )
+                                except Exception:
+                                    pass
                             continue
                 except queue.Empty:
                     pass
@@ -2910,6 +2969,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.face_fullframe_imgsz_spin.setSingleStep(32)
         self.face_fullframe_imgsz_spin.setValue(int(self.cfg.face_fullframe_imgsz))
         self.face_fullframe_imgsz_spin.setToolTip("int: face_fullframe_imgsz (0 disables override)")
+        self.rot_adaptive_check = QtWidgets.QCheckBox()
+        self.rot_adaptive_check.setChecked(bool(self.cfg.rot_adaptive))
+        self.rot_adaptive_check.setToolTip("bool: rot_adaptive")
+        self.rot_every_spin = QtWidgets.QSpinBox()
+        self.rot_every_spin.setRange(1, 360)
+        self.rot_every_spin.setSingleStep(1)
+        self.rot_every_spin.setValue(int(self.cfg.rot_every_n))
+        self.rot_every_spin.setToolTip("int: rot_every_n")
+        self.rot_after_hit_spin = QtWidgets.QSpinBox()
+        self.rot_after_hit_spin.setRange(0, 120)
+        self.rot_after_hit_spin.setSingleStep(1)
+        self.rot_after_hit_spin.setValue(int(self.cfg.rot_after_hit_frames))
+        self.rot_after_hit_spin.setToolTip("int: rot_after_hit_frames")
+        self.fast_no_face_spin = QtWidgets.QSpinBox()
+        self.fast_no_face_spin.setRange(320, 4096)
+        self.fast_no_face_spin.setSingleStep(32)
+        self.fast_no_face_spin.setValue(int(self.cfg.fast_no_face_imgsz))
+        self.fast_no_face_spin.setToolTip("int: fast_no_face_imgsz")
         self.only_best_check = QtWidgets.QCheckBox("Only best per frame")
         self.only_best_check.setChecked(True)
         # Pre-scan controls
@@ -3109,6 +3186,10 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Disable ReID", self.disable_reid_check),
             ("Face fallback when missed", self.face_fullframe_check),
             ("Full-frame face size", self.face_fullframe_imgsz_spin),
+            ("Rotate adaptively", self.rot_adaptive_check),
+            ("Rotate every N frames (empty)", self.rot_every_spin),
+            ("Rotation grace frames", self.rot_after_hit_spin),
+            ("Fast no-face imgsz", self.fast_no_face_spin),
             ("Only best", self.only_best_check),
             ("Enable pre-scan", self.chk_prescan),
             ("Pre-scan stride (frames)", self.spin_prescan_stride),
@@ -3890,6 +3971,10 @@ class MainWindow(QtWidgets.QMainWindow):
             "face_quality_min",
             "face_det_conf",
             "face_det_pad",
+            "rot_adaptive",
+            "rot_every_n",
+            "rot_after_hit_frames",
+            "fast_no_face_imgsz",
         }
         delta = {}
         for k in prescan_live | live:
@@ -3962,6 +4047,10 @@ class MainWindow(QtWidgets.QMainWindow):
             face_det_conf=float(self.face_det_conf_spin.value()) if hasattr(self, "face_det_conf_spin") else 0.5,
             face_det_pad=float(self.face_det_pad_spin.value()) if hasattr(self, "face_det_pad_spin") else 0.08,
             face_fullframe_imgsz=int(self.face_fullframe_imgsz_spin.value()) if hasattr(self, "face_fullframe_imgsz_spin") else 1408,
+            rot_adaptive=bool(self.rot_adaptive_check.isChecked()) if hasattr(self, "rot_adaptive_check") else True,
+            rot_every_n=int(self.rot_every_spin.value()) if hasattr(self, "rot_every_spin") else 12,
+            rot_after_hit_frames=int(self.rot_after_hit_spin.value()) if hasattr(self, "rot_after_hit_spin") else 8,
+            fast_no_face_imgsz=int(self.fast_no_face_spin.value()) if hasattr(self, "fast_no_face_spin") else 512,
             face_margin_min=float(getattr(self, 'margin_spin', QtWidgets.QDoubleSpinBox()).value()) if hasattr(self, 'margin_spin') else 0.05,
             allow_faceless_when_locked=bool(self.faceless_allow_check.isChecked()) if hasattr(self, "faceless_allow_check") else True,
             learn_bank_runtime=bool(self.learn_bank_runtime_check.isChecked()) if hasattr(self, "learn_bank_runtime_check") else False,
@@ -4006,6 +4095,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.face_fullframe_check.setChecked(cfg.face_fullframe_when_missed)
         if hasattr(self, 'face_fullframe_imgsz_spin'):
             self.face_fullframe_imgsz_spin.setValue(int(cfg.face_fullframe_imgsz))
+        if hasattr(self, 'rot_adaptive_check'):
+            self.rot_adaptive_check.setChecked(bool(cfg.rot_adaptive))
+        if hasattr(self, 'rot_every_spin'):
+            self.rot_every_spin.setValue(int(cfg.rot_every_n))
+        if hasattr(self, 'rot_after_hit_spin'):
+            self.rot_after_hit_spin.setValue(int(cfg.rot_after_hit_frames))
+        if hasattr(self, 'fast_no_face_spin'):
+            self.fast_no_face_spin.setValue(int(cfg.fast_no_face_imgsz))
         self.only_best_check.setChecked(cfg.only_best)
         if hasattr(self, 'chk_prescan'):
             self.chk_prescan.setChecked(cfg.prescan_enable)
@@ -4401,6 +4498,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.face_fullframe_check.setChecked(s.value("face_fullframe_when_missed", True, type=bool))
         if hasattr(self, 'face_fullframe_imgsz_spin'):
             self.face_fullframe_imgsz_spin.setValue(int(s.value("face_fullframe_imgsz", self.cfg.face_fullframe_imgsz)))
+        if hasattr(self, 'rot_adaptive_check'):
+            self.rot_adaptive_check.setChecked(
+                s.value("rot_adaptive", self.cfg.rot_adaptive, type=bool)
+            )
+        if hasattr(self, 'rot_every_spin'):
+            self.rot_every_spin.setValue(int(s.value("rot_every_n", self.cfg.rot_every_n)))
+        if hasattr(self, 'rot_after_hit_spin'):
+            self.rot_after_hit_spin.setValue(int(s.value("rot_after_hit_frames", self.cfg.rot_after_hit_frames)))
+        if hasattr(self, 'fast_no_face_spin'):
+            self.fast_no_face_spin.setValue(int(s.value("fast_no_face_imgsz", self.cfg.fast_no_face_imgsz)))
         self.only_best_check.setChecked(s.value("only_best", True, type=bool))
         if hasattr(self, 'chk_prescan'):
             self.chk_prescan.setChecked(s.value("prescan_enable", True, type=bool))
@@ -4569,6 +4676,26 @@ class MainWindow(QtWidgets.QMainWindow):
             s.setValue(
                 "drop_reid_if_any_face_match",
                 bool(self.drop_reid_if_any_face_match_check.isChecked()),
+            )
+        if hasattr(self, 'rot_adaptive_check'):
+            s.setValue(
+                "rot_adaptive",
+                bool(self.rot_adaptive_check.isChecked()),
+            )
+        if hasattr(self, 'rot_every_spin'):
+            s.setValue(
+                "rot_every_n",
+                int(self.rot_every_spin.value()),
+            )
+        if hasattr(self, 'rot_after_hit_spin'):
+            s.setValue(
+                "rot_after_hit_frames",
+                int(self.rot_after_hit_spin.value()),
+            )
+        if hasattr(self, 'fast_no_face_spin'):
+            s.setValue(
+                "fast_no_face_imgsz",
+                int(self.fast_no_face_spin.value()),
             )
         s.sync()
 

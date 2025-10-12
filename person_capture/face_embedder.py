@@ -70,6 +70,11 @@ ANTELOPE_ZIPS = [
     "https://sourceforge.net/projects/insightface.mirror/files/v0.7/antelopev2.zip/download"
 ]
 
+
+def _round32(x: int) -> int:
+    return ((int(x) + 31) // 32) * 32
+
+
 def _ensure_file(path: str, urls, progress=None) -> str:
     p = Path(path)
     if p.exists():
@@ -191,6 +196,24 @@ class FaceEmbedder:
 
         self.progress = progress
         self._torch = _torch
+        # --- pre-scan controls ---
+        self._fast_prescan: bool = False
+        self._prescan_rr: int = 0
+        self._prescan_rr_mode: str = "rr"
+        self._prescan_escalate: bool = False
+        self._probe_conf: float = 0.03
+        self._high_90: int = 1536
+        self._high_180: int = 1280
+        # --- adaptive rotation controls (speed-up on empty scenes) ---
+        self._frame_idx: int = 0
+        self._no_face_streak: int = 0
+        self._last_face_idx: int = -10**9
+        self._rot_cycle: int = 0
+        # Do rotation passes only occasionally when we have not seen faces recently.
+        self.rot_adaptive: bool = True       # set False to force rotations every frame
+        self.rot_every_n: int = 12           # run rotations every N frames while empty
+        self.rot_after_hit_frames: int = 8   # after a hit, allow rotations for this many frames
+        self.fast_no_face_imgsz: int = 512   # shrink 0° pass when streak >= 3
         if self.detector_backend == "yolov8":
             self.det = _YOLO(yolo_path)
         else:
@@ -403,6 +426,54 @@ class FaceEmbedder:
             self.model.eval().to(self.device)
             self.backend = 'clip'
             pass
+
+    def set_prescan_fast(self, enable: bool, *, mode: str = "rr") -> None:
+        """Enable/disable light-weight rotation policy for pre-scan."""
+
+        self._fast_prescan = bool(enable)
+        self._prescan_rr_mode = str(mode)
+        self._prescan_rr = 0
+
+    def set_prescan_hint(self, *, escalate: bool = False) -> None:
+        """Per-call hint from caller: allow heavy pass on this sample."""
+
+        self._prescan_escalate = bool(escalate)
+
+    def configure_rotation_strategy(
+        self,
+        *,
+        adaptive: Optional[bool] = None,
+        every_n: Optional[int] = None,
+        after_hit_frames: Optional[int] = None,
+        fast_no_face_imgsz: Optional[int] = None,
+    ) -> None:
+        """Update rotation gating behaviour for SCRFD inference.
+
+        Args:
+            adaptive: Enable adaptive gating (False → rotate every frame).
+            every_n: Run rotated passes every N frames during no-face streaks.
+            after_hit_frames: Allow rotations for this many frames after a detection.
+            fast_no_face_imgsz: Shrink the upright pass to this size after long streaks.
+        """
+
+        if adaptive is not None:
+            self.rot_adaptive = bool(adaptive)
+        if every_n is not None:
+            try:
+                self.rot_every_n = max(1, int(every_n))
+            except Exception:
+                pass
+        if after_hit_frames is not None:
+            try:
+                self.rot_after_hit_frames = max(0, int(after_hit_frames))
+            except Exception:
+                pass
+        if fast_no_face_imgsz is not None:
+            try:
+                self.fast_no_face_imgsz = max(0, int(fast_no_face_imgsz))
+            except Exception:
+                pass
+        self._rot_cycle = 0
 
     def _face_quality(self, bgr):
         g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -722,7 +793,11 @@ class FaceEmbedder:
         # YOLOv8-face detection
         dyn_imgsz = int(imgsz) if (imgsz is not None and imgsz > 0) else 640
         dyn_imgsz = max(320, dyn_imgsz)
-        dyn_imgsz = ((dyn_imgsz + 31) // 32) * 32  # divisible by 32
+        dyn_imgsz = _round32(dyn_imgsz)  # divisible by 32
+        L = max(H0, W0)
+        heavy_cap = max(int(getattr(self, "_heavy_cap", 2048)), dyn_imgsz)  # optional safety cap
+        heavy_size_auto = min(_round32(max(dyn_imgsz, int(0.75 * L))), heavy_cap)
+        heavy_size_auto_180 = min(_round32(max(dyn_imgsz, int(0.67 * L))), heavy_cap)
         try:
             res = self.det.predict(
                 bgr_img,
@@ -751,22 +826,11 @@ class FaceEmbedder:
 
         if not boxes:
             # multi-scale TTA before rot-fallback
-            for s in (1.25, 1.5):
-                img_s = cv2.resize(bgr_img, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
-                imgsz_s = max(320, int(dyn_imgsz * s))
-                imgsz_s = ((imgsz_s + 31) // 32) * 32
-                try:
-                    res_s = self.det.predict(
-                        img_s,
-                        conf=min(self.conf, 0.10),
-                        verbose=False,
-                        device=self.device,
-                        max_det=80,
-                        imgsz=imgsz_s,
-                        iou=0.30,
-                        augment=True,
-                    )[0]
-                except Exception:
+            if not self._fast_prescan:
+                for s in (1.25, 1.5):
+                    img_s = cv2.resize(bgr_img, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
+                    imgsz_s = max(320, int(dyn_imgsz * s))
+                    imgsz_s = ((imgsz_s + 31) // 32) * 32
                     try:
                         res_s = self.det.predict(
                             img_s,
@@ -776,43 +840,58 @@ class FaceEmbedder:
                             max_det=80,
                             imgsz=imgsz_s,
                             iou=0.30,
+                            augment=True,
                         )[0]
                     except Exception:
-                        continue
-                bxs_s = getattr(res_s, "boxes", None)
-                if bxs_s is None or len(bxs_s) == 0:
-                    continue
-                confs_s = getattr(bxs_s, "conf", None)
-                for j, b in enumerate(bxs_s):
-                    confv = 1.0
-                    if confs_s is not None and len(confs_s) > j:
                         try:
-                            confv = float(confs_s[j].item())
+                            res_s = self.det.predict(
+                                img_s,
+                                conf=min(self.conf, 0.10),
+                                verbose=False,
+                                device=self.device,
+                                max_det=80,
+                                imgsz=imgsz_s,
+                                iou=0.30,
+                            )[0]
                         except Exception:
-                            try:
-                                confv = float(confs_s[j])
-                            except Exception:
-                                confv = 1.0
-                    if confv < 0.05:
+                            continue
+                    bxs_s = getattr(res_s, "boxes", None)
+                    if bxs_s is None or len(bxs_s) == 0:
                         continue
-                    x1s, y1s, x2s, y2s = [v.item() for v in b.xyxy[0]]
-                    x1 = max(0, min(W0 - 1, int(round(x1s / s))))
-                    y1 = max(0, min(H0 - 1, int(round(y1s / s))))
-                    x2 = max(x1 + 1, min(W0, int(round(x2s / s))))
-                    y2 = max(y1 + 1, min(H0, int(round(y2s / s))))
-                    boxes.append((x1, y1, x2, y2))
-                if boxes:
-                    break
+                    confs_s = getattr(bxs_s, "conf", None)
+                    for j, b in enumerate(bxs_s):
+                        confv = 1.0
+                        if confs_s is not None and len(confs_s) > j:
+                            try:
+                                confv = float(confs_s[j].item())
+                            except Exception:
+                                try:
+                                    confv = float(confs_s[j])
+                                except Exception:
+                                    confv = 1.0
+                        if confv < 0.05:
+                            continue
+                        x1s, y1s, x2s, y2s = [v.item() for v in b.xyxy[0]]
+                        x1 = max(0, min(W0 - 1, int(round(x1s / s))))
+                        y1 = max(0, min(H0 - 1, int(round(y1s / s))))
+                        x2 = max(x1 + 1, min(W0, int(round(x2s / s))))
+                        y2 = max(y1 + 1, min(H0, int(round(y2s / s))))
+                        boxes.append((x1, y1, x2, y2))
+                    if boxes:
+                        break
 
         if not boxes:
             # Bootstrap with rotated full-frame when detector misses
-            fullframe_sizes = []
-            for base in (max(dyn_imgsz, 1280), max(dyn_imgsz, 1536)):
-                base = ((int(base) + 31) // 32) * 32
-                if base not in fullframe_sizes:
-                    fullframe_sizes.append(base)
-            if not fullframe_sizes:
-                fullframe_sizes = [max(dyn_imgsz, 896)]
+            fullframe_sizes: List[int] = []
+            if self._fast_prescan:
+                fullframe_sizes = [dyn_imgsz]
+            else:
+                for base in (max(dyn_imgsz, 1280), max(dyn_imgsz, 1536)):
+                    base = ((int(base) + 31) // 32) * 32
+                    if base not in fullframe_sizes:
+                        fullframe_sizes.append(base)
+                if not fullframe_sizes:
+                    fullframe_sizes = [max(dyn_imgsz, 896)]
 
             def _map_pts_back(xr, yr, rot):
                 # inverse mappings from rotated -> original
@@ -831,14 +910,59 @@ class FaceEmbedder:
                 ys = [p[1] for p in pts]
                 return (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
 
-            for rot in (
-                cv2.ROTATE_90_CLOCKWISE,
-                cv2.ROTATE_90_COUNTERCLOCKWISE,
-                cv2.ROTATE_180,
-            ):
+            if self._fast_prescan:
+                rr = self._prescan_rr % 2
+                if self._prescan_rr_mode == "rr":
+                    rot_list = (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                    rot_seq = (rot_list[rr],)
+                    self._prescan_rr += 1
+                else:
+                    rot_seq = (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            else:
+                rot_seq = (
+                    cv2.ROTATE_90_CLOCKWISE,
+                    cv2.ROTATE_90_COUNTERCLOCKWISE,
+                    cv2.ROTATE_180,
+                )
+            for rot in rot_seq:
                 img_r = cv2.rotate(bgr_img, rot)
                 res_r = None
-                for det_size in fullframe_sizes:
+                try:
+                    probe = self.det.predict(
+                        img_r,
+                        conf=self._probe_conf,
+                        imgsz=dyn_imgsz,
+                        verbose=False,
+                        device=self.device,
+                        max_det=40,
+                        iou=0.40,
+                        augment=False,
+                    )[0]
+                except Exception:
+                    probe = None
+                probe_boxes = getattr(probe, "boxes", None)
+                probe_hits = int(getattr(probe_boxes, "__len__", lambda: 0)())
+
+                do_heavy = (
+                    (probe_hits > 0)
+                    or (self._fast_prescan and self._prescan_escalate)
+                    or (not self._fast_prescan)
+                )
+                if self._fast_prescan:
+                    if rot == cv2.ROTATE_180:
+                        heavy_size = heavy_size_auto_180
+                        override = self._high_180
+                    else:
+                        heavy_size = heavy_size_auto
+                        override = self._high_90
+                    if override and override > 0:
+                        heavy_size = max(heavy_size, _round32(int(override)))
+                    heavy_size = min(heavy_size, heavy_cap)
+                    det_sizes = [dyn_imgsz] if not do_heavy else [heavy_size]
+                else:
+                    det_sizes = fullframe_sizes if do_heavy else [dyn_imgsz]
+
+                for det_size in det_sizes:
                     try:
                         res_r = self.det.predict(
                             img_r,
@@ -848,7 +972,7 @@ class FaceEmbedder:
                             device=self.device,
                             max_det=80,
                             iou=0.30,
-                            augment=True,
+                            augment=(not self._fast_prescan) or do_heavy,
                         )[0]
                     except Exception:
                         try:
@@ -927,6 +1051,9 @@ class FaceEmbedder:
                 ]
 
             # Try arbitrary angles via affine rotation (±45°, ±135°)
+            if self._fast_prescan:
+                return []
+
             def _affine_rotate(img, angle_deg):
                 h, w = img.shape[:2]
                 M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle_deg, 1.0)
@@ -1150,6 +1277,9 @@ class FaceEmbedder:
         raise RuntimeError("SCRFD not initialized.")
 
     def _extract_with_scrfd_raw(self, bgr_img: np.ndarray, *, imgsz: Optional[int] = None):
+        # bump frame counter
+        self._frame_idx += 1
+
         def _rot_img(img, deg):
             if deg == 90:   return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
             if deg == 180:  return cv2.rotate(img, cv2.ROTATE_180)
@@ -1179,8 +1309,16 @@ class FaceEmbedder:
                         return self.scrfd.detect(img, (dyn, dyn))
 
         H0, W0 = bgr_img.shape[:2]
-        dyn = int(imgsz) if (imgsz is not None and imgsz > 0) else 640
-        dyn = max(320, min(1920, ((dyn + 31) // 32) * 32))
+        dyn_req = int(imgsz) if (imgsz is not None and imgsz > 0) else 640
+        dyn = dyn_req
+        # speed-up: during a no-face streak, use a smaller first-pass size
+        if self._no_face_streak >= 3:
+            dyn = min(dyn_req, self.fast_no_face_imgsz)
+        dyn = _round32(max(320, dyn))
+        L = max(H0, W0)
+        heavy_cap = max(int(getattr(self, "_heavy_cap", 2048)), dyn)  # optional safety cap
+        heavy90 = min(_round32(max(dyn, int(0.75 * L))), heavy_cap)
+        heavy180 = min(_round32(max(dyn, int(0.67 * L))), heavy_cap)
 
         # 1) Try 0° first
         bboxes, kpss = _detect_once(bgr_img, dyn, conf=float(self.conf))
@@ -1218,22 +1356,78 @@ class FaceEmbedder:
             for i, bb in enumerate(bboxes):
                 kp = None if (kpss is None or i >= len(kpss)) else kpss[i]
                 _accumulate(bb, kp, 0)
-        # 2) If empty, try rotated views: 90, 270, then 180
+        # decide whether to run rotations
+        need_rot = False
         if not dets:
-            for deg in (90, 270, 180):
+            # empty this frame
+            self._no_face_streak += 1
+            # adaptive policy: rotate only occasionally while empty
+            if self.rot_adaptive:
+                if (self._frame_idx - self._last_face_idx) <= self.rot_after_hit_frames:
+                    need_rot = True  # just after a hit, allow rotations
+                elif ((self._frame_idx + (id(self) & 7)) % self.rot_every_n) == 0:
+                    need_rot = True  # periodic probe
+            else:
+                need_rot = True      # always rotate if configured so
+        else:
+            # we have faces; reset streak and remember index
+            self._no_face_streak = 0
+            self._last_face_idx = self._frame_idx
+            self._rot_cycle = 0
+
+        if self._fast_prescan:
+            need_rot = True
+
+        # 2) If requested, try rotated views: 90, 270, then 180
+        if (not dets) and need_rot:
+            self._rot_cycle += 1
+            if self._fast_prescan:
+                rr = self._prescan_rr % 2
+                if self._prescan_rr_mode == "rr":
+                    rot_seq = (90, 270)
+                    rot_seq = (rot_seq[rr],)
+                    self._prescan_rr += 1
+                else:
+                    rot_seq = (90, 270)
+            else:
+                rot_seq = (90, 270, 180)
+            for deg in rot_seq:
                 rimg = _rot_img(bgr_img, deg)
                 # pad to avoid losing faces near borders after rotation
                 pad = 24
                 rimg = cv2.copyMakeBorder(rimg, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
-                L = max(H0, W0)
-                dyn_rot = max(dyn, 896)
-                if deg in (90, 270):
-                    if L >= 2160:
-                        dyn_rot = max(dyn_rot, 1280)
-                    elif L >= 1440:
-                        dyn_rot = max(dyn_rot, 1024)
+                probe_conf = max(0.02, float(getattr(self, "_probe_conf", 0.02)))
+                probe_boxes, _ = _detect_once(rimg, dyn, conf=probe_conf)
+                probe_hits = len(probe_boxes) if probe_boxes is not None else 0
+
+                do_heavy = (
+                    (probe_hits > 0)
+                    or (self._fast_prescan and self._prescan_escalate)
+                    or (not self._fast_prescan)
+                )
+                if self._fast_prescan:
+                    heavy = heavy180 if deg == 180 else heavy90
+                    override = getattr(self, "_high_180" if deg == 180 else "_high_90", None)
+                    if override and override > 0:
+                        heavy = max(heavy, _round32(int(override)))
+                    heavy = min(heavy, heavy_cap)
+                    det_sizes = [dyn] if not do_heavy else [heavy]
+                else:
+                    fullframe_sizes: List[int] = []
+                    for base in (max(dyn, 1280), max(dyn, 1536)):
+                        base = _round32(base)
+                        if base not in fullframe_sizes:
+                            fullframe_sizes.append(base)
+                    if not fullframe_sizes:
+                        fullframe_sizes = [_round32(max(dyn, 896))]
+                    det_sizes = fullframe_sizes if do_heavy else [dyn]
                 conf_deg = max(0.10, float(self.conf) * (0.8 if deg in (90, 270) else 0.6))
-                rb, rk = _detect_once(rimg, dyn_rot, conf=conf_deg)
+                rb = rk = None
+                for det_size in det_sizes:
+                    rb, rk = _detect_once(rimg, det_size, conf=conf_deg)
+                    if rb is not None and len(rb) > 0:
+                        break
+                    rb = rk = None
                 if rb is None or len(rb) == 0:
                     continue
                 for i, bb in enumerate(rb):
@@ -1296,6 +1490,7 @@ class FaceEmbedder:
             ),
             reverse=True,
         )
+        # if still empty, streak already incremented; otherwise it's reset above
         return out
 
     @staticmethod
