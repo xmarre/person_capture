@@ -176,6 +176,11 @@ class SessionConfig:
     crop_bottom_min_face_heights: float = 1.5    # min bottom margin in face-heights
     crop_penalty_weight: float = 3.0             # weight for placement penalties vs area growth
     face_anchor_down_frac: float = 1.1           # shift center downward by this * face_h (torso bias)
+    # --- smart crop ---
+    smart_crop_enable: bool = True           # dynamic, per-frame
+    smart_crop_steps: int = 6                # lateral search half-steps per side
+    smart_crop_side_search_frac: float = 0.35# search ± this * crop_w
+    smart_crop_use_grad: bool = True         # use gradient saliency (no extra deps)
     # --- anti-zoom guards ---
     face_max_frac_in_crop: float = 0.42          # face_h / crop_h ≤ this
     face_min_frac_in_crop: float = 0.18          # optional lower bound to avoid face too small
@@ -2127,6 +2132,12 @@ class Processor(QtCore.QObject):
                                 if ox2 > ox1 + 1 and oy2 > oy1 + 1:
                                     crop_img = frame[oy1:oy2, ox1:ox2]
                                     sharp = self._calc_sharpness(crop_img)
+                                    face_box_global = (
+                                        max(0, min(W - 1, fx1 + off_x)),
+                                        max(0, min(H - 1, fy1 + off_y)),
+                                        max(0, min(W - 1, fx2 + off_x)),
+                                        max(0, min(H - 1, fy2 + off_y)),
+                                    )
                                     short_circuit_candidate = dict(
                                         score=fd_val,
                                         fd=fd_val,
@@ -2140,6 +2151,7 @@ class Processor(QtCore.QObject):
                                             max(0, min(W - 1, fx2 + off_x)),
                                             max(0, min(H - 1, fy2 + off_y)),
                                         ),
+                                        face_box=face_box_global,
                                         face_feat=gbest["feat"],
                                         reid_feat=None,
                                         ratio=chosen_ratio,
@@ -2418,6 +2430,15 @@ class Processor(QtCore.QObject):
                     # Map to original frame coords for annotation
                     ox1, oy1, ox2, oy2 = ex1+off_x, ey1+off_y, ex2+off_x, ey2+off_y
                     area = (ox2-ox1)*(oy2-oy1)
+                    face_box_global = None
+                    if face_box_abs is not None:
+                        fx1, fy1, fx2, fy2 = face_box_abs
+                        face_box_global = (
+                            max(0, min(W - 1, fx1 + off_x)),
+                            max(0, min(H - 1, fy1 + off_y)),
+                            max(0, min(W - 1, fx2 + off_x)),
+                            max(0, min(H - 1, fy2 + off_y)),
+                        )
                     candidates.append(
                         dict(
                             score=score,
@@ -2427,6 +2448,7 @@ class Processor(QtCore.QObject):
                             box=(ox1, oy1, ox2, oy2),
                             area=area,
                             show_box=(x1 + off_x, y1 + off_y, x2 + off_x, y2 + off_y),
+                            face_box=face_box_global,
                             face_feat=(bf["feat"] if bf is not None else None),
                             reid_feat=(reid_feats[i] if i < len(reid_feats) else None),
                             ratio=chosen_ratio,
@@ -2440,25 +2462,47 @@ class Processor(QtCore.QObject):
                 def save_hit(c, idx):
                     nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box, ref_face_feat, ref_bank_list
                     crop_img_path = os.path.join(crops_dir, f"f{idx:08d}.jpg")
-                    cx1,cy1,cx2,cy2 = c["box"]
-                     # final ratio enforcement
+                    cx1, cy1, cx2, cy2 = c["box"]
+                    # final ratio enforcement / smart crop
                     ratio_str = c.get("ratio") or (ratios[0] if 'ratios' in locals() and ratios else (self.cfg.ratio.split(',')[0] if self.cfg.ratio else '2:3'))
-                    try:
-                        tw, th = parse_ratio(ratio_str)
-                    except Exception:
-                        tw, th = 2.0, 3.0
-                    w = cx2 - cx1; h = cy2 - cy1
-                    target = float(tw)/float(th)
-                    cur = w/float(h) if h>0 else target
-                    if abs(cur - target) > 1e-3 and w>2 and h>2:
-                        if cur < target:
-                            new_h = int(round(w/target))
-                            dy = (h - new_h)//2
-                            cy1 += dy; cy2 = cy1 + new_h
-                        else:
-                            new_w = int(round(h*target))
-                            dx = (w - new_w)//2
-                            cx1 += dx; cx2 = cx1 + new_w
+                    if bool(getattr(cfg, "smart_crop_enable", True)):
+                        cx1, cy1, cx2, cy2 = self._smart_crop_box(
+                            frame,
+                            (cx1, cy1, cx2, cy2),
+                            c.get("face_box"),
+                            ratio_str,
+                            cfg,
+                        )
+                        # Re-enforce global bounds after smart crop
+                        H_, W_ = frame.shape[:2]
+                        cx1, cy1, cx2, cy2 = self._enforce_scale_and_margins(
+                            (cx1, cy1, cx2, cy2),
+                            ratio_str,
+                            W_,
+                            H_,
+                            face_box=c.get("face_box"),
+                            anchor=None,
+                        )
+                    else:
+                        try:
+                            tw, th = parse_ratio(ratio_str)
+                        except Exception:
+                            tw, th = 2.0, 3.0
+                        w = cx2 - cx1
+                        h = cy2 - cy1
+                        target = float(tw) / float(th)
+                        cur = w / float(h) if h > 0 else target
+                        if abs(cur - target) > 1e-3 and w > 2 and h > 2:
+                            if cur < target:
+                                new_h = int(round(w / target))
+                                dy = (h - new_h) // 2
+                                cy1 += dy
+                                cy2 = cy1 + new_h
+                            else:
+                                new_w = int(round(h * target))
+                                dx = (w - new_w) // 2
+                                cx1 += dx
+                                cx2 = cx1 + new_w
                     crop_img2 = frame[cy1:cy2, cx1:cx2]
                     row = [
                         idx,
@@ -2996,6 +3040,88 @@ class Processor(QtCore.QObject):
         self._status_last_time = {}
         self._status_last_text = {}
 
+    # ---------- Smart crop helpers ----------
+    def _smart_crop_box(self, frame, box, face_box, ratio_str, cfg):
+        H, W = frame.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in box]
+        x1 = max(0, x1); y1 = max(0, y1); x2 = min(W-1, x2); y2 = min(H-1, y2)
+        if x2 <= x1+2 or y2 <= y1+2:
+            return x1, y1, x2, y2
+        # parse ratio
+        try:
+            tw, th = parse_ratio(ratio_str)
+            target = float(tw) / float(th)
+        except Exception:
+            target = 2.0 / 3.0
+        w = x2 - x1; h = y2 - y1
+        # ensure exact ratio by adjusting height
+        h = int(round(max(2, w / max(1e-6, target))))
+        cy = (y1 + y2) // 2
+        y1 = max(0, min(H - h, cy - h // 2)); y2 = y1 + h
+
+        # Build a downscaled gradient saliency once (cheap)
+        if bool(getattr(cfg, "smart_crop_use_grad", True)):
+            small_w = min(384, W)
+            scale = (small_w / float(W)) if W > 0 else 1.0
+            small_h = max(8, int(round(H * scale)))
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+            small = cv2.resize(gray, (small_w, small_h), interpolation=interp)
+            gradx = cv2.Sobel(small, cv2.CV_32F, 1, 0, ksize=3)
+            grady = cv2.Sobel(small, cv2.CV_32F, 0, 1, ksize=3)
+            sal = cv2.magnitude(gradx, grady)
+        else:
+            sal = None; scale = 1.0
+
+        # Dynamic scale so face ≤ max_frac depending on profile-ness
+        if face_box is not None:
+            fx1, fy1, fx2, fy2 = [int(v) for v in face_box]
+            fx1 = max(0, fx1); fy1 = max(0, fy1); fx2 = min(W-1, fx2); fy2 = min(H-1, fy2)
+            fw = max(1, fx2 - fx1)
+            # proxy for profile: face near crop side -> lower max_frac
+            rel = None
+            cw_left, cw_right = x1, x2
+            fcx = (fx1 + fx2) * 0.5
+            if cw_right > cw_left:
+                rel = (fcx - cw_left) / float(cw_right - cw_left)  # 0..1
+            profile = 2.0 * abs((rel if rel is not None else 0.5) - 0.5)  # 0=frontal, 1=profile
+            max_frac = 0.42 - 0.12 * profile  # 0.42 frontal → 0.30 profile
+            need_w = int(math.ceil(fw / max(1e-6, max_frac)))
+            if need_w > w:
+                w = min(W, need_w)
+                h = int(round(max(2, w / target)))
+                # center on face horizontally by default
+                cx = int(round(fcx))
+                x1 = max(0, min(W - w, cx - w // 2)); x2 = x1 + w
+                y1 = max(0, min(H - h, cy - h // 2)); y2 = y1 + h
+
+        # Lateral search to maximize saliency and keep face centered with margin
+        steps = int(getattr(cfg, "smart_crop_steps", 6))
+        sfrac = float(getattr(cfg, "smart_crop_side_search_frac", 0.35))
+        max_shift = int(round(w * sfrac))
+        best = (x1, y1, x2, y2); best_score = -1e9
+        for dx in np.linspace(-max_shift, max_shift, 2 * steps + 1):
+            nx1 = int(max(0, min(W - w, x1 + dx))); nx2 = nx1 + w
+            # saliency score
+            if sal is not None:
+                sx1 = int(nx1 * scale); sx2 = int(nx2 * scale)
+                sy1 = int(y1 * scale);  sy2 = int(y2 * scale)
+                s_patch = sal[sy1:sy2, sx1:sx2]
+                s_val = float(np.mean(s_patch)) if s_patch.size else 0.0
+            else:
+                s_val = 0.0
+            # margin score: prefer balanced headroom around face if available
+            m_val = 0.0
+            if face_box is not None:
+                fx1, _, fx2, _ = face_box
+                fcx = 0.5 * (fx1 + fx2)
+                left_m = max(0.0, fcx - nx1); right_m = max(0.0, nx2 - fcx)
+                m_val = min(left_m, right_m) / max(1.0, w)
+            score = s_val + 0.15 * m_val
+            if score > best_score:
+                best_score = score; best = (nx1, y1, nx2, y2)
+        return best
+
     def _status(self, msg: str, key: str = None, interval: float = None):
         """
         Thread-safe-ish status throttle.
@@ -3355,6 +3481,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.crop_penalty_weight_spin.setValue(float(self.cfg.crop_penalty_weight))
         self.face_anchor_down_spin = _mk_fspin(0.0, 2.0, 0.05, 2, "float: face_anchor_down_frac")
         self.face_anchor_down_spin.setValue(float(self.cfg.face_anchor_down_frac))
+        self.smart_crop_enable_check = QtWidgets.QCheckBox()
+        self.smart_crop_enable_check.setChecked(bool(self.cfg.smart_crop_enable))
+        self.smart_crop_enable_check.setToolTip("bool: smart_crop_enable")
+        self.smart_crop_enable_check.stateChanged.connect(self._on_ui_change)
+        self.smart_crop_steps_spin = QtWidgets.QSpinBox()
+        self.smart_crop_steps_spin.setRange(0, 50)
+        self.smart_crop_steps_spin.setValue(int(self.cfg.smart_crop_steps))
+        self.smart_crop_steps_spin.setToolTip("int: smart_crop_steps")
+        self.smart_crop_steps_spin.valueChanged.connect(self._on_ui_change)
+        self.smart_crop_side_search_spin = _mk_fspin(0.0, 1.5, 0.01, 3, "float: smart_crop_side_search_frac")
+        self.smart_crop_side_search_spin.setValue(float(self.cfg.smart_crop_side_search_frac))
+        self.smart_crop_side_search_spin.valueChanged.connect(self._on_ui_change)
+        self.smart_crop_use_grad_check = QtWidgets.QCheckBox()
+        self.smart_crop_use_grad_check.setChecked(bool(self.cfg.smart_crop_use_grad))
+        self.smart_crop_use_grad_check.setToolTip("bool: smart_crop_use_grad")
+        self.smart_crop_use_grad_check.stateChanged.connect(self._on_ui_change)
         self.face_max_frac_spin = _mk_fspin(0.05, 1.0, 0.01, 3, "float: face_max_frac_in_crop")
         self.face_max_frac_spin.setValue(float(self.cfg.face_max_frac_in_crop))
         self.face_min_frac_spin = _mk_fspin(0.0, 1.0, 0.01, 3, "float: face_min_frac_in_crop")
@@ -3438,6 +3580,10 @@ class MainWindow(QtWidgets.QMainWindow):
             ("crop_bottom_min_face_heights", self.crop_bottom_min_face_spin),
             ("crop_penalty_weight", self.crop_penalty_weight_spin),
             ("face_anchor_down_frac", self.face_anchor_down_spin),
+            ("smart_crop_enable", self.smart_crop_enable_check),
+            ("smart_crop_steps", self.smart_crop_steps_spin),
+            ("smart_crop_side_search_frac", self.smart_crop_side_search_spin),
+            ("smart_crop_use_grad", self.smart_crop_use_grad_check),
             ("face_max_frac_in_crop", self.face_max_frac_spin),
             ("face_min_frac_in_crop", self.face_min_frac_spin),
             ("crop_min_height_frac", self.crop_min_height_frac_spin),
@@ -4161,6 +4307,10 @@ class MainWindow(QtWidgets.QMainWindow):
             "crop_bottom_min_face_heights",
             "crop_penalty_weight",
             "face_anchor_down_frac",
+            "smart_crop_enable",
+            "smart_crop_steps",
+            "smart_crop_side_search_frac",
+            "smart_crop_use_grad",
             "face_max_frac_in_crop",
             "face_min_frac_in_crop",
             "crop_min_height_frac",
@@ -4268,6 +4418,10 @@ class MainWindow(QtWidgets.QMainWindow):
             crop_bottom_min_face_heights=float(self.crop_bottom_min_face_spin.value()) if hasattr(self, "crop_bottom_min_face_spin") else 1.5,
             crop_penalty_weight=float(self.crop_penalty_weight_spin.value()) if hasattr(self, "crop_penalty_weight_spin") else 3.0,
             face_anchor_down_frac=float(self.face_anchor_down_spin.value()) if hasattr(self, "face_anchor_down_spin") else 1.1,
+            smart_crop_enable=bool(self.smart_crop_enable_check.isChecked()) if hasattr(self, "smart_crop_enable_check") else True,
+            smart_crop_steps=int(self.smart_crop_steps_spin.value()) if hasattr(self, "smart_crop_steps_spin") else 6,
+            smart_crop_side_search_frac=float(self.smart_crop_side_search_spin.value()) if hasattr(self, "smart_crop_side_search_spin") else 0.35,
+            smart_crop_use_grad=bool(self.smart_crop_use_grad_check.isChecked()) if hasattr(self, "smart_crop_use_grad_check") else True,
             face_max_frac_in_crop=float(self.face_max_frac_spin.value()) if hasattr(self, "face_max_frac_spin") else 0.42,
             face_min_frac_in_crop=float(self.face_min_frac_spin.value()) if hasattr(self, "face_min_frac_spin") else 0.18,
             crop_min_height_frac=float(self.crop_min_height_frac_spin.value()) if hasattr(self, "crop_min_height_frac_spin") else 0.28,
@@ -4406,6 +4560,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.crop_penalty_weight_spin.setValue(cfg.crop_penalty_weight)
         if hasattr(self, 'face_anchor_down_spin'):
             self.face_anchor_down_spin.setValue(cfg.face_anchor_down_frac)
+        if hasattr(self, 'smart_crop_enable_check'):
+            self.smart_crop_enable_check.setChecked(bool(cfg.smart_crop_enable))
+        if hasattr(self, 'smart_crop_steps_spin'):
+            self.smart_crop_steps_spin.setValue(int(cfg.smart_crop_steps))
+        if hasattr(self, 'smart_crop_side_search_spin'):
+            self.smart_crop_side_search_spin.setValue(float(cfg.smart_crop_side_search_frac))
+        if hasattr(self, 'smart_crop_use_grad_check'):
+            self.smart_crop_use_grad_check.setChecked(bool(cfg.smart_crop_use_grad))
         if hasattr(self, 'face_max_frac_spin'):
             self.face_max_frac_spin.setValue(cfg.face_max_frac_in_crop)
         if hasattr(self, 'face_min_frac_spin'):
@@ -4829,6 +4991,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self.face_anchor_down_spin.setValue(
                 float(s.value("face_anchor_down_frac", self.cfg.face_anchor_down_frac))
             )
+        if hasattr(self, 'smart_crop_enable_check'):
+            self.smart_crop_enable_check.setChecked(
+                s.value("smart_crop_enable", self.cfg.smart_crop_enable, type=bool)
+            )
+        if hasattr(self, 'smart_crop_steps_spin'):
+            self.smart_crop_steps_spin.setValue(
+                int(s.value("smart_crop_steps", self.cfg.smart_crop_steps))
+            )
+        if hasattr(self, 'smart_crop_side_search_spin'):
+            self.smart_crop_side_search_spin.setValue(
+                float(s.value("smart_crop_side_search_frac", self.cfg.smart_crop_side_search_frac))
+            )
+        if hasattr(self, 'smart_crop_use_grad_check'):
+            self.smart_crop_use_grad_check.setChecked(
+                s.value("smart_crop_use_grad", self.cfg.smart_crop_use_grad, type=bool)
+            )
         if hasattr(self, 'face_max_frac_spin'):
             self.face_max_frac_spin.setValue(
                 float(s.value("face_max_frac_in_crop", self.cfg.face_max_frac_in_crop))
@@ -4857,6 +5035,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.face_det_conf_spin.setValue(float(s.value("face_det_conf", 0.5)))
         if hasattr(self, 'face_det_pad_spin'):
             self.face_det_pad_spin.setValue(float(s.value("face_det_pad", 0.08)))
+        self._on_ui_change()
+
     def _save_qsettings(self):
         s = QtCore.QSettings(APP_ORG, APP_NAME)
         cfg = self._collect_cfg()
@@ -4904,6 +5084,26 @@ class MainWindow(QtWidgets.QMainWindow):
             s.setValue(
                 "fast_no_face_imgsz",
                 int(self.fast_no_face_spin.value()),
+            )
+        if hasattr(self, 'smart_crop_enable_check'):
+            s.setValue(
+                "smart_crop_enable",
+                bool(self.smart_crop_enable_check.isChecked()),
+            )
+        if hasattr(self, 'smart_crop_steps_spin'):
+            s.setValue(
+                "smart_crop_steps",
+                int(self.smart_crop_steps_spin.value()),
+            )
+        if hasattr(self, 'smart_crop_side_search_spin'):
+            s.setValue(
+                "smart_crop_side_search_frac",
+                float(self.smart_crop_side_search_spin.value()),
+            )
+        if hasattr(self, 'smart_crop_use_grad_check'):
+            s.setValue(
+                "smart_crop_use_grad",
+                bool(self.smart_crop_use_grad_check.isChecked()),
             )
         s.sync()
 
