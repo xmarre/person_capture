@@ -240,7 +240,6 @@ class FaceEmbedder:
 
             # Prepare ONNX Runtime so any session created by SCRFD uses TensorRT EP
             try:
-                global ort
                 import onnxruntime as ort  # type: ignore
             except Exception as e:
                 raise RuntimeError(f"onnxruntime not importable for SCRFD/TRT: {e!r}")
@@ -385,8 +384,7 @@ class FaceEmbedder:
                         except OSError:
                             pass
                 # Import ORT only after DLL dirs are set
-                global ort
-                import onnxruntime as ort  # noqa
+                import onnxruntime as ort  # type: ignore
                 if hasattr(ort, "preload_dlls"):
                     try:
                         ort.preload_dlls()
