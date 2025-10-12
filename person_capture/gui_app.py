@@ -15,6 +15,7 @@ from __future__ import annotations
 import os, sys, subprocess, shutil, threading
 import json, csv, traceback
 import time
+import logging
 import cv2
 import numpy as np
 import bisect
@@ -93,6 +94,12 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtWidgets import QDockWidget
 
 
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO)
+
+logger = logging.getLogger(__name__)
+
+
 class FileList(QtWidgets.QListWidget):
     filesDropped = QtCore.Signal(list)
 
@@ -161,6 +168,11 @@ class SessionConfig:
     face_model: str = "scrfd_10g_bnkps"
     save_annot: bool = False
     preview_every: int = 120
+    # I/O
+    async_save: bool = True                # write crops/CSV on a background thread
+    jpg_quality: int = 85                  # JPEG quality (lower = faster, smaller)
+    # Face full-frame fallback cadence (frames). 0 disables.
+    face_fullframe_cadence: int = 12
     prefer_face_when_available: bool = True
     face_quality_min: float = 70.0
     face_visible_uses_quality: bool = True      # if False, any detected face counts as "visible"
@@ -241,8 +253,6 @@ class SessionConfig:
     # --- runtime paths ---
     trt_lib_dir: str = ""                  # preferred TensorRT lib directory
     # --- I/O + runtime speed controls ---
-    async_save: bool = True                # write crops/CSV on a background thread
-    jpg_quality: int = 85                  # JPEG quality (lower = faster, smaller)
     skip_yolo_when_faceonly: bool = True   # if any face is visible, skip YOLO in face_only
     # --- curator (MMR over crops) ---
     curate_enable: bool = True
@@ -1537,6 +1547,11 @@ class Processor(QtCore.QObject):
 
     @QtCore.Slot()
     def run(self):
+        cap = None
+        save_q = None
+        saver_thread = None
+        csv_f = None
+        dbg_f = None
         try:
             self._paused = False
             self._init_status()
@@ -1559,7 +1574,6 @@ class Processor(QtCore.QObject):
             if ann_dir:
                 ensure_dir(ann_dir)
             # Debug I/O
-            dbg_f = None
             if getattr(cfg, "debug_dump", False):
                 dbg_dir = os.path.join(cfg.out_dir, getattr(cfg, "debug_dir", "debug"))
                 ensure_dir(dbg_dir)
@@ -1767,8 +1781,6 @@ class Processor(QtCore.QObject):
             header_only_csv_handle = csv_f
 
             # Async saver
-            save_q = None
-            saver_thread = None
             jpg_q = int(getattr(cfg, "jpg_quality", 0))
             if bool(getattr(cfg, "async_save", True)):
                 try:
@@ -1789,10 +1801,15 @@ class Processor(QtCore.QObject):
                         img_path, img, row = item
                         try:
                             if jpg_q > 0:
-                                cv2.imwrite(img_path, img, [int(cv2.IMWRITE_JPEG_QUALITY), jpg_q])
+                                ok = cv2.imwrite(
+                                    img_path, img, [int(cv2.IMWRITE_JPEG_QUALITY), jpg_q]
+                                )
                             else:
-                                cv2.imwrite(img_path, img)
-                            w.writerow(row)
+                                ok = cv2.imwrite(img_path, img)
+                            if not ok:
+                                logger.error("Failed to save crop %s", img_path)
+                            else:
+                                w.writerow(row)
                         finally:
                             save_q.task_done()
                     f.close()
@@ -2004,6 +2021,7 @@ class Processor(QtCore.QObject):
                 if not ret:
                     break
                 current_idx = frame_idx
+                idx = current_idx
                 if not force_process and current_idx % max(1, int(cfg.frame_stride)) != 0:
                     frame_idx = current_idx + 1
                     self.progress.emit(current_idx)
@@ -2053,12 +2071,19 @@ class Processor(QtCore.QObject):
                     and getattr(cfg, "face_fullframe_when_missed", True)
                     and (face_only_pipeline or self._lock_last_bbox is not None)
                 )
+                # Run full-frame face detect at a coarse cadence only.
+                gfaces = []
                 if face_short_ok:
                     try:
-                        gfaces = face.extract(frame_for_det, imgsz=fullframe_imgsz)
+                        ff_cad = int(getattr(cfg, "face_fullframe_cadence", 12))
                     except Exception:
-                        gfaces = []
-                    if gfaces:
+                        ff_cad = 12
+                    if ff_cad <= 0 or (idx % max(1, ff_cad) == 0):
+                        try:
+                            gfaces = face.extract(frame_for_det, imgsz=fullframe_imgsz)
+                        except Exception:
+                            gfaces = []
+                if gfaces:
                         quality_min = float(cfg.face_quality_min)
                         use_quality_vis = bool(cfg.face_visible_uses_quality)
                         tmp_faces_detected = len(gfaces)
@@ -2520,7 +2545,8 @@ class Processor(QtCore.QObject):
                     ]
                     if save_q is not None:
                         try:
-                            save_q.put_nowait((crop_img_path, crop_img2, row))
+                            # IMPORTANT: enqueue a copy; slices are views into `frame`.
+                            save_q.put_nowait((crop_img_path, crop_img2.copy(), row))
                         except queue.Full:
                             pass  # drop if saver is behind
                     else:
@@ -3002,34 +3028,43 @@ class Processor(QtCore.QObject):
                             ],
                         }
                     )
-
-            # drain saver
-            if "save_q" in locals() and save_q is not None:
-                try:
-                    save_q.put(None)
-                    save_q.join()
-                    if saver_thread is not None:
-                        saver_thread.join(timeout=2.0)
-                except Exception:
-                    pass
-            cap.release()
-            # finalize CSV
-            csv_f.close()
-            if dbg_f:
-                dbg_f.close()
-
             if self._abort:
                 self.finished.emit(False, "Aborted")
             else:
                 self.finished.emit(True, f"Done. Hits: {hit_count}. Index: {csv_path}")
         except Exception as e:
-            if 'dbg_f' in locals() and dbg_f:
+            err = f"Error: {e}\n{traceback.format_exc()}"
+            self.finished.emit(False, err)
+        finally:
+            if save_q is not None:
+                try:
+                    save_q.put(None)
+                except Exception:
+                    pass
+                try:
+                    save_q.join()
+                except Exception:
+                    pass
+                if saver_thread is not None:
+                    try:
+                        saver_thread.join()
+                    except Exception:
+                        pass
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            if csv_f is not None:
+                try:
+                    csv_f.close()
+                except Exception:
+                    pass
+            if dbg_f:
                 try:
                     dbg_f.close()
                 except Exception:
                     pass
-            err = f"Error: {e}\n{traceback.format_exc()}"
-            self.finished.emit(False, err)
 
     def _init_status(self):
         self._last_status_time = 0.0
