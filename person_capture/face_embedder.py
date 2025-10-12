@@ -254,7 +254,9 @@ class FaceEmbedder:
         self.device = 'cuda' if (ctx.startswith('cuda') and _torch.cuda.is_available()) else 'cpu'
         self.backend = None
         self.arc_sess = None
+        self._arc_fixed_batch = False
         self.arc_input = None
+        self._arc_scratch: Optional[np.ndarray] = None  # reused fixed-batch buffer for TRT
         if self.use_arcface:
             try:
                 try:
@@ -414,6 +416,11 @@ class FaceEmbedder:
                 out0 = self.arc_sess.get_outputs()[0]
                 if hasattr(out0, "shape") and (out0.shape is not None) and (out0.shape[-1] not in (512,)):
                     raise RuntimeError(f"Unexpected ArcFace output dim: {out0.shape}")
+                try:
+                    provs = [p.lower() for p in self.arc_sess.get_providers()]
+                    self._arc_fixed_batch = any("tensorrt" in p for p in provs)
+                except Exception:
+                    self._arc_fixed_batch = False
             except Exception as _e:
                 # Hard fail so the real reason is visible
                 raise RuntimeError(f"ArcFace download/init failed: {_e!r}")
@@ -490,7 +497,8 @@ class FaceEmbedder:
     def _arcface_preprocess(self, bgr):
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         if rgb.shape[:2] != (112,112):
-            rgb = cv2.resize(rgb, (112,112), interpolation=cv2.INTER_LINEAR)
+            interp = cv2.INTER_AREA if (rgb.shape[0] > 112 or rgb.shape[1] > 112) else cv2.INTER_LINEAR
+            rgb = cv2.resize(rgb, (112,112), interpolation=interp)
         arr = rgb.astype(np.float32) / 127.5 - 1.0
         arr = np.transpose(arr, (2,0,1))[None, ...]  # NCHW
         return arr
@@ -498,20 +506,35 @@ class FaceEmbedder:
     def _arcface_encode(self, bgr_list: List[np.ndarray]):
         if not bgr_list:
             return []
-        chips = [self._arcface_preprocess(b) for b in bgr_list]
-        chips_flip = [self._arcface_preprocess(cv2.flip(b, 1)) for b in bgr_list]
-        batch = np.concatenate(chips + chips_flip, axis=0).astype(np.float32, copy=False)
-        # Pad to fixed batch so TRT compiles once
-        FIX = 32
-        n = batch.shape[0]
-        if n < FIX:
-            pad = np.repeat(batch[:1], FIX - n, axis=0)
-            batch = np.concatenate([batch, pad], axis=0)
-        batch = np.ascontiguousarray(batch)
-        feats = self.arc_sess.run(None, {self.arc_input: batch})[0]
+
         m = len(bgr_list)
-        f = feats[:m] + feats[m:2*m]
-        f /= (np.linalg.norm(f, axis=1, keepdims=True) + 1e-9)
+        do_flip = not getattr(self, "_fast_prescan", False)
+        pairs: List[np.ndarray] = list(bgr_list)
+        if do_flip:
+            pairs.extend(cv2.flip(b, 1) for b in bgr_list)
+
+        def _prep(bgr: np.ndarray) -> np.ndarray:
+            arr = self._arcface_preprocess(bgr)
+            return arr[0]
+
+        X = np.empty((len(pairs), 3, 112, 112), dtype=np.float32)
+        for i, bgr in enumerate(pairs):
+            X[i] = _prep(bgr)
+
+        X = np.ascontiguousarray(X, dtype=np.float32)
+        if getattr(self, "_arc_fixed_batch", False):
+            FIX = 32
+            if self._arc_scratch is None or self._arc_scratch.shape[0] != FIX:
+                self._arc_scratch = np.zeros((FIX, 3, 112, 112), dtype=np.float32)
+            batch = self._arc_scratch
+            batch[: len(pairs)] = X
+            feats = self.arc_sess.run(None, {self.arc_input: batch})[0][: len(pairs)]
+        else:
+            feats = self.arc_sess.run(None, {self.arc_input: X})[0]
+
+        f = feats[:m] + feats[m:2 * m] if do_flip else feats[:m]
+        norms = np.linalg.norm(f, axis=1, keepdims=True)
+        f = f / np.maximum(norms, 1e-6)
         return f.astype(np.float32)
 
     def _try_keypoints(self, res) -> Optional[np.ndarray]:
@@ -1224,8 +1247,10 @@ class FaceEmbedder:
         # prescan throttle for both SCRFD and insight_app backends
         if self._fast_prescan:
             period = max(1, int(getattr(self, "_prescan_period", 3)))
-            do_probe = self._prescan_escalate or (((self._frame_idx + self._prescan_rr) % period) == 0)
-            if not do_probe:
+            if not (
+                self._prescan_escalate
+                or ((self._frame_idx + self._prescan_rr) % period) == 0
+            ):
                 return []
         if self.scrfd is not None:
             return self._extract_with_scrfd_raw(bgr_img, imgsz=imgsz)
@@ -1319,12 +1344,6 @@ class FaceEmbedder:
                         return self.scrfd.detect(img, (dyn, dyn))
 
         H0, W0 = bgr_img.shape[:2]
-        # fast prescan: only probe every Nth sample unless escalated
-        if self._fast_prescan:
-            period = max(1, int(getattr(self, "_prescan_period", 3)))
-            do_probe = self._prescan_escalate or (((self._frame_idx + self._prescan_rr) % period) == 0)
-            if not do_probe:
-                return []
         dyn_req = int(imgsz) if (imgsz is not None and imgsz > 0) else 640
         dyn = dyn_req
         # speed-up: during a no-face streak, use a smaller first-pass size
@@ -1397,9 +1416,12 @@ class FaceEmbedder:
         if self._fast_prescan:
             # rotate only periodically when empty; escalate when active
             period = max(1, int(getattr(self, "_prescan_period", 3)))
-            need_rot = need_rot or self._prescan_escalate or (((self._frame_idx + self._prescan_rr) % period) == 0)
-            if not dets and not need_rot:
-                return []  # cheap early exit on empty frames
+            need_rot = need_rot or self._prescan_escalate or (
+                ((self._frame_idx + self._prescan_rr) % period) == 0
+            )
+
+        if self._fast_prescan and (not dets) and (not need_rot):
+            return []
 
         # 2) If requested, try rotated views: 90, 270, then 180
         if (not dets) and need_rot:
@@ -1417,8 +1439,9 @@ class FaceEmbedder:
             for deg in rot_seq:
                 rimg_probe = _rot_img(bgr_img, deg)
                 probe_conf = max(0.02, float(getattr(self, "_probe_conf", 0.02)))
-                probe_dyn = min(dyn, int(getattr(self, "_prescan_probe_imgsz", 384)))
-                probe_dyn = _round32(max(320, probe_dyn))
+                probe_dyn = _round32(
+                    max(320, min(dyn, int(getattr(self, "_prescan_probe_imgsz", 384))))
+                )
                 probe_boxes, _ = _detect_once(rimg_probe, probe_dyn, conf=probe_conf)
                 probe_hits = len(probe_boxes) if probe_boxes is not None else 0
 
@@ -1427,7 +1450,7 @@ class FaceEmbedder:
                     or (self._fast_prescan and self._prescan_escalate)
                     or (not self._fast_prescan)
                 )
-                if self._fast_prescan and probe_hits == 0:
+                if self._fast_prescan and (probe_boxes is None or len(probe_boxes) == 0):
                     continue  # no heavy pass on this rotation
 
                 # heavy path needs padding to avoid edge loss

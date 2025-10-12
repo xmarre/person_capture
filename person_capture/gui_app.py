@@ -505,11 +505,19 @@ class Processor(QtCore.QObject):
                 if self._paused:
                     time.sleep(0.02)
                     continue
+                if i % stride != 0:
+                    next_i = ((i // stride) + 1) * stride
+                    if next_i >= total_frames:
+                        break
+                    if not cap.set(cv2.CAP_PROP_POS_FRAMES, next_i):
+                        steps = next_i - i
+                        for _ in range(steps):
+                            if not cap.grab():
+                                break
+                    i = next_i
+                    continue
                 if not cap.grab():
                     break
-                if i % stride != 0:
-                    i += 1
-                    continue
                 ok, frame = cap.retrieve()
                 if not ok or frame is None:
                     i += 1
@@ -4735,4 +4743,10 @@ def main():
 
 
 if __name__ == "__main__":
+    try:
+        import cv2
+
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
     main()
