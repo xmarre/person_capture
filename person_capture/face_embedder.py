@@ -204,6 +204,9 @@ class FaceEmbedder:
         self._probe_conf: float = 0.03
         self._high_90: int = 1536
         self._high_180: int = 1280
+        self._prescan_period: int = 3       # rotate every N prescan samples when empty
+        self._prescan_probe_imgsz: int = 384
+        self._heavy_cap: int = 2048
         # --- adaptive rotation controls (speed-up on empty scenes) ---
         self._frame_idx: int = 0
         self._no_face_streak: int = 0
@@ -432,7 +435,9 @@ class FaceEmbedder:
 
         self._fast_prescan = bool(enable)
         self._prescan_rr_mode = str(mode)
-        self._prescan_rr = 0
+        # reset the round-robin counter when enabling fast mode
+        if enable:
+            self._prescan_rr = 0
 
     def set_prescan_hint(self, *, escalate: bool = False) -> None:
         """Per-call hint from caller: allow heavy pass on this sample."""
@@ -1215,6 +1220,13 @@ class FaceEmbedder:
         return out
 
     def _extract_with_scrfd(self, bgr_img: np.ndarray, *, imgsz: Optional[int] = None):
+        self._frame_idx += 1
+        # prescan throttle for both SCRFD and insight_app backends
+        if self._fast_prescan:
+            period = max(1, int(getattr(self, "_prescan_period", 3)))
+            do_probe = self._prescan_escalate or (((self._frame_idx + self._prescan_rr) % period) == 0)
+            if not do_probe:
+                return []
         if self.scrfd is not None:
             return self._extract_with_scrfd_raw(bgr_img, imgsz=imgsz)
         if self.insight_app is not None:
@@ -1277,8 +1289,6 @@ class FaceEmbedder:
         raise RuntimeError("SCRFD not initialized.")
 
     def _extract_with_scrfd_raw(self, bgr_img: np.ndarray, *, imgsz: Optional[int] = None):
-        # bump frame counter
-        self._frame_idx += 1
 
         def _rot_img(img, deg):
             if deg == 90:   return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
@@ -1309,11 +1319,20 @@ class FaceEmbedder:
                         return self.scrfd.detect(img, (dyn, dyn))
 
         H0, W0 = bgr_img.shape[:2]
+        # fast prescan: only probe every Nth sample unless escalated
+        if self._fast_prescan:
+            period = max(1, int(getattr(self, "_prescan_period", 3)))
+            do_probe = self._prescan_escalate or (((self._frame_idx + self._prescan_rr) % period) == 0)
+            if not do_probe:
+                return []
         dyn_req = int(imgsz) if (imgsz is not None and imgsz > 0) else 640
         dyn = dyn_req
         # speed-up: during a no-face streak, use a smaller first-pass size
         if self._no_face_streak >= 3:
-            dyn = min(dyn_req, self.fast_no_face_imgsz)
+            dyn = min(dyn, self.fast_no_face_imgsz)
+        # in fast pre-scan, cap upright pass to probe size for empty scenes
+        if self._fast_prescan:
+            dyn = min(dyn, int(getattr(self, "_prescan_probe_imgsz", 384)))
         dyn = _round32(max(320, dyn))
         L = max(H0, W0)
         heavy_cap = max(int(getattr(self, "_heavy_cap", 2048)), dyn)  # optional safety cap
@@ -1376,7 +1395,11 @@ class FaceEmbedder:
             self._rot_cycle = 0
 
         if self._fast_prescan:
-            need_rot = True
+            # rotate only periodically when empty; escalate when active
+            period = max(1, int(getattr(self, "_prescan_period", 3)))
+            need_rot = need_rot or self._prescan_escalate or (((self._frame_idx + self._prescan_rr) % period) == 0)
+            if not dets and not need_rot:
+                return []  # cheap early exit on empty frames
 
         # 2) If requested, try rotated views: 90, 270, then 180
         if (not dets) and need_rot:
@@ -1392,12 +1415,11 @@ class FaceEmbedder:
             else:
                 rot_seq = (90, 270, 180)
             for deg in rot_seq:
-                rimg = _rot_img(bgr_img, deg)
-                # pad to avoid losing faces near borders after rotation
-                pad = 24
-                rimg = cv2.copyMakeBorder(rimg, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
+                rimg_probe = _rot_img(bgr_img, deg)
                 probe_conf = max(0.02, float(getattr(self, "_probe_conf", 0.02)))
-                probe_boxes, _ = _detect_once(rimg, dyn, conf=probe_conf)
+                probe_dyn = min(dyn, int(getattr(self, "_prescan_probe_imgsz", 384)))
+                probe_dyn = _round32(max(320, probe_dyn))
+                probe_boxes, _ = _detect_once(rimg_probe, probe_dyn, conf=probe_conf)
                 probe_hits = len(probe_boxes) if probe_boxes is not None else 0
 
                 do_heavy = (
@@ -1405,12 +1427,19 @@ class FaceEmbedder:
                     or (self._fast_prescan and self._prescan_escalate)
                     or (not self._fast_prescan)
                 )
+                if self._fast_prescan and probe_hits == 0:
+                    continue  # no heavy pass on this rotation
+
+                # heavy path needs padding to avoid edge loss
+                pad = 24
+                rimg = cv2.copyMakeBorder(rimg_probe, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
+
                 if self._fast_prescan:
                     heavy = heavy180 if deg == 180 else heavy90
                     override = getattr(self, "_high_180" if deg == 180 else "_high_90", None)
                     if override and override > 0:
                         heavy = max(heavy, _round32(int(override)))
-                    heavy = min(heavy, heavy_cap)
+                    heavy = min(heavy, int(getattr(self, "_heavy_cap", 2048)))
                     det_sizes = [dyn] if not do_heavy else [heavy]
                 else:
                     fullframe_sizes: List[int] = []

@@ -216,6 +216,11 @@ class SessionConfig:
     prescan_fd_add: float = 0.22           # ArcFace dist to add to bank (tighter)
     prescan_fd_exit: float = 0.52          # ArcFace dist to EXIT  (hysteresis)
     prescan_add_cooldown_samples: int = 5  # add at most every N prescan samples
+    prescan_rot_probe_period: int = 3
+    prescan_probe_imgsz: int = 384
+    prescan_probe_conf: float = 0.03
+    prescan_heavy_90: int = 1536
+    prescan_heavy_180: int = 1280
     prescan_min_segment_sec: float = 1.0
     prescan_pad_sec: float = 2.0
     prescan_bridge_gap_sec: float = 1.0    # merge spans separated by short gaps
@@ -397,14 +402,21 @@ class Processor(QtCore.QObject):
         fd_add = float(getattr(cfg, "prescan_fd_add", enter))
         old_face_conf = getattr(face, "conf", 0.5)
         face.conf = float(cfg.prescan_face_conf)
+        old_rot_adapt = getattr(face, "rot_adaptive", True)
         try:
+            # freeze legacy rotation gating; rely on pre-scan throttle
+            try:
+                face.configure_rotation_strategy(adaptive=False)
+            except Exception:
+                pass
             try:
                 face.set_prescan_fast(True, mode="rr")
                 face.set_prescan_hint(escalate=False)
-                # Quick sideways recall overrides for high-res tilted faces.
-                face._probe_conf = 0.03
-                face._high_90 = 1536
-                face._high_180 = 1280
+                face._probe_conf = float(getattr(cfg, "prescan_probe_conf", 0.03))
+                face._prescan_period = int(getattr(cfg, "prescan_rot_probe_period", 3))
+                face._prescan_probe_imgsz = int(getattr(cfg, "prescan_probe_imgsz", 384))
+                face._high_90  = int(getattr(cfg, "prescan_heavy_90", 1536))
+                face._high_180 = int(getattr(cfg, "prescan_heavy_180", 1280))
             except Exception:
                 pass
             add_cooldown_samples = int(
@@ -509,9 +521,9 @@ class Processor(QtCore.QObject):
                 if w > Wmax:
                     nh = int(round(h * (Wmax / float(w))))
                     frame = cv2.resize(frame, (Wmax, nh), interpolation=cv2.INTER_AREA)
-                # While a segment is active, widen angles and escalate heavy per-rotation pass.
-                face._prescan_rr_mode = "full" if active else "rr"
+                # widen angles while active; keep probe-throttled when idle
                 try:
+                    face._prescan_rr_mode = "full" if active else "rr"
                     face.set_prescan_hint(escalate=active)
                 except Exception:
                     pass
@@ -633,6 +645,10 @@ class Processor(QtCore.QObject):
                 bridged.append((cs, ce))
                 spans = bridged
         finally:
+            try:
+                face.configure_rotation_strategy(adaptive=bool(old_rot_adapt))
+            except Exception:
+                pass
             try:
                 face.set_prescan_fast(False)
                 face.set_prescan_hint(escalate=False)
