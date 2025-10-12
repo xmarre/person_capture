@@ -228,6 +228,10 @@ class SessionConfig:
     prescan_bank_max: int = 64                 # target size
     prescan_diversity_dedup_cos: float = 0.968 # ≥ skip as duplicate
     prescan_replace_margin: float = 0.010      # new score must beat worst by this
+    # Early-out on empty frames: skip heavy work when last best fd≈9.00
+    prescan_fd9_skip: bool = True               # enable fd=9.0 skip-gate
+    prescan_fd9_grace: int = 1                  # start skipping after this many consecutive fd≈9 samples
+    prescan_fd9_probe_period: int = 3           # while skipping, run a real probe every Nth sample
     prescan_weights: Tuple[float, float, float] = (0.70, 0.25, 0.05)  # (anchor, diversity, quality)
     # --- runtime paths ---
     trt_lib_dir: str = ""                  # preferred TensorRT lib directory
@@ -438,6 +442,10 @@ class Processor(QtCore.QObject):
             last_preview_idx = -preview_step
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             processed_samples = 0
+            fd9_streak = 0
+            fd9_skip_samples = 0
+            fd9_probe_samples = 0
+            fd9_gate_period = 1
             i = 0
             # fast pass
             while i < total_frames:
@@ -457,6 +465,10 @@ class Processor(QtCore.QObject):
                             processed_samples = i // stride
                             active = False
                             neg_run = 0
+                            fd9_streak = 0
+                            fd9_skip_samples = 0
+                            fd9_probe_samples = 0
+                            fd9_gate_period = 1
                             try:
                                 self.progress.emit(i)
                             except Exception:
@@ -526,56 +538,108 @@ class Processor(QtCore.QObject):
                 sample_idx = processed_samples
                 processed_samples += 1
                 h, w = frame.shape[:2]
-                if w > Wmax:
-                    nh = int(round(h * (Wmax / float(w))))
-                    frame = cv2.resize(frame, (Wmax, nh), interpolation=cv2.INTER_AREA)
                 # widen angles while active; keep probe-throttled when idle
                 try:
                     face._prescan_rr_mode = "full" if active else "rr"
                     face.set_prescan_hint(escalate=active)
                 except Exception:
                     pass
-                faces = face.extract(frame)
-                # best ArcFace distance on this sample
-                best = 9.0
-                for f in faces:
-                    feat = f.get("feat")
-                    if feat is None:
-                        continue
-                    # current best vs live bank
-                    fd = self._fd_min(feat, ref_feat_local)
-                    best = min(best, fd)
-                    if (
-                        fd <= fd_add
-                        and (sample_idx - last_add_sample) >= add_cooldown_samples
-                        and f.get("quality", 1e9) >= cfg.face_quality_min
-                    ):
-                        try:
-                            quality_val = float(f.get("quality", 0.0))
-                        except Exception:
-                            quality_val = 0.0
-                        ref_feat_local, action, idx_info = self._stream_ref_bank_update(
-                            ref_bank_list,
-                            ref_feat_local,
-                            feat,
-                            quality_val,
-                            cfg,
-                        )
-                        if action in {"added", "replaced"}:
-                            last_add_sample = sample_idx
-                            if action == "added":
-                                added_vecs += 1
-                                self._status(
-                                    f"Pre-scan ref bank +1 (size={len(ref_bank_list)}) fd={fd:.3f}",
-                                    key="prescan_bank",
-                                    interval=2.0,
-                                )
-                            elif action == "replaced":
-                                self._status(
-                                    f"Pre-scan replaced #{idx_info} with better ref (score↑)",
-                                    key="prescan_bank",
-                                    interval=2.0,
-                                )
+                best = 9.0  # defensive default
+                # ---- fd9 skip-gate ----
+                skip_extract = False
+                fd9_gate_active = False
+                try:
+                    if (not active) and bool(getattr(cfg, "prescan_fd9_skip", True)):
+                        grace = max(0, int(getattr(cfg, "prescan_fd9_grace", 1)))
+                        period = max(1, int(getattr(cfg, "prescan_fd9_probe_period", 3)))
+                        if fd9_streak >= grace:
+                            fd9_gate_active = True
+                            fd9_gate_period = period
+                            if (fd9_streak % period) != 0:
+                                skip_extract = True
+                except Exception:
+                    pass
+
+                if fd9_gate_active:
+                    if skip_extract:
+                        fd9_skip_samples += 1
+                    else:
+                        fd9_probe_samples += 1
+                else:
+                    fd9_skip_samples = 0
+                    fd9_probe_samples = 0
+
+                if not skip_extract:
+                    # defer resize until we actually extract
+                    if w > Wmax:
+                        nh = int(round(h * (Wmax / float(w))))
+                        frame = cv2.resize(frame, (Wmax, nh), interpolation=cv2.INTER_AREA)
+                    try:
+                        faces = face.extract(frame)
+                    except Exception:
+                        faces = ()
+                    for f in faces:
+                        feat = f.get("feat")
+                        if feat is None:
+                            continue
+                        # current best vs live bank
+                        fd = self._fd_min(feat, ref_feat_local)
+                        best = min(best, fd)
+                        if (
+                            fd <= fd_add
+                            and (sample_idx - last_add_sample) >= add_cooldown_samples
+                            and f.get("quality", 1e9) >= cfg.face_quality_min
+                        ):
+                            try:
+                                quality_val = float(f.get("quality", 0.0))
+                            except Exception:
+                                quality_val = 0.0
+                            ref_feat_local, action, idx_info = self._stream_ref_bank_update(
+                                ref_bank_list,
+                                ref_feat_local,
+                                feat,
+                                quality_val,
+                                cfg,
+                            )
+                            if action in {"added", "replaced"}:
+                                last_add_sample = sample_idx
+                                if action == "added":
+                                    added_vecs += 1
+                                    self._status(
+                                        f"Pre-scan ref bank +1 (size={len(ref_bank_list)}) fd={fd:.3f}",
+                                        key="prescan_bank",
+                                        interval=2.0,
+                                    )
+                                elif action == "replaced":
+                                    self._status(
+                                        f"Pre-scan replaced #{idx_info} with better ref (score↑)",
+                                        key="prescan_bank",
+                                        interval=2.0,
+                                    )
+                else:
+                    best = 9.0
+                    self._status(
+                        "Pre-scan: fd9-skip gate active",
+                        key="prescan_skip",
+                        interval=5.0,
+                    )
+                    self._status(
+                        f"Pre-scan fd9 cadence skip={fd9_skip_samples} probe={fd9_probe_samples} period={fd9_gate_period}",
+                        key="prescan_skip_cadence",
+                        interval=5.0,
+                    )
+
+                if fd9_gate_active and not skip_extract:
+                    self._status(
+                        f"Pre-scan fd9 cadence probe skip={fd9_skip_samples} probe={fd9_probe_samples} period={fd9_gate_period}",
+                        key="prescan_skip_probe",
+                        interval=5.0,
+                    )
+
+                if best >= 8.99:
+                    fd9_streak += 1
+                else:
+                    fd9_streak = 0
                 if sample_idx >= next_progress_sample:
                     pct = min(100.0, (idx + stride) / max(1.0, float(total_frames)) * 100.0)
                     self._status(
@@ -595,6 +659,10 @@ class Processor(QtCore.QObject):
                 if best <= enter:
                     if not active:
                         active = True
+                        fd9_streak = 0
+                        fd9_skip_samples = 0
+                        fd9_probe_samples = 0
+                        fd9_gate_period = 1
                         start = idx
                     neg_run = 0
                     emit_preview = True
@@ -613,6 +681,10 @@ class Processor(QtCore.QObject):
                                     spans.append((s, e))
                             active = False
                             neg_run = 0
+                            fd9_streak = 0
+                            fd9_skip_samples = 0
+                            fd9_probe_samples = 0
+                            fd9_gate_period = 1
                 if emit_preview:
                     try:
                         vis = frame.copy()
@@ -3946,6 +4018,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "prescan_bank_max",
             "prescan_diversity_dedup_cos",
             "prescan_replace_margin",
+            "prescan_fd9_skip",
+            "prescan_fd9_grace",
+            "prescan_fd9_probe_period",
         }
         live = {
             "frame_stride",
