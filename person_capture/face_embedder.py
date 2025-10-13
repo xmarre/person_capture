@@ -196,6 +196,10 @@ class FaceEmbedder:
 
         self.progress = progress
         self._torch = _torch
+        # --- SCRFD probe controls ---
+        self.scrfd_tta_scales = getattr(self, "scrfd_tta_scales", (0.75, 0.60))
+        self.scrfd_probe_conf_cap = getattr(self, "scrfd_probe_conf_cap", 0.20)
+        self.scrfd_edge_pad_frac = getattr(self, "scrfd_edge_pad_frac", 0.06)
         # --- pre-scan controls ---
         self._fast_prescan: bool = False
         self._prescan_rr: int = 0
@@ -1513,9 +1517,90 @@ class FaceEmbedder:
             for i, bb in enumerate(bboxes):
                 kp = None if (kpss is None or i >= len(kpss)) else kpss[i]
                 _accumulate(bb, kp, 0)
+
+        # if still empty at 0°, try SCRFD multi-scale and edge-pad probes
+        if not dets and (not self._fast_prescan):
+            # scales <1 help very large/partial faces; >1 helps tiny faces
+            tta_scales = tuple(self.scrfd_tta_scales) + (
+                (1.25,) if max(W0, H0) <= 1920 else ()
+            )
+            base_conf = float(getattr(self, "conf", 0.5))
+            probe_conf = min(base_conf, float(self.scrfd_probe_conf_cap))
+            pad = 0
+            if tta_scales:
+                for s in tta_scales:
+                    if s == 1.0:
+                        continue
+                    try:
+                        interp = cv2.INTER_AREA if s < 1.0 else cv2.INTER_LINEAR
+                        img_s = cv2.resize(bgr_img, None, fx=s, fy=s, interpolation=interp)
+                        dyn_s = _round32(min(self._heavy_cap, max(320, int(dyn * s))))
+                        try:
+                            bb_s, kp_s = _detect_once(img_s, dyn_s, conf=probe_conf)
+                        except TypeError:
+                            bb_s, kp_s = _detect_once(img_s, dyn_s)
+                    except Exception:
+                        bb_s, kp_s = None, None
+                    if bb_s is None or len(bb_s) == 0:
+                        continue
+                    inv = (1.0 / s)
+                    for i, bb in enumerate(bb_s):
+                        kp = None if (kp_s is None or i >= len(kp_s)) else kp_s[i]
+                        bb = np.asarray(bb).copy()
+                        bb[:4] = np.asarray(bb[:4], dtype=np.float32) * inv
+                        if kp is not None:
+                            kp = np.asarray(kp, dtype=np.float32) * inv
+                        _accumulate(bb, kp, 0)
+                    if dets:
+                        break
+            if dets:
+                pass  # detections already recovered; skip pad probe
+            else:
+                # final probe: replicate-pad edges to recover near-border faces
+                pad_frac = float(self.scrfd_edge_pad_frac)
+                pad = int(round(min(64, pad_frac * max(W0, H0))))
+                if pad > 0:
+                    try:
+                        img_p = cv2.copyMakeBorder(
+                            bgr_img, pad, pad, pad, pad, cv2.BORDER_REPLICATE
+                        )
+                        try:
+                            bb_p, kp_p = _detect_once(img_p, dyn, conf=probe_conf)
+                        except TypeError:
+                            bb_p, kp_p = _detect_once(img_p, dyn)
+                    except Exception:
+                        bb_p, kp_p = None, None
+                    if bb_p is not None and len(bb_p) > 0:
+                        for i, bb in enumerate(bb_p):
+                            kp = None if (kp_p is None or i >= len(kp_p)) else kp_p[i]
+                            bb = np.asarray(bb).copy()
+                            bb[:4] -= np.array([pad, pad, pad, pad], dtype=np.float32)
+                            # clamp to original frame
+                            bb[0] = max(0.0, min(float(W0 - 1), float(bb[0])))
+                            bb[1] = max(0.0, min(float(H0 - 1), float(bb[1])))
+                            bb[2] = max(bb[0] + 1.0, min(float(W0), float(bb[2])))
+                            bb[3] = max(bb[1] + 1.0, min(float(H0), float(bb[3])))
+                            if kp is not None:
+                                kp = np.asarray(kp, dtype=np.float32)
+                                kp[..., 0] = np.clip(kp[..., 0] - pad, 0, W0 - 1)
+                                kp[..., 1] = np.clip(kp[..., 1] - pad, 0, H0 - 1)
+                            _accumulate(bb, kp, 0)
+        # remove probe artifacts that are too small to be useful before rotations
+        min_px = int(getattr(self, "scrfd_min_box_px", 8))
+        dets = [
+            d
+            for d in dets
+            if (d[0][2] - d[0][0] >= min_px and d[0][3] - d[0][1] >= min_px)
+        ]
+        if (
+            callable(getattr(self, "progress", None))
+            and (not dets)
+            and ((self._frame_idx & 15) == 0)
+        ):
+            self.progress(f"SCRFD TTA scales={tta_scales} pad={pad}")
         # decide whether to run rotations
-        need_rot = False
         if not dets:
+            need_rot = False
             # empty this frame
             self._no_face_streak += 1
             # adaptive policy: rotate only occasionally while empty
@@ -1527,17 +1612,21 @@ class FaceEmbedder:
             else:
                 need_rot = True      # always rotate if configured so
         else:
+            need_rot = False
             # we have faces; reset streak and remember index
             self._no_face_streak = 0
             self._last_face_idx = self._frame_idx
             self._rot_cycle = 0
 
         if self._fast_prescan:
-            # rotate only periodically when empty; escalate when active
-            period = max(1, int(getattr(self, "_prescan_period", 3)))
-            need_rot = need_rot or self._prescan_escalate or (
-                ((self._frame_idx + self._prescan_rr) % period) == 0
-            )
+            if dets:
+                need_rot = False
+            else:
+                # rotate only periodically when empty; escalate when active
+                period = max(1, int(getattr(self, "_prescan_period", 3)))
+                need_rot = need_rot or self._prescan_escalate or (
+                    ((self._frame_idx + self._prescan_rr) % period) == 0
+                )
 
         if self._fast_prescan and (not dets) and (not need_rot):
             return []
