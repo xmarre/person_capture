@@ -1038,6 +1038,15 @@ class Processor(QtCore.QObject):
         self._cur_reid: Optional[ReIDEmbedder] = None
         self._cur_face: Optional[FaceEmbedder] = None
 
+    def _emit_hit(self, path: str) -> None:
+        emit = getattr(self.hit, "emit", None)
+        if emit is None:
+            return
+        try:
+            emit(path)
+        except Exception:
+            logger.exception("Failed to emit hit for %s", path)
+
     @QtCore.Slot()
     def request_abort(self):
         self._abort = True
@@ -1795,21 +1804,39 @@ class Processor(QtCore.QObject):
                     w = csv.writer(f)
                     while True:
                         item = save_q.get()
-                        if item is None:
-                            save_q.task_done()
-                            break
-                        img_path, img, row = item
                         try:
+                            if item is None:
+                                break
+                            img_path, img, row = item
+                            tmp_path = img_path + ".tmp"
                             if jpg_q > 0:
                                 ok = cv2.imwrite(
-                                    img_path, img, [int(cv2.IMWRITE_JPEG_QUALITY), jpg_q]
+                                    tmp_path, img, [int(cv2.IMWRITE_JPEG_QUALITY), jpg_q]
                                 )
                             else:
-                                ok = cv2.imwrite(img_path, img)
+                                ok = cv2.imwrite(tmp_path, img)
                             if not ok:
                                 logger.error("Failed to save crop %s", img_path)
-                            else:
-                                w.writerow(row)
+                                try:
+                                    os.remove(tmp_path)
+                                except Exception:
+                                    pass
+                                continue
+                            try:
+                                os.replace(tmp_path, img_path)
+                            except Exception:
+                                logger.exception("Failed to replace crop %s", img_path)
+                                try:
+                                    os.remove(tmp_path)
+                                except Exception:
+                                    pass
+                                continue
+                            w.writerow(row)
+                            try:
+                                f.flush()
+                            except Exception:
+                                pass
+                            self._emit_hit(img_path)
                         finally:
                             save_q.task_done()
                     f.close()
@@ -2545,16 +2572,48 @@ class Processor(QtCore.QObject):
                     ]
                     if save_q is not None:
                         try:
-                            # IMPORTANT: enqueue a copy; slices are views into `frame`.
-                            save_q.put_nowait((crop_img_path, crop_img2.copy(), row))
+                            # enqueue a copy; slices are views into `frame`
+                            save_q.put_nowait(
+                                (
+                                    crop_img_path,
+                                    np.ascontiguousarray(crop_img2),
+                                    row,
+                                )
+                            )
                         except queue.Full:
                             pass  # drop if saver is behind
                     else:
+                        tmp_path = crop_img_path + ".tmp"
                         if jpg_q > 0:
-                            cv2.imwrite(crop_img_path, crop_img2, [int(cv2.IMWRITE_JPEG_QUALITY), jpg_q])
+                            ok = cv2.imwrite(
+                                tmp_path,
+                                crop_img2,
+                                [int(cv2.IMWRITE_JPEG_QUALITY), jpg_q],
+                            )
                         else:
-                            cv2.imwrite(crop_img_path, crop_img2)
+                            ok = cv2.imwrite(tmp_path, crop_img2)
+                        if not ok:
+                            logger.error("Failed to save crop %s", crop_img_path)
+                            try:
+                                os.remove(tmp_path)
+                            except Exception:
+                                pass
+                            continue
+                        try:
+                            os.replace(tmp_path, crop_img_path)
+                        except Exception:
+                            logger.exception("Failed to replace crop %s", crop_img_path)
+                            try:
+                                os.remove(tmp_path)
+                            except Exception:
+                                pass
+                            continue
                         writer.writerow(row)
+                        try:
+                            csv_f.flush()
+                        except Exception:
+                            pass
+                        self._emit_hit(crop_img_path)
                     reasons_list = c.get("reasons") or []
                     reasons = "|".join(reasons_list)
                     area = (cx2 - cx1) * (cy2 - cy1)
@@ -2566,7 +2625,7 @@ class Processor(QtCore.QObject):
                         ),
                         key="cap",
                     )
-                    self.hit.emit(crop_img_path)
+                    # hit is emitted by the saver (async) or right after atomic save (sync)
                     # update lock source
                     face_feat_curr = c.get("face_feat")
                     if face_feat_curr is not None:
@@ -3037,19 +3096,10 @@ class Processor(QtCore.QObject):
             self.finished.emit(False, err)
         finally:
             if save_q is not None:
-                try:
-                    save_q.put(None)
-                except Exception:
-                    pass
-                try:
-                    save_q.join()
-                except Exception:
-                    pass
+                save_q.put(None)
+                save_q.join()
                 if saver_thread is not None:
-                    try:
-                        saver_thread.join()
-                    except Exception:
-                        pass
+                    saver_thread.join()
             if cap is not None:
                 try:
                     cap.release()
@@ -3065,10 +3115,6 @@ class Processor(QtCore.QObject):
                     dbg_f.close()
                 except Exception:
                     pass
-
-    def _init_status(self):
-        self._last_status_time = 0.0
-        self._last_status_text = None
 
     def _init_status(self):
         # Per-key throttle timestamps and last texts
