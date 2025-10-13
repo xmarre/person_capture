@@ -1804,41 +1804,48 @@ class Processor(QtCore.QObject):
                     w = csv.writer(f)
                     while True:
                         item = save_q.get()
-                        try:
-                            if item is None:
-                                break
-                            img_path, img, row = item
-                            tmp_path = img_path + ".tmp"
-                            if jpg_q > 0:
-                                ok = cv2.imwrite(
-                                    tmp_path, img, [int(cv2.IMWRITE_JPEG_QUALITY), jpg_q]
-                                )
-                            else:
-                                ok = cv2.imwrite(tmp_path, img)
-                            if not ok:
-                                logger.error("Failed to save crop %s", img_path)
-                                try:
-                                    os.remove(tmp_path)
-                                except Exception:
-                                    pass
-                                continue
+                        if item is None:
+                            save_q.task_done()
+                            break
+
+                        img_path, img, row = item
+                        tmp_path = img_path + ".tmp"
+
+                        if jpg_q > 0:
+                            ok = cv2.imwrite(
+                                tmp_path, img, [int(cv2.IMWRITE_JPEG_QUALITY), jpg_q]
+                            )
+                        else:
+                            ok = cv2.imwrite(tmp_path, img)
+
+                        if ok:
+                            replaced = False
                             try:
                                 os.replace(tmp_path, img_path)
+                                replaced = True
                             except Exception:
                                 logger.exception("Failed to replace crop %s", img_path)
                                 try:
                                     os.remove(tmp_path)
                                 except Exception:
                                     pass
-                                continue
-                            w.writerow(row)
+
+                            if replaced:
+                                w.writerow(row)
+                                try:
+                                    f.flush()
+                                except Exception:
+                                    pass
+                                self._emit_hit(img_path)
+                        else:
+                            logger.error("Failed to save crop %s", img_path)
                             try:
-                                f.flush()
+                                os.remove(tmp_path)
                             except Exception:
                                 pass
-                            self._emit_hit(img_path)
-                        finally:
-                            save_q.task_done()
+
+                        save_q.task_done()
+
                     f.close()
 
                 saver_thread = threading.Thread(target=_saver, name="pc.saver", daemon=True)
