@@ -1556,7 +1556,7 @@ class Processor(QtCore.QObject):
 
     @QtCore.Slot()
     def run(self):
-        cap = save_q = saver_thread = csv_f = dbg_f = None
+        cap = save_q = saver_thread = csv_f = dbg_f = hit_q = None
         try:
             self._paused = False
             self._init_status()
@@ -1796,6 +1796,7 @@ class Processor(QtCore.QObject):
                     pass
                 writer = None
                 save_q = queue.Queue(maxsize=512)
+                hit_q = queue.Queue(maxsize=512)
 
                 def _saver():
                     f = open(csv_path, "a", newline="")
@@ -1836,6 +1837,12 @@ class Processor(QtCore.QObject):
                                 pass
 
                         if saved:
+                            # hand off to worker thread for emitting
+                            try:
+                                hit_q.put_nowait(img_path)
+                            except queue.Full:
+                                pass
+                            # CSV is best-effort and must not block the UI update
                             try:
                                 w.writerow(row)
                                 wrote += 1
@@ -1843,9 +1850,6 @@ class Processor(QtCore.QObject):
                                     f.flush()
                             except Exception:
                                 logger.exception("CSV write failed for %s", img_path)
-                                # optionally unlink img_path if you want strict atomicity
-                            else:
-                                self._emit_hit(img_path)
 
                         save_q.task_done()
 
@@ -2027,6 +2031,15 @@ class Processor(QtCore.QObject):
                             continue
                 except queue.Empty:
                     pass
+
+                if hit_q is not None:
+                    try:
+                        while True:
+                            _p = hit_q.get_nowait()
+                            self._emit_hit(_p)
+                            hit_q.task_done()
+                    except queue.Empty:
+                        pass
 
                 # segment gate (auto-skip regions with no target)
                 if keep_spans:
@@ -2582,14 +2595,11 @@ class Processor(QtCore.QObject):
                     ]
                     if save_q is not None:
                         try:
-                            # enqueue a copy; slices are views into `frame`
-                            save_q.put_nowait(
-                                (
-                                    crop_img_path,
-                                    np.ascontiguousarray(crop_img2),
-                                    row,
-                                )
-                            )
+                            # enqueue a contiguous copy; slices are views into `frame`
+                            buf = np.ascontiguousarray(crop_img2)
+                            if not buf.flags.owndata:
+                                buf = buf.copy()
+                            save_q.put_nowait((crop_img_path, buf, row))
                         except queue.Full:
                             pass  # drop if saver is behind
                     else:
@@ -2616,6 +2626,9 @@ class Processor(QtCore.QObject):
                             except Exception:
                                 pass
                         if saved:
+                            # emit on worker thread directly
+                            self.hit.emit(crop_img_path)
+                            # CSV best-effort
                             try:
                                 writer.writerow(row)
                                 sync_wrote += 1
@@ -2623,9 +2636,6 @@ class Processor(QtCore.QObject):
                                     csv_f.flush()
                             except Exception:
                                 logger.exception("CSV write failed for %s", crop_img_path)
-                                # optionally unlink crop_img_path if you want strict atomicity
-                            else:
-                                self._emit_hit(crop_img_path)
                     reasons_list = c.get("reasons") or []
                     reasons = "|".join(reasons_list)
                     area = (cx2 - cx1) * (cy2 - cy1)
@@ -3107,6 +3117,14 @@ class Processor(QtCore.QObject):
             err = f"Error: {e}\n{traceback.format_exc()}"
             self.finished.emit(False, err)
         finally:
+            if hit_q is not None:
+                try:
+                    while True:
+                        _p = hit_q.get_nowait()
+                        self._emit_hit(_p)
+                        hit_q.task_done()
+                except queue.Empty:
+                    pass
             if save_q is not None:
                 save_q.put(None)
                 save_q.join()
