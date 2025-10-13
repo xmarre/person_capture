@@ -138,6 +138,13 @@ APP_NAME = "PersonCapture GUI"
 class SessionConfig:
     video: str = ""
     ref: str = ""
+    # --- seek behavior ---
+    # Fast seek: jump to nearest previous keyframe and cap forward grabs,
+    # then resume processing immediately. Set to False for exact frame seeks.
+    seek_fast: bool = True
+    # Max frames to grab forward after landing on a keyframe during seek.
+    # ≤0 uses fps-derived auto cap (~1s of decoding) to avoid long stalls.
+    seek_max_grabs: int = 0
     out_dir: str = "output"
     ratio: str = "2:3,1:1,3:2"
     frame_stride: int = 2
@@ -524,7 +531,13 @@ class Processor(QtCore.QObject):
                 if last_seek is not None or step_accum:
                     tgt = int(last_seek) if last_seek is not None else int(i + step_accum)
                     tgt = max(0, min(total_frames - 1, tgt))
-                    new_pos = self._seek_to(cap, i, tgt)
+                    new_pos = self._seek_to(
+                        cap,
+                        i,
+                        tgt,
+                        fast=bool(getattr(cfg, "seek_fast", True)),
+                        max_grabs=int(getattr(cfg, "seek_max_grabs", 0)),
+                    )
                     i = (new_pos // stride) * stride
                     processed_samples = i // stride
                     active = False
@@ -547,7 +560,13 @@ class Processor(QtCore.QObject):
                     next_i = ((i // stride) + 1) * stride
                     if next_i >= total_frames:
                         break
-                    i = self._seek_to(cap, i, next_i)
+                    i = self._seek_to(
+                        cap,
+                        i,
+                        next_i,
+                        fast=bool(getattr(cfg, "seek_fast", True)),
+                        max_grabs=int(getattr(cfg, "seek_max_grabs", 0)),
+                    )
                     continue
                 if not cap.grab():
                     break
@@ -1398,8 +1417,16 @@ class Processor(QtCore.QObject):
         keyframes = sorted(set(keyframes))
         return keyframes
 
-    def _seek_to(self, cap: cv2.VideoCapture, cur_idx: int, tgt_idx: int) -> int:
-        """Keyframe-aware seek: jump to prev keyframe then grab() forward."""
+    def _seek_to(
+        self,
+        cap: cv2.VideoCapture,
+        cur_idx: int,
+        tgt_idx: int,
+        *,
+        fast: bool = False,
+        max_grabs: int = 0,
+    ) -> int:
+        """Keyframe-aware seek. If fast=True, cap forward grabs to max_grabs to avoid long stalls."""
         if self._total_frames is not None:
             tgt_idx = max(0, min(self._total_frames - 1, int(tgt_idx)))
         base = tgt_idx
@@ -1412,6 +1439,22 @@ class Processor(QtCore.QObject):
             cap.set(cv2.CAP_PROP_POS_FRAMES, base)
         idx = base
         limit = max(0, tgt_idx - base)
+        # Cap forward grabs in fast mode to keep UI responsive
+        if fast:
+            if max_grabs <= 0:
+                f = float(self._fps or 30.0)
+                max_grabs = max(15, min(240, int(round(f))))
+            capped = (tgt_idx - base) > max_grabs
+            limit = min(limit, int(max_grabs))
+            if capped:
+                try:
+                    self._status(
+                        f"Fast-seek capped forward decode to {limit} frames",
+                        key="seek_cap",
+                        interval=1.0,
+                    )
+                except Exception:
+                    pass
         for _ in range(limit):
             if not cap.grab():
                 break
@@ -2184,7 +2227,13 @@ class Processor(QtCore.QObject):
                 )
                 if keep_spans:
                     s0 = keep_spans[0][0]
-                    frame_idx = self._seek_to(cap, 0, s0)
+                    frame_idx = self._seek_to(
+                        cap,
+                        0,
+                        s0,
+                        fast=bool(getattr(cfg, "seek_fast", True)),
+                        max_grabs=int(getattr(cfg, "seek_max_grabs", 0)),
+                    )
                     self._status(f"Pre-scan segments: {len(keep_spans)}", key="prescan", interval=30.0)
                 else:
                     self._status("Pre-scan found no matches; full scan", key="prescan", interval=30.0)
@@ -2439,7 +2488,13 @@ class Processor(QtCore.QObject):
                         tgt = frame_idx + int(step_accum)
                     if self._total_frames is not None:
                         tgt = max(0, min(self._total_frames - 1, tgt))
-                    frame_idx = self._seek_to(cap, frame_idx, tgt)
+                    frame_idx = self._seek_to(
+                        cap,
+                        frame_idx,
+                        tgt,
+                        fast=bool(getattr(self.cfg, "seek_fast", True)),
+                        max_grabs=int(getattr(self.cfg, "seek_max_grabs", 0)),
+                    )
                     self.progress.emit(frame_idx)
                     # reset temporal gates so back/forward scrubs work
                     lock_hits = 0
@@ -2475,7 +2530,13 @@ class Processor(QtCore.QObject):
                         break
                     s, e = keep_spans[span_i]
                     if frame_idx < s:
-                        frame_idx = self._seek_to(cap, frame_idx, s)
+                        frame_idx = self._seek_to(
+                            cap,
+                            frame_idx,
+                            s,
+                            fast=bool(getattr(self.cfg, "seek_fast", True)),
+                            max_grabs=int(getattr(self.cfg, "seek_max_grabs", 0)),
+                        )
                         self._seek_cooldown_frames = int(max(2, (self._fps or 30) * 0.25))
                         continue
                     if frame_idx > e:
@@ -2483,7 +2544,13 @@ class Processor(QtCore.QObject):
                         if span_i >= len(keep_spans):
                             break
                         s2, _ = keep_spans[span_i]
-                        frame_idx = self._seek_to(cap, frame_idx, s2)
+                        frame_idx = self._seek_to(
+                            cap,
+                            frame_idx,
+                            s2,
+                            fast=bool(getattr(self.cfg, "seek_fast", True)),
+                            max_grabs=int(getattr(self.cfg, "seek_max_grabs", 0)),
+                        )
                         self._seek_cooldown_frames = int(max(2, (self._fps or 30) * 0.25))
                         continue
 
@@ -4945,6 +5012,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ref=ref_join,
             out_dir=self.out_edit.text().strip() or "output",
             ratio=self.ratio_edit.text().strip() or "2:3",
+            seek_fast=bool(getattr(self.cfg, "seek_fast", True)),
+            seek_max_grabs=max(0, int(getattr(self.cfg, "seek_max_grabs", 0))),
             frame_stride=int(self.stride_spin.value()),
             min_det_conf=float(self.det_conf_spin.value()),
             face_thresh=float(self.face_thr_spin.value()),
@@ -5032,6 +5101,11 @@ class MainWindow(QtWidgets.QMainWindow):
         return cfg
 
     def _apply_cfg(self, cfg: SessionConfig):
+        self.cfg.seek_fast = bool(getattr(cfg, "seek_fast", True))
+        try:
+            self.cfg.seek_max_grabs = int(getattr(cfg, "seek_max_grabs", 0))
+        except Exception:
+            self.cfg.seek_max_grabs = 0
         self.video_edit.setText(cfg.video)
         paths = [part.strip() for part in (cfg.ref or "").split(';') if part.strip()]
         self._set_ref_paths(paths)
@@ -5480,6 +5554,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_ref_paths(paths)
         self.out_edit.setText(s.value("out_dir", "output"))
         self.ratio_edit.setText(s.value("ratio", "2:3"))
+        self.cfg.seek_fast = s.value("seek_fast", True, type=bool)
+        try:
+            self.cfg.seek_max_grabs = int(s.value("seek_max_grabs", 0))
+        except Exception:
+            self.cfg.seek_max_grabs = 0
         self.stride_spin.setValue(int(s.value("frame_stride", 2)))
         self.det_conf_spin.setValue(float(s.value("min_det_conf", 0.35)))
         self.face_thr_spin.setValue(float(s.value("face_thresh", 0.45)))
