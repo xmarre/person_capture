@@ -12,7 +12,7 @@ Run:
 
 from __future__ import annotations
 
-import os, sys, subprocess, shutil, threading
+import os, sys, subprocess, shutil, threading, struct
 import json, csv, traceback
 import time
 import logging
@@ -468,7 +468,11 @@ class Processor(QtCore.QObject):
             i = 0
             # fast pass
             while i < total_frames:
-                # ---- handle UI commands during pre-scan ----
+                # drain + coalesce controls
+                last_seek: Optional[int] = None
+                step_accum: int = 0
+                pending_speed: Optional[float] = None
+                pending_cfg: dict = {}
                 try:
                     while True:
                         cmd, arg = self._cmd_q.get_nowait()
@@ -477,35 +481,18 @@ class Processor(QtCore.QObject):
                         elif cmd == "play":
                             self._paused = False
                         elif cmd == "seek":
-                            tgt = max(0, min(total_frames - 1, int(arg)))
-                            cap.set(cv2.CAP_PROP_POS_FRAMES, tgt)
-                            # align to stride
-                            i = (tgt // stride) * stride
-                            processed_samples = i // stride
-                            active = False
-                            neg_run = 0
-                            fd9_streak = 0
-                            fd9_skip_samples = 0
-                            fd9_probe_samples = 0
-                            fd9_gate_period = 1
                             try:
-                                self.progress.emit(i)
+                                last_seek = int(arg)
                             except Exception:
                                 pass
                         elif cmd == "step":
-                            stepn = int(arg) if arg is not None else 1
-                            tgt = max(0, min(total_frames - 1, i + stepn))
-                            cap.set(cv2.CAP_PROP_POS_FRAMES, tgt)
-                            i = (tgt // stride) * stride
-                            processed_samples = i // stride
-                            self._paused = True
                             try:
-                                self.progress.emit(i)
+                                step_accum += int(arg) if arg is not None else 1
                             except Exception:
-                                pass
+                                step_accum += 1
                         elif cmd == "speed":
                             try:
-                                self._speed = max(0.1, min(4.0, float(arg)))
+                                pending_speed = float(arg)
                             except Exception:
                                 pass
                         elif cmd == "cfg":
@@ -531,6 +518,26 @@ class Processor(QtCore.QObject):
                                 pass
                 except queue.Empty:
                     pass
+
+                if pending_speed is not None:
+                    self._speed = max(0.1, min(4.0, float(pending_speed)))
+                if last_seek is not None or step_accum:
+                    tgt = int(last_seek) if last_seek is not None else int(i + step_accum)
+                    tgt = max(0, min(total_frames - 1, tgt))
+                    new_pos = self._seek_to(cap, i, tgt)
+                    i = (new_pos // stride) * stride
+                    processed_samples = i // stride
+                    active = False
+                    neg_run = 0
+                    fd9_streak = 0
+                    fd9_skip_samples = 0
+                    fd9_probe_samples = 0
+                    fd9_gate_period = 1
+                    try:
+                        self.progress.emit(i)
+                    except Exception:
+                        pass
+
                 if self._abort:
                     break
                 if self._paused:
@@ -540,12 +547,7 @@ class Processor(QtCore.QObject):
                     next_i = ((i // stride) + 1) * stride
                     if next_i >= total_frames:
                         break
-                    if not cap.set(cv2.CAP_PROP_POS_FRAMES, next_i):
-                        steps = next_i - i
-                        for _ in range(steps):
-                            if not cap.grab():
-                                break
-                    i = next_i
+                    i = self._seek_to(cap, i, next_i)
                     continue
                 if not cap.grab():
                     break
@@ -1016,6 +1018,405 @@ class Processor(QtCore.QObject):
         except Exception:
             pass
 
+    # -------- keyframe utils inside worker (MP4/MOV/MKV native; no externals required) --------
+    def _read_keyframes_worker(self, video_path: str, fps: Optional[float], total: Optional[int]) -> List[int]:
+        if not video_path or not os.path.exists(video_path):
+            return []
+        if not fps or fps <= 0:
+            fps = float(self._fps or 30.0) or 30.0
+        ext = os.path.splitext(video_path)[1].lower()
+        ks: List[int] = []
+        if ext in (".mkv", ".webm"):
+            try:
+                mkv_ks = self._mkv_read_cues(video_path, float(fps), int(total or 0))
+                if mkv_ks:
+                    self.status.emit(f"Keyframes (MKV cues): {len(mkv_ks)}")
+                    ks = mkv_ks
+            except Exception:
+                pass
+        if not ks and ext in (".mp4", ".m4v", ".mov"):
+            try:
+                mp4_ks = self._mp4_read_stss(video_path, int(total or 0))
+                if mp4_ks:
+                    self.status.emit(f"Keyframes (MP4 stss): {len(mp4_ks)}")
+                    ks = mp4_ks
+            except Exception:
+                pass
+        if not ks:
+            f = float(fps or 30.0)
+            tf = int(total or 0)
+            step = max(1, int(round(f)))
+            if tf > 0:
+                ks = list(range(0, tf, step))
+            else:
+                ks = [0]
+            if ks:
+                self.status.emit(f"Keyframes (grid): {len(ks)} at ~1 Hz")
+        ks = sorted(set(ks))
+        if isinstance(total, int) and total > 0:
+            last = total - 1
+            ks = [k for k in ks if 0 <= k <= last]
+        if not ks:
+            self.status.emit(
+                f"KF stats: ext={ext} total={total} fps={float(fps):.3f} ks={len(ks)}"
+            )
+        return ks
+
+    def _mp4_read_stss(self, path: str, total_frames: int) -> List[int]:
+        def _u32(b: bytes) -> int:
+            return struct.unpack(">I", b)[0]
+
+        def _u64(b: bytes) -> int:
+            return struct.unpack(">Q", b)[0]
+
+        def _read_box(f, end_pos: int):
+            pos = f.tell()
+            if pos + 8 > end_pos:
+                return None
+            hdr = f.read(8)
+            if len(hdr) < 8:
+                return None
+            sz = _u32(hdr[:4])
+            typ = hdr[4:8].decode("ascii", "ignore")
+            header = 8
+            if sz == 1:
+                ext = f.read(8)
+                if len(ext) < 8:
+                    return None
+                sz = _u64(ext)
+                header = 16
+            if sz == 0:
+                sz = end_pos - pos
+            return pos, typ, sz, header
+
+        def _find_child(f, parent_start: int, parent_size: int, name: str):
+            end = parent_start + parent_size
+            f.seek(parent_start + 8)
+            while f.tell() + 8 <= end:
+                box = _read_box(f, end)
+                if not box:
+                    break
+                pos, typ, sz, header = box
+                if typ == name:
+                    return (pos, sz)
+                f.seek(pos + sz)
+            return None
+
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            end = size
+            f.seek(0)
+            moov = None
+            while f.tell() + 8 <= end:
+                box = _read_box(f, end)
+                if not box:
+                    break
+                pos, typ, sz, header = box
+                if typ == "moov":
+                    moov = (pos, sz)
+                    break
+                f.seek(pos + sz)
+            if not moov:
+                return []
+
+            moov_pos, moov_sz = moov
+            f.seek(moov_pos + 8)
+            moov_end = moov_pos + moov_sz
+            video_trak = None
+            while f.tell() + 8 <= moov_end:
+                box = _read_box(f, moov_end)
+                if not box:
+                    break
+                pos, typ, sz, header = box
+                if typ == "trak":
+                    mdia = _find_child(f, pos, sz, "mdia")
+                    if mdia:
+                        hdlr = _find_child(f, mdia[0], mdia[1], "hdlr")
+                        if hdlr:
+                            f.seek(hdlr[0] + 16)
+                            handler = f.read(4).decode("ascii", "ignore")
+                            if handler == "vide":
+                                video_trak = (pos, sz)
+                                break
+                f.seek(pos + sz)
+            if not video_trak:
+                return []
+
+            mdia = _find_child(f, video_trak[0], video_trak[1], "mdia")
+            if not mdia:
+                return []
+            minf = _find_child(f, mdia[0], mdia[1], "minf")
+            if not minf:
+                return []
+            stbl = _find_child(f, minf[0], minf[1], "stbl")
+            if not stbl:
+                return []
+            stss = _find_child(f, stbl[0], stbl[1], "stss")
+            if not stss:
+                return []
+
+            f.seek(stss[0] + 8)
+            _ = f.read(4)
+            cnt = f.read(4)
+            if len(cnt) < 4:
+                return []
+            n = _u32(cnt)
+            out: List[int] = []
+            max_sample = 0
+            for _ in range(n):
+                data = f.read(4)
+                if len(data) < 4:
+                    break
+                sample_num = _u32(data)
+                max_sample = max(max_sample, sample_num)
+                out.append(max(sample_num - 1, 0))
+            out.sort()
+            if not out:
+                return []
+            if total_frames and max_sample and max_sample - 1 != total_frames:
+                scale = float(total_frames) / float(max_sample)
+                out = [
+                    max(0, min(total_frames - 1, int(round((s + 1) * scale) - 1)))
+                    for s in out
+                ]
+                out = sorted(set(out))
+            elif total_frames:
+                out = [min(total_frames - 1, s) for s in out]
+            return out
+
+    def _mkv_read_cues(self, path: str, fps: float, total_frames: int) -> List[int]:
+        ID_SEGMENT = 0x18538067
+        ID_INFO = 0x1549A966
+        ID_TIMECODESCALE = 0x2AD7B1
+        ID_TRACKS = 0x1654AE6B
+        ID_TRACKENTRY = 0xAE
+        ID_TRACKNUMBER = 0xD7
+        ID_TRACKTYPE = 0x83
+        ID_CUES = 0x1C53BB6B
+        ID_CUEPOINT = 0xBB
+        ID_CUETIME = 0xB3
+        ID_CUETRACKPOS = 0xB7
+        ID_CUETRACK = 0xF7
+
+        def read_vint(f):
+            first = f.read(1)
+            if not first:
+                return None
+            b0 = first[0]
+            mask = 0x80
+            length = 1
+            while length <= 8 and (b0 & mask) == 0:
+                mask >>= 1
+                length += 1
+            if length > 8:
+                return None
+            value = b0 & (mask - 1)
+            for _ in range(length - 1):
+                nxt = f.read(1)
+                if not nxt:
+                    return None
+                value = (value << 8) | nxt[0]
+            return value, length
+
+        def read_id(f):
+            first = f.read(1)
+            if not first:
+                return None
+            b0 = first[0]
+            mask = 0x80
+            length = 1
+            while length <= 4 and (b0 & mask) == 0:
+                mask >>= 1
+                length += 1
+            if length > 4:
+                return None
+            raw = bytes([b0]) + f.read(length - 1)
+            val = 0
+            for b in raw:
+                val = (val << 8) | b
+            return val, length
+
+        def read_elem_header(f):
+            rid = read_id(f)
+            if not rid:
+                return None
+            size = read_vint(f)
+            if not size:
+                return None
+            eid, _ = rid
+            esz, _ = size
+            return eid, esz
+
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            seg_start = None
+            seg_size = None
+            end = size
+            f.seek(0)
+            while f.tell() < end:
+                header = read_elem_header(f)
+                if not header:
+                    break
+                eid, esz = header
+                body = f.tell()
+                if eid == ID_SEGMENT:
+                    seg_start = body
+                    # esz of all 1 bits means "unknown"; treat as None
+                    max_unknown = (1 << (7 * 4)) - 1
+                    seg_size = esz if esz < max_unknown else None
+                    break
+                f.seek(body + esz)
+            if seg_start is None:
+                return []
+
+            timecode_scale = 1_000_000
+            video_track = None
+            cues_pos = None
+            cues_size = None
+
+            seg_end = end if seg_size is None else seg_start + seg_size
+            f.seek(seg_start)
+            while f.tell() < seg_end:
+                header = read_elem_header(f)
+                if not header:
+                    break
+                eid, esz = header
+                body = f.tell()
+                if eid == ID_INFO:
+                    info_end = body + esz
+                    while f.tell() < info_end:
+                        sub = read_elem_header(f)
+                        if not sub:
+                            break
+                        sid, ssz = sub
+                        sub_body = f.tell()
+                        if sid == ID_TIMECODESCALE:
+                            raw = f.read(ssz)
+                            val = 0
+                            for b in raw:
+                                val = (val << 8) | b
+                            if val > 0:
+                                timecode_scale = int(val)
+                        f.seek(sub_body + ssz)
+                elif eid == ID_TRACKS:
+                    tracks_end = body + esz
+                    while f.tell() < tracks_end:
+                        sub = read_elem_header(f)
+                        if not sub:
+                            break
+                        sid, ssz = sub
+                        sub_body = f.tell()
+                        if sid == ID_TRACKENTRY:
+                            te_end = sub_body + ssz
+                            track_num = None
+                            track_type = None
+                            while f.tell() < te_end:
+                                entry = read_elem_header(f)
+                                if not entry:
+                                    break
+                                eid3, ssz3 = entry
+                                entry_body = f.tell()
+                                if eid3 == ID_TRACKNUMBER:
+                                    raw = f.read(ssz3)
+                                    val = 0
+                                    for b in raw:
+                                        val = (val << 8) | b
+                                    track_num = val
+                                elif eid3 == ID_TRACKTYPE:
+                                    raw = f.read(ssz3)
+                                    val = 0
+                                    for b in raw:
+                                        val = (val << 8) | b
+                                    track_type = val
+                                f.seek(entry_body + ssz3)
+                            if track_type == 1 and track_num is not None and video_track is None:
+                                video_track = track_num
+                        f.seek(sub_body + ssz)
+                elif eid == ID_CUES:
+                    cues_pos = body
+                    cues_size = esz
+                    f.seek(body + esz)
+                    break
+                f.seek(body + esz)
+
+            if cues_pos is None or cues_size is None:
+                return []
+
+            f.seek(cues_pos)
+            cues_end = cues_pos + cues_size
+            keyframes: List[int] = []
+            while f.tell() < cues_end:
+                cp = read_elem_header(f)
+                if not cp:
+                    break
+                eid, esz = cp
+                body = f.tell()
+                if eid != ID_CUEPOINT:
+                    f.seek(body + esz)
+                    continue
+                cue_end = body + esz
+                cue_time = None
+                track_ok = video_track is None
+                while f.tell() < cue_end:
+                    sub = read_elem_header(f)
+                    if not sub:
+                        break
+                    sid, ssz = sub
+                    sub_body = f.tell()
+                    if sid == ID_CUETIME:
+                        raw = f.read(ssz)
+                        val = 0
+                        for b in raw:
+                            val = (val << 8) | b
+                        cue_time = val
+                    elif sid == ID_CUETRACKPOS:
+                        sub_end = sub_body + ssz
+                        while f.tell() < sub_end:
+                            entry = read_elem_header(f)
+                            if not entry:
+                                break
+                            eid3, ssz3 = entry
+                            entry_body = f.tell()
+                            if eid3 == ID_CUETRACK:
+                                raw = f.read(ssz3)
+                                val = 0
+                                for b in raw:
+                                    val = (val << 8) | b
+                                if video_track is None or val == video_track:
+                                    track_ok = True
+                            f.seek(entry_body + ssz3)
+                    f.seek(sub_body + ssz)
+                if cue_time is not None and track_ok:
+                    seconds = cue_time * (timecode_scale / 1_000_000_000.0)
+                    idx = int(round(seconds * float(fps)))
+                    if total_frames:
+                        idx = max(0, min(total_frames - 1, idx))
+                    keyframes.append(idx)
+                f.seek(body + esz)
+
+        keyframes = sorted(set(keyframes))
+        return keyframes
+
+    def _seek_to(self, cap: cv2.VideoCapture, cur_idx: int, tgt_idx: int) -> int:
+        """Keyframe-aware seek: jump to prev keyframe then grab() forward."""
+        if self._total_frames is not None:
+            tgt_idx = max(0, min(self._total_frames - 1, int(tgt_idx)))
+        base = tgt_idx
+        ks = self._keyframes
+        if ks:
+            i = bisect.bisect_right(ks, tgt_idx) - 1
+            if i >= 0:
+                base = int(ks[i])
+        if base != cur_idx:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, base)
+        idx = base
+        limit = max(0, tgt_idx - base)
+        for _ in range(limit):
+            if not cap.grab():
+                break
+            idx += 1
+        return idx
+
     def __init__(self, cfg: SessionConfig, parent=None):
         super().__init__(parent)
         self.cfg = cfg
@@ -1027,6 +1428,7 @@ class Processor(QtCore.QObject):
         self._speed = 1.0
         self._fps: Optional[float] = None
         self._total_frames: Optional[int] = None
+        self._keyframes: List[int] = []   # worker-side keyframe index
         self._seek_cooldown_frames: int = 0  # disable lock/IoU for a few frames after seek
         self._runtime_last_bank_add_idx: int = -10**9  # cooldown anchor for runtime bank adds
         # Target lock state for faceless fallback
@@ -1747,13 +2149,24 @@ class Processor(QtCore.QObject):
                 cap = cv2.VideoCapture(cfg.video)
             if not cap.isOpened():
                 raise RuntimeError(f"Cannot open video: {cfg.video}")
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            self._fps = float(fps)
-            self._total_frames = int(total_frames)
+            self._fps = fps
+            self._total_frames = total_frames
             keep_spans = []
             span_i = 0
-            self.setup.emit(total_frames, float(fps))
+            self.setup.emit(total_frames, fps)
+            # Build keyframe index in worker to enable fast seeking
+            try:
+                self._keyframes = self._read_keyframes_worker(cfg.video, fps, total_frames)
+            except Exception:
+                self._keyframes = []
+            try:
+                self.status.emit(
+                    f"KFs={len(self._keyframes)} fps={float(fps):.3f} total={total_frames}"
+                )
+            except Exception:
+                pass
             try:
                 self.progress.emit(0)
             except Exception:
@@ -1765,8 +2178,7 @@ class Processor(QtCore.QObject):
                 )
                 if keep_spans:
                     s0 = keep_spans[0][0]
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, s0)
-                    frame_idx = s0
+                    frame_idx = self._seek_to(cap, 0, s0)
                     self._status(f"Pre-scan segments: {len(keep_spans)}", key="prescan", interval=30.0)
                 else:
                     self._status("Pre-scan found no matches; full scan", key="prescan", interval=30.0)
@@ -1894,163 +2306,154 @@ class Processor(QtCore.QObject):
                     self._status("Aborting...", key="phase")
                     break
                 force_process = False
+                # --------- drain and coalesce controls ---------
+                last_seek: Optional[int] = None
+                step_accum: int = 0
+                pending_speed: Optional[float] = None
+                pending_cfg: dict = {}
                 try:
                     while True:
                         cmd, arg = self._cmd_q.get_nowait()
                         if cmd == "seek":
-                            tgt = int(arg)
-                            if self._total_frames is not None:
-                                tgt = max(0, min(self._total_frames - 1, tgt))
-                            cap.set(cv2.CAP_PROP_POS_FRAMES, tgt)
-                            frame_idx = tgt
-                            self.progress.emit(frame_idx)
-                            # Fast preroll: decode a few frames to flush decoder, no inference
-                            preroll = min(12, int((self._fps or 30) // 3))
-                            for _ in range(preroll):
-                                if not cap.grab():
-                                    break
-                                if self._total_frames is not None and frame_idx >= self._total_frames - 1:
-                                    break
-                                frame_idx += 1
-                            force_process = True
-                            # --- reset temporal gating so scrolling back works ---
-                            lock_hits = 0
-                            locked_face = None
-                            locked_reid = None
-                            prev_box = None
-                            self._clear_lock()
-                            self._prev_gray = None
-                            # allow immediate capture after seek by backdating last_hit
-                            now_t = _frame_time(frame_idx)
-                            self._last_hit_t = now_t - float(self.cfg.min_gap_sec)
-                            self._seek_cooldown_frames = _cooldown_frames()
-                            self._status(
-                                f"Seek reset at f={frame_idx} cooldown={self._seek_cooldown_frames}",
-                                key="seek_reset",
-                                interval=0.5,
-                            )
-                            if keep_spans:
-                                span_i = self._span_index_for(frame_idx, keep_spans)
+                            try:
+                                last_seek = int(arg)
+                            except Exception:
+                                pass
+                        elif cmd == "step":
+                            try:
+                                step_accum += int(arg) if arg is not None else 1
+                            except Exception:
+                                step_accum += 1
                         elif cmd == "pause":
                             self._paused = True
                         elif cmd == "play":
                             self._paused = False
-                        elif cmd == "step":
-                            stepn = int(arg) if arg is not None else 1
-                            tgt = frame_idx + stepn
-                            if self._total_frames is not None:
-                                tgt = max(0, min(self._total_frames - 1, tgt))
-                            cap.set(cv2.CAP_PROP_POS_FRAMES, tgt)
-                            frame_idx = tgt
-                            self.progress.emit(frame_idx)
-                            self._paused = True
-                            force_process = True
-                            # If this was a scrub (|step| >= stride threshold), treat like a mini-seek
-                            scrub_threshold = max(2, _frame_stride())
-                            if abs(stepn) >= scrub_threshold:
-                                lock_hits = 0
-                                locked_face = None
-                                locked_reid = None
-                                prev_box = None
-                                self._clear_lock()
-                                self._prev_gray = None
-                                now_t = _frame_time(frame_idx)
-                                self._last_hit_t = now_t - float(self.cfg.min_gap_sec)
-                                self._seek_cooldown_frames = _cooldown_frames()
-                                self._status(
-                                    f"Step reset at f={frame_idx} cooldown={self._seek_cooldown_frames}",
-                                    key="seek_reset",
-                                    interval=0.5,
-                                )
-                            if keep_spans:
-                                span_i = self._span_index_for(frame_idx, keep_spans)
                         elif cmd == "speed":
                             try:
-                                self._speed = max(0.1, min(4.0, float(arg)))
+                                pending_speed = float(arg)
                             except Exception:
                                 pass
                         elif cmd == "cfg":
-                            LIVE = {
-                                "frame_stride",
-                                "min_det_conf",
-                                "face_thresh",
-                                "reid_thresh",
-                                "combine",
-                                "match_mode",
-                                "only_best",
-                                "min_sharpness",
-                                "min_gap_sec",
-                                "min_box_pixels",
-                                "auto_crop_borders",
-                                "border_threshold",
-                                "score_margin",
-                                "iou_gate",
-                                "preview_every",
-                                # keep score_margin; do not use face_margin_min here
-                                "require_face_if_visible",
-                                "prefer_face_when_available",
-                                "suppress_negatives",
-                                "neg_tolerance",
-                                "max_negatives",
-                                "log_interval_sec",
-                                "lock_after_hits",
-                                "lock_face_thresh",
-                                "lock_reid_thresh",
-                                "lock_momentum",
-                                "allow_faceless_when_locked",
-                                "learn_bank_runtime",
-                                "drop_reid_if_any_face_match",
-                                "faceless_reid_thresh",
-                                "faceless_iou_min",
-                                "faceless_persist_frames",
-                                "faceless_min_area_frac",
-                                "faceless_max_area_frac",
-                                "faceless_center_max_frac",
-                                "faceless_min_motion_frac",
-                                "crop_face_side_margin_frac",
-                                "crop_top_headroom_max_frac",
-                                "crop_bottom_min_face_heights",
-                                "crop_penalty_weight",
-                                "face_anchor_down_frac",
-                                "face_max_frac_in_crop",
-                                "face_min_frac_in_crop",
-                                "crop_min_height_frac",
-                                "face_visible_uses_quality",
-                                "face_quality_min",
-                                "face_det_conf",
-                                "face_det_pad",
-                                "face_fullframe_imgsz",
-                                "rot_adaptive",
-                                "rot_every_n",
-                                "rot_after_hit_frames",
-                                "fast_no_face_imgsz",
-                            }
-                            rot_keys = {
-                                "rot_adaptive",
-                                "rot_every_n",
-                                "rot_after_hit_frames",
-                                "fast_no_face_imgsz",
-                            }
-                            rot_changed = False
-                            for k, v in (arg or {}).items():
-                                if k in LIVE and hasattr(self.cfg, k):
-                                    setattr(self.cfg, k, v)
-                                    if k in rot_keys:
-                                        rot_changed = True
-                            if rot_changed:
-                                try:
-                                    face.configure_rotation_strategy(
-                                        adaptive=getattr(self.cfg, "rot_adaptive", True),
-                                        every_n=getattr(self.cfg, "rot_every_n", 12),
-                                        after_hit_frames=getattr(self.cfg, "rot_after_hit_frames", 8),
-                                        fast_no_face_imgsz=getattr(self.cfg, "fast_no_face_imgsz", 512),
-                                    )
-                                except Exception:
-                                    pass
-                            continue
+                            try:
+                                pending_cfg.update(dict(arg or {}))
+                            except Exception:
+                                pass
+                        else:
+                            # ignore unknowns
+                            pass
                 except queue.Empty:
                     pass
 
+                # apply speed/cfg first
+                if pending_speed is not None:
+                    self._speed = max(0.1, min(4.0, float(pending_speed)))
+                if pending_cfg:
+                    LIVE = {
+                        "frame_stride",
+                        "min_det_conf",
+                        "face_thresh",
+                        "reid_thresh",
+                        "combine",
+                        "match_mode",
+                        "only_best",
+                        "min_sharpness",
+                        "min_gap_sec",
+                        "min_box_pixels",
+                        "auto_crop_borders",
+                        "border_threshold",
+                        "score_margin",
+                        "iou_gate",
+                        "preview_every",
+                        "require_face_if_visible",
+                        "prefer_face_when_available",
+                        "suppress_negatives",
+                        "neg_tolerance",
+                        "max_negatives",
+                        "log_interval_sec",
+                        "lock_after_hits",
+                        "lock_face_thresh",
+                        "lock_reid_thresh",
+                        "lock_momentum",
+                        "allow_faceless_when_locked",
+                        "learn_bank_runtime",
+                        "drop_reid_if_any_face_match",
+                        "faceless_reid_thresh",
+                        "faceless_iou_min",
+                        "faceless_persist_frames",
+                        "faceless_min_area_frac",
+                        "faceless_max_area_frac",
+                        "faceless_center_max_frac",
+                        "faceless_min_motion_frac",
+                        "crop_face_side_margin_frac",
+                        "crop_top_headroom_max_frac",
+                        "crop_bottom_min_face_heights",
+                        "crop_penalty_weight",
+                        "face_anchor_down_frac",
+                        "face_max_frac_in_crop",
+                        "face_min_frac_in_crop",
+                        "crop_min_height_frac",
+                        "face_visible_uses_quality",
+                        "face_quality_min",
+                        "face_det_conf",
+                        "face_det_pad",
+                        "face_fullframe_imgsz",
+                        "rot_adaptive",
+                        "rot_every_n",
+                        "rot_after_hit_frames",
+                        "fast_no_face_imgsz",
+                    }
+                    rot_keys = {
+                        "rot_adaptive",
+                        "rot_every_n",
+                        "rot_after_hit_frames",
+                        "fast_no_face_imgsz",
+                    }
+                    rot_changed = False
+                    for k, v in pending_cfg.items():
+                        if k in LIVE and hasattr(self.cfg, k):
+                            setattr(self.cfg, k, v)
+                            if k in rot_keys:
+                                rot_changed = True
+                    if rot_changed:
+                        try:
+                            face.configure_rotation_strategy(
+                                adaptive=getattr(self.cfg, "rot_adaptive", True),
+                                every_n=getattr(self.cfg, "rot_every_n", 12),
+                                after_hit_frames=getattr(self.cfg, "rot_after_hit_frames", 8),
+                                fast_no_face_imgsz=getattr(self.cfg, "fast_no_face_imgsz", 512),
+                            )
+                        except Exception:
+                            pass
+
+                # apply coalesced seek/step
+                if last_seek is not None or step_accum:
+                    if last_seek is not None:
+                        tgt = int(last_seek)
+                    else:
+                        tgt = frame_idx + int(step_accum)
+                    if self._total_frames is not None:
+                        tgt = max(0, min(self._total_frames - 1, tgt))
+                    frame_idx = self._seek_to(cap, frame_idx, tgt)
+                    self.progress.emit(frame_idx)
+                    # reset temporal gates so back/forward scrubs work
+                    lock_hits = 0
+                    locked_face = None
+                    locked_reid = None
+                    prev_box = None
+                    self._clear_lock()
+                    self._prev_gray = None
+                    # allow immediate capture after seek by backdating last_hit
+                    now_t = _frame_time(frame_idx)
+                    self._last_hit_t = now_t - float(self.cfg.min_gap_sec)
+                    self._seek_cooldown_frames = _cooldown_frames()
+                    self._status(
+                        f"Seek@{frame_idx} cooldown={self._seek_cooldown_frames}",
+                        key="seek_reset",
+                        interval=0.5,
+                    )
+                    if keep_spans:
+                        span_i = self._span_index_for(frame_idx, keep_spans)
+                    force_process = True
                 if hit_q is not None:
                     try:
                         while True:
@@ -2066,8 +2469,7 @@ class Processor(QtCore.QObject):
                         break
                     s, e = keep_spans[span_i]
                     if frame_idx < s:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, s)
-                        frame_idx = s
+                        frame_idx = self._seek_to(cap, frame_idx, s)
                         self._seek_cooldown_frames = int(max(2, (self._fps or 30) * 0.25))
                         continue
                     if frame_idx > e:
@@ -2075,8 +2477,7 @@ class Processor(QtCore.QObject):
                         if span_i >= len(keep_spans):
                             break
                         s2, _ = keep_spans[span_i]
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, s2)
-                        frame_idx = s2
+                        frame_idx = self._seek_to(cap, frame_idx, s2)
                         self._seek_cooldown_frames = int(max(2, (self._fps or 30) * 0.25))
                         continue
 
