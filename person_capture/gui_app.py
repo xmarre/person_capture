@@ -1788,7 +1788,43 @@ class Processor(QtCore.QObject):
             sync_wrote = 0
 
             # Async saver
-            jpg_q = int(getattr(cfg, "jpg_quality", 0))
+            save_q: Optional[queue.Queue] = None
+            hit_q: Optional[queue.Queue] = None
+            jpg_q = int(getattr(cfg, "jpg_quality", 85))
+
+            def _atomic_jpeg_write(img: np.ndarray, out_path: str, q: int) -> tuple[bool, str]:
+                try:
+                    tmp = out_path + ".tmp"
+                    params: list[int] = []
+                    try:
+                        qi = int(q)
+                        if qi > 0:
+                            params = [int(cv2.IMWRITE_JPEG_QUALITY), qi]
+                    except Exception:
+                        params = []
+                    ok, buf = cv2.imencode(".jpg", img, params)
+                    if not ok or buf is None:
+                        return False, "imencode_failed"
+                    with open(tmp, "wb") as fh:
+                        fh.write(buf.tobytes())
+                        fh.flush()
+                        try:
+                            os.fsync(fh.fileno())
+                        except Exception:
+                            pass
+                    os.replace(tmp, out_path)
+                    if not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
+                        return False, "file_too_small"
+                    return True, ""
+                except Exception as e:
+                    try:
+                        tmp_path = out_path + ".tmp"
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                    except Exception:
+                        pass
+                    return False, f"{type(e).__name__}: {e}"
+
             if bool(getattr(cfg, "async_save", True)):
                 try:
                     header_only_csv_handle.close()
@@ -1809,34 +1845,9 @@ class Processor(QtCore.QObject):
                             break
 
                         img_path, img, row = item
-                        tmp_path = img_path + ".tmp"
+                        ok, why = _atomic_jpeg_write(img, img_path, jpg_q)
 
-                        if jpg_q > 0:
-                            ok = cv2.imwrite(
-                                tmp_path, img, [int(cv2.IMWRITE_JPEG_QUALITY), jpg_q]
-                            )
-                        else:
-                            ok = cv2.imwrite(tmp_path, img)
-
-                        saved = False
                         if ok:
-                            try:
-                                os.replace(tmp_path, img_path)
-                                saved = True
-                            except Exception:
-                                logger.exception("Failed to replace crop %s", img_path)
-                                try:
-                                    os.remove(tmp_path)
-                                except Exception:
-                                    pass
-                        else:
-                            logger.error("Failed to save crop %s", img_path)
-                            try:
-                                os.remove(tmp_path)
-                            except Exception:
-                                pass
-
-                        if saved:
                             # hand off to worker thread for emitting
                             try:
                                 hit_q.put_nowait(img_path)
@@ -1850,6 +1861,14 @@ class Processor(QtCore.QObject):
                                     f.flush()
                             except Exception:
                                 logger.exception("CSV write failed for %s", img_path)
+
+                        else:
+                            logger.error("Failed to save crop %s (%s)", img_path, why)
+                            self._status(
+                                f"Save failed ({why}): {img_path}",
+                                key="save_err_async",
+                                interval=0.5,
+                            )
 
                         save_q.task_done()
 
@@ -2603,29 +2622,8 @@ class Processor(QtCore.QObject):
                         except queue.Full:
                             pass  # drop if saver is behind
                     else:
-                        tmp_path = crop_img_path + ".tmp"
-                        if jpg_q > 0:
-                            ok = cv2.imwrite(tmp_path, crop_img2, [int(cv2.IMWRITE_JPEG_QUALITY), jpg_q])
-                        else:
-                            ok = cv2.imwrite(tmp_path, crop_img2)
-                        saved = False
+                        ok, why = _atomic_jpeg_write(crop_img2, crop_img_path, jpg_q)
                         if ok:
-                            try:
-                                os.replace(tmp_path, crop_img_path)
-                                saved = True
-                            except Exception:
-                                logger.exception("Failed to replace crop %s", crop_img_path)
-                                try:
-                                    os.remove(tmp_path)
-                                except Exception:
-                                    pass
-                        else:
-                            logger.error("Failed to save crop %s", crop_img_path)
-                            try:
-                                os.remove(tmp_path)
-                            except Exception:
-                                pass
-                        if saved:
                             # emit on worker thread directly
                             self.hit.emit(crop_img_path)
                             # CSV best-effort
@@ -2636,6 +2634,14 @@ class Processor(QtCore.QObject):
                                     csv_f.flush()
                             except Exception:
                                 logger.exception("CSV write failed for %s", crop_img_path)
+                        else:
+                            self._status(
+                                f"Save failed ({why}): {crop_img_path}",
+                                key="save_err",
+                                interval=0.5,
+                            )
+                            # skip this hit, keep processing
+                            pass
                     reasons_list = c.get("reasons") or []
                     reasons = "|".join(reasons_list)
                     area = (cx2 - cx1) * (cy2 - cy1)
@@ -3042,8 +3048,29 @@ class Processor(QtCore.QObject):
                                 1,
                                 cv2.LINE_AA,
                             )
+                    if ann_dir and cfg.save_annot:
+                        ann_path = os.path.join(ann_dir, f"f{current_idx:08d}.jpg")
+                        ok, why = _atomic_jpeg_write(show, ann_path, jpg_q)
+                        if not ok:
+                            self._status(
+                                f"Annot save failed ({why}): {ann_path}",
+                                key="save_err_ann",
+                                interval=1.0,
+                            )
                     qimg = self._cv_bgr_to_qimage(show)
                     self.preview.emit(qimg)
+
+                # drain any pending hit notifications (async saver)
+                if hit_q is not None:
+                    try:
+                        while True:
+                            _p = hit_q.get_nowait()
+                            try:
+                                self.hit.emit(_p)
+                            finally:
+                                hit_q.task_done()
+                    except Exception:
+                        pass
                 # Always-on preview cadence
                 if preview_due:
                     base = frame.copy()
@@ -4785,9 +4812,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.preview_label.setPixmap(pix.scaled(self.preview_label.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation))
 
     def _on_hit(self, crop_path: str):
+        def _set(img: QtGui.QImage) -> bool:
+            if img.isNull():
+                return False
+            self.hit_label.setPixmap(
+                QtGui.QPixmap.fromImage(img).scaled(
+                    self.hit_label.size(),
+                    QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                    QtCore.Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+            return True
+
         img = QtGui.QImage(crop_path)
-        if not img.isNull():
-            self.hit_label.setPixmap(QtGui.QPixmap.fromImage(img).scaled(self.hit_label.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation))
+        if _set(img):
+            return
+        try:
+            reader = QtGui.QImageReader(crop_path)
+            reader.setAutoTransform(True)
+            try:
+                reader.setDecideFormatFromContent(True)
+            except Exception:
+                pass
+            img2 = reader.read()
+            if _set(img2):
+                return
+        except Exception:
+            pass
+        self._log(f"Preview load failed: {crop_path}")
 
     def _on_finished(self, ok: bool, msg: str):
         self._log(msg)
