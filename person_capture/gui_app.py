@@ -2197,11 +2197,11 @@ class Processor(QtCore.QObject):
                             and len(gbest.get("bbox")) == 4
                         ):
                             gbbox = gbest.get("bbox")
-                            fx1, fy1, fx2, fy2 = [int(round(v)) for v in gbbox]
-                            fx1 = max(0, min(W2 - 1, fx1))
-                            fy1 = max(0, min(H2 - 1, fy1))
-                            fx2 = max(fx1 + 1, min(W2, int(round(fx2))))
-                            fy2 = max(fy1 + 1, min(H2, int(round(fy2))))
+                            fx1, fy1, fx2, fy2 = gbbox
+                            fx1 = max(0.0, min(float(W2), fx1))
+                            fy1 = max(0.0, min(float(H2), fy1))
+                            fx2 = max(fx1 + 1.0, min(float(W2), fx2))
+                            fy2 = max(fy1 + 1.0, min(float(H2), fy2))
                             face_box_abs = (fx1, fy1, fx2, fy2)
                             acx = (fx1 + fx2) / 2.0
                             acy = (fy1 + fy2) / 2.0
@@ -2227,10 +2227,10 @@ class Processor(QtCore.QObject):
                                     crop_img = frame[oy1:oy2, ox1:ox2]
                                     sharp = self._calc_sharpness(crop_img)
                                     face_box_global = (
-                                        max(0, min(W - 1, fx1 + off_x)),
-                                        max(0, min(H - 1, fy1 + off_y)),
-                                        max(0, min(W - 1, fx2 + off_x)),
-                                        max(0, min(H - 1, fy2 + off_y)),
+                                        max(0, min(W, fx1 + off_x)),
+                                        max(0, min(H, fy1 + off_y)),
+                                        max(0, min(W, fx2 + off_x)),
+                                        max(0, min(H, fy2 + off_y)),
                                     )
                                     short_circuit_candidate = dict(
                                         score=fd_val,
@@ -2240,10 +2240,10 @@ class Processor(QtCore.QObject):
                                         box=(ox1, oy1, ox2, oy2),
                                         area=(ox2 - ox1) * (oy2 - oy1),
                                         show_box=(
-                                            max(0, min(W - 1, fx1 + off_x)),
-                                            max(0, min(H - 1, fy1 + off_y)),
-                                            max(0, min(W - 1, fx2 + off_x)),
-                                            max(0, min(H - 1, fy2 + off_y)),
+                                            max(0, min(W, fx1 + off_x)),
+                                            max(0, min(H, fy1 + off_y)),
+                                            max(0, min(W, fx2 + off_x)),
+                                            max(0, min(H, fy2 + off_y)),
                                         ),
                                         face_box=face_box_global,
                                         face_feat=gbest["feat"],
@@ -2497,10 +2497,15 @@ class Processor(QtCore.QObject):
                         acx = x1 + (fb[0]+fb[2])/2.0
                         acy = y1 + (fb[1]+fb[3])/2.0
                         anchor = (acx, acy)
-                        face_box_abs = tuple(
-                            int(round(v))
-                            for v in (x1 + fb[0], y1 + fb[1], x1 + fb[2], y1 + fb[3])
-                        )
+                        fx1 = x1 + fb[0]
+                        fy1 = y1 + fb[1]
+                        fx2 = x1 + fb[2]
+                        fy2 = y1 + fb[3]
+                        fx1 = max(0.0, min(float(W2), fx1))
+                        fy1 = max(0.0, min(float(H2), fy1))
+                        fx2 = max(fx1 + 1.0, min(float(W2), fx2))
+                        fy2 = max(fy1 + 1.0, min(float(H2), fy2))
+                        face_box_abs = (fx1, fy1, fx2, fy2)
 
                     # expand to ratio within the DET frame using placement heuristics
                     (ex1,ey1,ex2,ey2), chosen_ratio = self._choose_best_ratio(
@@ -2528,10 +2533,10 @@ class Processor(QtCore.QObject):
                     if face_box_abs is not None:
                         fx1, fy1, fx2, fy2 = face_box_abs
                         face_box_global = (
-                            max(0, min(W - 1, fx1 + off_x)),
-                            max(0, min(H - 1, fy1 + off_y)),
-                            max(0, min(W - 1, fx2 + off_x)),
-                            max(0, min(H - 1, fy2 + off_y)),
+                            max(0, min(W, fx1 + off_x)),
+                            max(0, min(H, fy1 + off_y)),
+                            max(0, min(W, fx2 + off_x)),
+                            max(0, min(H, fy2 + off_y)),
                         )
                     candidates.append(
                         dict(
@@ -2556,47 +2561,96 @@ class Processor(QtCore.QObject):
                 def save_hit(c, idx):
                     nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box, ref_face_feat, ref_bank_list
                     crop_img_path = os.path.join(crops_dir, f"f{idx:08d}.jpg")
-                    cx1, cy1, cx2, cy2 = c["box"]
-                    # final ratio enforcement / smart crop
-                    ratio_str = c.get("ratio") or (ratios[0] if 'ratios' in locals() and ratios else (self.cfg.ratio.split(',')[0] if self.cfg.ratio else '2:3'))
-                    if bool(getattr(cfg, "smart_crop_enable", True)):
-                        cx1, cy1, cx2, cy2 = self._smart_crop_box(
-                            frame,
-                            (cx1, cy1, cx2, cy2),
-                            c.get("face_box"),
-                            ratio_str,
-                            cfg,
-                        )
-                        # Re-enforce global bounds after smart crop
-                        H_, W_ = frame.shape[:2]
-                        cx1, cy1, cx2, cy2 = self._enforce_scale_and_margins(
-                            (cx1, cy1, cx2, cy2),
-                            ratio_str,
-                            W_,
-                            H_,
-                            face_box=c.get("face_box"),
-                            anchor=None,
-                        )
+                    # Start from candidate box in GLOBAL coords
+                    gx1, gy1, gx2, gy2 = c["box"]
+                    ratio_str = c.get("ratio") or (
+                        ratios[0]
+                        if 'ratios' in locals() and ratios
+                        else (self.cfg.ratio.split(',')[0] if self.cfg.ratio else '2:3')
+                    )
+
+                    # If auto-crop borders were applied for detection, run smart-crop inside the ROI
+                    use_roi = bool(getattr(cfg, "auto_crop_borders", False)) and (
+                        (W2 != W) or (H2 != H) or (off_x != 0) or (off_y != 0)
+                    )
+                    if use_roi:
+                        rx1 = max(0.0, min(float(W2), gx1 - off_x))
+                        ry1 = max(0.0, min(float(H2), gy1 - off_y))
+                        rx2 = min(float(W2), max(rx1 + 1.0, gx2 - off_x))
+                        ry2 = min(float(H2), max(ry1 + 1.0, gy2 - off_y))
+                        face_box_roi = None
+                        if c.get("face_box") is not None:
+                            fx1, fy1, fx2, fy2 = c["face_box"]
+                            face_box_roi = (
+                                max(0.0, min(float(W2), fx1 - off_x)),
+                                max(0.0, min(float(H2), fy1 - off_y)),
+                                max(0.0, min(float(W2), fx2 - off_x)),
+                                max(0.0, min(float(H2), fy2 - off_y)),
+                            )
+                        if bool(getattr(cfg, "smart_crop_enable", True)):
+                            rx1, ry1, rx2, ry2 = self._smart_crop_box(
+                                frame_for_det, (rx1, ry1, rx2, ry2), face_box_roi, ratio_str, cfg
+                            )
+                            rx1, ry1, rx2, ry2 = self._enforce_scale_and_margins(
+                                (rx1, ry1, rx2, ry2), ratio_str, W2, H2, face_box=face_box_roi, anchor=None
+                            )
+                        else:
+                            try:
+                                tw, th = parse_ratio(ratio_str)
+                            except Exception:
+                                tw, th = 2.0, 3.0
+                            w = rx2 - rx1
+                            h = ry2 - ry1
+                            target = float(tw) / float(th)
+                            cur = w / float(h) if h > 0 else target
+                            if abs(cur - target) > 1e-3 and w > 2 and h > 2:
+                                if cur < target:
+                                    new_h = int(round(w / target))
+                                    dy = (h - new_h) // 2
+                                    ry1 = max(0, min(H2 - new_h, ry1 + dy))
+                                    ry2 = ry1 + new_h
+                                else:
+                                    new_w = int(round(h * target))
+                                    dx = (w - new_w) // 2
+                                    rx1 = max(0, min(W2 - new_w, rx1 + dx))
+                                    rx2 = rx1 + new_w
+                        cx1, cy1, cx2, cy2 = rx1 + off_x, ry1 + off_y, rx2 + off_x, ry2 + off_y
                     else:
-                        try:
-                            tw, th = parse_ratio(ratio_str)
-                        except Exception:
-                            tw, th = 2.0, 3.0
-                        w = cx2 - cx1
-                        h = cy2 - cy1
-                        target = float(tw) / float(th)
-                        cur = w / float(h) if h > 0 else target
-                        if abs(cur - target) > 1e-3 and w > 2 and h > 2:
-                            if cur < target:
-                                new_h = int(round(w / target))
-                                dy = (h - new_h) // 2
-                                cy1 += dy
-                                cy2 = cy1 + new_h
-                            else:
-                                new_w = int(round(h * target))
-                                dx = (w - new_w) // 2
-                                cx1 += dx
-                                cx2 = cx1 + new_w
+                        cx1, cy1, cx2, cy2 = gx1, gy1, gx2, gy2
+                        if bool(getattr(cfg, "smart_crop_enable", True)):
+                            cx1, cy1, cx2, cy2 = self._smart_crop_box(
+                                frame, (cx1, cy1, cx2, cy2), c.get("face_box"), ratio_str, cfg
+                            )
+                            H_, W_ = frame.shape[:2]
+                            cx1, cy1, cx2, cy2 = self._enforce_scale_and_margins(
+                                (cx1, cy1, cx2, cy2), ratio_str, W_, H_, face_box=c.get("face_box"), anchor=None
+                            )
+                        else:
+                            try:
+                                tw, th = parse_ratio(ratio_str)
+                            except Exception:
+                                tw, th = 2.0, 3.0
+                            w = cx2 - cx1
+                            h = cy2 - cy1
+                            target = float(tw) / float(th)
+                            cur = w / float(h) if h > 0 else target
+                            if abs(cur - target) > 1e-3 and w > 2 and h > 2:
+                                if cur < target:
+                                    new_h = int(round(w / target))
+                                    dy = (h - new_h) // 2
+                                    cy1 += dy
+                                    cy2 = cy1 + new_h
+                                else:
+                                    new_w = int(round(h * target))
+                                    dx = (w - new_w) // 2
+                                    cx1 += dx
+                                    cx2 = cx1 + new_w
+
+                    cx1 = max(0, min(W - 1, int(round(cx1))))
+                    cy1 = max(0, min(H - 1, int(round(cy1))))
+                    cx2 = max(cx1 + 1, min(W, int(round(cx2))))
+                    cy2 = max(cy1 + 1, min(H, int(round(cy2))))
+
                     crop_img2 = frame[cy1:cy2, cx1:cx2]
                     row = [
                         idx,
@@ -2740,7 +2794,11 @@ class Processor(QtCore.QObject):
                         if gbest is not None and gbest.get("feat") is not None:
                             gfd = self._fd_min(gbest["feat"], ref_face_feat)
                             if gfd <= float(cfg.face_thresh):
-                                fx1, fy1, fx2, fy2 = [int(v) for v in gbest["bbox"]]
+                                fx1, fy1, fx2, fy2 = gbest["bbox"]
+                                fx1 = max(0.0, min(float(W2), fx1))
+                                fy1 = max(0.0, min(float(H2), fy1))
+                                fx2 = max(fx1 + 1.0, min(float(W2), fx2))
+                                fy2 = max(fy1 + 1.0, min(float(H2), fy2))
                                 acx = (fx1 + fx2) / 2.0
                                 acy = (fy1 + fy2) / 2.0
                                 face_box_abs = (fx1, fy1, fx2, fy2)
