@@ -965,6 +965,7 @@ class Processor(QtCore.QObject):
     preview = QtCore.Signal(QtGui.QImage)            # annotated frame
     hit = QtCore.Signal(str)                         # crop path
     finished = QtCore.Signal(bool, str)              # success, message
+    keyframes = QtCore.Signal(object)                # list[int]
 
     # --- Player control slots (queued, thread-safe) ---
     @QtCore.Slot(dict)
@@ -2155,12 +2156,17 @@ class Processor(QtCore.QObject):
             self._total_frames = total_frames
             keep_spans = []
             span_i = 0
-            self.setup.emit(total_frames, fps)
             # Build keyframe index in worker to enable fast seeking
             try:
                 self._keyframes = self._read_keyframes_worker(cfg.video, fps, total_frames)
             except Exception:
                 self._keyframes = []
+            try:
+                # publish to UI before setup so UI doesn't fall back
+                self.keyframes.emit(list(self._keyframes))
+            except Exception:
+                pass
+            self.setup.emit(total_frames, fps)
             try:
                 self.status.emit(
                     f"KFs={len(self._keyframes)} fps={float(fps):.3f} total={total_frames}"
@@ -5205,6 +5211,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker.preview.connect(self._on_preview)
         self._worker.hit.connect(self._on_hit)
         self._worker.finished.connect(self._on_finished)
+        self._worker.keyframes.connect(self._on_keyframes)
 
         self._on_speed_combo_changed(self.speed_combo.currentText())
         self._thread.start()
@@ -5232,17 +5239,18 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(self, "time_lbl"):
                 self.time_lbl.setText(f"{self._fmt_time(0)} / {self._fmt_time(total_frames)}")
         self._update_play_toggle_ui(paused=False)
-        # Load existing keyframes (I-frames) from the video file
+        # No ffprobe fallback here; worker will always emit a keyframe grid at minimum.
+        # _on_keyframes will populate self._keyframes.
+
+    def _on_keyframes(self, ks):
         try:
-            vf = self.video_edit.text().strip() if hasattr(self, "video_edit") else ""
-            self._keyframes = self._read_keyframes(vf, self._fps, self._total_frames)
+            self._keyframes = [int(x) for x in ks or []]
             if self._keyframes:
-                self._log(f"Keyframes: {len(self._keyframes)} loaded from file")
+                self._log(f"Keyframes: {len(self._keyframes)} from worker")
             else:
-                self._log("No keyframes found or ffprobe unavailable; arrows will step ±1")
-        except Exception as ex:
-            self._keyframes = []
-            self._log(f"Keyframe load error: {ex}")
+                self._log("No keyframes available; arrows step ±1")
+        except Exception:
+            pass
 
     def _on_progress(self, idx: int):
         self._current_idx = int(idx)
