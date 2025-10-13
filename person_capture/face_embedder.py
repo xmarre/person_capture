@@ -1518,6 +1518,9 @@ class FaceEmbedder:
                 kp = None if (kpss is None or i >= len(kpss)) else kpss[i]
                 _accumulate(bb, kp, 0)
 
+        # defaults so logging below never references undefined locals
+        tta_scales = ()
+        pad = 0
         # if still empty at 0°, try SCRFD multi-scale and edge-pad probes
         if not dets and (not self._fast_prescan):
             # scales <1 help very large/partial faces; >1 helps tiny faces
@@ -1526,7 +1529,6 @@ class FaceEmbedder:
             )
             base_conf = float(getattr(self, "conf", 0.5))
             probe_conf = min(base_conf, float(self.scrfd_probe_conf_cap))
-            pad = 0
             if tta_scales:
                 for s in tta_scales:
                     if s == 1.0:
