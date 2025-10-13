@@ -1556,11 +1556,7 @@ class Processor(QtCore.QObject):
 
     @QtCore.Slot()
     def run(self):
-        cap = None
-        save_q = None
-        saver_thread = None
-        csv_f = None
-        dbg_f = None
+        cap = save_q = saver_thread = csv_f = dbg_f = None
         try:
             self._paused = False
             self._init_status()
@@ -1788,6 +1784,8 @@ class Processor(QtCore.QObject):
             writer.writerow(["frame","time_secs","score","face_dist","reid_dist","x1","y1","x2","y2","crop_path","sharpness","ratio"])
             # If async saver is enabled, close this header handle now to prevent Windows write locks.
             header_only_csv_handle = csv_f
+            flush_every = max(1, int(getattr(cfg, "csv_flush_every", 25)))
+            sync_wrote = 0
 
             # Async saver
             jpg_q = int(getattr(cfg, "jpg_quality", 0))
@@ -1802,6 +1800,7 @@ class Processor(QtCore.QObject):
                 def _saver():
                     f = open(csv_path, "a", newline="")
                     w = csv.writer(f)
+                    wrote = 0
                     while True:
                         item = save_q.get()
                         if item is None:
@@ -1818,31 +1817,35 @@ class Processor(QtCore.QObject):
                         else:
                             ok = cv2.imwrite(tmp_path, img)
 
+                        saved = False
                         if ok:
-                            replaced = False
                             try:
                                 os.replace(tmp_path, img_path)
-                                replaced = True
+                                saved = True
                             except Exception:
                                 logger.exception("Failed to replace crop %s", img_path)
                                 try:
                                     os.remove(tmp_path)
                                 except Exception:
                                     pass
-
-                            if replaced:
-                                w.writerow(row)
-                                try:
-                                    f.flush()
-                                except Exception:
-                                    pass
-                                self._emit_hit(img_path)
                         else:
                             logger.error("Failed to save crop %s", img_path)
                             try:
                                 os.remove(tmp_path)
                             except Exception:
                                 pass
+
+                        if saved:
+                            try:
+                                w.writerow(row)
+                                wrote += 1
+                                if wrote % flush_every == 0:
+                                    f.flush()
+                            except Exception:
+                                logger.exception("CSV write failed for %s", img_path)
+                                # optionally unlink img_path if you want strict atomicity
+                            else:
+                                self._emit_hit(img_path)
 
                         save_q.task_done()
 
@@ -2592,35 +2595,37 @@ class Processor(QtCore.QObject):
                     else:
                         tmp_path = crop_img_path + ".tmp"
                         if jpg_q > 0:
-                            ok = cv2.imwrite(
-                                tmp_path,
-                                crop_img2,
-                                [int(cv2.IMWRITE_JPEG_QUALITY), jpg_q],
-                            )
+                            ok = cv2.imwrite(tmp_path, crop_img2, [int(cv2.IMWRITE_JPEG_QUALITY), jpg_q])
                         else:
                             ok = cv2.imwrite(tmp_path, crop_img2)
-                        if not ok:
+                        saved = False
+                        if ok:
+                            try:
+                                os.replace(tmp_path, crop_img_path)
+                                saved = True
+                            except Exception:
+                                logger.exception("Failed to replace crop %s", crop_img_path)
+                                try:
+                                    os.remove(tmp_path)
+                                except Exception:
+                                    pass
+                        else:
                             logger.error("Failed to save crop %s", crop_img_path)
                             try:
                                 os.remove(tmp_path)
                             except Exception:
                                 pass
-                            continue
-                        try:
-                            os.replace(tmp_path, crop_img_path)
-                        except Exception:
-                            logger.exception("Failed to replace crop %s", crop_img_path)
+                        if saved:
                             try:
-                                os.remove(tmp_path)
+                                writer.writerow(row)
+                                sync_wrote += 1
+                                if sync_wrote % flush_every == 0:
+                                    csv_f.flush()
                             except Exception:
-                                pass
-                            continue
-                        writer.writerow(row)
-                        try:
-                            csv_f.flush()
-                        except Exception:
-                            pass
-                        self._emit_hit(crop_img_path)
+                                logger.exception("CSV write failed for %s", crop_img_path)
+                                # optionally unlink crop_img_path if you want strict atomicity
+                            else:
+                                self._emit_hit(crop_img_path)
                     reasons_list = c.get("reasons") or []
                     reasons = "|".join(reasons_list)
                     area = (cx2 - cx1) * (cy2 - cy1)
@@ -3105,8 +3110,8 @@ class Processor(QtCore.QObject):
             if save_q is not None:
                 save_q.put(None)
                 save_q.join()
-                if saver_thread is not None:
-                    saver_thread.join()
+            if saver_thread is not None:
+                saver_thread.join()
             if cap is not None:
                 try:
                     cap.release()
