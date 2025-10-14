@@ -386,14 +386,15 @@ class FaceEmbedder:
                 mirrors = SCRFD_URLS.get(os.path.basename(mdl))
                 if mirrors:
                     mdl = _ensure_file(os.path.basename(mdl), mirrors, progress=self.progress)
-            # Hint TRT with a safe dynamic-shape profile for SCRFD
+            # Hint TRT profile only when TensorRT EP is present
             try:
-                if os.path.exists(mdl):
+                trt_i = next((i for i, p in enumerate(_providers) if p == "TensorrtExecutionProvider"), -1)
+                if trt_i != -1 and os.path.exists(mdl):
                     _cpu_scrfd = ort.InferenceSession(mdl, providers=["CPUExecutionProvider"])
                     _in_name = _cpu_scrfd.get_inputs()[0].name
-                    _prov_opts[0].setdefault("trt_profile_min_shapes", f"{_in_name}:1x3x320x320")
-                    _prov_opts[0].setdefault("trt_profile_opt_shapes", f"{_in_name}:1x3x640x640")
-                    _prov_opts[0].setdefault("trt_profile_max_shapes", f"{_in_name}:1x3x2048x2048")
+                    _prov_opts[trt_i].setdefault("trt_profile_min_shapes", f"{_in_name}:1x3x320x320")
+                    _prov_opts[trt_i].setdefault("trt_profile_opt_shapes", f"{_in_name}:1x3x640x640")
+                    _prov_opts[trt_i].setdefault("trt_profile_max_shapes", f"{_in_name}:1x3x2048x2048")
             except Exception:
                 pass
             # keep ORT CPU threads low; TRT runs on GPU
