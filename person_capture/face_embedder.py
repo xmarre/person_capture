@@ -600,16 +600,21 @@ class FaceEmbedder:
                 except Exception:
                     _cuda_dev = 0
                 trt_opts_arc = _trt_opts(_cuda_dev, "arcface")
-                # Optional: hint TensorRT with dynamic shapes when batch varies
+                arc_in = None
+                cpu_probe = None
                 try:
-                    _cpu_probe = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-                    _in_name = _cpu_probe.get_inputs()[0].name
-                    _cpu_probe = None
-                    trt_opts_arc.setdefault("trt_profile_min_shapes",  f"{_in_name}:1x3x112x112")
-                    trt_opts_arc.setdefault("trt_profile_opt_shapes",  f"{_in_name}:8x3x112x112")
-                    trt_opts_arc.setdefault("trt_profile_max_shapes",  f"{_in_name}:32x3x112x112")
+                    cpu_probe = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+                    arc_in = cpu_probe.get_inputs()[0].name
                 except Exception:
-                    pass
+                    arc_in = None
+                finally:
+                    cpu_probe = None
+                if arc_in:
+                    trt_opts_arc.update({
+                        "trt_profile_min_shapes": f"{arc_in}:1x3x112x112",
+                        "trt_profile_opt_shapes": f"{arc_in}:1x3x112x112",
+                        "trt_profile_max_shapes": f"{arc_in}:1x3x112x112",
+                    })
                 cuda_opts = _cuda_opts(_cuda_dev)
 
                 prov_opts: List[Dict[str, str]] = []
@@ -623,6 +628,12 @@ class FaceEmbedder:
 
                 last_err = None
                 bound: List[str] = []
+                if callable(self.progress):
+                    try:
+                        self.progress(f"ArcFace providers={tuple(prov)}")
+                    except Exception:
+                        pass
+
                 try:
                     _logd(f"Trying TRT session providers={prov} (env-driven opts)")
                     self.arc_sess = ort.InferenceSession(
@@ -651,13 +662,14 @@ class FaceEmbedder:
 
                 inp0 = self.arc_sess.get_inputs()[0]
                 self.arc_input = inp0.name
+                self._arc_fixed_batch_len = 1
                 try:
                     shape0 = getattr(inp0, "shape", None)
                     dim0 = shape0[0] if isinstance(shape0, (list, tuple)) and shape0 else None
                     if isinstance(dim0, int) and dim0 > 0:
-                        self._arc_fixed_batch_len = dim0
+                        self._arc_fixed_batch_len = max(1, int(dim0))
                 except Exception:
-                    self._arc_fixed_batch_len = None
+                    pass
                 self.backend = 'arcface'
                 # sanity: output embedding should be 512-D
                 out0 = self.arc_sess.get_outputs()[0]
@@ -677,8 +689,7 @@ class FaceEmbedder:
                 except Exception:
                     self._arc_fixed_batch = False
                 if self._arc_fixed_batch:
-                    if not self._arc_fixed_batch_len:
-                        self._arc_fixed_batch_len = 32
+                    self._arc_fixed_batch_len = max(1, int(self._arc_fixed_batch_len or 1))
                 else:
                     self._arc_fixed_batch_len = None
                     self._arc_scratch = None
@@ -784,7 +795,7 @@ class FaceEmbedder:
 
         X = np.ascontiguousarray(X, dtype=np.float32)
         if getattr(self, "_arc_fixed_batch", False):
-            FIX = max(1, int(self._arc_fixed_batch_len or 32))
+            FIX = max(1, int(self._arc_fixed_batch_len or 1))
             if self._arc_scratch is None or self._arc_scratch.shape[0] != FIX:
                 self._arc_scratch = np.zeros((FIX, 3, 112, 112), dtype=np.float32, order="C")
                 assert self._arc_scratch.flags["C_CONTIGUOUS"]
@@ -792,16 +803,10 @@ class FaceEmbedder:
             feats = np.empty((X.shape[0], feat_dim), dtype=np.float32)
             run = self.arc_sess.run
             inp = self.arc_input
-            for start in range(0, X.shape[0], FIX):
-                end = min(start + FIX, X.shape[0])
-                n = end - start
-                if n == FIX:
-                    np.copyto(self._arc_scratch, X[start:end], casting="no")
-                else:
-                    self._arc_scratch.fill(0.0)
-                    self._arc_scratch[:n] = X[start:end]
-                out = run(None, {inp: self._arc_scratch})[0]
-                feats[start:end] = out[:n]
+            for idx in range(X.shape[0]):
+                np.copyto(self._arc_scratch[0], X[idx], casting="no")
+                out = run(None, {inp: self._arc_scratch[:1]})[0]
+                feats[idx] = out[0]
         else:
             feats = self.arc_sess.run(None, {self.arc_input: X})[0]
 
