@@ -802,19 +802,20 @@ class FaceEmbedder:
                 assert self._arc_scratch.flags["C_CONTIGUOUS"]
             feat_dim = int(self._arc_feat_dim or 512)
             feats = np.empty((X.shape[0], feat_dim), dtype=np.float32)
-            run = self.arc_sess.run
             inp = self.arc_input
+            out_name = getattr(self, "arc_output", self.arc_sess.get_outputs()[0].name)
+            import onnxruntime as ort
             for idx in range(X.shape[0]):
                 np.copyto(self._arc_scratch[0], X[idx], casting="no")
-                outs = run(None, {inp: self._arc_scratch[:1]})
+                # Robust path: IO binding (avoids empty outputs on TRT)
+                io = ort.IOBinding(self.arc_sess._sess)
+                arr = self._arc_scratch[:1]
+                io.bind_input(inp, "cpu", 0, np.float32, arr.shape, arr.ctypes.data)
+                io.bind_output(out_name, "cpu")
+                self.arc_sess.run_with_iobinding(io)
+                outs = io.copy_outputs_to_cpu()
                 if not outs:
-                    outs = run([
-                        getattr(self, "arc_output", self.arc_sess.get_outputs()[0].name)
-                    ], {inp: self._arc_scratch[:1]})
-                if not outs:
-                    raise RuntimeError(
-                        f"ArcFace returned no outputs; providers={self.arc_sess.get_providers()}"
-                    )
+                    raise RuntimeError(f"ArcFace returned no outputs; providers={self.arc_sess.get_providers()}")
                 feats[idx] = np.asarray(outs[0][0], dtype=np.float32, order="C")
         else:
             outs = self.arc_sess.run(None, {self.arc_input: X})
