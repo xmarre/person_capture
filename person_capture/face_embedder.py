@@ -806,10 +806,27 @@ class FaceEmbedder:
             inp = self.arc_input
             for idx in range(X.shape[0]):
                 np.copyto(self._arc_scratch[0], X[idx], casting="no")
-                out = run(None, {inp: self._arc_scratch[:1]})[0]
-                feats[idx] = out[0]
+                outs = run(None, {inp: self._arc_scratch[:1]})
+                if not outs:
+                    outs = run([
+                        getattr(self, "arc_output", self.arc_sess.get_outputs()[0].name)
+                    ], {inp: self._arc_scratch[:1]})
+                if not outs:
+                    raise RuntimeError(
+                        f"ArcFace returned no outputs; providers={self.arc_sess.get_providers()}"
+                    )
+                feats[idx] = np.asarray(outs[0][0], dtype=np.float32, order="C")
         else:
-            feats = self.arc_sess.run(None, {self.arc_input: X})[0]
+            outs = self.arc_sess.run(None, {self.arc_input: X})
+            if not outs:
+                outs = self.arc_sess.run([
+                    getattr(self, "arc_output", self.arc_sess.get_outputs()[0].name)
+                ], {self.arc_input: X})
+            if not outs:
+                raise RuntimeError(
+                    f"ArcFace returned no outputs; providers={self.arc_sess.get_providers()}"
+                )
+            feats = np.asarray(outs[0], dtype=np.float32, order="C")
 
         if feats.shape[0] != X.shape[0]:
             raise RuntimeError(f"ArcFace rows {feats.shape[0]} != input {X.shape[0]}")
