@@ -213,6 +213,8 @@ class FaceEmbedder:
                 return default
 
         def _trt_opts(device_id: int, prefix: str) -> Dict[str, str]:
+            def _b(v: bool) -> str:
+                return "True" if bool(v) else "False"
             cache_root = _P(_e("PERSON_CAPTURE_TRT_CACHE_ROOT", "trt_cache")).resolve()
             (cache_root / prefix).mkdir(parents=True, exist_ok=True)
             timing_en = _ef("PERSON_CAPTURE_TRT_TIMING_CACHE_ENABLE", True)
@@ -226,18 +228,18 @@ class FaceEmbedder:
             tcache = str(tcache_p)
             return {
                 "device_id": str(device_id),
-                "trt_fp16_enable": "1" if fp16_en else "0",
-                "trt_bf16_enable": "0",
-                "trt_int8_enable": "0",
-                "trt_timing_cache_enable": "1" if timing_en else "0",
+                "trt_fp16_enable": _b(fp16_en),
+                "trt_bf16_enable": _b(False),
+                "trt_int8_enable": _b(False),
+                "trt_timing_cache_enable": _b(timing_en),
                 "trt_timing_cache_path": tcache if timing_en else "",
-                "trt_engine_cache_enable": "1" if engine_en else "0",
+                "trt_engine_cache_enable": _b(engine_en),
                 "trt_engine_cache_path": str((cache_root / prefix).resolve()) if engine_en else "",
                 "trt_engine_cache_prefix": prefix if engine_en else "",
                 "trt_builder_optimization_level": str(max(0, min(5, build_lvl))),
-                "trt_build_heuristics_enable": "1",
-                "trt_cuda_graph_enable": "1" if cg_en else "0",
-                "trt_context_memory_sharing_enable": "1" if ctxshare else "0",
+                "trt_build_heuristics_enable": _b(True),
+                "trt_cuda_graph_enable": _b(cg_en),
+                "trt_context_memory_sharing_enable": _b(ctxshare),
                 "trt_auxiliary_streams": str(aux_stream),
             }
 
@@ -358,7 +360,7 @@ class FaceEmbedder:
             _prov_opts = [_trt_opts(ctx_id, "scrfd")]
             # Optional: richer failure logs when debugging
             if os.getenv("PERSON_CAPTURE_TRT_DEBUG", "0") not in ("0", "", "false"):
-                _prov_opts[0]["trt_detailed_build_log"] = "1"
+                _prov_opts[0]["trt_detailed_build_log"] = "True"
                 try:
                     _default_so.log_severity_level = 0
                 except Exception:
@@ -396,7 +398,14 @@ class FaceEmbedder:
                     reg = getattr(ort, "_pc_provider_registry", {})
                     if (providers in (None, [], ())) and (provider_options in (None, [], ())) and _mp in reg:
                         _p, _po, _so = reg[_mp]
-                        s = _orig_IS(model_path, sess_options or _so, providers=_p, provider_options=_po, *a, **kw)
+                        s = _orig_IS(
+                            model_path,
+                            sess_options or _so,
+                            providers=_p,
+                            provider_options=list(_po),
+                            *a,
+                            **kw,
+                        )
                         provs = tuple(s.get_providers())
                         if 'TensorrtExecutionProvider' not in provs:
                             try:
