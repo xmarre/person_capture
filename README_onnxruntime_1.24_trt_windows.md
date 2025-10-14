@@ -126,3 +126,4 @@ dir build\Windows\Release\dist
 - **`nvinfer.dll not found`**: In the GUI, set **TensorRT folder** to the directory containing `lib\nvinfer*.dll`.
 - **`no available providers`**: Update NVIDIA driver and use Python 3.12. Reinstall the wheel in a clean venv.
 - **Crashes on load**: Version mismatch between CUDA/cuDNN/TRT. Align to the versions listed above.
+- **TensorRT engine won't rebuild**: Delete cached engines after toggling FP16 or resizing limits, e.g. `rd /s /q trt_cache` from a Developer Command Prompt.

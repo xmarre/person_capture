@@ -1,5 +1,6 @@
 
-import os, io, sys, glob, site, ctypes, math
+import os, io, sys, glob, site, math
+import ctypes
 from pathlib import Path
 from pathlib import Path as _P
 import cv2
@@ -196,6 +197,7 @@ class FaceEmbedder:
 
         self.progress = progress
         self._torch = _torch
+        self.trt_lib_dir = trt_lib_dir
         # ---- ORT/TRT option helpers (env-driven from GUI) -------------------
         def _e(name: str, default: str) -> str:
             return os.getenv(name, default)
@@ -292,11 +294,53 @@ class FaceEmbedder:
             except Exception:
                 ctx_id = 0
 
+            # Prepare DLL search path first (Windows): add CUDA/cuDNN/TRT so TRT EP can load nvinfer*.dll
+            if os.name == 'nt':
+                def _add_dir(p: _P) -> None:
+                    try:
+                        if p and p.exists():
+                            os.add_dll_directory(str(p))
+                            if callable(getattr(self, "progress", None)):
+                                self.progress(f"Added DLL dir: {p}")
+                    except Exception:
+                        pass
+                _add_dir(_P(_torch.__file__).parent / "lib")  # PyTorch CUDA/cuDNN bin
+                trt_root = (
+                    getattr(self, "trt_lib_dir", None)
+                    or os.environ.get("TRT_LIB_DIR")
+                    or os.environ.get("TENSORRT_DIR")
+                    or os.environ.get("TENSORRT_HOME")
+                    or r"D:\\tensorrt\\TensorRT-10.13.3.9"
+                )
+                trt_root_p = _P(trt_root)
+                trt_lib_p = trt_root_p / "lib" if (trt_root_p / "lib").exists() else trt_root_p
+                _add_dir(trt_lib_p)
+                if callable(getattr(self, "progress", None)):
+                    self.progress(f"Using TensorRT dir: {trt_lib_p}")
+                # Hard sanity check
+                try:
+                    ctypes.WinDLL("nvinfer.dll")
+                    ctypes.WinDLL("nvinfer_plugin.dll")
+                except OSError as e:
+                    raise RuntimeError(f"TensorRT core DLLs not loadable from {trt_lib_p}: {e}")
+                for opt in ("nvonnxparser.dll", "nvonnxparser_runtime.dll"):
+                    try:
+                        ctypes.WinDLL(opt)
+                        break
+                    except OSError:
+                        pass
+
             # Prepare ONNX Runtime so any session created by SCRFD uses TensorRT EP
             try:
                 import onnxruntime as ort  # type: ignore
             except Exception as e:
                 raise RuntimeError(f"onnxruntime not importable for SCRFD/TRT: {e!r}")
+            if hasattr(ort, "preload_dlls"):
+                try:
+                    ort.preload_dlls()
+                except Exception as e:
+                    if callable(getattr(self, "progress", None)):
+                        self.progress(f"ORT preload_dlls note: {e!r}")
             avail = list(getattr(ort, "get_available_providers", lambda: [])())
             if 'TensorrtExecutionProvider' not in avail:
                 raise RuntimeError(f"TensorRT EP not available in onnxruntime. avail={avail}")
@@ -309,40 +353,16 @@ class FaceEmbedder:
                     _default_so.graph_optimization_level = level
             _default_so.add_session_config_entry("session.logid", "scrfd_trt")
 
-            _providers = ['TensorrtExecutionProvider', 'CUDAExecutionProvider']
-            _prov_opts = [
-                _trt_opts(ctx_id, "scrfd"),
-                _cuda_opts(ctx_id),
-            ]
-            # keep ORT CPU threads low; TRT runs on GPU
-            _default_so.intra_op_num_threads = 1
-            _default_so.inter_op_num_threads = 1
-            if not hasattr(ort, "_pc_trt_patched"):
-                _orig_IS = ort.InferenceSession
-
-                def _pc_InferenceSession(model_path, sess_options=None, providers=None, provider_options=None, *a, **kw):
-                    try:
-                        import os
-                        mp = (os.fspath(model_path)).lower() if model_path is not None else ""
-                    except Exception:
-                        mp = ""
-                    is_scrfd = ("scrfd" in mp)
-                    if is_scrfd:
-                        _p  = _providers
-                        _po = _prov_opts
-                        s = _orig_IS(model_path, sess_options or _default_so, providers=_p, provider_options=_po, *a, **kw)
-                        provs = tuple(s.get_providers())
-                        if 'TensorrtExecutionProvider' not in provs:
-                            raise RuntimeError(f"SCRFD expected TRT EP; got {provs}")
-                        if callable(self.progress):
-                            self.progress(f"SCRFD providers={provs}")
-                        return s
-                    # Non-SCRFD sessions: do not touch providers or options.
-                    return _orig_IS(model_path, sess_options, providers=providers, provider_options=provider_options, *a, **kw)
-
-                ort.InferenceSession = _pc_InferenceSession  # type: ignore
-                setattr(ort, "_pc_trt_patched", True)
-
+            # Force TRT-only. If TRT can't build, fail fast instead of silently binding CPU.
+            _providers = ['TensorrtExecutionProvider']
+            _prov_opts = [_trt_opts(ctx_id, "scrfd")]
+            # Optional: richer failure logs when debugging
+            if os.getenv("PERSON_CAPTURE_TRT_DEBUG", "0") not in ("0", "", "false"):
+                _prov_opts[0]["trt_detailed_build_log"] = "1"
+                try:
+                    _default_so.log_severity_level = 0
+                except Exception:
+                    pass
             mdl = yolo_model if isinstance(yolo_model, str) else ""
             if not mdl or not mdl.lower().startswith("scrfd"):
                 mdl = "scrfd_10g_bnkps.onnx"
@@ -352,6 +372,65 @@ class FaceEmbedder:
                 mirrors = SCRFD_URLS.get(os.path.basename(mdl))
                 if mirrors:
                     mdl = _ensure_file(os.path.basename(mdl), mirrors, progress=self.progress)
+            # Hint TRT with a safe dynamic-shape profile for SCRFD
+            try:
+                if os.path.exists(mdl):
+                    _cpu_scrfd = ort.InferenceSession(mdl, providers=["CPUExecutionProvider"])
+                    _in_name = _cpu_scrfd.get_inputs()[0].name
+                    _prov_opts[0].setdefault("trt_profile_min_shapes", f"{_in_name}:1x3x320x320")
+                    _prov_opts[0].setdefault("trt_profile_opt_shapes", f"{_in_name}:1x3x640x640")
+                    _prov_opts[0].setdefault("trt_profile_max_shapes", f"{_in_name}:1x3x2048x2048")
+            except Exception:
+                pass
+            # keep ORT CPU threads low; TRT runs on GPU
+            _default_so.intra_op_num_threads = 1
+            _default_so.inter_op_num_threads = 1
+            if not hasattr(ort, "_pc_trt_patched"):
+                _orig_IS = ort.InferenceSession
+                import os
+                _target_paths = {os.path.normcase(os.path.abspath(os.fspath(mdl)))}
+                ort._pc_trt_targets = _target_paths
+
+                def _pc_InferenceSession(model_path, sess_options=None, providers=None, provider_options=None, *a, **kw):
+                    # Only intercept the SCRFD session with no providers given.
+                    _mp = os.path.normcase(os.path.abspath(os.fspath(model_path))) if model_path else ""
+                    if not providers and not provider_options and _mp in getattr(ort, "_pc_trt_targets", set()):
+                        _p  = _providers
+                        _po = _prov_opts
+                        s = _orig_IS(model_path, sess_options or _default_so, providers=_p, provider_options=_po, *a, **kw)
+                        provs = tuple(s.get_providers())
+                        if 'TensorrtExecutionProvider' not in provs:
+                            try:
+                                # Emit full provider options for diagnostics
+                                if callable(getattr(self, "progress", None)):
+                                    self.progress(f"SCRFD get_provider_options={s.get_provider_options()}")
+                            except Exception:
+                                pass
+                            raise RuntimeError(f"SCRFD expected TRT EP; got {provs}")
+                        if callable(self.progress):
+                            self.progress(f"SCRFD providers={provs}")
+                            if os.getenv("PERSON_CAPTURE_TRT_DEBUG", "0") not in ("0", "", "false"):
+                                try:
+                                    self.progress(f"SCRFD provider_options={s.get_provider_options()}")
+                                except Exception:
+                                    pass
+                        return s
+                    # Sessions that explicitly requested providers: respect caller configuration.
+                    return _orig_IS(model_path, sess_options, providers=providers, provider_options=provider_options, *a, **kw)
+
+                ort.InferenceSession = _pc_InferenceSession  # type: ignore
+                setattr(ort, "_pc_trt_patched", True)
+            else:
+                # If already patched, register this model path too.
+                try:
+                    import os
+                    _mp = os.path.normcase(os.path.abspath(os.fspath(mdl)))
+                    _targets = getattr(ort, "_pc_trt_targets", None)
+                    if isinstance(_targets, set):
+                        _targets.add(_mp)
+                except Exception:
+                    pass
+
             self.scrfd = _SCRFD(mdl)
             # Robust TRT init on the chosen GPU. Retry smaller det_size once. Then warm up.
             _last_err = None
@@ -410,7 +489,7 @@ class FaceEmbedder:
                     _add_dir(_P(_torch.__file__).parent / "lib")
                     # Priority: GUI -> env -> fallback
                     trt_root = (
-                        trt_lib_dir
+                        getattr(self, "trt_lib_dir", None)
                         or os.environ.get("TRT_LIB_DIR")
                         or os.environ.get("TENSORRT_DIR")
                         or os.environ.get("TENSORRT_HOME")
