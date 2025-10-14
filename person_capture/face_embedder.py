@@ -662,6 +662,8 @@ class FaceEmbedder:
 
                 inp0 = self.arc_sess.get_inputs()[0]
                 self.arc_input = inp0.name
+                out0 = self.arc_sess.get_outputs()[0]
+                self.arc_output = out0.name
                 self._arc_fixed_batch_len = 1
                 try:
                     shape0 = getattr(inp0, "shape", None)
@@ -672,7 +674,6 @@ class FaceEmbedder:
                     pass
                 self.backend = 'arcface'
                 # sanity: output embedding should be 512-D
-                out0 = self.arc_sess.get_outputs()[0]
                 feat_dim = None
                 try:
                     shape = getattr(out0, "shape", None)
@@ -805,10 +806,10 @@ class FaceEmbedder:
             inp = self.arc_input
             for idx in range(X.shape[0]):
                 np.copyto(self._arc_scratch[0], X[idx], casting="no")
-                out = run(None, {inp: self._arc_scratch[:1]})[0]
+                out = run([self.arc_output], {inp: self._arc_scratch[:1]})[0]
                 feats[idx] = out[0]
         else:
-            feats = self.arc_sess.run(None, {self.arc_input: X})[0]
+            feats = self.arc_sess.run([self.arc_output], {self.arc_input: X})[0]
 
         if feats.shape[0] != X.shape[0]:
             raise RuntimeError(f"ArcFace rows {feats.shape[0]} != input {X.shape[0]}")
