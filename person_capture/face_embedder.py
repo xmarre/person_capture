@@ -385,18 +385,18 @@ class FaceEmbedder:
             # keep ORT CPU threads low; TRT runs on GPU
             _default_so.intra_op_num_threads = 1
             _default_so.inter_op_num_threads = 1
+            key = os.path.normcase(os.path.abspath(os.fspath(mdl)))
             if not hasattr(ort, "_pc_trt_patched"):
                 _orig_IS = ort.InferenceSession
-                _target_paths = {os.path.normcase(os.path.abspath(os.fspath(mdl)))}
-                ort._pc_trt_targets = _target_paths
+                # path -> (providers, provider_options, session_options)
+                ort._pc_provider_registry = {key: (_providers, _prov_opts, _default_so)}
 
                 def _pc_InferenceSession(model_path, sess_options=None, providers=None, provider_options=None, *a, **kw):
-                    # Only intercept the SCRFD session with no providers given.
                     _mp = os.path.normcase(os.path.abspath(os.fspath(model_path))) if model_path else ""
-                    if not providers and not provider_options and _mp in getattr(ort, "_pc_trt_targets", set()):
-                        _p  = _providers
-                        _po = _prov_opts
-                        s = _orig_IS(model_path, sess_options or _default_so, providers=_p, provider_options=_po, *a, **kw)
+                    reg = getattr(ort, "_pc_provider_registry", {})
+                    if (providers in (None, [], ())) and (provider_options in (None, [], ())) and _mp in reg:
+                        _p, _po, _so = reg[_mp]
+                        s = _orig_IS(model_path, sess_options or _so, providers=_p, provider_options=_po, *a, **kw)
                         provs = tuple(s.get_providers())
                         if 'TensorrtExecutionProvider' not in provs:
                             try:
@@ -420,14 +420,10 @@ class FaceEmbedder:
                 ort.InferenceSession = _pc_InferenceSession  # type: ignore
                 setattr(ort, "_pc_trt_patched", True)
             else:
-                # If already patched, register this model path too.
-                try:
-                    _mp = os.path.normcase(os.path.abspath(os.fspath(mdl)))
-                    _targets = getattr(ort, "_pc_trt_targets", None)
-                    if isinstance(_targets, set):
-                        _targets.add(_mp)
-                except Exception:
-                    pass
+                # Already patched: register/overwrite this model's config.
+                reg = getattr(ort, "_pc_provider_registry", {})
+                reg[key] = (_providers, _prov_opts, _default_so)
+                ort._pc_provider_registry = reg
 
             self.scrfd = _SCRFD(mdl)
             # Robust TRT init on the chosen GPU. Retry smaller det_size once. Then warm up.
