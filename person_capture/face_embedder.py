@@ -172,6 +172,8 @@ class FaceEmbedder:
         self.scrfd = None
         self._scrfd_model_path: Optional[str] = None
         self._scrfd_ctx_id: int = 0
+        self._scrfd_fixed_shape: Tuple[int, int] = (640, 640)
+        self._scrfd_is_trt: bool = False
         self.insight_app: Optional[object] = None  # FaceAnalysis fallback that auto-downloads models
         self.conf = float(conf)
         yolo_path = yolo_model
@@ -386,15 +388,20 @@ class FaceEmbedder:
                 mirrors = SCRFD_URLS.get(os.path.basename(mdl))
                 if mirrors:
                     mdl = _ensure_file(os.path.basename(mdl), mirrors, progress=self.progress)
-            # Hint TRT profile only when TensorRT EP is present
+            # Hint TRT profile only when TRT EP exists; use fixed shape with cache hints
             try:
                 trt_i = next((i for i, p in enumerate(_providers) if p == "TensorrtExecutionProvider"), -1)
                 if trt_i != -1 and os.path.exists(mdl):
                     _cpu_scrfd = ort.InferenceSession(mdl, providers=["CPUExecutionProvider"])
                     _in_name = _cpu_scrfd.get_inputs()[0].name
-                    _prov_opts[trt_i].setdefault("trt_profile_min_shapes", f"{_in_name}:1x3x320x320")
-                    _prov_opts[trt_i].setdefault("trt_profile_opt_shapes", f"{_in_name}:1x3x640x640")
-                    _prov_opts[trt_i].setdefault("trt_profile_max_shapes", f"{_in_name}:1x3x2048x2048")
+                    w, h = self._scrfd_fixed_shape
+                    fixed = f"1x3x{h}x{w}"
+                    _prov_opts[trt_i].setdefault("trt_profile_min_shapes", f"{_in_name}:{fixed}")
+                    _prov_opts[trt_i].setdefault("trt_profile_opt_shapes", f"{_in_name}:{fixed}")
+                    _prov_opts[trt_i].setdefault("trt_profile_max_shapes", f"{_in_name}:{fixed}")
+                    _prov_opts[trt_i].setdefault("trt_force_sequential_engine_build", "1")
+                    _prov_opts[trt_i].setdefault("trt_engine_cache_prefix", "scrfd")
+                    _prov_opts[trt_i].setdefault("trt_engine_cache_enable", "1")
             except Exception:
                 pass
             # keep ORT CPU threads low; TRT runs on GPU
@@ -446,9 +453,10 @@ class FaceEmbedder:
             self._scrfd_model_path = mdl
             self._scrfd_ctx_id = ctx_id
             self.scrfd = _SCRFD(mdl)
-            # Robust TRT init on the chosen GPU. Retry smaller det_size once. Then warm up.
+            # Robust TRT init: fixed shape only for deterministic engine/profile.
+            self._scrfd_fixed_shape = (640, 640)
             _last_err = None
-            for _det_size in ((640, 640), (512, 512)):
+            for _det_size in (self._scrfd_fixed_shape,):
                 try:
                     self.scrfd.prepare(ctx_id=ctx_id, det_size=_det_size)
                     if callable(self.progress):
@@ -460,9 +468,9 @@ class FaceEmbedder:
                         except Exception:
                             pass
                         try:
-                            _ = self.scrfd.detect(_dummy, input_size=_det_size)
+                            _ = self.scrfd.detect(_dummy, input_size=self._scrfd_fixed_shape)
                         except TypeError:
-                            _ = self.scrfd.detect(_dummy, _det_size)
+                            _ = self.scrfd.detect(_dummy, self._scrfd_fixed_shape)
                     except Exception:
                         pass
                     break
@@ -475,6 +483,11 @@ class FaceEmbedder:
                 self.scrfd.det_thresh = float(self.conf)
             except Exception:
                 pass
+            # Flag whether this SCRFD session actually bound TRT
+            try:
+                self._scrfd_is_trt = 'TensorrtExecutionProvider' in tuple(self.scrfd.session.get_providers())
+            except Exception:
+                self._scrfd_is_trt = False
             self.insight_app = None  # avoid RetinaFace/FaceAnalysis to prevent CUDA provider issues
         self.use_arcface = bool(use_arcface)
         # Keep ArcFace enabled; we'll align by 5pts only if keypoints are available at inference time.
@@ -1712,30 +1725,22 @@ class FaceEmbedder:
             if deg == 270: return W0 - 1 - yr, xr
             return xr, yr
         def _detect_once(img, dyn, conf: float):
-            # Normalize across SCRFD API variants: set the attribute and call with input_size only.
+            # Normalize across SCRFD API variants; fix input_size when TRT is active.
             try:
                 self.scrfd.det_thresh = float(conf)
             except Exception:
                 pass
 
+            use_sz = getattr(self, "_scrfd_fixed_shape", (dyn, dyn)) if getattr(self, "_scrfd_is_trt", False) else (dyn, dyn)
+
             def _invoke() -> Tuple[np.ndarray, Optional[np.ndarray]]:
                 try:
-                    return self.scrfd.detect(img, input_size=(dyn, dyn))
+                    return self.scrfd.detect(img, input_size=use_sz)
                 except TypeError:
                     # some builds take positional input_size
-                    return self.scrfd.detect(img, (dyn, dyn))
+                    return self.scrfd.detect(img, use_sz)
 
-            for attempt in range(2):
-                try:
-                    return _invoke()
-                except IndexError:
-                    if attempt == 0:
-                        # ORT/TRT produced no outputs; reinit to CUDA and retry once.
-                        self._scrfd_fallback_to_cuda_only()
-                        continue
-                    raise
-
-            raise RuntimeError("SCRFD detect failed to recover after fallback.")
+            return _invoke()
 
         H0, W0 = bgr_img.shape[:2]
         dyn_req = int(imgsz) if (imgsz is not None and imgsz > 0) else 640
@@ -1752,13 +1757,8 @@ class FaceEmbedder:
         heavy90 = min(_round32(max(dyn, int(0.75 * L))), heavy_cap)
         heavy180 = min(_round32(max(dyn, int(0.67 * L))), heavy_cap)
 
-        # 1) Try 0° first, with runtime fallback if TRT returns empty outputs
-        try:
-            bboxes, kpss = _detect_once(bgr_img, dyn, conf=float(self.conf))
-        except IndexError:
-            # TRT produced no outputs: re-init SCRFD with CUDA EP and retry once.
-            self._scrfd_fallback_to_cuda_only()
-            bboxes, kpss = _detect_once(bgr_img, dyn, conf=float(self.conf))
+        # 1) Try 0° first
+        bboxes, kpss = _detect_once(bgr_img, dyn, conf=float(self.conf))
 
         dets = []  # list of (box, kps, score)
         def _accumulate(bb, kp, deg):
