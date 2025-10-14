@@ -830,19 +830,12 @@ class FaceEmbedder:
                     int(self._arc_out_cuda.data_ptr()),
                 )
                 self.arc_sess.run_with_iobinding(io)
-                if self._arc_out_cuda.device.type == "cuda":
-                    feats[idx] = self._arc_out_cuda.detach().cpu().numpy()[0].astype(np.float32, copy=False)
-                else:
-                    outs = io.copy_outputs_to_cpu()
-                    if not outs:
-                        outs = self.arc_sess.run([out_name], {inp: self._arc_scratch[:1]})
-                    if not outs:
-                        raise RuntimeError(
-                            f"ArcFace returned no outputs; providers={self.arc_sess.get_providers()}"
-                        )
-                    ov = outs[0]
-                    arr = ov.numpy() if hasattr(ov, "numpy") else np.asarray(ov)
-                    feats[idx] = arr[0].astype(np.float32, copy=False)
+                _chk = io.copy_outputs_to_cpu()
+                if not _chk:
+                    raise RuntimeError(
+                        f"ArcFace returned no outputs; providers={self.arc_sess.get_providers()}"
+                    )
+                feats[idx] = self._arc_out_cuda.detach().cpu().numpy()[0].astype(np.float32, copy=False)
         else:
             outs = self.arc_sess.run(None, {self.arc_input: X})
             if not outs:
