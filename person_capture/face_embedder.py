@@ -599,6 +599,7 @@ class FaceEmbedder:
                     _cuda_dev = self._torch.cuda.current_device()
                 except Exception:
                     _cuda_dev = 0
+                self._cuda_dev = int(_cuda_dev)
                 trt_opts_arc = _trt_opts(_cuda_dev, "arcface")
                 arc_in = None
                 cpu_probe = None
@@ -802,21 +803,46 @@ class FaceEmbedder:
                 assert self._arc_scratch.flags["C_CONTIGUOUS"]
             feat_dim = int(self._arc_feat_dim or 512)
             feats = np.empty((X.shape[0], feat_dim), dtype=np.float32)
+            import onnxruntime as ort
+            t = self._torch
             inp = self.arc_input
             out_name = getattr(self, "arc_output", self.arc_sess.get_outputs()[0].name)
-            import onnxruntime as ort
+            dev = int(getattr(self, "_cuda_dev", t.cuda.current_device()))
+            # persistent CUDA buffers
+            if not hasattr(self, "_arc_scratch_cuda") or self._arc_scratch_cuda.numel() != 1 * 3 * 112 * 112:
+                self._arc_scratch_cuda = t.empty((1, 3, 112, 112), device=f"cuda:{dev}", dtype=t.float32)
+            if not hasattr(self, "_arc_out_cuda") or self._arc_out_cuda.numel() != 1 * feat_dim:
+                self._arc_out_cuda = t.empty((1, feat_dim), device=f"cuda:{dev}", dtype=t.float32)
+            arr_cpu = t.from_numpy(self._arc_scratch[:1])
             for idx in range(X.shape[0]):
                 np.copyto(self._arc_scratch[0], X[idx], casting="no")
-                # Robust path: IO binding (avoids empty outputs on TRT)
-                io = ort.IOBinding(self.arc_sess._sess)
-                arr = self._arc_scratch[:1]
-                io.bind_input(inp, "cpu", 0, np.float32, arr.shape, arr.ctypes.data)
-                io.bind_output(out_name, "cpu")
+                # H2D copy into CUDA tensor
+                self._arc_scratch_cuda.copy_(arr_cpu, non_blocking=False)
+                # Bind CUDA pointers
+                io = self.arc_sess.io_binding()
+                io.bind_input(inp, "cuda", dev, np.float32, (1, 3, 112, 112), int(self._arc_scratch_cuda.data_ptr()))
+                io.bind_output(
+                    out_name,
+                    "cuda",
+                    dev,
+                    np.float32,
+                    (1, feat_dim),
+                    int(self._arc_out_cuda.data_ptr()),
+                )
                 self.arc_sess.run_with_iobinding(io)
-                outs = io.copy_outputs_to_cpu()
-                if not outs:
-                    raise RuntimeError(f"ArcFace returned no outputs; providers={self.arc_sess.get_providers()}")
-                feats[idx] = np.asarray(outs[0][0], dtype=np.float32, order="C")
+                if self._arc_out_cuda.device.type == "cuda":
+                    feats[idx] = self._arc_out_cuda.detach().cpu().numpy()[0].astype(np.float32, copy=False)
+                else:
+                    outs = io.copy_outputs_to_cpu()
+                    if not outs:
+                        outs = self.arc_sess.run([out_name], {inp: self._arc_scratch[:1]})
+                    if not outs:
+                        raise RuntimeError(
+                            f"ArcFace returned no outputs; providers={self.arc_sess.get_providers()}"
+                        )
+                    ov = outs[0]
+                    arr = ov.numpy() if hasattr(ov, "numpy") else np.asarray(ov)
+                    feats[idx] = arr[0].astype(np.float32, copy=False)
         else:
             outs = self.arc_sess.run(None, {self.arc_input: X})
             if not outs:
