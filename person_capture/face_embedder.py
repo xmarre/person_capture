@@ -10,7 +10,7 @@ from urllib.error import URLError, HTTPError
 from socket import timeout as SocketTimeout
 import tempfile
 import shutil
-from typing import TYPE_CHECKING, Optional, List, Tuple, Dict
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from PIL import Image
 
@@ -170,6 +170,8 @@ class FaceEmbedder:
         self.detector_backend = "yolov8"
         self.det = None
         self.scrfd = None
+        self._scrfd_model_path: Optional[str] = None
+        self._scrfd_ctx_id: int = 0
         self.insight_app: Optional[object] = None  # FaceAnalysis fallback that auto-downloads models
         self.conf = float(conf)
         yolo_path = yolo_model
@@ -344,8 +346,8 @@ class FaceEmbedder:
                     if callable(getattr(self, "progress", None)):
                         self.progress(f"ORT preload_dlls note: {e!r}")
             avail = list(getattr(ort, "get_available_providers", lambda: [])())
-            if 'TensorrtExecutionProvider' not in avail:
-                raise RuntimeError(f"TensorRT EP not available in onnxruntime. avail={avail}")
+            if 'TensorrtExecutionProvider' not in avail and callable(getattr(self, "progress", None)):
+                self.progress(f"TensorRT EP not available; falling back to CUDA/CPU. avail={avail}")
 
             _default_so = getattr(ort, "SessionOptions")()
             _gopt = getattr(ort, "GraphOptimizationLevel", None)
@@ -355,12 +357,22 @@ class FaceEmbedder:
                     _default_so.graph_optimization_level = level
             _default_so.add_session_config_entry("session.logid", "scrfd_trt")
 
-            # Force TRT-only. If TRT can't build, fail fast instead of silently binding CPU.
-            _providers = ['TensorrtExecutionProvider']
-            _prov_opts = [_trt_opts(ctx_id, "scrfd")]
+            # Prefer TRT, then CUDA, always include CPU. Only add EPs that exist.
+            _providers, _prov_opts = [], []
+            if 'TensorrtExecutionProvider' in avail:
+                _providers.append('TensorrtExecutionProvider')
+                _prov_opts.append(_trt_opts(ctx_id, "scrfd"))
+            if 'CUDAExecutionProvider' in avail:
+                _providers.append('CUDAExecutionProvider')
+                _prov_opts.append({})
+            _providers.append('CPUExecutionProvider')
+            _prov_opts.append({})
             # Optional: richer failure logs when debugging
-            if os.getenv("PERSON_CAPTURE_TRT_DEBUG", "0") not in ("0", "", "false"):
-                _prov_opts[0]["trt_detailed_build_log"] = "True"
+            if (
+                os.getenv("PERSON_CAPTURE_TRT_DEBUG", "0") not in ("0", "", "false")
+                and 'TensorrtExecutionProvider' in _providers
+            ):
+                _prov_opts[_providers.index('TensorrtExecutionProvider')]["trt_detailed_build_log"] = "True"
                 try:
                     _default_so.log_severity_level = 0
                 except Exception:
@@ -407,21 +419,17 @@ class FaceEmbedder:
                             **kw,
                         )
                         provs = tuple(s.get_providers())
-                        if 'TensorrtExecutionProvider' not in provs:
+                        # Log providers but do not hard-fail if TRT is unavailable.
+                        if callable(getattr(self, "progress", None)):
                             try:
-                                # Emit full provider options for diagnostics
-                                if callable(getattr(self, "progress", None)):
-                                    self.progress(f"SCRFD get_provider_options={s.get_provider_options()}")
+                                self.progress(f"SCRFD providers={provs}")
+                                if os.getenv("PERSON_CAPTURE_TRT_DEBUG", "0") not in ("0", "", "false"):
+                                    try:
+                                        self.progress(f"SCRFD provider_options={s.get_provider_options()}")
+                                    except Exception:
+                                        pass
                             except Exception:
                                 pass
-                            raise RuntimeError(f"SCRFD expected TRT EP; got {provs}")
-                        if callable(self.progress):
-                            self.progress(f"SCRFD providers={provs}")
-                            if os.getenv("PERSON_CAPTURE_TRT_DEBUG", "0") not in ("0", "", "false"):
-                                try:
-                                    self.progress(f"SCRFD provider_options={s.get_provider_options()}")
-                                except Exception:
-                                    pass
                         return s
                     # Sessions that explicitly requested providers: respect caller configuration.
                     return _orig_IS(model_path, sess_options, providers=providers, provider_options=provider_options, *a, **kw)
@@ -434,6 +442,8 @@ class FaceEmbedder:
                 reg[key] = (_providers, _prov_opts, _default_so)
                 ort._pc_provider_registry = reg
 
+            self._scrfd_model_path = mdl
+            self._scrfd_ctx_id = ctx_id
             self.scrfd = _SCRFD(mdl)
             # Robust TRT init on the chosen GPU. Retry smaller det_size once. Then warm up.
             _last_err = None
@@ -444,7 +454,14 @@ class FaceEmbedder:
                         self.progress(f"SCRFD(TRT) ready on cuda:{ctx_id} det={_det_size}")
                     try:
                         _dummy = np.zeros((_det_size[1], _det_size[0], 3), dtype=np.uint8)
-                        _ = self.scrfd.detect(_dummy, threshold=max(self.conf, 0.30))
+                        try:
+                            self.scrfd.det_thresh = float(self.conf)
+                        except Exception:
+                            pass
+                        try:
+                            _ = self.scrfd.detect(_dummy, input_size=_det_size)
+                        except TypeError:
+                            _ = self.scrfd.detect(_dummy, _det_size)
                     except Exception:
                         pass
                     break
@@ -711,6 +728,31 @@ class FaceEmbedder:
             self.backend = 'clip'
             pass
 
+    def _scrfd_fallback_to_cuda_only(self) -> None:
+        try:
+            import onnxruntime as ort
+            reg = getattr(ort, "_pc_provider_registry", {})
+            key = getattr(self, "_scrfd_model_path", None)
+            if key:
+                import os
+                k = os.path.normcase(os.path.abspath(os.fspath(key)))
+                so = getattr(ort, "SessionOptions")()
+                reg[k] = (['CUDAExecutionProvider', 'CPUExecutionProvider'], [{}, {}], so)
+                ort._pc_provider_registry = reg
+            from insightface.model_zoo.scrfd import SCRFD as _SCRFD
+            ctx_id = int(getattr(self, "_scrfd_ctx_id", 0))
+            self.scrfd = _SCRFD(self._scrfd_model_path)
+            self.scrfd.prepare(ctx_id=ctx_id, det_size=(640, 640))
+            try:
+                self.scrfd.det_thresh = float(self.conf)
+            except Exception:
+                pass
+            if callable(getattr(self, "progress", None)):
+                self.progress("SCRFD fallback: reinitialized with CUDA EP")
+        except Exception as e:
+            if callable(getattr(self, "progress", None)):
+                self.progress(f"SCRFD fallback failed: {e!r}")
+
     def set_prescan_fast(self, enable: bool, *, mode: str = "rr") -> None:
         """Enable/disable light-weight rotation policy for pre-scan."""
 
@@ -830,12 +872,32 @@ class FaceEmbedder:
                     int(self._arc_out_cuda.data_ptr()),
                 )
                 self.arc_sess.run_with_iobinding(io)
-                _chk = io.copy_outputs_to_cpu()
-                if not _chk:
-                    raise RuntimeError(
-                        f"ArcFace returned no outputs; providers={self.arc_sess.get_providers()}"
+                # Prefer CPU copies if IO binding didn’t write the CUDA buffer.
+                outs = io.copy_outputs_to_cpu()
+                if outs:
+                    ov = outs[0]
+                    arr = ov.numpy() if hasattr(ov, "numpy") else np.asarray(ov)
+                    v = arr[0] if arr.ndim > 1 else arr
+                    feats[idx] = v.astype(np.float32, copy=False)
+                elif self._arc_out_cuda.device.type == "cuda":
+                    # Bound GPU output was written. Read it.
+                    feats[idx] = (
+                        self._arc_out_cuda[:1].detach().cpu().numpy()[0].astype(np.float32, copy=False)
                     )
-                feats[idx] = self._arc_out_cuda.detach().cpu().numpy()[0].astype(np.float32, copy=False)
+                else:
+                    # Last resort: normal run() to fetch CPU output.
+                    outs = self.arc_sess.run([out_name], {inp: self._arc_scratch[:1]})
+                    if not outs:
+                        raise RuntimeError(
+                            f"ArcFace returned no outputs; providers={self.arc_sess.get_providers()}"
+                        )
+                    ov = outs[0]
+                    arr = ov.numpy() if hasattr(ov, "numpy") else np.asarray(ov)
+                    v = arr[0] if arr.ndim > 1 else arr
+                    feats[idx] = v.astype(np.float32, copy=False)
+                # Optional sanity check
+                if feats[idx].ndim != 1:
+                    raise RuntimeError("ArcFace embedding shape invalid; expected (D,).")
         else:
             outs = self.arc_sess.run(None, {self.arc_input: X})
             if not outs:
@@ -1649,21 +1711,30 @@ class FaceEmbedder:
             if deg == 270: return W0 - 1 - yr, xr
             return xr, yr
         def _detect_once(img, dyn, conf: float):
-            # handle SCRFD API variants
+            # Normalize across SCRFD API variants: set the attribute and call with input_size only.
             try:
-                return self.scrfd.detect(img, thresh=float(conf), input_size=(dyn, dyn))
-            except TypeError:
+                self.scrfd.det_thresh = float(conf)
+            except Exception:
+                pass
+
+            def _invoke() -> Tuple[np.ndarray, Optional[np.ndarray]]:
                 try:
-                    return self.scrfd.detect(img, det_thresh=float(conf), input_size=(dyn, dyn))
+                    return self.scrfd.detect(img, input_size=(dyn, dyn))
                 except TypeError:
-                    try:
-                        self.scrfd.det_thresh = float(conf)
-                    except Exception:
-                        pass
-                    try:
-                        return self.scrfd.detect(img, input_size=(dyn, dyn))
-                    except TypeError:
-                        return self.scrfd.detect(img, (dyn, dyn))
+                    # some builds take positional input_size
+                    return self.scrfd.detect(img, (dyn, dyn))
+
+            for attempt in range(2):
+                try:
+                    return _invoke()
+                except IndexError:
+                    if attempt == 0:
+                        # ORT/TRT produced no outputs; reinit to CUDA and retry once.
+                        self._scrfd_fallback_to_cuda_only()
+                        continue
+                    raise
+
+            raise RuntimeError("SCRFD detect failed to recover after fallback.")
 
         H0, W0 = bgr_img.shape[:2]
         dyn_req = int(imgsz) if (imgsz is not None and imgsz > 0) else 640
@@ -1680,8 +1751,13 @@ class FaceEmbedder:
         heavy90 = min(_round32(max(dyn, int(0.75 * L))), heavy_cap)
         heavy180 = min(_round32(max(dyn, int(0.67 * L))), heavy_cap)
 
-        # 1) Try 0° first
-        bboxes, kpss = _detect_once(bgr_img, dyn, conf=float(self.conf))
+        # 1) Try 0° first, with runtime fallback if TRT returns empty outputs
+        try:
+            bboxes, kpss = _detect_once(bgr_img, dyn, conf=float(self.conf))
+        except IndexError:
+            # TRT produced no outputs: re-init SCRFD with CUDA EP and retry once.
+            self._scrfd_fallback_to_cuda_only()
+            bboxes, kpss = _detect_once(bgr_img, dyn, conf=float(self.conf))
 
         dets = []  # list of (box, kps, score)
         def _accumulate(bb, kp, deg):
