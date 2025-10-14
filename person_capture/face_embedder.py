@@ -1,6 +1,7 @@
 
 import os, io, sys, glob, site, ctypes, math
 from pathlib import Path
+from pathlib import Path as _P
 import cv2
 import numpy as np
 from urllib.request import urlopen, Request
@@ -8,7 +9,7 @@ from urllib.error import URLError, HTTPError
 from socket import timeout as SocketTimeout
 import tempfile
 import shutil
-from typing import TYPE_CHECKING, Optional, List, Tuple
+from typing import TYPE_CHECKING, Optional, List, Tuple, Dict
 
 from PIL import Image
 
@@ -17,7 +18,6 @@ if TYPE_CHECKING:  # pragma: no cover - import only for type checking
     from ultralytics import YOLO as YOLOType
     import open_clip as open_clip_type
 
-ort = None  # import after DLL dirs are added
 Y8F_DEFAULT = "yolov8l-face.pt"  # default remains; pass "scrfd_10g_bnkps" to switch backends
 
 # Candidate mirrors for YOLOv8-face weights (keyed by filename)
@@ -196,6 +196,56 @@ class FaceEmbedder:
 
         self.progress = progress
         self._torch = _torch
+        # ---- ORT/TRT option helpers (env-driven from GUI) -------------------
+        def _e(name: str, default: str) -> str:
+            return os.getenv(name, default)
+
+        def _ef(name: str, default: bool) -> bool:
+            v = os.getenv(name, "1" if default else "0").strip().lower()
+            return v in ("1", "true", "yes", "on")
+
+        def _ei(name: str, default: int) -> int:
+            try:
+                return int(os.getenv(name, str(default)))
+            except Exception:
+                return default
+
+        def _trt_opts(device_id: int, prefix: str) -> Dict[str, str]:
+            cache_root = _P(_e("PERSON_CAPTURE_TRT_CACHE_ROOT", "trt_cache")).resolve()
+            (cache_root / prefix).mkdir(parents=True, exist_ok=True)
+            timing_en = _ef("PERSON_CAPTURE_TRT_TIMING_CACHE_ENABLE", True)
+            engine_en = _ef("PERSON_CAPTURE_TRT_ENGINE_CACHE_ENABLE", True)
+            fp16_en = _ef("PERSON_CAPTURE_TRT_FP16", True)
+            cg_en = _ef("PERSON_CAPTURE_TRT_CUDA_GRAPH_ENABLE", True)
+            ctxshare = _ef("PERSON_CAPTURE_TRT_CONTEXT_MEMORY_SHARING_ENABLE", True)
+            aux_stream = _ei("PERSON_CAPTURE_TRT_AUX_STREAMS", -1)
+            build_lvl = _ei("PERSON_CAPTURE_TRT_BUILDER_OPT_LEVEL", 5)
+            tcache_p = (cache_root / prefix / "timing.cache").resolve()
+            tcache = str(tcache_p)
+            return {
+                "device_id": str(device_id),
+                "trt_fp16_enable": "1" if fp16_en else "0",
+                "trt_bf16_enable": "0",
+                "trt_int8_enable": "0",
+                "trt_timing_cache_enable": "1" if timing_en else "0",
+                "trt_timing_cache_path": tcache if timing_en else "",
+                "trt_engine_cache_enable": "1" if engine_en else "0",
+                "trt_engine_cache_path": str((cache_root / prefix).resolve()) if engine_en else "",
+                "trt_engine_cache_prefix": prefix if engine_en else "",
+                "trt_builder_optimization_level": str(max(0, min(5, build_lvl))),
+                "trt_build_heuristics_enable": "1",
+                "trt_cuda_graph_enable": "1" if cg_en else "0",
+                "trt_context_memory_sharing_enable": "1" if ctxshare else "0",
+                "trt_auxiliary_streams": str(aux_stream),
+            }
+
+        def _cuda_opts(device_id: int) -> Dict[str, str]:
+            cg_en = _ef("PERSON_CAPTURE_TRT_CUDA_GRAPH_ENABLE", True)
+            return {
+                "device_id": str(device_id),
+                "enable_cuda_graph": "1" if cg_en else "0",
+                "do_copy_in_default_stream": "1",
+            }
         # --- SCRFD probe controls ---
         self.scrfd_tta_scales = getattr(self, "scrfd_tta_scales", (0.75, 0.60))
         self.scrfd_probe_conf_cap = getattr(self, "scrfd_probe_conf_cap", 0.20)
@@ -261,8 +311,8 @@ class FaceEmbedder:
 
             _providers = ['TensorrtExecutionProvider', 'CUDAExecutionProvider']
             _prov_opts = [
-                {"device_id": str(ctx_id)},
-                {"device_id": str(ctx_id)},
+                _trt_opts(ctx_id, "scrfd"),
+                _cuda_opts(ctx_id),
             ]
             # keep ORT CPU threads low; TRT runs on GPU
             _default_so.intra_op_num_threads = 1
@@ -278,8 +328,8 @@ class FaceEmbedder:
                         mp = ""
                     is_scrfd = ("scrfd" in mp)
                     if is_scrfd:
-                        _p  = providers or _providers
-                        _po = provider_options or _prov_opts
+                        _p  = _providers
+                        _po = _prov_opts
                         s = _orig_IS(model_path, sess_options or _default_so, providers=_p, provider_options=_po, *a, **kw)
                         provs = tuple(s.get_providers())
                         if 'TensorrtExecutionProvider' not in provs:
@@ -291,7 +341,7 @@ class FaceEmbedder:
                     return _orig_IS(model_path, sess_options, providers=providers, provider_options=provider_options, *a, **kw)
 
                 ort.InferenceSession = _pc_InferenceSession  # type: ignore
-                ort._pc_trt_patched = True  # type: ignore
+                setattr(ort, "_pc_trt_patched", True)
 
             mdl = yolo_model if isinstance(yolo_model, str) else ""
             if not mdl or not mdl.lower().startswith("scrfd"):
@@ -347,8 +397,6 @@ class FaceEmbedder:
                     )
                 # Ensure CUDA/cuDNN/TensorRT DLLs are discoverable on Windows
                 if os.name == 'nt':
-                    from pathlib import Path as _P
-
                     def _add_dir(p):
                         try:
                             if p and p.exists():
@@ -400,7 +448,8 @@ class FaceEmbedder:
                     raise RuntimeError(f"TensorRT EP not available in ORT. avail={avail}")
 
                 so = ort.SessionOptions()
-                so.log_severity_level = 0  # VERBOSE
+                _dbg = os.getenv("PERSON_CAPTURE_TRT_DEBUG", "0").lower() not in ("0", "", "false")
+                so.log_severity_level = 0 if _dbg else 2  # 0=verbose, 2=warning
                 go = getattr(ort, "GraphOptimizationLevel", None)
                 if go is not None:
                     level = getattr(go, "ORT_ENABLE_ALL", None)
@@ -410,7 +459,7 @@ class FaceEmbedder:
                 so.add_session_config_entry("session.logid", "arcface_trt")
 
                 # ---- Debug & options -------------------------------------------------
-                debug_lines: list[str] = []
+                debug_lines: List[str] = []
 
                 def _logd(msg: str) -> None:
                     debug_lines.append(msg)
@@ -455,20 +504,45 @@ class FaceEmbedder:
                     except Exception as e:
                         _logd(f"ctypes probe error: {e!r}")
 
-                # Build provider chain: TRT -> CUDA -> CPU with **no fp16, no cache**, default opts
-                prov = []
+                # Build provider chain: TRT -> CUDA -> CPU with tuned opts (fp16, cache, graphs)
+                avail = list(getattr(ort, "get_available_providers", lambda: [])())
+                prov: List[str] = []
                 if 'TensorrtExecutionProvider' in avail:
                     prov.append('TensorrtExecutionProvider')
                 if 'CUDAExecutionProvider' in avail:
                     prov.append('CUDAExecutionProvider')
                 prov.append('CPUExecutionProvider')
 
-                prov_opts: list[dict] = [{} for _ in prov]
+                try:
+                    _cuda_dev = self._torch.cuda.current_device()
+                except Exception:
+                    _cuda_dev = 0
+                trt_opts_arc = _trt_opts(_cuda_dev, "arcface")
+                # Optional: hint TensorRT with dynamic shapes when batch varies
+                try:
+                    _cpu_probe = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+                    _in_name = _cpu_probe.get_inputs()[0].name
+                    _cpu_probe = None
+                    trt_opts_arc.setdefault("trt_profile_min_shapes",  f"{_in_name}:1x3x112x112")
+                    trt_opts_arc.setdefault("trt_profile_opt_shapes",  f"{_in_name}:8x3x112x112")
+                    trt_opts_arc.setdefault("trt_profile_max_shapes",  f"{_in_name}:32x3x112x112")
+                except Exception:
+                    pass
+                cuda_opts = _cuda_opts(_cuda_dev)
+
+                prov_opts: List[Dict[str, str]] = []
+                for p in prov:
+                    if p == 'TensorrtExecutionProvider':
+                        prov_opts.append(trt_opts_arc)
+                    elif p == 'CUDAExecutionProvider':
+                        prov_opts.append(cuda_opts)
+                    else:
+                        prov_opts.append({})
 
                 last_err = None
-                bound = []
+                bound: List[str] = []
                 try:
-                    _logd(f"Trying TRT session providers={prov} (no fp16, no cache)")
+                    _logd(f"Trying TRT session providers={prov} (env-driven opts)")
                     self.arc_sess = ort.InferenceSession(
                         onnx_path, sess_options=so, providers=prov, provider_options=prov_opts
                     )

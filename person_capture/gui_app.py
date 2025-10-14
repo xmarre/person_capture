@@ -129,6 +129,35 @@ class FileList(QtWidgets.QListWidget):
             event.setDropAction(QtCore.Qt.MoveAction)
         super().dropEvent(event)
 
+# ---------------------- UI helpers ----------------------
+class CollapsibleSection(QtWidgets.QWidget):
+    toggled = QtCore.Signal(bool)
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self._btn = QtWidgets.QToolButton(self)
+        self._btn.setText(title)
+        self._btn.setCheckable(True)
+        self._btn.setChecked(False)
+        self._btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self._btn.setArrowType(QtCore.Qt.RightArrow)
+        self._btn.clicked.connect(self._on_clicked)
+        self._content = QtWidgets.QWidget()
+        self._content.setVisible(False)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        lay.addWidget(self._btn)
+        lay.addWidget(self._content)
+
+    def setContentLayout(self, layout: QtWidgets.QLayout):
+        self._content.setLayout(layout)
+
+    def _on_clicked(self, checked: bool):
+        self._btn.setArrowType(QtCore.Qt.DownArrow if checked else QtCore.Qt.RightArrow)
+        self._content.setVisible(checked)
+        self.toggled.emit(checked)
+
 APP_ORG = "PersonCapture"
 APP_NAME = "PersonCapture GUI"
 
@@ -259,6 +288,16 @@ class SessionConfig:
     prescan_weights: Tuple[float, float, float] = (0.70, 0.25, 0.05)  # (anchor, diversity, quality)
     # --- runtime paths ---
     trt_lib_dir: str = ""                  # preferred TensorRT lib directory
+    # --- TensorRT / ORT (advanced) ---
+    trt_fp16_enable: bool = True
+    trt_timing_cache_enable: bool = True
+    trt_engine_cache_enable: bool = True
+    trt_cache_root: str = "trt_cache"
+    trt_builder_optimization_level: int = 5
+    trt_cuda_graph_enable: bool = True
+    trt_context_memory_sharing_enable: bool = True
+    trt_auxiliary_streams: int = -1
+    cuda_use_tf32: bool = True
     # --- I/O + runtime speed controls ---
     skip_yolo_when_faceonly: bool = True   # if any face is visible, skip YOLO in face_only
     # --- curator (MMR over crops) ---
@@ -2102,6 +2141,34 @@ class Processor(QtCore.QObject):
     def run(self):
         cap = save_q = saver_thread = csv_f = dbg_f = hit_q = None
         try:
+            # Apply TRT/ORT env from cfg early
+            def _env_set(k, v):
+                if v is None:
+                    return
+                os.environ[k] = str(v)
+
+            _env_set("PERSON_CAPTURE_TRT_CACHE_ROOT", getattr(self.cfg, "trt_cache_root", "trt_cache"))
+            _env_set("PERSON_CAPTURE_TRT_FP16", "1" if getattr(self.cfg, "trt_fp16_enable", True) else "0")
+            _env_set("PERSON_CAPTURE_TRT_TIMING_CACHE_ENABLE", "1" if getattr(self.cfg, "trt_timing_cache_enable", True) else "0")
+            _env_set("PERSON_CAPTURE_TRT_ENGINE_CACHE_ENABLE", "1" if getattr(self.cfg, "trt_engine_cache_enable", True) else "0")
+            _env_set("PERSON_CAPTURE_TRT_BUILDER_OPT_LEVEL", int(getattr(self.cfg, "trt_builder_optimization_level", 5)))
+            _env_set("PERSON_CAPTURE_TRT_CUDA_GRAPH_ENABLE", "1" if getattr(self.cfg, "trt_cuda_graph_enable", True) else "0")
+            _env_set(
+                "PERSON_CAPTURE_TRT_CONTEXT_MEMORY_SHARING_ENABLE",
+                "1" if getattr(self.cfg, "trt_context_memory_sharing_enable", True) else "0",
+            )
+            _env_set("PERSON_CAPTURE_TRT_AUX_STREAMS", int(getattr(self.cfg, "trt_auxiliary_streams", -1)))
+            _env_set("PERSON_CAPTURE_CUDA_USE_TF32", "1" if getattr(self.cfg, "cuda_use_tf32", True) else "0")
+
+            # Honor TF32 after env is set
+            try:
+                import torch as _torch_tf32
+                _tf32 = os.getenv("PERSON_CAPTURE_CUDA_USE_TF32", "1").lower() not in ("0", "", "false")
+                _torch_tf32.backends.cuda.matmul.allow_tf32 = _tf32
+                _torch_tf32.backends.cudnn.allow_tf32 = _tf32
+            except Exception:
+                pass
+
             self._paused = False
             self._init_status()
             cfg = self.cfg
@@ -4212,6 +4279,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # TensorRT path controls
         self.trt_edit = QtWidgets.QLineEdit(self.cfg.trt_lib_dir or r"D:\\tensorrt\\TensorRT-10.13.3.9")
         self.trt_btn = QtWidgets.QPushButton("Browse…")
+        # Advanced TensorRT/ORT collapsible
 
         def _pick_trt():
             d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select TensorRT lib folder", self.trt_edit.text() or "")
@@ -4224,6 +4292,59 @@ class MainWindow(QtWidgets.QMainWindow):
         trt_row_layout.setContentsMargins(0, 0, 0, 0)
         trt_row_layout.addWidget(self.trt_edit, 1)
         trt_row_layout.addWidget(self.trt_btn)
+
+        # --- Collapsible: TensorRT / ORT (Advanced) ---
+        self.trt_box = CollapsibleSection("TensorRT / ORT (Advanced)")
+        trt_adv = QtWidgets.QGridLayout()
+        r = 0
+        self.chk_trt_fp16 = QtWidgets.QCheckBox("TRT FP16")
+        self.chk_trt_fp16.setChecked(bool(self.cfg.trt_fp16_enable))
+        trt_adv.addWidget(self.chk_trt_fp16, r, 0)
+        r += 1
+        self.chk_trt_timing = QtWidgets.QCheckBox("Timing cache")
+        self.chk_trt_timing.setChecked(bool(self.cfg.trt_timing_cache_enable))
+        trt_adv.addWidget(self.chk_trt_timing, r, 0)
+        self.chk_trt_engine = QtWidgets.QCheckBox("Engine cache")
+        self.chk_trt_engine.setChecked(bool(self.cfg.trt_engine_cache_enable))
+        trt_adv.addWidget(self.chk_trt_engine, r, 1)
+        r += 1
+        self.edit_trt_cache = QtWidgets.QLineEdit(self.cfg.trt_cache_root or "trt_cache")
+        trt_adv.addWidget(QtWidgets.QLabel("Cache root"), r, 0)
+        trt_adv.addWidget(self.edit_trt_cache, r, 1)
+        r += 1
+        self.spin_trt_level = QtWidgets.QSpinBox()
+        self.spin_trt_level.setRange(0, 5)
+        self.spin_trt_level.setValue(int(self.cfg.trt_builder_optimization_level))
+        trt_adv.addWidget(QtWidgets.QLabel("Builder opt level"), r, 0)
+        trt_adv.addWidget(self.spin_trt_level, r, 1)
+        r += 1
+        self.chk_trt_cuda_graph = QtWidgets.QCheckBox("CUDA Graphs")
+        self.chk_trt_cuda_graph.setChecked(bool(self.cfg.trt_cuda_graph_enable))
+        trt_adv.addWidget(self.chk_trt_cuda_graph, r, 0)
+        self.chk_trt_ctx_share = QtWidgets.QCheckBox("Context memory sharing")
+        self.chk_trt_ctx_share.setChecked(bool(self.cfg.trt_context_memory_sharing_enable))
+        trt_adv.addWidget(self.chk_trt_ctx_share, r, 1)
+        r += 1
+        self.spin_trt_aux = QtWidgets.QSpinBox()
+        self.spin_trt_aux.setRange(-1, 16)
+        self.spin_trt_aux.setValue(int(self.cfg.trt_auxiliary_streams))
+        trt_adv.addWidget(QtWidgets.QLabel("Aux streams"), r, 0)
+        trt_adv.addWidget(self.spin_trt_aux, r, 1)
+        r += 1
+        self.chk_cuda_tf32 = QtWidgets.QCheckBox("CUDA TF32")
+        self.chk_cuda_tf32.setChecked(bool(self.cfg.cuda_use_tf32))
+        trt_adv.addWidget(self.chk_cuda_tf32, r, 0)
+        r += 1
+        self.trt_box.setContentLayout(trt_adv)
+        self.chk_trt_fp16.stateChanged.connect(self._on_ui_change)
+        self.chk_trt_timing.stateChanged.connect(self._on_ui_change)
+        self.chk_trt_engine.stateChanged.connect(self._on_ui_change)
+        self.edit_trt_cache.textChanged.connect(self._on_ui_change)
+        self.spin_trt_level.valueChanged.connect(self._on_ui_change)
+        self.chk_trt_cuda_graph.stateChanged.connect(self._on_ui_change)
+        self.chk_trt_ctx_share.stateChanged.connect(self._on_ui_change)
+        self.spin_trt_aux.valueChanged.connect(self._on_ui_change)
+        self.chk_cuda_tf32.stateChanged.connect(self._on_ui_change)
         self.min_sharp_spin = QtWidgets.QDoubleSpinBox(); self.min_sharp_spin.setRange(0.0, 5000.0); self.min_sharp_spin.setValue(0.0)
         self.min_gap_spin = QtWidgets.QDoubleSpinBox(); self.min_gap_spin.setDecimals(2); self.min_gap_spin.setRange(0.0, 30.0); self.min_gap_spin.setValue(1.5)
         self.min_box_pix_spin = QtWidgets.QSpinBox(); self.min_box_pix_spin.setRange(0, 5000000); self.min_box_pix_spin.setValue(5000)
@@ -4371,6 +4492,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Pre-scan dedup cos ≥", self.spin_prescan_dedup),
             ("Pre-scan replace margin", self.spin_prescan_margin),
             ("TensorRT lib dir", self._trt_row_widget),
+            ("", self.trt_box),
             ("Min sharpness", self.min_sharp_spin),
             ("Min seconds between hits", self.min_gap_spin),
             ("Min box area (px)", self.min_box_pix_spin),
@@ -5200,6 +5322,16 @@ class MainWindow(QtWidgets.QMainWindow):
             prescan_diversity_dedup_cos=float(self.spin_prescan_dedup.value()) if hasattr(self, "spin_prescan_dedup") else 0.968,
             prescan_replace_margin=float(self.spin_prescan_margin.value()) if hasattr(self, "spin_prescan_margin") else 0.01,
             trt_lib_dir=self.trt_edit.text().strip() if hasattr(self, "trt_edit") else "",
+            # TensorRT/ORT advanced
+            trt_fp16_enable=bool(self.chk_trt_fp16.isChecked()) if hasattr(self, "chk_trt_fp16") else True,
+            trt_timing_cache_enable=bool(self.chk_trt_timing.isChecked()) if hasattr(self, "chk_trt_timing") else True,
+            trt_engine_cache_enable=bool(self.chk_trt_engine.isChecked()) if hasattr(self, "chk_trt_engine") else True,
+            trt_cache_root=self.edit_trt_cache.text().strip() if hasattr(self, "edit_trt_cache") else "trt_cache",
+            trt_builder_optimization_level=int(self.spin_trt_level.value()) if hasattr(self, "spin_trt_level") else 5,
+            trt_cuda_graph_enable=bool(self.chk_trt_cuda_graph.isChecked()) if hasattr(self, "chk_trt_cuda_graph") else True,
+            trt_context_memory_sharing_enable=bool(self.chk_trt_ctx_share.isChecked()) if hasattr(self, "chk_trt_ctx_share") else True,
+            trt_auxiliary_streams=int(self.spin_trt_aux.value()) if hasattr(self, "spin_trt_aux") else -1,
+            cuda_use_tf32=bool(self.chk_cuda_tf32.isChecked()) if hasattr(self, "chk_cuda_tf32") else True,
             min_sharpness=float(self.min_sharp_spin.value()),
             min_gap_sec=float(self.min_gap_spin.value()),
             min_box_pixels=int(self.min_box_pix_spin.value()),
@@ -5335,6 +5467,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spin_prescan_margin.setValue(float(cfg.prescan_replace_margin))
         if hasattr(self, 'trt_edit'):
             self.trt_edit.setText(cfg.trt_lib_dir or r"D:\\tensorrt\\TensorRT-10.13.3.9")
+        if hasattr(self, 'chk_trt_fp16'):
+            self.chk_trt_fp16.setChecked(bool(getattr(cfg, 'trt_fp16_enable', True)))
+        if hasattr(self, 'chk_trt_timing'):
+            self.chk_trt_timing.setChecked(bool(getattr(cfg, 'trt_timing_cache_enable', True)))
+        if hasattr(self, 'chk_trt_engine'):
+            self.chk_trt_engine.setChecked(bool(getattr(cfg, 'trt_engine_cache_enable', True)))
+        if hasattr(self, 'edit_trt_cache'):
+            self.edit_trt_cache.setText(getattr(cfg, 'trt_cache_root', 'trt_cache') or 'trt_cache')
+        if hasattr(self, 'spin_trt_level'):
+            self.spin_trt_level.setValue(int(getattr(cfg, 'trt_builder_optimization_level', 5)))
+        if hasattr(self, 'chk_trt_cuda_graph'):
+            self.chk_trt_cuda_graph.setChecked(bool(getattr(cfg, 'trt_cuda_graph_enable', True)))
+        if hasattr(self, 'chk_trt_ctx_share'):
+            self.chk_trt_ctx_share.setChecked(bool(getattr(cfg, 'trt_context_memory_sharing_enable', True)))
+        if hasattr(self, 'spin_trt_aux'):
+            self.spin_trt_aux.setValue(int(getattr(cfg, 'trt_auxiliary_streams', -1)))
+        if hasattr(self, 'chk_cuda_tf32'):
+            self.chk_cuda_tf32.setChecked(bool(getattr(cfg, 'cuda_use_tf32', True)))
         self.min_sharp_spin.setValue(cfg.min_sharpness)
         self.min_gap_spin.setValue(cfg.min_gap_sec)
         self.min_box_pix_spin.setValue(cfg.min_box_pixels)
