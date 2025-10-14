@@ -144,7 +144,7 @@ class SessionConfig:
     seek_fast: bool = True
     # Max frames to grab forward after landing on a keyframe during seek.
     # ≤0 uses fps-derived auto cap (~1s of decoding) to avoid long stalls.
-    seek_max_grabs: int = 0
+    seek_max_grabs: int = 45
     out_dir: str = "output"
     ratio: str = "2:3,1:1,3:2"
     frame_stride: int = 2
@@ -536,7 +536,7 @@ class Processor(QtCore.QObject):
                         i,
                         tgt,
                         fast=bool(getattr(cfg, "seek_fast", True)),
-                        max_grabs=int(getattr(cfg, "seek_max_grabs", 0)),
+                        max_grabs=int(getattr(cfg, "seek_max_grabs", 45)),
                     )
                     i = (new_pos // stride) * stride
                     processed_samples = i // stride
@@ -565,8 +565,80 @@ class Processor(QtCore.QObject):
                         i,
                         next_i,
                         fast=bool(getattr(cfg, "seek_fast", True)),
-                        max_grabs=int(getattr(cfg, "seek_max_grabs", 0)),
+                        max_grabs=int(getattr(cfg, "seek_max_grabs", 45)),
                     )
+                    continue
+                # Preempt before IO to honor newly queued seeks/steps
+                try:
+                    while True:
+                        cmd, arg = self._cmd_q.get_nowait()
+                        if cmd == "seek":
+                            try:
+                                last_seek = int(arg)
+                            except Exception:
+                                pass
+                        elif cmd == "step":
+                            try:
+                                step_accum += int(arg) if arg is not None else 1
+                            except Exception:
+                                step_accum += 1
+                        elif cmd == "speed":
+                            try:
+                                pending_speed = float(arg)
+                            except Exception:
+                                pass
+                        elif cmd == "cfg":
+                            try:
+                                ch = dict(arg or {})
+                                for k, v in ch.items():
+                                    if k.startswith("prescan_"):
+                                        setattr(cfg, k, v)
+                                stride = max(1, int(cfg.prescan_stride))
+                                enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
+                                fd_add = float(getattr(cfg, "prescan_fd_add", enter))
+                                Wmax = int(cfg.prescan_max_width)
+                                face.conf = float(cfg.prescan_face_conf)
+                                add_cooldown_samples = int(
+                                    getattr(
+                                        cfg,
+                                        "prescan_add_cooldown_samples",
+                                        getattr(cfg, "prescan_add_cooldown_frames", 5),
+                                    )
+                                )
+                            except Exception:
+                                pass
+                        elif cmd == "pause":
+                            self._paused = True
+                        elif cmd == "play":
+                            self._paused = False
+                except queue.Empty:
+                    pass
+
+                if pending_speed is not None:
+                    self._speed = max(0.1, min(4.0, float(pending_speed)))
+                    pending_speed = None
+                if last_seek is not None or step_accum:
+                    tgt = int(last_seek) if last_seek is not None else int(i + step_accum)
+                    tgt = max(0, min(total_frames - 1, tgt))
+                    new_pos = self._seek_to(
+                        cap,
+                        i,
+                        tgt,
+                        fast=bool(getattr(cfg, "seek_fast", True)),
+                        max_grabs=int(getattr(cfg, "seek_max_grabs", 45)),
+                    )
+                    i = (new_pos // stride) * stride
+                    processed_samples = i // stride
+                    active = False
+                    neg_run = 0
+                    fd9_streak = 0
+                    fd9_skip_samples = 0
+                    fd9_probe_samples = 0
+                    fd9_gate_period = 1
+                    try:
+                        self.progress.emit(i)
+                    except Exception:
+                        pass
                     continue
                 if not cap.grab():
                     break
@@ -1435,8 +1507,21 @@ class Processor(QtCore.QObject):
             i = bisect.bisect_right(ks, tgt_idx) - 1
             if i >= 0:
                 base = int(ks[i])
+        # If we have no KF info or landed exactly on tgt, choose a near target base in fast mode
+        if fast and (not ks or base == tgt_idx):
+            mg = max_grabs
+            if mg <= 0:
+                f = float(self._fps or 30.0)
+                mg = max(15, min(240, int(round(f))))
+            base = max(0, tgt_idx - int(mg))
         if base != cur_idx:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, base)
+            # time-based reposition is often faster on some backends; fall back if it fails
+            if fast and self._fps:
+                ok = cap.set(cv2.CAP_PROP_POS_MSEC, (base / float(self._fps)) * 1000.0)
+                if not ok:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, base)
+            else:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, base)
         idx = base
         limit = max(0, tgt_idx - base)
         # Cap forward grabs in fast mode to keep UI responsive
@@ -1455,10 +1540,23 @@ class Processor(QtCore.QObject):
                     )
                 except Exception:
                     pass
+        # Time-budgeted forward grabs to avoid long decode stalls
+        t0 = time.perf_counter() if fast else None
+        budget = 0.15  # ~150 ms max spent per seek
         for _ in range(limit):
             if not cap.grab():
                 break
             idx += 1
+            if fast and (time.perf_counter() - t0) > budget:
+                try:
+                    self._status(
+                        f"Fast-seek time-capped at {idx - base} grabs",
+                        key="seek_cap_t",
+                        interval=1.0,
+                    )
+                except Exception:
+                    pass
+                break
         return idx
 
     def __init__(self, cfg: SessionConfig, parent=None):
@@ -2193,6 +2291,10 @@ class Processor(QtCore.QObject):
                 cap = cv2.VideoCapture(cfg.video)
             if not cap.isOpened():
                 raise RuntimeError(f"Cannot open video: {cfg.video}")
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+            except Exception:
+                pass
             fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
             self._fps = fps
@@ -2232,7 +2334,7 @@ class Processor(QtCore.QObject):
                         0,
                         s0,
                         fast=bool(getattr(cfg, "seek_fast", True)),
-                        max_grabs=int(getattr(cfg, "seek_max_grabs", 0)),
+                        max_grabs=int(getattr(cfg, "seek_max_grabs", 45)),
                     )
                     self._status(f"Pre-scan segments: {len(keep_spans)}", key="prescan", interval=30.0)
                 else:
@@ -2356,16 +2458,108 @@ class Processor(QtCore.QObject):
             self._seek_cooldown_frames = 0
 
             self._status("Processing...", key="phase", interval=5.0)
+            next_seek: Optional[int] = None
+            next_steps: int = 0
+            next_speed: Optional[float] = None
+            next_cfg: dict = {}
             while True:
                 if self._abort:
                     self._status("Aborting...", key="phase")
                     break
                 force_process = False
                 # --------- drain and coalesce controls ---------
-                last_seek: Optional[int] = None
-                step_accum: int = 0
-                pending_speed: Optional[float] = None
-                pending_cfg: dict = {}
+                last_seek: Optional[int] = next_seek
+                step_accum: int = next_steps
+                pending_speed: Optional[float] = next_speed
+                pending_cfg: dict = dict(next_cfg)
+                next_seek = None
+                next_steps = 0
+                next_speed = None
+                next_cfg = {}
+
+                def _apply_live_updates() -> None:
+                    nonlocal pending_speed, pending_cfg
+                    if pending_speed is not None:
+                        self._speed = max(0.1, min(4.0, float(pending_speed)))
+                        pending_speed = None
+                    if pending_cfg:
+                        LIVE = {
+                            "frame_stride",
+                            "min_det_conf",
+                            "face_thresh",
+                            "reid_thresh",
+                            "combine",
+                            "match_mode",
+                            "only_best",
+                            "min_sharpness",
+                            "min_gap_sec",
+                            "min_box_pixels",
+                            "auto_crop_borders",
+                            "border_threshold",
+                            "score_margin",
+                            "iou_gate",
+                            "preview_every",
+                            "require_face_if_visible",
+                            "prefer_face_when_available",
+                            "suppress_negatives",
+                            "neg_tolerance",
+                            "max_negatives",
+                            "log_interval_sec",
+                            "lock_after_hits",
+                            "lock_face_thresh",
+                            "lock_reid_thresh",
+                            "lock_momentum",
+                            "allow_faceless_when_locked",
+                            "learn_bank_runtime",
+                            "drop_reid_if_any_face_match",
+                            "faceless_reid_thresh",
+                            "faceless_iou_min",
+                            "faceless_persist_frames",
+                            "faceless_min_area_frac",
+                            "faceless_max_area_frac",
+                            "faceless_center_max_frac",
+                            "faceless_min_motion_frac",
+                            "crop_face_side_margin_frac",
+                            "crop_top_headroom_max_frac",
+                            "crop_bottom_min_face_heights",
+                            "crop_penalty_weight",
+                            "face_anchor_down_frac",
+                            "face_max_frac_in_crop",
+                            "face_min_frac_in_crop",
+                            "crop_min_height_frac",
+                            "face_visible_uses_quality",
+                            "face_quality_min",
+                            "face_det_conf",
+                            "face_det_pad",
+                            "face_fullframe_imgsz",
+                            "rot_adaptive",
+                            "rot_every_n",
+                            "rot_after_hit_frames",
+                            "fast_no_face_imgsz",
+                        }
+                        rot_keys = {
+                            "rot_adaptive",
+                            "rot_every_n",
+                            "rot_after_hit_frames",
+                            "fast_no_face_imgsz",
+                        }
+                        rot_changed = False
+                        for k, v in pending_cfg.items():
+                            if k in LIVE and hasattr(self.cfg, k):
+                                setattr(self.cfg, k, v)
+                                if k in rot_keys:
+                                    rot_changed = True
+                        if rot_changed:
+                            try:
+                                face.configure_rotation_strategy(
+                                    adaptive=getattr(self.cfg, "rot_adaptive", True),
+                                    every_n=getattr(self.cfg, "rot_every_n", 12),
+                                    after_hit_frames=getattr(self.cfg, "rot_after_hit_frames", 8),
+                                    fast_no_face_imgsz=getattr(self.cfg, "fast_no_face_imgsz", 512),
+                                )
+                            except Exception:
+                                pass
+                        pending_cfg = {}
                 try:
                     while True:
                         cmd, arg = self._cmd_q.get_nowait()
@@ -2398,87 +2592,7 @@ class Processor(QtCore.QObject):
                             pass
                 except queue.Empty:
                     pass
-
-                # apply speed/cfg first
-                if pending_speed is not None:
-                    self._speed = max(0.1, min(4.0, float(pending_speed)))
-                if pending_cfg:
-                    LIVE = {
-                        "frame_stride",
-                        "min_det_conf",
-                        "face_thresh",
-                        "reid_thresh",
-                        "combine",
-                        "match_mode",
-                        "only_best",
-                        "min_sharpness",
-                        "min_gap_sec",
-                        "min_box_pixels",
-                        "auto_crop_borders",
-                        "border_threshold",
-                        "score_margin",
-                        "iou_gate",
-                        "preview_every",
-                        "require_face_if_visible",
-                        "prefer_face_when_available",
-                        "suppress_negatives",
-                        "neg_tolerance",
-                        "max_negatives",
-                        "log_interval_sec",
-                        "lock_after_hits",
-                        "lock_face_thresh",
-                        "lock_reid_thresh",
-                        "lock_momentum",
-                        "allow_faceless_when_locked",
-                        "learn_bank_runtime",
-                        "drop_reid_if_any_face_match",
-                        "faceless_reid_thresh",
-                        "faceless_iou_min",
-                        "faceless_persist_frames",
-                        "faceless_min_area_frac",
-                        "faceless_max_area_frac",
-                        "faceless_center_max_frac",
-                        "faceless_min_motion_frac",
-                        "crop_face_side_margin_frac",
-                        "crop_top_headroom_max_frac",
-                        "crop_bottom_min_face_heights",
-                        "crop_penalty_weight",
-                        "face_anchor_down_frac",
-                        "face_max_frac_in_crop",
-                        "face_min_frac_in_crop",
-                        "crop_min_height_frac",
-                        "face_visible_uses_quality",
-                        "face_quality_min",
-                        "face_det_conf",
-                        "face_det_pad",
-                        "face_fullframe_imgsz",
-                        "rot_adaptive",
-                        "rot_every_n",
-                        "rot_after_hit_frames",
-                        "fast_no_face_imgsz",
-                    }
-                    rot_keys = {
-                        "rot_adaptive",
-                        "rot_every_n",
-                        "rot_after_hit_frames",
-                        "fast_no_face_imgsz",
-                    }
-                    rot_changed = False
-                    for k, v in pending_cfg.items():
-                        if k in LIVE and hasattr(self.cfg, k):
-                            setattr(self.cfg, k, v)
-                            if k in rot_keys:
-                                rot_changed = True
-                    if rot_changed:
-                        try:
-                            face.configure_rotation_strategy(
-                                adaptive=getattr(self.cfg, "rot_adaptive", True),
-                                every_n=getattr(self.cfg, "rot_every_n", 12),
-                                after_hit_frames=getattr(self.cfg, "rot_after_hit_frames", 8),
-                                fast_no_face_imgsz=getattr(self.cfg, "fast_no_face_imgsz", 512),
-                            )
-                        except Exception:
-                            pass
+                _apply_live_updates()
 
                 # apply coalesced seek/step
                 if last_seek is not None or step_accum:
@@ -2493,7 +2607,7 @@ class Processor(QtCore.QObject):
                         frame_idx,
                         tgt,
                         fast=bool(getattr(self.cfg, "seek_fast", True)),
-                        max_grabs=int(getattr(self.cfg, "seek_max_grabs", 0)),
+                        max_grabs=int(getattr(self.cfg, "seek_max_grabs", 45)),
                     )
                     self.progress.emit(frame_idx)
                     # reset temporal gates so back/forward scrubs work
@@ -2535,7 +2649,7 @@ class Processor(QtCore.QObject):
                             frame_idx,
                             s,
                             fast=bool(getattr(self.cfg, "seek_fast", True)),
-                            max_grabs=int(getattr(self.cfg, "seek_max_grabs", 0)),
+                            max_grabs=int(getattr(self.cfg, "seek_max_grabs", 45)),
                         )
                         self._seek_cooldown_frames = int(max(2, (self._fps or 30) * 0.25))
                         continue
@@ -2549,7 +2663,7 @@ class Processor(QtCore.QObject):
                             frame_idx,
                             s2,
                             fast=bool(getattr(self.cfg, "seek_fast", True)),
-                            max_grabs=int(getattr(self.cfg, "seek_max_grabs", 0)),
+                            max_grabs=int(getattr(self.cfg, "seek_max_grabs", 45)),
                         )
                         self._seek_cooldown_frames = int(max(2, (self._fps or 30) * 0.25))
                         continue
@@ -2558,6 +2672,54 @@ class Processor(QtCore.QObject):
                     self._paused = True
                 if self._paused and not force_process:
                     time.sleep(0.01)
+                    continue
+
+                # --- preempt before any IO/inference ---
+                try:
+                    while True:
+                        cmd, arg = self._cmd_q.get_nowait()
+                        if cmd == "seek":
+                            try:
+                                next_seek = int(arg)
+                            except Exception:
+                                pass
+                        elif cmd == "step":
+                            try:
+                                next_steps += int(arg) if arg is not None else 1
+                            except Exception:
+                                next_steps += 1
+                        elif cmd == "speed":
+                            try:
+                                next_speed = float(arg)
+                            except Exception:
+                                pass
+                        elif cmd == "cfg":
+                            try:
+                                next_cfg.update(dict(arg or {}))
+                            except Exception:
+                                pass
+                        elif cmd == "pause":
+                            self._paused = True
+                        elif cmd == "play":
+                            self._paused = False
+                        else:
+                            pass
+                except queue.Empty:
+                    pass
+
+                if next_speed is not None:
+                    pending_speed = next_speed
+                    next_speed = None
+                if next_cfg:
+                    if pending_cfg:
+                        pending_cfg.update(next_cfg)
+                    else:
+                        pending_cfg = dict(next_cfg)
+                    next_cfg = {}
+
+                _apply_live_updates()
+
+                if next_seek is not None or next_steps:
                     continue
 
                 ret = cap.grab()
@@ -5013,7 +5175,7 @@ class MainWindow(QtWidgets.QMainWindow):
             out_dir=self.out_edit.text().strip() or "output",
             ratio=self.ratio_edit.text().strip() or "2:3",
             seek_fast=bool(getattr(self.cfg, "seek_fast", True)),
-            seek_max_grabs=max(0, int(getattr(self.cfg, "seek_max_grabs", 0))),
+            seek_max_grabs=max(0, int(getattr(self.cfg, "seek_max_grabs", 45))),
             frame_stride=int(self.stride_spin.value()),
             min_det_conf=float(self.det_conf_spin.value()),
             face_thresh=float(self.face_thr_spin.value()),
@@ -5103,9 +5265,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _apply_cfg(self, cfg: SessionConfig):
         self.cfg.seek_fast = bool(getattr(cfg, "seek_fast", True))
         try:
-            self.cfg.seek_max_grabs = int(getattr(cfg, "seek_max_grabs", 0))
+            self.cfg.seek_max_grabs = int(getattr(cfg, "seek_max_grabs", 45))
         except Exception:
-            self.cfg.seek_max_grabs = 0
+            self.cfg.seek_max_grabs = 45
         self.video_edit.setText(cfg.video)
         paths = [part.strip() for part in (cfg.ref or "").split(';') if part.strip()]
         self._set_ref_paths(paths)
@@ -5556,9 +5718,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ratio_edit.setText(s.value("ratio", "2:3"))
         self.cfg.seek_fast = s.value("seek_fast", True, type=bool)
         try:
-            self.cfg.seek_max_grabs = int(s.value("seek_max_grabs", 0))
+            self.cfg.seek_max_grabs = int(s.value("seek_max_grabs", 45))
         except Exception:
-            self.cfg.seek_max_grabs = 0
+            self.cfg.seek_max_grabs = 45
         self.stride_spin.setValue(int(s.value("frame_stride", 2)))
         self.det_conf_spin.setValue(float(s.value("min_det_conf", 0.35)))
         self.face_thr_spin.setValue(float(s.value("face_thresh", 0.45)))
