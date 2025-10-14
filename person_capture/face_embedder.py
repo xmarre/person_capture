@@ -387,7 +387,6 @@ class FaceEmbedder:
             _default_so.inter_op_num_threads = 1
             if not hasattr(ort, "_pc_trt_patched"):
                 _orig_IS = ort.InferenceSession
-                import os
                 _target_paths = {os.path.normcase(os.path.abspath(os.fspath(mdl)))}
                 ort._pc_trt_targets = _target_paths
 
@@ -423,7 +422,6 @@ class FaceEmbedder:
             else:
                 # If already patched, register this model path too.
                 try:
-                    import os
                     _mp = os.path.normcase(os.path.abspath(os.fspath(mdl)))
                     _targets = getattr(ort, "_pc_trt_targets", None)
                     if isinstance(_targets, set):
