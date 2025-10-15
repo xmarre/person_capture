@@ -330,8 +330,7 @@ class FaceEmbedder:
                 return default
 
         def _trt_opts(device_id: int, prefix: str) -> Dict[str, str]:
-            def _b(v: bool) -> str:
-                return "True" if bool(v) else "False"
+            _b = lambda v: "True" if v else "False"
             cache_root = _P(_e("PERSON_CAPTURE_TRT_CACHE_ROOT", "trt_cache")).resolve()
             (cache_root / prefix).mkdir(parents=True, exist_ok=True)
             timing_en = _ef("PERSON_CAPTURE_TRT_TIMING_CACHE_ENABLE", True)
@@ -360,13 +359,6 @@ class FaceEmbedder:
                 "trt_auxiliary_streams": str(aux_stream),
             }
 
-        def _cuda_opts(device_id: int) -> Dict[str, str]:
-            cg_en = _ef("PERSON_CAPTURE_TRT_CUDA_GRAPH_ENABLE", True)
-            return {
-                "device_id": str(device_id),
-                "enable_cuda_graph": "1" if cg_en else "0",
-                "do_copy_in_default_stream": "1",
-            }
         # --- SCRFD probe controls ---
         self.scrfd_tta_scales = getattr(self, "scrfd_tta_scales", (0.75, 0.60))
         self.scrfd_probe_conf_cap = getattr(self, "scrfd_probe_conf_cap", 0.20)
@@ -741,13 +733,11 @@ class FaceEmbedder:
                     except Exception as e:
                         _logd(f"ctypes probe error: {e!r}")
 
-                # Build provider chain: TRT -> CUDA -> CPU with tuned opts (fp16, cache, graphs)
+                # Build provider chain: TRT -> CPU with tuned opts (fp16, cache, graphs)
                 avail = list(getattr(ort, "get_available_providers", lambda: [])())
                 prov: List[str] = []
                 if 'TensorrtExecutionProvider' in avail:
                     prov.append('TensorrtExecutionProvider')
-                if 'CUDAExecutionProvider' in avail:
-                    prov.append('CUDAExecutionProvider')
                 prov.append('CPUExecutionProvider')
 
                 try:
@@ -771,14 +761,10 @@ class FaceEmbedder:
                         "trt_profile_opt_shapes": f"{arc_in}:1x3x112x112",
                         "trt_profile_max_shapes": f"{arc_in}:1x3x112x112",
                     })
-                cuda_opts = _cuda_opts(_cuda_dev)
-
                 prov_opts: List[Dict[str, str]] = []
                 for p in prov:
                     if p == 'TensorrtExecutionProvider':
                         prov_opts.append(trt_opts_arc)
-                    elif p == 'CUDAExecutionProvider':
-                        prov_opts.append(cuda_opts)
                     else:
                         prov_opts.append({})
 
@@ -911,9 +897,6 @@ class FaceEmbedder:
             # Per-device tuned TRT options and cache
             trt_opts = {}  # will fill after we learn input name
             opts.append(trt_opts)
-        if 'CUDAExecutionProvider' in avail:
-            provs.append('CUDAExecutionProvider')
-            opts.append({})
         provs.append('CPUExecutionProvider')
         opts.append({})
 
@@ -938,13 +921,6 @@ class FaceEmbedder:
                     dev_id = -1
             if isinstance(dev_id, int) and dev_id >= 0:
                 trt['device_id'] = str(dev_id)
-                # mirror to CUDA EP if present
-                try:
-                    i_cuda = provs.index('CUDAExecutionProvider')
-                    opts[i_cuda]['device_id'] = str(dev_id)
-                except ValueError:
-                    pass
-
             cache_root = _P(getattr(self, "trt_cache_dir", "trt_cache")) / "scrfd"
             try:
                 cache_root.mkdir(parents=True, exist_ok=True)
@@ -962,9 +938,9 @@ class FaceEmbedder:
 
             trt.update({'trt_ep_context_file_path': cache_root_resolved})
             trt.update({
-                'trt_fp16_enable': '1',
-                'trt_timing_cache_enable': '1',
-                'trt_engine_cache_enable': '1',
+                'trt_fp16_enable': 'True',
+                'trt_timing_cache_enable': 'True',
+                'trt_engine_cache_enable': 'True',
                 'trt_engine_cache_prefix': 'scrfd_dyn',
                 'trt_engine_cache_path': cache_root_resolved,
                 'trt_timing_cache_path': timing_path_resolved,
@@ -984,8 +960,8 @@ class FaceEmbedder:
         if provs and provs[0] == 'TensorrtExecutionProvider':
             trt = opts[0]
             trt.update({
-                'trt_dump_subgraphs': '1',
-                'trt_detailed_build_log': '1',
+                'trt_dump_subgraphs': 'True',
+                'trt_detailed_build_log': 'True',
                 'trt_min_subgraph_size': '1',
             })
         try:
@@ -1030,39 +1006,12 @@ class FaceEmbedder:
                     trt['trt_profile_max_shapes'] = f'{in_name}:1x3x640x640'
                     trt['trt_min_subgraph_size'] = '1'
                     trt['trt_max_partition_iterations'] = '1000'
-                    trt['trt_force_sequential_engine_build'] = '1'
+                    trt['trt_force_sequential_engine_build'] = 'True'
                 sess = ort.InferenceSession(
                     self._scrfd_model_path, so, providers=provs, provider_options=opts
                 )
                 if callable(getattr(self, "progress", None)):
                     self.progress(f"SCRFD ORT fixed-profile providers={tuple(sess.get_providers())}")
-            except Exception:
-                pass
-        # If still no TRT, force a CUDA session
-        try:
-            bound0 = tuple(sess.get_providers())
-        except Exception:
-            bound0 = tuple()
-        if 'TensorrtExecutionProvider' not in bound0 and 'CUDAExecutionProvider' in avail:
-            try:
-                cuda_opts: dict[str, Any] = {}
-                if 'CUDAExecutionProvider' in provs:
-                    try:
-                        idx_cuda = provs.index('CUDAExecutionProvider')
-                    except ValueError:
-                        idx_cuda = -1
-                    if idx_cuda >= 0:
-                        src_opts = opts[idx_cuda]
-                        if isinstance(src_opts, dict) and 'device_id' in src_opts:
-                            cuda_opts['device_id'] = src_opts['device_id']
-                sess = ort.InferenceSession(
-                    self._scrfd_model_path,
-                    so,
-                    providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
-                    provider_options=[cuda_opts, {}],
-                )
-                if callable(getattr(self, "progress", None)):
-                    self.progress(f"SCRFD ORT CUDA-only providers={tuple(sess.get_providers())}")
             except Exception:
                 pass
         try:

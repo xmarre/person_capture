@@ -14,6 +14,8 @@ ultralytics==8.3.205
 insightface>=0.7.3
 # Install onnxruntime-gpu 1.24.0 from the local wheel; see README_onnxruntime_1.24_trt_windows.md
 open-clip-torch==3.2.0
+onnx
+onnxsim
 PySide6
 tensorrt-cu12==10.13.3.9
 ## CUDA deps for TensorRT EP
