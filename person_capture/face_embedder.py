@@ -1,5 +1,5 @@
 
-import os, io, sys, glob, site, math
+import os, io, sys, glob, site, math, re
 import ctypes
 from pathlib import Path
 from pathlib import Path as _P
@@ -453,7 +453,7 @@ class FaceEmbedder:
 
             self._scrfd_model_path = mdl
             self._scrfd_ctx_id = ctx_id
-            self.scrfd = _SCRFD(mdl)
+            self.scrfd = self._get_scrfd_trt((640, 640))
             # Robust TRT init: fixed shape only for deterministic engine/profile.
             self._scrfd_fixed_shape = (640, 640)
             self._scrfd_trt_cache: Dict[Tuple[int, int], object] = {}
@@ -513,10 +513,14 @@ class FaceEmbedder:
                     )
                 # Ensure CUDA/cuDNN/TensorRT DLLs are discoverable on Windows
                 if os.name == 'nt':
-                    def _add_dir(p):
+                    # keep DLL dir handles alive so providers remain visible
+                    self._dll_dir_handles = getattr(self, "_dll_dir_handles", [])
+
+                    def _add_dir(p: _P) -> None:
                         try:
                             if p and p.exists():
-                                os.add_dll_directory(str(p))
+                                h = os.add_dll_directory(str(p))
+                                self._dll_dir_handles.append(h)
                                 if progress:
                                     progress(f"Added DLL dir: {p}")
                         except Exception:
@@ -746,103 +750,143 @@ class FaceEmbedder:
             pass
 
     def _get_scrfd_trt(self, shape: Tuple[int, int]):
-        """Return SCRFD detector backed by a single dynamic TensorRT profile."""
+        """Return SCRFD detector with an explicitly built TRT session. Avoid registry races."""
         import onnxruntime as ort  # type: ignore
+        from insightface.model_zoo.scrfd import SCRFD as _SCRFD
+
+        if hasattr(self, "_scrfd_trt_singleton") and self._scrfd_trt_singleton is not None:
+            try:
+                self._scrfd_trt_singleton.prepare(ctx_id=self._scrfd_ctx_id, det_size=shape)
+            except Exception:
+                pass
+            try:
+                bound = tuple(self._scrfd_trt_singleton.session.get_providers())
+            except Exception:
+                bound = tuple()
+            self._scrfd_is_trt = 'TensorrtExecutionProvider' in bound
+            require_trt_cached = str(os.getenv("PERSON_CAPTURE_REQUIRE_TRT", "")).lower() in ("1", "true", "yes", "on")
+            if require_trt_cached and not self._scrfd_is_trt:
+                raise RuntimeError(f"SCRFD not bound to TRT. providers={bound}")
+            self.scrfd = self._scrfd_trt_singleton
+            return self._scrfd_trt_singleton
 
         require_trt = str(os.getenv("PERSON_CAPTURE_REQUIRE_TRT", "")).lower() in ("1", "true", "yes", "on")
-        if require_trt and 'TensorrtExecutionProvider' not in ort.get_available_providers():
+        avail = list(getattr(ort, "get_available_providers", lambda: [])())
+        if callable(getattr(self, "progress", None)):
+            self.progress(f"ORT EPs available: {avail}")
+        if require_trt and 'TensorrtExecutionProvider' not in avail:
             raise RuntimeError("TRT not available to ORT. Check PATH/DLLs.")
 
         if not getattr(self, "_scrfd_model_path", None):
             return self.scrfd
 
-        if not hasattr(self, "_scrfd_trt_singleton"):
-            if hasattr(self, "_scrfd_trt_cache"):
+        # Build fresh provider chain now, ignoring any earlier registry state.
+        provs: list[str] = []
+        opts: list[dict] = []
+        if 'TensorrtExecutionProvider' in avail:
+            provs.append('TensorrtExecutionProvider')
+            # Per-device tuned TRT options and cache
+            trt_opts = {}  # will fill after we learn input name
+            opts.append(trt_opts)
+        if 'CUDAExecutionProvider' in avail:
+            provs.append('CUDAExecutionProvider')
+            opts.append({})
+        provs.append('CPUExecutionProvider')
+        opts.append({})
+
+        # Discover input tensor name with a CPU probe. Safe and cheap.
+        cpu_probe = ort.InferenceSession(self._scrfd_model_path, providers=['CPUExecutionProvider'])
+        in_name = cpu_probe.get_inputs()[0].name
+
+        # Dynamic profile: min 320, opt 640, max <= heavy_cap
+        max_hw = max(int(getattr(self, "_heavy_cap", 2048)), 1024)
+        if provs and provs[0] == 'TensorrtExecutionProvider':
+            trt = opts[0]
+            # derive device id
+            dev_id = getattr(self, "_scrfd_ctx_id", 0)
+            if isinstance(dev_id, str):
+                match = re.search(r'-?\d+', dev_id)
+                if match:
+                    try:
+                        dev_id = int(match.group(0))
+                    except ValueError:
+                        dev_id = -1
+                else:
+                    dev_id = -1
+            if isinstance(dev_id, int) and dev_id >= 0:
+                trt['device_id'] = str(dev_id)
+                # mirror to CUDA EP if present
                 try:
-                    self._scrfd_trt_cache.clear()
-                except Exception:
+                    i_cuda = provs.index('CUDAExecutionProvider')
+                    opts[i_cuda]['device_id'] = str(dev_id)
+                except ValueError:
                     pass
-                delattr(self, "_scrfd_trt_cache")
 
-            key = os.path.normcase(os.path.abspath(os.fspath(self._scrfd_model_path)))
-            reg = getattr(ort, "_pc_provider_registry", {})
-            if key not in reg:
-                if require_trt:
-                    raise RuntimeError("SCRFD provider registry missing. TRT patch not applied.")
-                self._scrfd_trt_singleton = self.scrfd
-                return self._scrfd_trt_singleton
-
-            provs, opts, so = reg[key]
-            provs = list(provs)
-            opts = [dict(o) for o in opts]
-            if 'TensorrtExecutionProvider' in provs:
-                i = provs.index('TensorrtExecutionProvider')
-                cpu_sess = ort.InferenceSession(self._scrfd_model_path, providers=["CPUExecutionProvider"])
-                in_name = cpu_sess.get_inputs()[0].name
-                min_shape = "1x3x320x320"
-                opt_shape = "1x3x640x640"
-                max_hw = max(int(getattr(self, "_heavy_cap", 2048)), 1024)
-                # If you ever do pad/rot probes > max_hw, raise this.
-                max_shape = f"1x3x{max_hw}x{max_hw}"
-                trt_opts = opts[i]
-                trt_opts['trt_profile_min_shapes'] = f"{in_name}:{min_shape}"
-                trt_opts['trt_profile_opt_shapes'] = f"{in_name}:{opt_shape}"
-                trt_opts['trt_profile_max_shapes'] = f"{in_name}:{max_shape}"
-                trt_opts['trt_engine_cache_enable'] = "1"
-                trt_opts['trt_engine_cache_prefix'] = "scrfd_dyn"
-                if callable(getattr(self, "progress", None)):
-                    self.progress(f"SCRFD TRT dynamic profile active min=320 opt=640 max={max_hw}")
-                # move TRT pair to the front so provider_options stay matched
-                trt_p = provs.pop(i)
-                trt_o = opts.pop(i)
-                provs.insert(0, trt_p)
-                opts.insert(0, trt_o)
-            ort._pc_provider_registry[key] = (provs, opts, so)
-
-            from insightface.model_zoo.scrfd import SCRFD as _SCRFD
-            # Build ORT session explicitly with TRT-first providers/options
-            so0 = so
-            provs_explicit = list(provs)
-            opts_explicit = list(opts)
-            if len(opts_explicit) < len(provs_explicit):
-                opts_explicit.extend({} for _ in range(len(provs_explicit) - len(opts_explicit)))
-            if (
-                provs_explicit
-                and opts_explicit
-                and provs_explicit[0] == "TensorrtExecutionProvider"
-            ):
-                trt = opts_explicit[0]
-                trt.setdefault('trt_fp16_enable', '1')
-                trt.setdefault('trt_timing_cache_enable', '1')
-                trt.setdefault('trt_engine_cache_enable', '1')
-                trt.setdefault('trt_max_workspace_size', '4294967296')  # 4 GiB
-            sess = ort.InferenceSession(
-                self._scrfd_model_path,
-                so0,
-                providers=provs_explicit,
-                provider_options=opts_explicit,
-            )
-            # Inject session into SCRFD
+            cache_root = _P(getattr(self, "trt_cache_dir", "trt_cache")) / "scrfd"
             try:
-                s = _SCRFD(self._scrfd_model_path, session=sess)
-            except TypeError:
-                s = _SCRFD(self._scrfd_model_path)
-                try:
-                    setattr(s, "session", sess)
-                except Exception as e:
-                    raise RuntimeError(f"SCRFD cannot accept external ORT session: {e!r}")
-            s.prepare(ctx_id=self._scrfd_ctx_id, det_size=(640, 640))
-            sess0 = getattr(s, "session", None)
-            provs0 = tuple(sess0.get_providers()) if sess0 else tuple()
-            self._scrfd_is_trt = 'TensorrtExecutionProvider' in provs0
-            if not self._scrfd_is_trt:
-                if require_trt:
-                    raise RuntimeError(f"SCRFD not bound to TRT at init. providers={provs0}")
-                if callable(getattr(self, "progress", None)):
-                    self.progress(f"WARNING: SCRFD running without TRT at init. providers={provs0}")
+                cache_root.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            timing_path = cache_root / "timing.cache"
+            try:
+                cache_root_resolved = str(cache_root.resolve())
+            except Exception:
+                cache_root_resolved = str(cache_root)
+            try:
+                timing_path_resolved = str(timing_path.resolve())
+            except Exception:
+                timing_path_resolved = str(timing_path)
+
+            trt.update({
+                'trt_fp16_enable': '1',
+                'trt_timing_cache_enable': '1',
+                'trt_engine_cache_enable': '1',
+                'trt_engine_cache_prefix': 'scrfd_dyn',
+                'trt_engine_cache_path': cache_root_resolved,
+                'trt_timing_cache_path': timing_path_resolved,
+                'trt_max_workspace_size': '4294967296',
+                'trt_profile_min_shapes': f'{in_name}:1x3x320x320',
+                'trt_profile_opt_shapes': f'{in_name}:1x3x640x640',
+                'trt_profile_max_shapes': f'{in_name}:1x3x{max_hw}x{max_hw}',
+            })
             if callable(getattr(self, "progress", None)):
-                self.progress(f"SCRFD providers={provs0}")
-            self._scrfd_trt_singleton = s
+                self.progress(f"SCRFD TRT dynamic profile active min=320 opt=640 max={max_hw}")
+
+        so = getattr(ort, "SessionOptions")()
+        gopt = getattr(ort, "GraphOptimizationLevel", None)
+        if gopt is not None and hasattr(gopt, "ORT_ENABLE_ALL"):
+            so.graph_optimization_level = gopt.ORT_ENABLE_ALL
+        so.add_session_config_entry("session.logid", "scrfd_trt")
+
+        # Pad provider_options if lengths mismatch
+        while len(opts) < len(provs):
+            opts.append({})
+
+        # Build and inject the session
+        sess = ort.InferenceSession(
+            self._scrfd_model_path,
+            so,
+            providers=provs,
+            provider_options=opts,
+        )
+        try:
+            s = _SCRFD(self._scrfd_model_path, session=sess)
+        except TypeError:
+            s = _SCRFD(self._scrfd_model_path)
+            setattr(s, "session", sess)
+        s.prepare(ctx_id=self._scrfd_ctx_id, det_size=(640, 640))
+
+        bound = tuple(s.session.get_providers()) if getattr(s, "session", None) else tuple()
+        self._scrfd_is_trt = 'TensorrtExecutionProvider' in bound
+        if not self._scrfd_is_trt:
+            if require_trt:
+                raise RuntimeError(f"SCRFD not bound to TRT at init. providers={bound}")
+            if callable(getattr(self, "progress", None)):
+                self.progress(f"WARNING: SCRFD running without TRT at init. providers={bound}")
+        if callable(getattr(self, "progress", None)):
+            self.progress(f"SCRFD providers={bound}")
+        self._scrfd_trt_singleton = s
+        self.scrfd = s
 
         try:
             self._scrfd_trt_singleton.prepare(ctx_id=self._scrfd_ctx_id, det_size=shape)
