@@ -806,7 +806,11 @@ class FaceEmbedder:
             opts_explicit = list(opts)
             if len(opts_explicit) < len(provs_explicit):
                 opts_explicit.extend({} for _ in range(len(provs_explicit) - len(opts_explicit)))
-            if opts_explicit:
+            if (
+                provs_explicit
+                and opts_explicit
+                and provs_explicit[0] == "TensorrtExecutionProvider"
+            ):
                 trt = opts_explicit[0]
                 trt.setdefault('trt_fp16_enable', '1')
                 trt.setdefault('trt_timing_cache_enable', '1')
