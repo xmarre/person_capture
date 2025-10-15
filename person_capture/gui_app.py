@@ -187,7 +187,6 @@ class SessionConfig:
     min_gap_sec: float = 1.5
     min_box_pixels: int = 8000
     auto_crop_borders: bool = False
-    border_threshold: int = 10
     log_interval_sec: float = 1.0
     lock_after_hits: int = 1
     lock_face_thresh: float = 0.28
@@ -224,6 +223,8 @@ class SessionConfig:
     crop_bottom_min_face_heights: float = 1.5    # min bottom margin in face-heights
     crop_penalty_weight: float = 3.0             # weight for placement penalties vs area growth
     face_anchor_down_frac: float = 1.1           # shift center downward by this * face_h (torso bias)
+    border_threshold: int = 10                   # grayscale threshold for border trimming
+    border_scan_frac: float = 0.18               # scan depth as fraction of min(w,h)
     # --- smart crop ---
     smart_crop_enable: bool = True           # dynamic, per-frame
     smart_crop_steps: int = 6                # lateral search half-steps per side
@@ -3293,8 +3294,23 @@ class Processor(QtCore.QObject):
                             rx1, ry1, rx2, ry2 = self._smart_crop_box(
                                 frame_for_det, (rx1, ry1, rx2, ry2), face_box_roi, ratio_str, cfg
                             )
+                            # nudge center downwards toward torso when a face is present
+                            anchor_roi = None
+                            if face_box_roi is not None:
+                                fcx = 0.5 * (face_box_roi[0] + face_box_roi[2])
+                                fcy = 0.5 * (face_box_roi[1] + face_box_roi[3])
+                                fh = max(1.0, face_box_roi[3] - face_box_roi[1])
+                                anchor_roi = (
+                                    fcx,
+                                    fcy + 0.5 * float(getattr(cfg, "face_anchor_down_frac", 1.1)) * fh,
+                                )
                             rx1, ry1, rx2, ry2 = self._enforce_scale_and_margins(
-                                (rx1, ry1, rx2, ry2), ratio_str, W2, H2, face_box=face_box_roi, anchor=None
+                                (rx1, ry1, rx2, ry2),
+                                ratio_str,
+                                W2,
+                                H2,
+                                face_box=face_box_roi,
+                                anchor=anchor_roi,
                             )
                         else:
                             try:
@@ -3324,8 +3340,23 @@ class Processor(QtCore.QObject):
                                 frame, (cx1, cy1, cx2, cy2), c.get("face_box"), ratio_str, cfg
                             )
                             H_, W_ = frame.shape[:2]
+                            anchor_final = None
+                            fb = c.get("face_box")
+                            if fb is not None:
+                                fcx = 0.5 * (fb[0] + fb[2])
+                                fcy = 0.5 * (fb[1] + fb[3])
+                                fh = max(1.0, fb[3] - fb[1])
+                                anchor_final = (
+                                    fcx,
+                                    fcy + 0.5 * float(getattr(cfg, "face_anchor_down_frac", 1.1)) * fh,
+                                )
                             cx1, cy1, cx2, cy2 = self._enforce_scale_and_margins(
-                                (cx1, cy1, cx2, cy2), ratio_str, W_, H_, face_box=c.get("face_box"), anchor=None
+                                (cx1, cy1, cx2, cy2),
+                                ratio_str,
+                                W_,
+                                H_,
+                                face_box=c.get("face_box"),
+                                anchor=anchor_final,
                             )
                         else:
                             try:
@@ -3348,15 +3379,62 @@ class Processor(QtCore.QObject):
                                     cx1 += dx
                                     cx2 = cx1 + new_w
 
+                    # Final black-border trim on the saved crop, then re-expand to exact ratio
+                    try:
+                        try:
+                            from .utils import detect_black_borders  # type: ignore
+                        except Exception:
+                            from utils import detect_black_borders  # type: ignore
+                        sub = frame[int(round(cy1)):int(round(cy2)), int(round(cx1)):int(round(cx2))]
+                        if sub.size > 0:
+                            scan_frac = max(0.0, float(getattr(cfg, "border_scan_frac", 0.18)))
+                            max_scan = int(round(min(sub.shape[0], sub.shape[1]) * scan_frac))
+                            if scan_frac > 0.0 and max_scan < 1:
+                                max_scan = 1
+                            if max_scan == 0:
+                                l, t, r, b = 0, 0, sub.shape[1], sub.shape[0]
+                            else:
+                                l, t, r, b = detect_black_borders(
+                                    sub,
+                                    thr=int(getattr(cfg, "border_threshold", 10)),
+                                    max_scan=max_scan,
+                                )
+                            if (l > 0) or (t > 0) or (r < sub.shape[1]) or (b < sub.shape[0]):
+                                nx1, ny1 = int(round(cx1)) + int(l), int(round(cy1)) + int(t)
+                                nx2, ny2 = int(round(cx1)) + int(r), int(round(cy1)) + int(b)
+                                try:
+                                    tw, th = parse_ratio(ratio_str)
+                                except Exception:
+                                    tw, th = 2, 3
+                                anchor_glob = None
+                                fb = c.get("face_box")
+                                if fb is not None:
+                                    fcx = 0.5 * (fb[0] + fb[2])
+                                    fcy = 0.5 * (fb[1] + fb[3])
+                                    fh = max(1.0, fb[3] - fb[1])
+                                    anchor_glob = (
+                                        fcx,
+                                        fcy + 0.5 * float(getattr(cfg, "face_anchor_down_frac", 1.1)) * fh,
+                                    )
+                                cx1, cy1, cx2, cy2 = self._expand_to_ratio(
+                                    (nx1, ny1, nx2, ny2), int(tw), int(th), W, H, anchor=anchor_glob
+                                )
+                    except Exception:
+                        pass
+
                     cx1 = max(0, min(W - 1, int(round(cx1))))
                     cy1 = max(0, min(H - 1, int(round(cy1))))
                     cx2 = max(cx1 + 1, min(W, int(round(cx2))))
                     cy2 = max(cy1 + 1, min(H, int(round(cy2))))
 
+                    self._status(
+                        f"crop@{idx}: face_box={c.get('face_box')}", key="cropface", interval=2.0
+                    )
+
                     crop_img2 = frame[cy1:cy2, cx1:cx2]
                     row = [
                         idx,
-                        idx/float(fps),
+                        idx / float(fps),
                         c.get("score"),
                         c.get("fd"),
                         c.get("rd"),
@@ -3977,6 +4055,8 @@ class Processor(QtCore.QObject):
         cy = (y1 + y2) // 2
         y1 = max(0, min(H - h, cy - h // 2)); y2 = y1 + h
 
+        skip_side_search = False
+
         # Build a downscaled gradient saliency once (cheap)
         if bool(getattr(cfg, "smart_crop_use_grad", True)):
             small_w = min(384, W)
@@ -4005,20 +4085,35 @@ class Processor(QtCore.QObject):
             profile = 2.0 * abs((rel if rel is not None else 0.5) - 0.5)  # 0=frontal, 1=profile
             max_frac = 0.42 - 0.12 * profile  # 0.42 frontal → 0.30 profile
             need_w = int(math.ceil(fw / max(1e-6, max_frac)))
+            # also ensure requested side margins around face
+            want_side = float(getattr(cfg, "crop_face_side_margin_frac", 0.30)) * fw
+            need_w = max(need_w, int(round(fw + 2.0 * want_side)))
             if need_w > w:
                 w = min(W, need_w)
                 h = int(round(max(2, w / target)))
-                # center on face horizontally by default
-                cx = int(round(fcx))
-                x1 = max(0, min(W - w, cx - w // 2)); x2 = x1 + w
-                y1 = max(0, min(H - h, cy - h // 2)); y2 = y1 + h
+            # center on face horizontally by default
+            cx = int(round(fcx))
+            x1 = max(0, min(W - w, cx - w // 2)); x2 = x1 + w
+            y1 = max(0, min(H - h, cy - h // 2)); y2 = y1 + h
+            # when a face is known, skip lateral saliency drift to avoid off-centering
+            sal = None
+            skip_side_search = True
 
         # Lateral search to maximize saliency and keep face centered with margin
-        steps = int(getattr(cfg, "smart_crop_steps", 6))
+        steps_cfg = int(getattr(cfg, "smart_crop_steps", 6))
         sfrac = float(getattr(cfg, "smart_crop_side_search_frac", 0.35))
-        max_shift = int(round(w * sfrac))
+        if skip_side_search:
+            steps = 0
+            max_shift = 0
+        else:
+            steps = max(0, steps_cfg)
+            max_shift = int(round(w * sfrac))
         best = (x1, y1, x2, y2); best_score = -1e9
-        for dx in np.linspace(-max_shift, max_shift, 2 * steps + 1):
+        if steps <= 0 or max_shift <= 0:
+            dx_vals = (0.0,)
+        else:
+            dx_vals = np.linspace(-max_shift, max_shift, 2 * steps + 1)
+        for dx in dx_vals:
             nx1 = int(max(0, min(W - w, x1 + dx))); nx2 = nx1 + w
             # saliency score
             if sal is not None:
