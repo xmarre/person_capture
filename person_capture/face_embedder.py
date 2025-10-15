@@ -869,6 +869,39 @@ class FaceEmbedder:
             providers=provs,
             provider_options=opts,
         )
+        # Debug: what did ORT actually bind for this raw session?
+        try:
+            if callable(getattr(self, "progress", None)):
+                self.progress(f"SCRFD ORT raw providers={tuple(sess.get_providers())}")
+                try:
+                    self.progress(f"SCRFD ORT raw provider_options={sess.get_provider_options()}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # If TRT did not bind, retry with a fixed 640x640 profile (often required by SCRFD builds)
+        try:
+            bound0 = tuple(sess.get_providers())
+        except Exception:
+            bound0 = tuple()
+        if 'TensorrtExecutionProvider' not in bound0:
+            try:
+                # overwrite TRT options with strict static shapes
+                if provs and provs[0] == 'TensorrtExecutionProvider':
+                    trt = opts[0]
+                    trt['trt_profile_min_shapes'] = f'{in_name}:1x3x640x640'
+                    trt['trt_profile_opt_shapes'] = f'{in_name}:1x3x640x640'
+                    trt['trt_profile_max_shapes'] = f'{in_name}:1x3x640x640'
+                    trt['trt_min_subgraph_size'] = '1'
+                    trt['trt_max_partition_iterations'] = '1000'
+                    trt['trt_force_sequential_engine_build'] = '1'
+                sess = ort.InferenceSession(
+                    self._scrfd_model_path, so, providers=provs, provider_options=opts
+                )
+                if callable(getattr(self, "progress", None)):
+                    self.progress(f"SCRFD ORT fixed-profile providers={tuple(sess.get_providers())}")
+            except Exception:
+                pass
         try:
             s = _SCRFD(self._scrfd_model_path, session=sess)
         except TypeError:
