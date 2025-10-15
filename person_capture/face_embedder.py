@@ -746,40 +746,77 @@ class FaceEmbedder:
             pass
 
     def _get_scrfd_trt(self, shape: Tuple[int, int]):
-        if not hasattr(self, "_scrfd_trt_cache"):
-            self._scrfd_trt_cache = {}
-        if shape in getattr(self, "_scrfd_trt_cache", {}):
-            return self._scrfd_trt_cache[shape]
+        """Return SCRFD detector backed by a single dynamic TensorRT profile."""
         import onnxruntime as ort  # type: ignore
 
         if not getattr(self, "_scrfd_model_path", None):
             return self.scrfd
 
-        h, w = shape[1], shape[0]
-        key = os.path.normcase(os.path.abspath(self._scrfd_model_path))
-        reg = getattr(ort, "_pc_provider_registry", {})
-        if key not in reg:
-            return self.scrfd
-        provs, opts, so = reg[key]
-        provs = list(provs)
-        opts = [dict(o) for o in opts]
-        if 'TensorrtExecutionProvider' in provs:
-            i = provs.index('TensorrtExecutionProvider')
-            cpu_sess = ort.InferenceSession(self._scrfd_model_path, providers=["CPUExecutionProvider"])
-            in_name = cpu_sess.get_inputs()[0].name
-            fixed = f"1x3x{h}x{w}"
-            opts[i]['trt_profile_min_shapes'] = f"{in_name}:{fixed}"
-            opts[i]['trt_profile_opt_shapes'] = f"{in_name}:{fixed}"
-            opts[i]['trt_profile_max_shapes'] = f"{in_name}:{fixed}"
-            opts[i]['trt_engine_cache_enable'] = "1"
-            opts[i]['trt_engine_cache_prefix'] = f"scrfd_{w}x{h}"
-        ort._pc_provider_registry[key] = (provs, opts, so)
-        from insightface.model_zoo.scrfd import SCRFD as _SCRFD
+        if not hasattr(self, "_scrfd_trt_singleton"):
+            if hasattr(self, "_scrfd_trt_cache"):
+                try:
+                    self._scrfd_trt_cache.clear()
+                except Exception:
+                    pass
+                delattr(self, "_scrfd_trt_cache")
 
-        s = _SCRFD(self._scrfd_model_path)
-        s.prepare(ctx_id=self._scrfd_ctx_id, det_size=shape)
-        self._scrfd_trt_cache[shape] = s
-        return s
+            key = os.path.normcase(os.path.abspath(os.fspath(self._scrfd_model_path)))
+            reg = getattr(ort, "_pc_provider_registry", {})
+            if key not in reg:
+                self._scrfd_trt_singleton = self.scrfd
+                return self._scrfd_trt_singleton
+
+            provs, opts, so = reg[key]
+            provs = list(provs)
+            opts = [dict(o) for o in opts]
+            if 'TensorrtExecutionProvider' in provs:
+                i = provs.index('TensorrtExecutionProvider')
+                cpu_sess = ort.InferenceSession(self._scrfd_model_path, providers=["CPUExecutionProvider"])
+                in_name = cpu_sess.get_inputs()[0].name
+                min_shape = "1x3x320x320"
+                opt_shape = "1x3x640x640"
+                max_hw = max(int(getattr(self, "_heavy_cap", 2048)), 1024)
+                # If you ever do pad/rot probes > max_hw, raise this.
+                max_shape = f"1x3x{max_hw}x{max_hw}"
+                opts[i]['trt_profile_min_shapes'] = f"{in_name}:{min_shape}"
+                opts[i]['trt_profile_opt_shapes'] = f"{in_name}:{opt_shape}"
+                opts[i]['trt_profile_max_shapes'] = f"{in_name}:{max_shape}"
+                opts[i]['trt_engine_cache_enable'] = "1"
+                opts[i]['trt_engine_cache_prefix'] = "scrfd_dyn"
+                if callable(getattr(self, "progress", None)):
+                    self.progress(f"SCRFD TRT dynamic profile active min=320 opt=640 max={max_hw}")
+                provs = ['TensorrtExecutionProvider'] + [p for p in provs if p != 'TensorrtExecutionProvider']
+            ort._pc_provider_registry[key] = (provs, opts, so)
+
+            from insightface.model_zoo.scrfd import SCRFD as _SCRFD
+
+            s = _SCRFD(self._scrfd_model_path)
+            s.prepare(ctx_id=self._scrfd_ctx_id, det_size=(640, 640))
+            try:
+                sess = getattr(s, "session", None)
+                provs = tuple(sess.get_providers()) if sess else tuple()
+                self._scrfd_is_trt = 'TensorrtExecutionProvider' in provs
+                if callable(getattr(self, "progress", None)):
+                    self.progress(f"SCRFD providers={provs}")
+            except Exception:
+                self._scrfd_is_trt = False
+            self._scrfd_trt_singleton = s
+
+        try:
+            self._scrfd_trt_singleton.prepare(ctx_id=self._scrfd_ctx_id, det_size=shape)
+        except Exception:
+            pass
+        # Verify provider
+        try:
+            sess = getattr(self._scrfd_trt_singleton, "session", None)
+            provs = tuple(sess.get_providers()) if sess else tuple()
+        except Exception as exc:
+            self._scrfd_is_trt = False
+            raise RuntimeError("SCRFD provider query failed") from exc
+        self._scrfd_is_trt = 'TensorrtExecutionProvider' in provs
+        if not self._scrfd_is_trt:
+            raise RuntimeError(f"SCRFD not bound to TRT. providers={provs}")
+        return self._scrfd_trt_singleton
 
     def _scrfd_fallback_to_cuda_only(self) -> None:
         try:
@@ -1764,14 +1801,9 @@ class FaceEmbedder:
             if deg == 270: return W0 - 1 - yr, xr
             return xr, yr
         def _detect_once(img, dyn, conf: float):
-            # Choose engine for this size, then set its threshold.
+            # Always use the TRT singleton. Only det_size changes.
             use_sz = (dyn, dyn)
-            scrfd_impl = self.scrfd
-            try:
-                if 'TensorrtExecutionProvider' in tuple(self.scrfd.session.get_providers()):
-                    scrfd_impl = self._get_scrfd_trt(use_sz)
-            except Exception:
-                pass
+            scrfd_impl = self._get_scrfd_trt(use_sz)
             try:
                 scrfd_impl.det_thresh = float(conf)
             except Exception:
