@@ -874,9 +874,21 @@ class FaceEmbedder:
         except TypeError:
             s = _SCRFD(self._scrfd_model_path)
             setattr(s, "session", sess)
+        # Prepare anchors, then guard against session replacement inside prepare()
         s.prepare(ctx_id=self._scrfd_ctx_id, det_size=(640, 640))
-
-        bound = tuple(s.session.get_providers()) if getattr(s, "session", None) else tuple()
+        try:
+            bound = tuple(s.session.get_providers())
+        except Exception:
+            bound = tuple()
+        if 'TensorrtExecutionProvider' not in bound:
+            # Some insightface versions recreate a CPU session in prepare(); re-inject TRT
+            try:
+                setattr(s, "session", sess)
+                bound = tuple(s.session.get_providers())
+                if callable(getattr(self, "progress", None)):
+                    self.progress("SCRFD: re-injected TRT session after prepare()")
+            except Exception:
+                pass
         self._scrfd_is_trt = 'TensorrtExecutionProvider' in bound
         if not self._scrfd_is_trt:
             if require_trt:
@@ -890,6 +902,12 @@ class FaceEmbedder:
 
         try:
             self._scrfd_trt_singleton.prepare(ctx_id=self._scrfd_ctx_id, det_size=shape)
+        except Exception:
+            pass
+        try:
+            if 'TensorrtExecutionProvider' not in tuple(self._scrfd_trt_singleton.session.get_providers()):
+                # re-attach TRT session if prepare() swapped it
+                self._scrfd_trt_singleton.session = sess
         except Exception:
             pass
         # Verify provider
