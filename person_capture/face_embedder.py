@@ -10,7 +10,8 @@ from urllib.error import URLError, HTTPError
 from socket import timeout as SocketTimeout
 import tempfile
 import shutil
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, List
+from typing import Optional, Tuple, Dict
 
 from PIL import Image
 
@@ -455,6 +456,7 @@ class FaceEmbedder:
             self.scrfd = _SCRFD(mdl)
             # Robust TRT init: fixed shape only for deterministic engine/profile.
             self._scrfd_fixed_shape = (640, 640)
+            self._scrfd_trt_cache: Dict[Tuple[int, int], object] = {}
             _last_err = None
             for _det_size in (self._scrfd_fixed_shape,):
                 try:
@@ -478,6 +480,7 @@ class FaceEmbedder:
                     _last_err = e
             else:
                 raise RuntimeError(f"SCRFD(TRT) init failed on cuda:{ctx_id}: {_last_err!r}")
+            self._scrfd_trt_cache[self._scrfd_fixed_shape] = self.scrfd
             # Align threshold handling across SCRFD API variants
             try:
                 self.scrfd.det_thresh = float(self.conf)
@@ -741,6 +744,42 @@ class FaceEmbedder:
             self.model.eval().to(self.device)
             self.backend = 'clip'
             pass
+
+    def _get_scrfd_trt(self, shape: Tuple[int, int]):
+        if not hasattr(self, "_scrfd_trt_cache"):
+            self._scrfd_trt_cache = {}
+        if shape in getattr(self, "_scrfd_trt_cache", {}):
+            return self._scrfd_trt_cache[shape]
+        import onnxruntime as ort  # type: ignore
+
+        if not getattr(self, "_scrfd_model_path", None):
+            return self.scrfd
+
+        h, w = shape[1], shape[0]
+        key = os.path.normcase(os.path.abspath(self._scrfd_model_path))
+        reg = getattr(ort, "_pc_provider_registry", {})
+        if key not in reg:
+            return self.scrfd
+        provs, opts, so = reg[key]
+        provs = list(provs)
+        opts = [dict(o) for o in opts]
+        if 'TensorrtExecutionProvider' in provs:
+            i = provs.index('TensorrtExecutionProvider')
+            cpu_sess = ort.InferenceSession(self._scrfd_model_path, providers=["CPUExecutionProvider"])
+            in_name = cpu_sess.get_inputs()[0].name
+            fixed = f"1x3x{h}x{w}"
+            opts[i]['trt_profile_min_shapes'] = f"{in_name}:{fixed}"
+            opts[i]['trt_profile_opt_shapes'] = f"{in_name}:{fixed}"
+            opts[i]['trt_profile_max_shapes'] = f"{in_name}:{fixed}"
+            opts[i]['trt_engine_cache_enable'] = "1"
+            opts[i]['trt_engine_cache_prefix'] = f"scrfd_{w}x{h}"
+        ort._pc_provider_registry[key] = (provs, opts, so)
+        from insightface.model_zoo.scrfd import SCRFD as _SCRFD
+
+        s = _SCRFD(self._scrfd_model_path)
+        s.prepare(ctx_id=self._scrfd_ctx_id, det_size=shape)
+        self._scrfd_trt_cache[shape] = s
+        return s
 
     def _scrfd_fallback_to_cuda_only(self) -> None:
         try:
@@ -1725,22 +1764,22 @@ class FaceEmbedder:
             if deg == 270: return W0 - 1 - yr, xr
             return xr, yr
         def _detect_once(img, dyn, conf: float):
-            # Normalize across SCRFD API variants; fix input_size when TRT is active.
+            # Choose engine for this size, then set its threshold.
+            use_sz = (dyn, dyn)
+            scrfd_impl = self.scrfd
             try:
-                self.scrfd.det_thresh = float(conf)
+                if 'TensorrtExecutionProvider' in tuple(self.scrfd.session.get_providers()):
+                    scrfd_impl = self._get_scrfd_trt(use_sz)
             except Exception:
                 pass
-
-            use_sz = getattr(self, "_scrfd_fixed_shape", (dyn, dyn)) if getattr(self, "_scrfd_is_trt", False) else (dyn, dyn)
-
-            def _invoke() -> Tuple[np.ndarray, Optional[np.ndarray]]:
-                try:
-                    return self.scrfd.detect(img, input_size=use_sz)
-                except TypeError:
-                    # some builds take positional input_size
-                    return self.scrfd.detect(img, use_sz)
-
-            return _invoke()
+            try:
+                scrfd_impl.det_thresh = float(conf)
+            except Exception:
+                pass
+            try:
+                return scrfd_impl.detect(img, input_size=use_sz)
+            except TypeError:
+                return scrfd_impl.detect(img, use_sz)
 
         H0, W0 = bgr_img.shape[:2]
         dyn_req = int(imgsz) if (imgsz is not None and imgsz > 0) else 640
