@@ -11,7 +11,7 @@ from socket import timeout as SocketTimeout
 import tempfile
 import shutil
 from typing import TYPE_CHECKING, List
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Any, Callable
 
 from PIL import Image
 
@@ -154,6 +154,118 @@ def _ensure_from_zip(out_path: str, zip_urls, want_suffix="glintr100.onnx", prog
     raise FileNotFoundError(
         f"Could not extract '{out_path}' from ZIPs. Tried: {', '.join(zip_urls)}. Last error: {last_err}"
     )
+
+
+def _ensure_scrfd_trt_friendly(model_path: str, progress: Optional[Callable[[str], None]] = None) -> str:
+    """Convert SCRFD ONNX to a TensorRT-friendly variant if needed."""
+    src = Path(model_path)
+    if not src.exists():
+        return model_path
+    if src.name.endswith("_trt.onnx"):
+        try:
+            return str(src.resolve())
+        except Exception:
+            return model_path
+    dst = src.with_name(f"{src.stem}_trt.onnx")
+    try:
+        if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
+            return str(dst.resolve())
+    except Exception:
+        # If we cannot stat the files, fall back to attempting conversion.
+        pass
+
+    try:
+        import onnx  # type: ignore
+        import onnxsim  # type: ignore
+        from onnx import helper as onnx_helper  # type: ignore
+        from onnx import numpy_helper  # type: ignore
+    except Exception as exc:
+        if callable(progress):
+            try:
+                progress(f"SCRFD TRT simplifier unavailable: {exc}")
+            except Exception:
+                pass
+        return model_path
+
+    def _cast_initializers_to_int32(model) -> None:
+        for idx, init in enumerate(model.graph.initializer):
+            if init.data_type == onnx.TensorProto.INT64:
+                arr = numpy_helper.to_array(init).astype(np.int32)
+                model.graph.initializer[idx].CopyFrom(numpy_helper.from_array(arr, init.name))
+
+    try:
+        model = onnx.load(str(src))
+
+        _cast_initializers_to_int32(model)
+
+        existing_initializer_names = {init.name for init in model.graph.initializer}
+        H = W = 640
+        created = 0
+        for node in model.graph.node:
+            if node.op_type != "Resize":
+                continue
+            while len(node.input) < 3:
+                node.input.append("")
+            if len(node.input) < 4 or not node.input[3]:
+                base_name = node.name or "resize"
+                sizes_name = f"{base_name}_sizes"
+                while sizes_name in existing_initializer_names:
+                    created += 1
+                    sizes_name = f"{base_name}_sizes_{created}"
+                existing_initializer_names.add(sizes_name)
+                sizes_tensor = onnx_helper.make_tensor(
+                    sizes_name,
+                    onnx.TensorProto.INT64,
+                    [4],
+                    np.array([1, 3, H, W], dtype=np.int64),
+                )
+                model.graph.initializer.append(sizes_tensor)
+                while len(node.input) < 4:
+                    node.input.append("")
+                node.input[3] = sizes_name
+            attrs = {attr.name: attr for attr in node.attribute}
+
+            def _set_attr(name: str, value: str) -> None:
+                if name in attrs:
+                    attrs[name].s = value.encode()
+                else:
+                    node.attribute.append(onnx_helper.make_attribute(name, value))
+
+            _set_attr("mode", "linear")
+            _set_attr("coordinate_transformation_mode", "half_pixel")
+            _set_attr("nearest_mode", "floor")
+
+        _cast_initializers_to_int32(model)
+
+        try:
+            onnx.checker.check_model(model)
+        except Exception as exc:
+            if callable(progress):
+                try:
+                    progress(f"SCRFD TRT model check failed: {exc}")
+                except Exception:
+                    pass
+            return model_path
+
+        input_name = model.graph.input[0].name if model.graph.input else "input.1"
+        simplified, _ = onnxsim.simplify(
+            model,
+            overwrite_input_shapes={input_name: [1, 3, 640, 640]},
+        )
+        onnx.save(simplified, str(dst))
+        if callable(progress):
+            try:
+                progress(f"SCRFD TRT-friendly model saved: {dst}")
+            except Exception:
+                pass
+        return str(dst.resolve())
+    except Exception as exc:
+        if callable(progress):
+            try:
+                progress(f"SCRFD TRT simplification failed: {exc}")
+            except Exception:
+                pass
+        return model_path
 
 class FaceEmbedder:
     """
@@ -453,6 +565,8 @@ class FaceEmbedder:
 
             self._scrfd_model_path = mdl
             self._scrfd_ctx_id = ctx_id
+            self._scrfd_is_trt = False
+            self._scrfd_is_cuda = False
             self.scrfd = self._get_scrfd_trt((640, 640))
             # Robust TRT init: fixed shape only for deterministic engine/profile.
             self._scrfd_fixed_shape = (640, 640)
@@ -462,7 +576,10 @@ class FaceEmbedder:
                 try:
                     self.scrfd.prepare(ctx_id=ctx_id, det_size=_det_size)
                     if callable(self.progress):
-                        self.progress(f"SCRFD(TRT) ready on cuda:{ctx_id} det={_det_size}")
+                        ep = "TRT" if getattr(self, "_scrfd_is_trt", False) else (
+                            "CUDA" if getattr(self, "_scrfd_is_cuda", False) else "CPU"
+                        )
+                        self.progress(f"SCRFD({ep}) ready on cuda:{ctx_id} det={_det_size}")
                     try:
                         _dummy = np.zeros((_det_size[1], _det_size[0], 3), dtype=np.uint8)
                         try:
@@ -764,6 +881,7 @@ class FaceEmbedder:
             except Exception:
                 bound = tuple()
             self._scrfd_is_trt = 'TensorrtExecutionProvider' in bound
+            self._scrfd_is_cuda = (not self._scrfd_is_trt) and ('CUDAExecutionProvider' in bound)
             require_trt_cached = str(os.getenv("PERSON_CAPTURE_REQUIRE_TRT", "")).lower() in ("1", "true", "yes", "on")
             if require_trt_cached and not self._scrfd_is_trt:
                 raise RuntimeError(f"SCRFD not bound to TRT. providers={bound}")
@@ -779,6 +897,11 @@ class FaceEmbedder:
 
         if not getattr(self, "_scrfd_model_path", None):
             return self.scrfd
+
+        progress_cb = self.progress if callable(getattr(self, "progress", None)) else None
+        friendly_path = _ensure_scrfd_trt_friendly(self._scrfd_model_path, progress=progress_cb)
+        if friendly_path and friendly_path != self._scrfd_model_path:
+            self._scrfd_model_path = friendly_path
 
         # Build fresh provider chain now, ignoring any earlier registry state.
         provs: list[str] = []
@@ -837,6 +960,7 @@ class FaceEmbedder:
             except Exception:
                 timing_path_resolved = str(timing_path)
 
+            trt.update({'trt_ep_context_file_path': cache_root_resolved})
             trt.update({
                 'trt_fp16_enable': '1',
                 'trt_timing_cache_enable': '1',
@@ -857,6 +981,18 @@ class FaceEmbedder:
         if gopt is not None and hasattr(gopt, "ORT_ENABLE_ALL"):
             so.graph_optimization_level = gopt.ORT_ENABLE_ALL
         so.add_session_config_entry("session.logid", "scrfd_trt")
+        if provs and provs[0] == 'TensorrtExecutionProvider':
+            trt = opts[0]
+            trt.update({
+                'trt_dump_subgraphs': '1',
+                'trt_detailed_build_log': '1',
+                'trt_min_subgraph_size': '1',
+            })
+        try:
+            so.log_severity_level = 0
+            so.log_verbosity_level = 1
+        except Exception:
+            pass
 
         # Pad provider_options if lengths mismatch
         while len(opts) < len(provs):
@@ -902,6 +1038,33 @@ class FaceEmbedder:
                     self.progress(f"SCRFD ORT fixed-profile providers={tuple(sess.get_providers())}")
             except Exception:
                 pass
+        # If still no TRT, force a CUDA session
+        try:
+            bound0 = tuple(sess.get_providers())
+        except Exception:
+            bound0 = tuple()
+        if 'TensorrtExecutionProvider' not in bound0 and 'CUDAExecutionProvider' in avail:
+            try:
+                cuda_opts: dict[str, Any] = {}
+                if 'CUDAExecutionProvider' in provs:
+                    try:
+                        idx_cuda = provs.index('CUDAExecutionProvider')
+                    except ValueError:
+                        idx_cuda = -1
+                    if idx_cuda >= 0:
+                        src_opts = opts[idx_cuda]
+                        if isinstance(src_opts, dict) and 'device_id' in src_opts:
+                            cuda_opts['device_id'] = src_opts['device_id']
+                sess = ort.InferenceSession(
+                    self._scrfd_model_path,
+                    so,
+                    providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
+                    provider_options=[cuda_opts, {}],
+                )
+                if callable(getattr(self, "progress", None)):
+                    self.progress(f"SCRFD ORT CUDA-only providers={tuple(sess.get_providers())}")
+            except Exception:
+                pass
         try:
             s = _SCRFD(self._scrfd_model_path, session=sess)
         except TypeError:
@@ -923,6 +1086,7 @@ class FaceEmbedder:
             except Exception:
                 pass
         self._scrfd_is_trt = 'TensorrtExecutionProvider' in bound
+        self._scrfd_is_cuda = (not self._scrfd_is_trt) and ('CUDAExecutionProvider' in bound)
         if not self._scrfd_is_trt:
             if require_trt:
                 raise RuntimeError(f"SCRFD not bound to TRT at init. providers={bound}")
@@ -951,6 +1115,7 @@ class FaceEmbedder:
             self._scrfd_is_trt = False
             raise RuntimeError("SCRFD provider query failed") from exc
         self._scrfd_is_trt = 'TensorrtExecutionProvider' in provs
+        self._scrfd_is_cuda = (not self._scrfd_is_trt) and ('CUDAExecutionProvider' in provs)
         if not self._scrfd_is_trt:
             if require_trt:
                 raise RuntimeError(f"SCRFD not bound to TRT. providers={provs}")
