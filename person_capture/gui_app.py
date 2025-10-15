@@ -186,7 +186,7 @@ class SessionConfig:
     min_sharpness: float = 0.0
     min_gap_sec: float = 1.5
     min_box_pixels: int = 8000
-    auto_crop_borders: bool = False
+    auto_crop_borders: bool = True
     log_interval_sec: float = 1.0
     lock_after_hits: int = 1
     lock_face_thresh: float = 0.28
@@ -223,8 +223,8 @@ class SessionConfig:
     crop_bottom_min_face_heights: float = 1.5    # min bottom margin in face-heights
     crop_penalty_weight: float = 3.0             # weight for placement penalties vs area growth
     face_anchor_down_frac: float = 1.1           # shift center downward by this * face_h (torso bias)
-    border_threshold: int = 10                   # grayscale threshold for border trimming
-    border_scan_frac: float = 0.18               # scan depth as fraction of min(w,h)
+    border_threshold: int = 22                   # grayscale threshold for border trimming
+    border_scan_frac: float = 0.25               # scan depth as fraction of min(w,h)
     # --- smart crop ---
     smart_crop_enable: bool = True           # dynamic, per-frame
     smart_crop_steps: int = 6                # lateral search half-steps per side
@@ -1066,7 +1066,11 @@ class Processor(QtCore.QObject):
             from .utils import detect_black_borders  # type: ignore
         except Exception:
             from utils import detect_black_borders  # type: ignore
-        x1,y1,x2,y2 = detect_black_borders(frame, thr=int(thr))
+        # deeper, configurable scan so thick bars get removed
+        h, w = frame.shape[:2]
+        scan_frac = float(getattr(self.cfg, "border_scan_frac", 0.25))
+        max_scan = int(round(min(h, w) * max(0.0, scan_frac))) if scan_frac > 0 else None
+        x1,y1,x2,y2 = detect_black_borders(frame, thr=int(thr), max_scan=max_scan)
         return frame[y1:y2, x1:x2], (x1,y1)
 
     def _iou(self, a, b):
@@ -3273,7 +3277,7 @@ class Processor(QtCore.QObject):
                     )
 
                     # If auto-crop borders were applied for detection, run smart-crop inside the ROI
-                    use_roi = bool(getattr(cfg, "auto_crop_borders", False)) and (
+                    use_roi = bool(getattr(cfg, "auto_crop_borders", True)) and (
                         (W2 != W) or (H2 != H) or (off_x != 0) or (off_y != 0)
                     )
                     if use_roi:
@@ -3387,16 +3391,15 @@ class Processor(QtCore.QObject):
                             from utils import detect_black_borders  # type: ignore
                         sub = frame[int(round(cy1)):int(round(cy2)), int(round(cx1)):int(round(cx2))]
                         if sub.size > 0:
-                            scan_frac = max(0.0, float(getattr(cfg, "border_scan_frac", 0.18)))
-                            max_scan = int(round(min(sub.shape[0], sub.shape[1]) * scan_frac))
-                            if scan_frac > 0.0 and max_scan < 1:
-                                max_scan = 1
-                            if max_scan == 0:
+                            scan_frac = max(0.0, float(getattr(cfg, "border_scan_frac", 0.25)))
+                            # full depth on the final crop to guarantee complete removal
+                            max_scan = min(sub.shape[0], sub.shape[1])
+                            if scan_frac == 0.0:
                                 l, t, r, b = 0, 0, sub.shape[1], sub.shape[0]
                             else:
                                 l, t, r, b = detect_black_borders(
                                     sub,
-                                    thr=int(getattr(cfg, "border_threshold", 10)),
+                                    thr=int(getattr(cfg, "border_threshold", 22)),
                                     max_scan=max_scan,
                                 )
                             if (l > 0) or (t > 0) or (r < sub.shape[1]) or (b < sub.shape[0]):
@@ -3406,19 +3409,27 @@ class Processor(QtCore.QObject):
                                     tw, th = parse_ratio(ratio_str)
                                 except Exception:
                                     tw, th = 2, 3
-                                anchor_glob = None
-                                fb = c.get("face_box")
-                                if fb is not None:
-                                    fcx = 0.5 * (fb[0] + fb[2])
-                                    fcy = 0.5 * (fb[1] + fb[3])
-                                    fh = max(1.0, fb[3] - fb[1])
-                                    anchor_glob = (
-                                        fcx,
-                                        fcy + 0.5 * float(getattr(cfg, "face_anchor_down_frac", 1.1)) * fh,
-                                    )
-                                cx1, cy1, cx2, cy2 = self._expand_to_ratio(
-                                    (nx1, ny1, nx2, ny2), int(tw), int(th), W, H, anchor=anchor_glob
-                                )
+                                # shrink INSIDE trimmed ROI to exact ratio (never reintroduce bars)
+                                tgt = float(tw) / float(th)
+                                iw, ih = nx2 - nx1, ny2 - ny1
+                                if iw > 2 and ih > 2:
+                                    cur = iw / float(ih)
+                                    if abs(cur - tgt) > 1e-3:
+                                        if cur < tgt:  # too tall -> reduce height
+                                            new_h = max(1, int(round(iw / tgt)))
+                                            if new_h > ih:
+                                                new_h = ih
+                                            dy = (ih - new_h) // 2
+                                            ny1 += dy
+                                            ny2 = ny1 + new_h
+                                        else:  # too wide -> reduce width
+                                            new_w = max(1, int(round(ih * tgt)))
+                                            if new_w > iw:
+                                                new_w = iw
+                                            dx = (iw - new_w) // 2
+                                            nx1 += dx
+                                            nx2 = nx1 + new_w
+                                cx1, cy1, cx2, cy2 = nx1, ny1, nx2, ny2
                     except Exception:
                         pass
 
@@ -4464,7 +4475,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.min_box_pix_spin = QtWidgets.QSpinBox(); self.min_box_pix_spin.setRange(0, 5000000); self.min_box_pix_spin.setValue(5000)
         self.auto_crop_check = QtWidgets.QCheckBox("Auto‑crop black borders")
         self.auto_crop_check.setChecked(True)
-        self.border_thr_spin = QtWidgets.QSpinBox(); self.border_thr_spin.setRange(0, 50); self.border_thr_spin.setValue(10)
+        self.border_thr_spin = QtWidgets.QSpinBox(); self.border_thr_spin.setRange(0, 50); self.border_thr_spin.setValue(22)
         self.require_face_check = QtWidgets.QCheckBox("Require face if visible"); self.require_face_check.setChecked(True)
         self.pref_face_check = QtWidgets.QCheckBox()
         self.pref_face_check.setChecked(bool(self.cfg.prefer_face_when_available))
@@ -6045,8 +6056,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.min_sharp_spin.setValue(float(s.value("min_sharpness", 0.0)))
         self.min_gap_spin.setValue(float(s.value("min_gap_sec", 1.5)))
         self.min_box_pix_spin.setValue(int(s.value("min_box_pixels", 5000)))
-        self.auto_crop_check.setChecked(s.value("auto_crop_borders", False, type=bool))
-        self.border_thr_spin.setValue(int(s.value("border_threshold", 10)))
+        self.auto_crop_check.setChecked(s.value("auto_crop_borders", True, type=bool))
+        self.border_thr_spin.setValue(int(s.value("border_threshold", 22)))
         self.require_face_check.setChecked(
             s.value("require_face_if_visible", True, type=bool)
         )
