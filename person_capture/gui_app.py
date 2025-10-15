@@ -2929,12 +2929,11 @@ class Processor(QtCore.QObject):
                                 if ox2 > ox1 + 1 and oy2 > oy1 + 1:
                                     crop_img = frame[oy1:oy2, ox1:ox2]
                                     sharp = self._calc_sharpness(crop_img)
-                                    face_box_global = (
-                                        max(0, min(W, fx1 + off_x)),
-                                        max(0, min(H, fy1 + off_y)),
-                                        max(0, min(W, fx2 + off_x)),
-                                        max(0, min(H, fy2 + off_y)),
-                                    )
+                                    fx1i = int(round(float(np.clip(fx1 + off_x, 0, W - 1))))
+                                    fy1i = int(round(float(np.clip(fy1 + off_y, 0, H - 1))))
+                                    fx2i = int(round(float(np.clip(fx2 + off_x, 0, W - 1))))
+                                    fy2i = int(round(float(np.clip(fy2 + off_y, 0, H - 1))))
+                                    face_box_global = (fx1i, fy1i, fx2i, fy2i)
                                     short_circuit_candidate = dict(
                                         score=fd_val,
                                         fd=fd_val,
@@ -2942,12 +2941,7 @@ class Processor(QtCore.QObject):
                                         sharp=sharp,
                                         box=(ox1, oy1, ox2, oy2),
                                         area=(ox2 - ox1) * (oy2 - oy1),
-                                        show_box=(
-                                            max(0, min(W, fx1 + off_x)),
-                                            max(0, min(H, fy1 + off_y)),
-                                            max(0, min(W, fx2 + off_x)),
-                                            max(0, min(H, fy2 + off_y)),
-                                        ),
+                                        show_box=face_box_global,
                                         face_box=face_box_global,
                                         face_feat=gbest["feat"],
                                         reid_feat=None,
@@ -3249,7 +3243,12 @@ class Processor(QtCore.QObject):
                             sharp=sharp,
                             box=(ox1, oy1, ox2, oy2),
                             area=area,
-                            show_box=(x1 + off_x, y1 + off_y, x2 + off_x, y2 + off_y),
+                            show_box=(
+                                int(x1 + off_x),
+                                int(y1 + off_y),
+                                int(x2 + off_x),
+                                int(y2 + off_y),
+                            ),
                             face_box=face_box_global,
                             face_feat=(bf["feat"] if bf is not None else None),
                             reid_feat=(reid_feats[i] if i < len(reid_feats) else None),
@@ -3771,10 +3770,23 @@ class Processor(QtCore.QObject):
                             1,
                             cv2.LINE_AA,
                         )
+                    H, W = show.shape[:2]
                     # draw person boxes
                     for c in candidates:
-                        x1,y1,x2,y2 = c["show_box"]
-                        cv2.rectangle(show, (x1,y1),(x2,y2),(0,255,0),1)
+                        sb = c.get("show_box") or c.get("box")
+                        if not sb or len(sb) != 4:
+                            continue
+                        vals = np.asarray(sb, dtype=float)
+                        if not np.isfinite(vals).all():
+                            continue
+                        x1, y1, x2, y2 = [int(round(v)) for v in vals]
+                        x1 = max(0, min(W - 1, x1))
+                        y1 = max(0, min(H - 1, y1))
+                        x2 = max(0, min(W - 1, x2))
+                        y2 = max(0, min(H - 1, y2))
+                        if x2 <= x1 or y2 <= y1:
+                            continue
+                        cv2.rectangle(show, (x1, y1), (x2, y2), (0,255,0), 1)
                         if getattr(cfg, "overlay_scores", True):
                             txt = []
                             if c.get("fd") is not None:
@@ -3787,7 +3799,7 @@ class Processor(QtCore.QObject):
                                 cv2.putText(
                                     show,
                                     " | ".join(txt),
-                                    (x1, max(0, y1 - 5)),
+                                    (int(x1), max(0, int(y1) - 5)),
                                     cv2.FONT_HERSHEY_SIMPLEX,
                                     0.45,
                                     (0, 255, 0),
@@ -3795,20 +3807,27 @@ class Processor(QtCore.QObject):
                                     cv2.LINE_AA,
                                 )
                     if candidates:
-                        bx1,by1,bx2,by2 = candidates[0]["box"]
-                        cv2.rectangle(show, (bx1,by1),(bx2,by2),(255,0,0),2)
-                        rs = candidates[0].get("reasons")
-                        if rs:
-                            cv2.putText(
-                                show,
-                                str(rs[0]),
-                                (bx1, max(0, by1 - 5)),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.45,
-                                (255, 0, 0),
-                                1,
-                                cv2.LINE_AA,
-                            )
+                        bvals = np.asarray(candidates[0]["box"], dtype=float)
+                        if np.isfinite(bvals).all():
+                            bx1, by1, bx2, by2 = [int(round(v)) for v in bvals]
+                            bx1 = max(0, min(W - 1, bx1))
+                            by1 = max(0, min(H - 1, by1))
+                            bx2 = max(0, min(W - 1, bx2))
+                            by2 = max(0, min(H - 1, by2))
+                            if bx2 > bx1 and by2 > by1:
+                                cv2.rectangle(show, (bx1, by1), (bx2, by2), (255,0,0), 2)
+                                rs = candidates[0].get("reasons")
+                                if rs:
+                                    cv2.putText(
+                                        show,
+                                        str(rs[0]),
+                                        (int(bx1), max(0, int(by1) - 5)),
+                                        cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.45,
+                                        (255, 0, 0),
+                                        1,
+                                        cv2.LINE_AA,
+                                    )
                     if ann_dir and cfg.save_annot:
                         ann_path = os.path.join(ann_dir, f"f{current_idx:08d}.jpg")
                         ok, why = _atomic_jpeg_write(show, ann_path, jpg_q)
