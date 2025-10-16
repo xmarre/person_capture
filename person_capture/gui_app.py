@@ -296,8 +296,13 @@ class SessionConfig:
     prescan_heavy_90: int = 1536
     prescan_heavy_180: int = 1280
     prescan_min_segment_sec: float = 1.0
-    prescan_pad_sec: float = 2.0
+    prescan_pad_sec: float = 1.5
     prescan_bridge_gap_sec: float = 1.0    # merge spans separated by short gaps
+    # --- pre-scan precision controls ---
+    prescan_exit_cooldown_sec: float = 0.50    # was hardcoded 0.5s; now tunable
+    prescan_boundary_refine_sec: float = 0.75  # rescan window around each edge
+    prescan_refine_stride_min: int = 3         # small stride for edge refine
+    prescan_trim_pad: bool = True              # remove pad if refine finds a tighter edge
     # --- pre-scan bank management ---
     prescan_bank_max: int = 64                 # target size
     prescan_diversity_dedup_cos: float = 0.968 # ≥ skip as duplicate
@@ -487,7 +492,7 @@ class Processor(QtCore.QObject):
         pad = int(round(cfg.prescan_pad_sec * fps))
         min_len = int(round(cfg.prescan_min_segment_sec * fps))
         pos0 = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
-        Wmax = int(cfg.prescan_max_width)
+        Wmax = int(getattr(cfg, "prescan_max_width", 0))
         enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
         fd_add = float(getattr(cfg, "prescan_fd_add", enter))
         old_face_conf = getattr(face, "conf", 0.5)
@@ -504,7 +509,7 @@ class Processor(QtCore.QObject):
                 face.set_prescan_hint(escalate=False)
                 face._probe_conf = float(getattr(cfg, "prescan_probe_conf", 0.03))
                 face._prescan_period = int(getattr(cfg, "prescan_rot_probe_period", 3))
-                face._prescan_probe_imgsz = int(getattr(cfg, "prescan_probe_imgsz", 384))
+                face._prescan_probe_imgsz = int(getattr(cfg, "prescan_probe_imgsz", 512))
                 face._high_90  = int(getattr(cfg, "prescan_heavy_90", 1536))
                 face._high_180 = int(getattr(cfg, "prescan_heavy_180", 1280))
             except Exception:
@@ -841,7 +846,14 @@ class Processor(QtCore.QObject):
                 else:
                     if active:
                         neg_run += 1
-                        if neg_run * stride >= int(0.5 * fps) or best >= exit_:
+                        # configurable exit cooldown instead of fixed 0.5s
+                        exit_cool = int(
+                            round(
+                                max(0.0, float(getattr(cfg, "prescan_exit_cooldown_sec", 0.5)))
+                                * fps
+                            )
+                        )
+                        if neg_run * stride >= exit_cool or best >= exit_:
                             end = idx
                             # pad, clamp, merge
                             s = max(0, start - pad)
@@ -896,6 +908,153 @@ class Processor(QtCore.QObject):
                         cs, ce = s, e
                 bridged.append((cs, ce))
                 spans = bridged
+
+            # --- boundary refinement: tighten edges to cut dead time ---
+            def _refine_edges(sp_list):
+                if not sp_list:
+                    return sp_list
+                # smaller stride and stronger probe around edges
+                stride_ref = max(
+                    1,
+                    min(
+                        int(max(1, cfg.prescan_stride) // 4),
+                        int(getattr(cfg, "prescan_refine_stride_min", 3)),
+                    ),
+                )
+                win = int(
+                    round(
+                        max(0.0, float(getattr(cfg, "prescan_boundary_refine_sec", 0.75)))
+                        * fps
+                    )
+                )
+                pad_frames = int(round(max(0.0, float(cfg.prescan_pad_sec)) * fps))
+                search = max(pad_frames, win)
+                refined = []
+                # temporarily crank prescan hints
+                rr_old = getattr(face, "_prescan_rr_mode", "rr")
+                try:
+                    face._prescan_rr_mode = "full"
+                except Exception:
+                    pass
+                try:
+                    face.set_prescan_hint(escalate=True)
+                except Exception:
+                    pass
+                for (s, e) in sp_list:
+                    ls = s
+                    le = e
+                    # LEFT edge: scan forward from s to s+search
+                    left_stop = min(e, s + search)
+                    j = s
+                    best_left = None
+                    while j <= left_stop:
+                        # keyframe-aware seek for responsiveness
+                        self._seek_to(
+                            cap,
+                            j,
+                            j,
+                            fast=bool(getattr(cfg, "seek_fast", True)),
+                            max_grabs=int(getattr(cfg, "seek_max_grabs", 45)),
+                        )
+                        ret, frame = cap.read()
+                        if not ret or frame is None:
+                            j += stride_ref
+                            continue
+                        h, w = frame.shape[:2]
+                        if Wmax > 0 and w > Wmax:
+                            scale = float(Wmax) / float(w)
+                            frame = cv2.resize(
+                                frame,
+                                (int(round(w * scale)), int(round(h * scale))),
+                                interpolation=cv2.INTER_AREA,
+                            )
+                        faces = face.extract(frame)
+                        if faces:
+                            bank = ref_feat_local if ref_feat_local is not None else ref_feat
+                            for f in faces:
+                                feat = f.get("feat")
+                                if feat is not None and self._fd_min(feat, bank) <= enter:
+                                    best_left = j
+                                    break
+                        if best_left is not None:
+                            break
+                        j += stride_ref
+                    if best_left is not None and bool(getattr(cfg, "prescan_trim_pad", True)):
+                        ls = max(s, best_left)
+                    # RIGHT edge: scan backward region [e-search, e] to last good
+                    right_start = max(ls, e - search)
+                    j = right_start
+                    last_good = None
+                    while j <= e:
+                        self._seek_to(
+                            cap,
+                            j,
+                            j,
+                            fast=bool(getattr(cfg, "seek_fast", True)),
+                            max_grabs=int(getattr(cfg, "seek_max_grabs", 45)),
+                        )
+                        ret, frame = cap.read()
+                        if not ret or frame is None:
+                            j += stride_ref
+                            continue
+                        h, w = frame.shape[:2]
+                        if Wmax > 0 and w > Wmax:
+                            scale = float(Wmax) / float(w)
+                            frame = cv2.resize(
+                                frame,
+                                (int(round(w * scale)), int(round(h * scale))),
+                                interpolation=cv2.INTER_AREA,
+                            )
+                        faces = face.extract(frame)
+                        if faces:
+                            bank = ref_feat_local if ref_feat_local is not None else ref_feat
+                            for f in faces:
+                                feat = f.get("feat")
+                                if feat is not None and self._fd_min(feat, bank) <= enter:
+                                    last_good = j
+                        j += stride_ref
+                    if last_good is not None and bool(getattr(cfg, "prescan_trim_pad", True)):
+                        le = min(e, last_good)
+                    # keep only if span remains big enough
+                    if le >= ls and (le - ls + 1) >= min_len:
+                        refined.append((ls, le))
+                # restore hints
+                try:
+                    face.set_prescan_hint(escalate=False)
+                except Exception:
+                    pass
+                try:
+                    face._prescan_rr_mode = rr_old
+                except Exception:
+                    pass
+                return refined
+
+            spans = _refine_edges(spans)
+            if spans and getattr(cfg, "prescan_bridge_gap_sec", 0) > 0:
+                # bridge tiny gaps (repeat post-refine)
+                bridged = []
+                gap = int(round(cfg.prescan_bridge_gap_sec * fps))
+                cs, ce = spans[0]
+                for s, e in spans[1:]:
+                    if s - ce <= gap:
+                        ce = max(ce, e)
+                    else:
+                        bridged.append((cs, ce))
+                        cs, ce = s, e
+                bridged.append((cs, ce))
+                spans = bridged
+            try:
+                fps_f = float(fps)
+            except Exception:
+                fps_f = 0.0
+            if fps_f <= 0:
+                fps_f = 1.0
+            total_sec = sum((e - s + 1) / fps_f for s, e in spans)
+            self._status(
+                f"Pre-scan refined spans={len(spans)} • total_keep≈{total_sec:.1f}s",
+                key="prescan_refine",
+                interval=1.0,
+            )
         finally:
             try:
                 face.configure_rotation_strategy(adaptive=bool(old_rot_adapt))
@@ -4272,6 +4431,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_prescan_bridge.setValue(float(self.cfg.prescan_bridge_gap_sec))
         self.spin_prescan_bridge.setToolTip("float: prescan_bridge_gap_sec")
         self.spin_prescan_bridge.valueChanged.connect(self._on_ui_change)
+        self.spin_prescan_exit_cooldown = QtWidgets.QDoubleSpinBox()
+        self.spin_prescan_exit_cooldown.setDecimals(2)
+        self.spin_prescan_exit_cooldown.setRange(0.0, 10.0)
+        self.spin_prescan_exit_cooldown.setSingleStep(0.05)
+        self.spin_prescan_exit_cooldown.setValue(float(self.cfg.prescan_exit_cooldown_sec))
+        self.spin_prescan_exit_cooldown.setToolTip("float: prescan_exit_cooldown_sec")
+        self.spin_prescan_exit_cooldown.valueChanged.connect(self._on_ui_change)
+        self.spin_prescan_refine_window = QtWidgets.QDoubleSpinBox()
+        self.spin_prescan_refine_window.setDecimals(2)
+        self.spin_prescan_refine_window.setRange(0.0, 10.0)
+        self.spin_prescan_refine_window.setSingleStep(0.05)
+        self.spin_prescan_refine_window.setValue(float(self.cfg.prescan_boundary_refine_sec))
+        self.spin_prescan_refine_window.setToolTip("float: prescan_boundary_refine_sec")
+        self.spin_prescan_refine_window.valueChanged.connect(self._on_ui_change)
+        self.spin_prescan_refine_stride = QtWidgets.QSpinBox()
+        self.spin_prescan_refine_stride.setRange(1, 120)
+        self.spin_prescan_refine_stride.setValue(int(self.cfg.prescan_refine_stride_min))
+        self.spin_prescan_refine_stride.setToolTip("int: prescan_refine_stride_min")
+        self.spin_prescan_refine_stride.valueChanged.connect(self._on_ui_change)
+        self.chk_prescan_trim_pad = QtWidgets.QCheckBox()
+        self.chk_prescan_trim_pad.setChecked(bool(self.cfg.prescan_trim_pad))
+        self.chk_prescan_trim_pad.setToolTip("bool: prescan_trim_pad")
+        self.chk_prescan_trim_pad.stateChanged.connect(self._on_ui_change)
         self.spin_prescan_bank_max = QtWidgets.QSpinBox()
         self.spin_prescan_bank_max.setRange(8, 4096)
         self.spin_prescan_bank_max.setValue(int(self.cfg.prescan_bank_max))
@@ -4557,6 +4739,10 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Pre-scan min segment sec", self.spin_prescan_min_segment),
             ("Pre-scan pad sec", self.spin_prescan_pad),
             ("Pre-scan bridge gap sec", self.spin_prescan_bridge),
+            ("Pre-scan exit cooldown sec", self.spin_prescan_exit_cooldown),
+            ("Pre-scan boundary refine sec", self.spin_prescan_refine_window),
+            ("Pre-scan refine stride min", self.spin_prescan_refine_stride),
+            ("Pre-scan trim pad", self.chk_prescan_trim_pad),
             ("Pre-scan bank max", self.spin_prescan_bank_max),
             ("Pre-scan dedup cos ≥", self.spin_prescan_dedup),
             ("Pre-scan replace margin", self.spin_prescan_margin),
@@ -5298,6 +5484,10 @@ class MainWindow(QtWidgets.QMainWindow):
             "prescan_min_segment_sec",
             "prescan_pad_sec",
             "prescan_bridge_gap_sec",
+            "prescan_exit_cooldown_sec",
+            "prescan_boundary_refine_sec",
+            "prescan_refine_stride_min",
+            "prescan_trim_pad",
             "prescan_bank_max",
             "prescan_diversity_dedup_cos",
             "prescan_replace_margin",
@@ -5419,8 +5609,12 @@ class MainWindow(QtWidgets.QMainWindow):
             prescan_fd_exit=float(self.spin_prescan_fd_exit.value()) if hasattr(self, "spin_prescan_fd_exit") else 0.52,
             prescan_add_cooldown_samples=int(self.spin_prescan_add_cooldown.value()) if hasattr(self, "spin_prescan_add_cooldown") else 5,
             prescan_min_segment_sec=float(self.spin_prescan_min_segment.value()) if hasattr(self, "spin_prescan_min_segment") else 1.0,
-            prescan_pad_sec=float(self.spin_prescan_pad.value()) if hasattr(self, "spin_prescan_pad") else 2.0,
+            prescan_pad_sec=float(self.spin_prescan_pad.value()) if hasattr(self, "spin_prescan_pad") else 1.5,
             prescan_bridge_gap_sec=float(self.spin_prescan_bridge.value()) if hasattr(self, "spin_prescan_bridge") else 1.0,
+            prescan_exit_cooldown_sec=float(self.spin_prescan_exit_cooldown.value()) if hasattr(self, "spin_prescan_exit_cooldown") else 0.5,
+            prescan_boundary_refine_sec=float(self.spin_prescan_refine_window.value()) if hasattr(self, "spin_prescan_refine_window") else 0.75,
+            prescan_refine_stride_min=int(self.spin_prescan_refine_stride.value()) if hasattr(self, "spin_prescan_refine_stride") else 3,
+            prescan_trim_pad=bool(self.chk_prescan_trim_pad.isChecked()) if hasattr(self, "chk_prescan_trim_pad") else True,
             prescan_bank_max=int(self.spin_prescan_bank_max.value()) if hasattr(self, "spin_prescan_bank_max") else 64,
             prescan_diversity_dedup_cos=float(self.spin_prescan_dedup.value()) if hasattr(self, "spin_prescan_dedup") else 0.968,
             prescan_replace_margin=float(self.spin_prescan_margin.value()) if hasattr(self, "spin_prescan_margin") else 0.01,
@@ -5578,6 +5772,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spin_prescan_pad.setValue(float(cfg.prescan_pad_sec))
         if hasattr(self, 'spin_prescan_bridge'):
             self.spin_prescan_bridge.setValue(float(cfg.prescan_bridge_gap_sec))
+        if hasattr(self, 'spin_prescan_exit_cooldown'):
+            self.spin_prescan_exit_cooldown.setValue(float(cfg.prescan_exit_cooldown_sec))
+        if hasattr(self, 'spin_prescan_refine_window'):
+            self.spin_prescan_refine_window.setValue(float(cfg.prescan_boundary_refine_sec))
+        if hasattr(self, 'spin_prescan_refine_stride'):
+            self.spin_prescan_refine_stride.setValue(int(cfg.prescan_refine_stride_min))
+        if hasattr(self, 'chk_prescan_trim_pad'):
+            self.chk_prescan_trim_pad.setChecked(bool(cfg.prescan_trim_pad))
         if hasattr(self, 'spin_prescan_bank_max'):
             self.spin_prescan_bank_max.setValue(int(cfg.prescan_bank_max))
         if hasattr(self, 'spin_prescan_dedup'):
@@ -6073,6 +6275,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spin_prescan_pad.setValue(float(s.value("prescan_pad_sec", self.cfg.prescan_pad_sec)))
         if hasattr(self, 'spin_prescan_bridge'):
             self.spin_prescan_bridge.setValue(float(s.value("prescan_bridge_gap_sec", self.cfg.prescan_bridge_gap_sec)))
+        if hasattr(self, 'spin_prescan_exit_cooldown'):
+            self.spin_prescan_exit_cooldown.setValue(
+                float(s.value("prescan_exit_cooldown_sec", self.cfg.prescan_exit_cooldown_sec))
+            )
+        if hasattr(self, 'spin_prescan_refine_window'):
+            self.spin_prescan_refine_window.setValue(
+                float(s.value("prescan_boundary_refine_sec", self.cfg.prescan_boundary_refine_sec))
+            )
+        if hasattr(self, 'spin_prescan_refine_stride'):
+            self.spin_prescan_refine_stride.setValue(
+                int(s.value("prescan_refine_stride_min", self.cfg.prescan_refine_stride_min))
+            )
+        if hasattr(self, 'chk_prescan_trim_pad'):
+            self.chk_prescan_trim_pad.setChecked(
+                s.value("prescan_trim_pad", self.cfg.prescan_trim_pad, type=bool)
+            )
         if hasattr(self, 'spin_prescan_bank_max'):
             self.spin_prescan_bank_max.setValue(int(s.value("prescan_bank_max", self.cfg.prescan_bank_max)))
         if hasattr(self, 'spin_prescan_dedup'):
@@ -6274,6 +6492,26 @@ class MainWindow(QtWidgets.QMainWindow):
             s.setValue(k, v)
         if hasattr(self, 'spin_prescan_fd_add'):
             s.setValue("prescan_fd_add", float(self.spin_prescan_fd_add.value()))
+        if hasattr(self, 'spin_prescan_exit_cooldown'):
+            s.setValue(
+                "prescan_exit_cooldown_sec",
+                float(self.spin_prescan_exit_cooldown.value()),
+            )
+        if hasattr(self, 'spin_prescan_refine_window'):
+            s.setValue(
+                "prescan_boundary_refine_sec",
+                float(self.spin_prescan_refine_window.value()),
+            )
+        if hasattr(self, 'spin_prescan_refine_stride'):
+            s.setValue(
+                "prescan_refine_stride_min",
+                int(self.spin_prescan_refine_stride.value()),
+            )
+        if hasattr(self, 'chk_prescan_trim_pad'):
+            s.setValue(
+                "prescan_trim_pad",
+                bool(self.chk_prescan_trim_pad.isChecked()),
+            )
         if hasattr(self, 'disable_reid_check'):
             s.setValue("disable_reid", self.disable_reid_check.isChecked())
         if hasattr(self, 'face_fullframe_check'):
