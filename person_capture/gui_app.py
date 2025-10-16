@@ -3510,7 +3510,7 @@ class Processor(QtCore.QObject):
                                 key="cap",
                                 interval=1.5,
                             )
-                            continue
+                            return False
                     try:
                         rw, rh = parse_ratio(ratio_str)
                         asp = (cx2 - cx1) / float(max(1, cy2 - cy1))
