@@ -1082,6 +1082,14 @@ class Processor(QtCore.QObject):
                 face_frac = farea / max(1.0, carea)
                 fw = max(1.0, fx2 - fx1)
                 fh = max(1.0, fy2 - fy1)
+
+                # HARD SIDE GUARD: discard ratios that would cut the face
+                L = max(0.0, (fx1 - ex1))
+                R = max(0.0, (ex2 - fx2))
+                want_side = float(cfg.crop_face_side_margin_frac) * fw
+                if min(L, R) < want_side:
+                    total += 1e9  # effectively skip this ratio
+
                 # reduce the influence of area when the face is large in-frame
                 face_scale = max(fw / max(1.0, frame_w), fh / max(1.0, frame_h))  # 0..1
                 area_scale = max(0.30, 1.0 - float(cfg.area_face_scale_weight) * face_scale)
@@ -3443,6 +3451,19 @@ class Processor(QtCore.QObject):
                         ry1 = max(0.0, min(float(H2), gy1 - off_y))
                         rx2 = min(float(W2), max(rx1 + 1.0, gx2 - off_x))
                         ry2 = min(float(H2), max(ry1 + 1.0, gy2 - off_y))
+                        rface = c.get("face_box")
+                        if rface is not None:
+                            fx1, fy1, fx2, fy2 = rface
+                            rface = (fx1 - off_x, fy1 - off_y, fx2 - off_x, fy2 - off_y)
+                            rface = (
+                                max(0, int(round(rface[0]))),
+                                max(0, int(round(rface[1]))),
+                                max(0, int(round(rface[2]))),
+                                max(0, int(round(rface[3]))),
+                            )
+                        (rx1, ry1, rx2, ry2), ratio_str, _ = self._choose_best_ratio(
+                            (rx1, ry1, rx2, ry2), ratios, W2, H2, anchor=None, face_box=rface
+                        )
                         face_box_roi = None
                         if c.get("face_box") is not None:
                             fx1, fy1, fx2, fy2 = c["face_box"]
@@ -3780,6 +3801,7 @@ class Processor(QtCore.QObject):
                                         box=(ox1, oy1, ox2, oy2),
                                         area=(ox2 - ox1) * (oy2 - oy1),
                                         show_box=(sfx1, sfy1, sfx2, sfy2),
+                                        face_box=(sfx1, sfy1, sfx2, sfy2),
                                         face_feat=gbest["feat"],
                                         reid_feat=None,
                                         ratio=chosen_ratio,
