@@ -3436,10 +3436,13 @@ class Processor(QtCore.QObject):
                     crop_img_path = os.path.join(crops_dir, f"f{idx:08d}.jpg")
                     # Start from candidate box in GLOBAL coords
                     gx1, gy1, gx2, gy2 = c["box"]
-                    ratio_str = c.get("ratio") or (
-                        ratios[0]
-                        if 'ratios' in locals() and ratios
-                        else (self.cfg.ratio.split(',')[0] if self.cfg.ratio else '2:3')
+                    ratio_str = str(
+                        c.get("ratio")
+                        or (
+                            ratios[0]
+                            if 'ratios' in locals() and ratios
+                            else (self.cfg.ratio.split(',')[0] if self.cfg.ratio else '2:3')
+                        )
                     )
 
                     # If auto-crop borders were applied for detection, run smart-crop inside the ROI
@@ -3451,19 +3454,8 @@ class Processor(QtCore.QObject):
                         ry1 = max(0.0, min(float(H2), gy1 - off_y))
                         rx2 = min(float(W2), max(rx1 + 1.0, gx2 - off_x))
                         ry2 = min(float(H2), max(ry1 + 1.0, gy2 - off_y))
-                        rface = c.get("face_box")
-                        if rface is not None:
-                            fx1, fy1, fx2, fy2 = rface
-                            rface = (fx1 - off_x, fy1 - off_y, fx2 - off_x, fy2 - off_y)
-                            rface = (
-                                max(0, int(round(rface[0]))),
-                                max(0, int(round(rface[1]))),
-                                max(0, int(round(rface[2]))),
-                                max(0, int(round(rface[3]))),
-                            )
-                        (rx1, ry1, rx2, ry2), ratio_str, _ = self._choose_best_ratio(
-                            (rx1, ry1, rx2, ry2), ratios, W2, H2, anchor=None, face_box=rface
-                        )
+                        # Keep the candidate's chosen ratio to avoid re-selecting here.
+                        ratio_str = str(c.get("ratio") or ratio_str)
                         face_box_roi = None
                         if c.get("face_box") is not None:
                             fx1, fy1, fx2, fy2 = c["face_box"]
@@ -3515,6 +3507,13 @@ class Processor(QtCore.QObject):
                                     dx = (w - new_w) // 2
                                     rx1 = max(0, min(W2 - new_w, rx1 + dx))
                                     rx2 = rx1 + new_w
+                        try:
+                            rw, rh = parse_ratio(ratio_str)
+                            rx1, ry1, rx2, ry2 = expand_box_to_ratio(
+                                rx1, ry1, rx2, ry2, rw, rh, W2, H2, anchor=None, head_bias=0.0
+                            )
+                        except Exception:
+                            pass
                         cx1, cy1, cx2, cy2 = rx1 + off_x, ry1 + off_y, rx2 + off_x, ry2 + off_y
                     else:
                         cx1, cy1, cx2, cy2 = gx1, gy1, gx2, gy2
@@ -3561,6 +3560,13 @@ class Processor(QtCore.QObject):
                                     dx = (w - new_w) // 2
                                     cx1 += dx
                                     cx2 = cx1 + new_w
+                        try:
+                            rw, rh = parse_ratio(ratio_str)
+                            cx1, cy1, cx2, cy2 = expand_box_to_ratio(
+                                cx1, cy1, cx2, cy2, rw, rh, W, H, anchor=None, head_bias=0.0
+                            )
+                        except Exception:
+                            pass
 
                     # Final black-border trim on the saved crop, then re-expand to exact ratio
                     try:
@@ -3610,6 +3616,34 @@ class Processor(QtCore.QObject):
                     cy1 = max(0, min(H - 1, int(round(cy1))))
                     cx2 = max(cx1 + 1, min(W, int(round(cx2))))
                     cy2 = max(cy1 + 1, min(H, int(round(cy2))))
+                    try:
+                        rw, rh = parse_ratio(ratio_str)
+                        w = cx2 - cx1
+                        h = cy2 - cy1
+                        target_w = max(1, int(round(h * float(rw) / float(rh))))
+                        if w != target_w:
+                            cx1 = max(0, min(W - target_w, cx1 + (w - target_w) // 2))
+                            cx2 = cx1 + target_w
+                            if cx2 > W:
+                                cx1 = max(0, W - target_w)
+                                cx2 = cx1 + target_w
+                            if cx2 - cx1 != target_w:
+                                target_h = max(1, int(round((cx2 - cx1) * float(rh) / float(rw))))
+                                cy1 = max(0, min(H - target_h, cy1 + (h - target_h) // 2))
+                                cy2 = cy1 + target_h
+                    except Exception:
+                        pass
+                    try:
+                        rw, rh = parse_ratio(ratio_str)
+                        asp = (cx2 - cx1) / float(max(1, cy2 - cy1))
+                        targ = float(rw) / float(rh)
+                        self._status(
+                            f"final_aspect={asp:.5f} target={targ:.5f} ratio={ratio_str}",
+                            key="aspect",
+                            interval=2.0,
+                        )
+                    except Exception:
+                        pass
 
                     self._status(
                         f"crop@{idx}: face_box={c.get('face_box')}", key="cropface", interval=2.0
@@ -3628,7 +3662,7 @@ class Processor(QtCore.QObject):
                         cy2,
                         crop_img_path,
                         c.get("sharp"),
-                        c.get("ratio", ""),
+                        str(ratio_str),
                     ]
                     if save_q is not None:
                         try:
@@ -3668,7 +3702,7 @@ class Processor(QtCore.QObject):
                         (
                             f"CAPTURE idx={idx} t={idx/float(fps):.2f} "
                             f"fd={c.get('fd')} rd={c.get('rd')} score={c.get('score')} "
-                            f"area={area} ratio={c.get('ratio')} face_frac={c.get('face_frac'):.3f} tloss={c.get('tloss', 0.0):.4f} reasons={reasons}"
+                            f"area={area} ratio={ratio_str} face_frac={c.get('face_frac'):.3f} tloss={c.get('tloss', 0.0):.4f} reasons={reasons}"
                         ),
                         key="cap",
                     )
