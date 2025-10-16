@@ -242,6 +242,9 @@ class SessionConfig:
     crop_top_headroom_max_frac: float = 0.15     # max(top margin / crop_h)
     crop_bottom_min_face_heights: float = 1.5    # min bottom margin in face-heights
     crop_penalty_weight: float = 3.0             # weight for placement penalties vs area growth
+    # Final safety guards (post-trim)
+    side_guard_drop_enable: bool = True          # drop frames that still violate side margin after all steps
+    side_guard_drop_factor: float = 0.66         # require at least this * desired margin on both sides before saving
     face_anchor_down_frac: float = 1.1           # shift center downward by this * face_h (torso bias)
     border_threshold: int = 22                   # grayscale threshold for border trimming
     border_scan_frac: float = 0.25               # scan depth as fraction of min(w,h)
@@ -2855,7 +2858,21 @@ class Processor(QtCore.QObject):
                         )
                         tmp_dists_all = []
                         tmp_dists_quality = []
-                        gbest = FaceEmbedder.best_face(gfaces)
+                        faces_with_feat = [gf for gf in gfaces if gf.get("feat") is not None]
+                        if ref_face_feat is not None and faces_with_feat:
+                            cand = faces_with_feat
+                            if use_quality_vis:
+                                cand = [
+                                    gf
+                                    for gf in cand
+                                    if float(gf.get("quality", 0.0)) >= quality_min
+                                ]
+                            gbest = min(
+                                cand or faces_with_feat,
+                                key=lambda f: self._fd_min(f["feat"], ref_face_feat),
+                            )
+                        else:
+                            gbest = FaceEmbedder.best_face(gfaces)
                         for gf in gfaces:
                             bbox = gf.get("bbox")
                             if bbox is None or len(bbox) != 4:
@@ -3440,6 +3457,18 @@ class Processor(QtCore.QObject):
                                     (nx1, ny1, nx2, ny2), int(tw), int(th),
                                     (nx1, ny1, nx2, ny2), anchor=anchor_glob
                                 )
+                                # Final guard: ensure the shrunken crop still honors face side margins.
+                                try:
+                                    cx1, cy1, cx2, cy2 = self._enforce_scale_and_margins(
+                                        (cx1, cy1, cx2, cy2),
+                                        ratio_str,
+                                        W,
+                                        H,
+                                        face_box=fb,
+                                        anchor=anchor_glob,
+                                    )
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
 
@@ -3447,6 +3476,7 @@ class Processor(QtCore.QObject):
                     cy1 = max(0, min(H - 1, int(round(cy1))))
                     cx2 = max(cx1 + 1, min(W, int(round(cx2))))
                     cy2 = max(cy1 + 1, min(H, int(round(cy2))))
+
                     try:
                         rw, rh = parse_ratio(ratio_str)
                         w = cx2 - cx1
@@ -3464,6 +3494,23 @@ class Processor(QtCore.QObject):
                                 cy2 = cy1 + target_h
                     except Exception:
                         pass
+
+                    # Side-margin safety drop: avoid saving half-face crops pinned to an edge.
+                    fb = c.get("face_box")
+                    if fb is not None and bool(getattr(cfg, "side_guard_drop_enable", True)):
+                        fcx = 0.5 * (float(fb[0]) + float(fb[2]))
+                        fw = max(1.0, float(fb[2]) - float(fb[0]))
+                        left_margin = max(0.0, fcx - float(cx1))
+                        right_margin = max(0.0, float(cx2) - fcx)
+                        desired = float(cfg.crop_face_side_margin_frac) * fw
+                        required = float(getattr(cfg, "side_guard_drop_factor", 0.66)) * desired
+                        if min(left_margin, right_margin) < required:
+                            self._status(
+                                "skip: side_guard_drop (insufficient face margin)",
+                                key="cap",
+                                interval=1.5,
+                            )
+                            continue
                     try:
                         rw, rh = parse_ratio(ratio_str)
                         asp = (cx2 - cx1) / float(max(1, cy2 - cy1))
@@ -3620,7 +3667,23 @@ class Processor(QtCore.QObject):
                         and ref_face_feat is not None
                     ):
                         gfaces = face.extract(frame_for_det, imgsz=fullframe_imgsz)
-                        gbest = FaceEmbedder.best_face(gfaces)
+                        quality_min = float(cfg.face_quality_min)
+                        use_quality_vis = bool(cfg.face_visible_uses_quality)
+                        faces_with_feat = [gf for gf in gfaces if gf.get("feat") is not None]
+                        if ref_face_feat is not None and faces_with_feat:
+                            cand = faces_with_feat
+                            if use_quality_vis:
+                                cand = [
+                                    gf
+                                    for gf in cand
+                                    if float(gf.get("quality", 0.0)) >= quality_min
+                                ]
+                            gbest = min(
+                                cand or faces_with_feat,
+                                key=lambda f: self._fd_min(f["feat"], ref_face_feat),
+                            )
+                        else:
+                            gbest = FaceEmbedder.best_face(gfaces)
                         if gbest is not None and gbest.get("feat") is not None:
                             gfd = self._fd_min(gbest["feat"], ref_face_feat)
                             if gfd <= float(cfg.face_thresh):

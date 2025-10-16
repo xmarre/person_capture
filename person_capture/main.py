@@ -231,12 +231,32 @@ def main():
 
             # Face features per person (optional)
             face_map = {}  # idx -> (face, dist)
+            refn = None
+            if ref_face_feat is not None:
+                refn = ref_face_feat / max(float(np.linalg.norm(ref_face_feat)), 1e-6)
             for i, crop in enumerate(crops):
                 ffaces = face.extract(crop)
-                bestf = FaceEmbedder.best_face(ffaces)
+                bestf = None
+                bestf_fd = None
+                if ref_face_feat is not None and ffaces:
+                    faces_with_feat = [f for f in ffaces if f.get("feat") is not None]
+                    if faces_with_feat:
+                        def _cosdist(f):
+                            v = np.asarray(f["feat"], dtype=np.float32)
+                            v = v / max(float(np.linalg.norm(v)), 1e-6)
+                            return 1.0 - float(np.dot(v, refn))
+
+                        bestf = min(faces_with_feat, key=_cosdist)
+                        bestf_fd = _cosdist(bestf)
+                if bestf is None:
+                    bestf = FaceEmbedder.best_face(ffaces)
                 if bestf and ref_face_feat is not None:
-                    fd = 1.0 - float(np.dot(bestf['feat'], ref_face_feat))  # cosine distance on normed features
-                    face_map[i] = (bestf, fd)
+                    if bestf_fd is None and bestf.get("feat") is not None:
+                        v = np.asarray(bestf["feat"], dtype=np.float32)
+                        v = v / max(float(np.linalg.norm(v)), 1e-6)
+                        bestf_fd = 1.0 - float(np.dot(v, refn))
+                    if bestf_fd is not None:
+                        face_map[i] = (bestf, bestf_fd)
 
             # Score and save matches
             for i, feat in enumerate(reid_feats):
