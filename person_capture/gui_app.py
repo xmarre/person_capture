@@ -198,6 +198,10 @@ class SessionConfig:
     clip_face_backbone: str = "ViT-L-14"
     clip_face_pretrained: str = "laion2b_s32b_b82k"
     use_arcface: bool = True
+    # ratio selection tuning
+    ratio_square_bias: float = 0.08          # subtract from score if 1:1
+    tight_face_relax_thresh: float = 0.48    # if face_h / crop_h ≥ thresh, relax bottom
+    tight_face_relax_scale: float = 0.5      # scale want_bottom by this when tight
     device: str = "cuda"            # cuda | cpu
     yolo_model: str = "yolov8n.pt"
     face_model: str = "scrfd_10g_bnkps"
@@ -991,7 +995,9 @@ class Processor(QtCore.QObject):
         det_area = max(1, (x2-x1)*(y2-y1))
         best = None
         best_ratio = None
+        best_aspect = None
         best_score = 1e9
+        eps = 0.06  # tie window for preferring square
         cfg = self.cfg
 
         def _penalty(crop_xyxy, face_xyxy):
@@ -1011,7 +1017,9 @@ class Processor(QtCore.QObject):
             headroom = T / ch
             headroom_def = max(0.0, headroom - float(cfg.crop_top_headroom_max_frac))
             # 3) bottom margin minimum in face-heights -> encourage torso inclusion
-            want_bottom = float(cfg.crop_bottom_min_face_heights) * fh
+            tight = (fh / ch) >= float(getattr(cfg, "tight_face_relax_thresh", 0.48))
+            relax = float(getattr(cfg, "tight_face_relax_scale", 0.5)) if tight else 1.0
+            want_bottom = float(cfg.crop_bottom_min_face_heights) * fh * relax
             bottom_def = max(0.0, want_bottom - B) / fh
             return side_def + headroom_def + bottom_def
 
@@ -1020,6 +1028,7 @@ class Processor(QtCore.QObject):
                 rw, rh = parse_ratio(rs)
             except Exception:
                 continue
+            aspect = float(rw) / float(rh)
             # dynamic head_bias: push framing downward to include torso
             hb = 0.0
             if face_box is not None:
@@ -1036,10 +1045,23 @@ class Processor(QtCore.QObject):
 
             pen = _penalty((ex1,ey1,ex2,ey2), face_box)
             total = area_factor + float(cfg.crop_penalty_weight) * pen
-            if total < best_score:
+            # prefer square slightly when candidates are otherwise close
+            if abs(aspect - 1.0) < 1e-3:
+                total -= float(getattr(cfg, "ratio_square_bias", 0.0))
+
+            pick = False
+            if total < best_score - eps:
+                pick = True
+            elif abs(total - best_score) <= eps:
+                # prefer aspect closer to 1:1 when near-tie
+                if best_aspect is None or abs(aspect - 1.0) < abs(best_aspect - 1.0):
+                    pick = True
+
+            if pick:
                 best_score = total
                 best = (ex1,ey1,ex2,ey2)
                 best_ratio = rs
+                best_aspect = aspect
         return best, (best_ratio or (f"{int(rw)}:{int(rh)}" if 'rw' in locals() else "unk"))
 
     def _calc_sharpness(self, bgr):
@@ -1092,6 +1114,33 @@ class Processor(QtCore.QObject):
         x1,y1,x2,y2 = box
         ex1,ey1,ex2,ey2 = expand_box_to_ratio(x1,y1,x2,y2, ratio_w, ratio_h, frame_w, frame_h, anchor=anchor, head_bias=0.12)
         return ex1,ey1,ex2,ey2
+
+    def _shrink_to_ratio_inside(self, box, ratio_w, ratio_h, bounds, anchor=None):
+        """Shrink `box` to target ratio inside `bounds`, biased to keep `anchor` centered."""
+        x1,y1,x2,y2 = map(int, box)
+        bx1,by1,bx2,by2 = map(int, bounds)
+        w = max(1, x2-x1); h = max(1, y2-y1)
+        tgt = float(ratio_w) / float(ratio_h)
+        cur = w / float(h)
+        if anchor is None:
+            ax = (x1 + x2) * 0.5; ay = (y1 + y2) * 0.5
+        else:
+            ax, ay = anchor
+        ax = max(bx1, min(bx2, ax)); ay = max(by1, min(by2, ay))
+        if abs(cur - tgt) <= 1e-3:
+            return x1,y1,x2,y2
+        if cur < tgt:
+            new_h = min(h, max(1, int(round(w / max(1e-6, tgt)))))
+            ny1 = int(round(ay - new_h * 0.5))
+            ny1 = max(by1, min(by2 - new_h, ny1))
+            ny2 = ny1 + new_h
+            return x1, ny1, x2, ny2
+        else:
+            new_w = min(w, max(1, int(round(h * tgt))))
+            nx1 = int(round(ax - new_w * 0.5))
+            nx1 = max(bx1, min(bx2 - new_w, nx1))
+            nx2 = nx1 + new_w
+            return nx1, y1, nx2, y2
 
     # Signals for UI
     setup = QtCore.Signal(int, float)                # total_frames, fps
@@ -3409,27 +3458,21 @@ class Processor(QtCore.QObject):
                                     tw, th = parse_ratio(ratio_str)
                                 except Exception:
                                     tw, th = 2, 3
-                                # shrink INSIDE trimmed ROI to exact ratio (never reintroduce bars)
-                                tgt = float(tw) / float(th)
-                                iw, ih = nx2 - nx1, ny2 - ny1
-                                if iw > 2 and ih > 2:
-                                    cur = iw / float(ih)
-                                    if abs(cur - tgt) > 1e-3:
-                                        if cur < tgt:  # too tall -> reduce height
-                                            new_h = max(1, int(round(iw / tgt)))
-                                            if new_h > ih:
-                                                new_h = ih
-                                            dy = (ih - new_h) // 2
-                                            ny1 += dy
-                                            ny2 = ny1 + new_h
-                                        else:  # too wide -> reduce width
-                                            new_w = max(1, int(round(ih * tgt)))
-                                            if new_w > iw:
-                                                new_w = iw
-                                            dx = (iw - new_w) // 2
-                                            nx1 += dx
-                                            nx2 = nx1 + new_w
-                                cx1, cy1, cx2, cy2 = nx1, ny1, nx2, ny2
+                                # anchor-aware shrink INSIDE trimmed ROI to exact ratio
+                                anchor_glob = None
+                                fb = c.get("face_box")
+                                if fb is not None:
+                                    fcx = 0.5 * (fb[0] + fb[2])
+                                    fcy = 0.5 * (fb[1] + fb[3])
+                                    fh  = max(1.0, fb[3] - fb[1])
+                                    anchor_glob = (
+                                        fcx,
+                                        fcy + 0.5 * float(getattr(cfg, "face_anchor_down_frac", 1.1)) * fh,
+                                    )
+                                cx1, cy1, cx2, cy2 = self._shrink_to_ratio_inside(
+                                    (nx1, ny1, nx2, ny2), int(tw), int(th),
+                                    (nx1, ny1, nx2, ny2), anchor=anchor_glob
+                                )
                     except Exception:
                         pass
 
