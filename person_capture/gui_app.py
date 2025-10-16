@@ -211,6 +211,11 @@ class SessionConfig:
     w_body: float = 0.50
     lambda_facefrac: float = 2.0             # weight for face-fraction loss
     crop_center_weight: float = 0.8          # weight for face-center alignment
+    # area vs. composition
+    area_gamma: float = 0.60                 # <1 softens area growth
+    area_face_scale_weight: float = 0.70     # down-weight area when face is large
+    square_pull_face_min: float = 0.45       # activate square pull when fh/frame_h > this; 0..1
+    square_pull_weight: float = 0.25         # strength of square pull
     tight_face_relax_thresh: float = 0.48    # if face_h / crop_h ≥ thresh, relax bottom
     tight_face_relax_scale: float = 0.5      # scale want_bottom by this when tight
     device: str = "cuda"            # cuda | cpu
@@ -1062,10 +1067,12 @@ class Processor(QtCore.QObject):
                 x1, y1, x2, y2, rw, rh, frame_w, frame_h, anchor=anchor, head_bias=hb
             )
             area = max(1, (ex2 - ex1) * (ey2 - ey1))
-            area_factor = float(area) / float(det_area)
+            area_raw = float(area) / float(det_area)
+            # soften pure-area dominance
+            area_term = pow(area_raw, float(cfg.area_gamma))
 
             pen = _penalty((ex1, ey1, ex2, ey2), face_box)
-            total = area_factor + float(cfg.crop_penalty_weight) * pen
+            total = area_term + float(cfg.crop_penalty_weight) * pen
             tmpl_loss = 0.0
 
             if face_box is not None:
@@ -1075,6 +1082,10 @@ class Processor(QtCore.QObject):
                 face_frac = farea / max(1.0, carea)
                 fw = max(1.0, fx2 - fx1)
                 fh = max(1.0, fy2 - fy1)
+                # reduce the influence of area when the face is large in-frame
+                face_scale = max(fw / max(1.0, frame_w), fh / max(1.0, frame_h))  # 0..1
+                area_scale = max(0.30, 1.0 - float(cfg.area_face_scale_weight) * face_scale)
+                total += (area_scale - 1.0) * area_term  # scales area term down only
                 allow_close = max(
                     fw / max(1.0, frame_w),
                     fh / max(1.0, frame_h),
@@ -1090,6 +1101,12 @@ class Processor(QtCore.QObject):
                 best_tloss = min(w * _huber(face_frac - t, delta) for t, w in targ)
                 tmpl_loss = best_tloss
                 total += float(cfg.lambda_facefrac) * best_tloss
+
+                # “square pull” only when face is large: penalize non-square aspect
+                asp = float(rw) / float(rh)
+                if (fh / max(1.0, frame_h)) > float(cfg.square_pull_face_min):
+                    pull = (fh / float(frame_h)) - float(cfg.square_pull_face_min)
+                    total += float(cfg.square_pull_weight) * pull * abs(asp - 1.0)
 
             if total < best_score:
                 best_score = total
