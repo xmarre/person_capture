@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os, json, threading
+import traceback
 from pathlib import Path
 from typing import Optional, List
 
@@ -36,6 +37,11 @@ class CurateWorker(QtCore.QObject):
     @QtCore.Slot()
     def run(self):
         try:
+            # let the UI show something immediately
+            try:
+                self.progress.emit("init: starting", 0, 0)
+            except Exception:
+                pass
             trt_dir = os.getenv("TRT_LIB_DIR") or os.getenv("TENSORRT_DIR") or ""
             cur = Curator(
                 ref_image=self.ref_path,
@@ -56,8 +62,8 @@ class CurateWorker(QtCore.QObject):
                     for parts in reader:
                         rows.append([p.strip() for p in parts])
             self.finished.emit(out, rows)
-        except Exception as e:
-            self.failed.emit(str(e))
+        except Exception:
+            self.failed.emit(traceback.format_exc())
 
 
 class CurateTab(QtWidgets.QWidget):
@@ -147,7 +153,8 @@ class CurateTab(QtWidgets.QWidget):
             self._set_status("Invalid output folder")
             return
         self.btnRun.setEnabled(False)
-        self.prog.setValue(0)
+        # show activity immediately; _on_progress will keep it busy during init
+        self.prog.setRange(0, 0); self.prog.setValue(0)
         self._set_status("Running…")
 
         self._thread = QtCore.QThread(self)
@@ -157,6 +164,9 @@ class CurateTab(QtWidgets.QWidget):
         self._worker.finished.connect(self._done)
         self._worker.failed.connect(self._fail)
         self._worker.progress.connect(self._on_progress)
+        # tidy up worker object after completion/failure
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.failed.connect(self._worker.deleteLater)
         self._worker.finished.connect(self._thread.quit)
         self._worker.failed.connect(self._thread.quit)
         self._thread.finished.connect(self._thread.deleteLater)
@@ -164,6 +174,7 @@ class CurateTab(QtWidgets.QWidget):
 
     def _done(self, out_dir: str, rows: list):
         self._set_status(f"Done → {out_dir}")
+        self.prog.setRange(0, 100)
         self.prog.setValue(100)
         self.btnRun.setEnabled(True)
         self.table.setRowCount(0)
@@ -180,6 +191,7 @@ class CurateTab(QtWidgets.QWidget):
 
     def _fail(self, msg: str):
         self._set_status(f"Failed: {msg}")
+        self.prog.setRange(0, 100)
         self.prog.setValue(0)
         self.btnRun.setEnabled(True)
 
@@ -188,7 +200,16 @@ class CurateTab(QtWidgets.QWidget):
 
     @QtCore.Slot(str, int, int)
     def _on_progress(self, phase: str, done: int, total: int):
-        pct = 0 if total <= 0 else int(round(100.0 * done / max(1, total)))
+        # During init (total==0), show an indeterminate (marquee) bar and just print the phase text.
+        if total <= 0:
+            if self.prog.minimum() != 0 or self.prog.maximum() != 0:
+                self.prog.setRange(0, 0)  # busy
+            self._set_status(str(phase))
+            return
+        # Determinate progress once we know totals
+        if self.prog.minimum() == 0 and self.prog.maximum() == 0:
+            self.prog.setRange(0, 100)
+        pct = int(round(100.0 * done / max(1, total)))
         self.prog.setValue(max(0, min(100, pct)))
         self._set_status(f"{phase}: {done}/{total}")
 
