@@ -229,9 +229,22 @@ class Curator:
                  progress: Optional[Callable[[str,int,int], None]]=None):
         self.device = device
         self._progress = progress
-        self.face = FaceEmbedder(ctx=device, use_arcface=True, progress=None, trt_lib_dir=trt_lib_dir)
+        # Bridge FaceEmbedder's textual progress into our (phase, done, total) channel.
+        def _p(msg: str) -> None:
+            try:
+                if self._progress:
+                    self._progress(f"init: {msg}", 0, 0)
+            except Exception:
+                pass
+        # Let init show up immediately in UI
+        if self._progress:
+            self._progress("init: loading models", 0, 0)
+
+        self.face = FaceEmbedder(ctx=device, use_arcface=True, progress=_p, trt_lib_dir=trt_lib_dir)
         # CLIP used for diversity (background/pose). Reuse ReIDEmbedder for whole image embeddings.
         self.reid = ReIDEmbedder(device=device)
+        if self._progress:
+            self._progress("init: models ready", 0, 0)
 
         # Build a small bank from the ref image
         ref_bgr = cv2.imread(ref_image, cv2.IMREAD_COLOR)
@@ -554,6 +567,8 @@ class Curator:
         paths.sort()
         total = len(paths)
         self._emit_progress("scan", 0, total, force=True)
+        if total == 0:
+            self._emit_progress("scan: empty folder", 0, 0, force=True)
         items: List[Item] = []
         for i, p in enumerate(paths, 1):
             it = self.describe(p)
