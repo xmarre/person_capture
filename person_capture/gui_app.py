@@ -198,8 +198,19 @@ class SessionConfig:
     clip_face_backbone: str = "ViT-L-14"
     clip_face_pretrained: str = "laion2b_s32b_b82k"
     use_arcface: bool = True
-    # ratio selection tuning
-    ratio_square_bias: float = 0.08          # subtract from score if 1:1
+    # crop scoring (per-frame, no ratio bias)
+    face_target_close: float = 0.38          # close face target frac (face_area/crop_area)
+    face_target_upper: float = 0.20          # head+upper torso target frac (ideal)
+    face_target_cowboy: float = 0.08         # cowboy target frac
+    face_target_body: float = 0.03           # full-body target frac
+    face_target_tolerance: float = 0.04      # Huber delta around targets
+    face_target_close_min_frac: float = 0.10   # min face_w / frame_w to allow close-ups
+    w_close: float = 1.10                    # template weights
+    w_upper: float = 1.00
+    w_cowboy: float = 0.70
+    w_body: float = 0.50
+    lambda_facefrac: float = 2.0             # weight for face-fraction loss
+    crop_center_weight: float = 0.8          # weight for face-center alignment
     tight_face_relax_thresh: float = 0.48    # if face_h / crop_h ≥ thresh, relax bottom
     tight_face_relax_scale: float = 0.5      # scale want_bottom by this when tight
     device: str = "cuda"            # cuda | cpu
@@ -991,25 +1002,26 @@ class Processor(QtCore.QObject):
           score = area_factor + λ * placement_penalty
         placement_penalty discourages: side-cut faces, excess headroom, missing lower torso.
         """
-        (x1,y1,x2,y2) = det_box
-        det_area = max(1, (x2-x1)*(y2-y1))
+        (x1, y1, x2, y2) = det_box
+        det_area = max(1, (x2 - x1) * (y2 - y1))
         best = None
         best_ratio = None
-        best_aspect = None
         best_score = 1e9
-        eps = 0.06  # tie window for preferring square
+        best_template_loss = 0.0
         cfg = self.cfg
 
         def _penalty(crop_xyxy, face_xyxy):
             if face_xyxy is None:
                 return 0.0
-            cx1,cy1,cx2,cy2 = crop_xyxy
-            fx1,fy1,fx2,fy2 = face_xyxy
-            cw, ch = max(1.0, cx2-cx1), max(1.0, cy2-cy1)
-            fw, fh = max(1.0, fx2-fx1), max(1.0, fy2-fy1)
+            cx1, cy1, cx2, cy2 = crop_xyxy
+            fx1, fy1, fx2, fy2 = face_xyxy
+            cw, ch = max(1.0, cx2 - cx1), max(1.0, cy2 - cy1)
+            fw, fh = max(1.0, fx2 - fx1), max(1.0, fy2 - fy1)
             # margins around face inside crop
-            L = max(0.0, (fx1 - cx1)); R = max(0.0, (cx2 - fx2))
-            T = max(0.0, (fy1 - cy1)); B = max(0.0, (cy2 - fy2))
+            L = max(0.0, (fx1 - cx1))
+            R = max(0.0, (cx2 - fx2))
+            T = max(0.0, (fy1 - cy1))
+            B = max(0.0, (cy2 - fy2))
             # 1) side margin deficit -> penalize half-face crops
             want_side = float(cfg.crop_face_side_margin_frac) * fw
             side_def = max(0.0, want_side - min(L, R)) / fw
@@ -1021,48 +1033,100 @@ class Processor(QtCore.QObject):
             relax = float(getattr(cfg, "tight_face_relax_scale", 0.5)) if tight else 1.0
             want_bottom = float(cfg.crop_bottom_min_face_heights) * fh * relax
             bottom_def = max(0.0, want_bottom - B) / fh
-            return side_def + headroom_def + bottom_def
+            # 4) face centrality
+            cx = 0.5 * (cx1 + cx2)
+            cy = 0.5 * (cy1 + cy2)
+            fcx = 0.5 * (fx1 + fx2)
+            fcy = 0.5 * (fy1 + fy2)
+            center_def = math.hypot((fcx - cx) / cw, (fcy - cy) / ch)
+            return side_def + headroom_def + bottom_def + float(cfg.crop_center_weight) * center_def
+
+        def _huber(x, delta):
+            ax = abs(x)
+            return 0.5 * ax * ax if ax <= delta else delta * (ax - 0.5 * delta)
 
         for rs in ratios:
             try:
                 rw, rh = parse_ratio(rs)
             except Exception:
                 continue
-            aspect = float(rw) / float(rh)
             # dynamic head_bias: push framing downward to include torso
             hb = 0.0
             if face_box is not None:
-                fbw = max(1.0, face_box[2]-face_box[0])
-                fbh = max(1.0, face_box[3]-face_box[1])
-                bh  = max(1.0, y2-y1)
+                fbw = max(1.0, face_box[2] - face_box[0])
+                fbh = max(1.0, face_box[3] - face_box[1])
+                bh = max(1.0, y2 - y1)
                 # move center DOWN by ~face_anchor_down_frac * face_h => negative head_bias
                 hb = -float(cfg.face_anchor_down_frac) * (fbh / bh)
-            ex1,ey1,ex2,ey2 = expand_box_to_ratio(
-                x1,y1,x2,y2, rw, rh, frame_w, frame_h, anchor=anchor, head_bias=hb
+            ex1, ey1, ex2, ey2 = expand_box_to_ratio(
+                x1, y1, x2, y2, rw, rh, frame_w, frame_h, anchor=anchor, head_bias=hb
             )
-            area = max(1, (ex2-ex1)*(ey2-ey1))
-            area_factor = float(area)/float(det_area)
+            area = max(1, (ex2 - ex1) * (ey2 - ey1))
+            area_factor = float(area) / float(det_area)
 
-            pen = _penalty((ex1,ey1,ex2,ey2), face_box)
+            pen = _penalty((ex1, ey1, ex2, ey2), face_box)
             total = area_factor + float(cfg.crop_penalty_weight) * pen
-            # prefer square slightly when candidates are otherwise close
-            if abs(aspect - 1.0) < 1e-3:
-                total -= float(getattr(cfg, "ratio_square_bias", 0.0))
+            tmpl_loss = 0.0
 
-            pick = False
-            if total < best_score - eps:
-                pick = True
-            elif abs(total - best_score) <= eps:
-                # prefer aspect closer to 1:1 when near-tie
-                if best_aspect is None or abs(aspect - 1.0) < abs(best_aspect - 1.0):
-                    pick = True
+            if face_box is not None:
+                fx1, fy1, fx2, fy2 = face_box
+                farea = max(1.0, (fx2 - fx1) * (fy2 - fy1))
+                carea = float(area)
+                face_frac = farea / max(1.0, carea)
+                fw = max(1.0, fx2 - fx1)
+                fh = max(1.0, fy2 - fy1)
+                allow_close = max(
+                    fw / max(1.0, frame_w),
+                    fh / max(1.0, frame_h),
+                ) >= float(getattr(cfg, "face_target_close_min_frac", 0.10))
+                targ = [
+                    (float(cfg.face_target_upper), float(cfg.w_upper)),
+                    (float(cfg.face_target_cowboy), float(cfg.w_cowboy)),
+                    (float(cfg.face_target_body), float(cfg.w_body)),
+                ]
+                if allow_close:
+                    targ.append((float(cfg.face_target_close), float(cfg.w_close)))
+                delta = float(cfg.face_target_tolerance)
+                best_tloss = min(w * _huber(face_frac - t, delta) for t, w in targ)
+                tmpl_loss = best_tloss
+                total += float(cfg.lambda_facefrac) * best_tloss
 
-            if pick:
+            if total < best_score:
                 best_score = total
-                best = (ex1,ey1,ex2,ey2)
+                best = (
+                    int(round(ex1)),
+                    int(round(ey1)),
+                    int(round(ex2)),
+                    int(round(ey2)),
+                )
                 best_ratio = rs
-                best_aspect = aspect
-        return best, (best_ratio or (f"{int(rw)}:{int(rh)}" if 'rw' in locals() else "unk"))
+                best_template_loss = tmpl_loss
+
+        # Fallback if no candidate selected
+        if best is None:
+            try:
+                rw, rh = parse_ratio(str(ratios[0]))
+                ex1, ey1, ex2, ey2 = expand_box_to_ratio(
+                    x1, y1, x2, y2, rw, rh, frame_w, frame_h, anchor=anchor, head_bias=0.0
+                )
+                best = (
+                    int(round(ex1)),
+                    int(round(ey1)),
+                    int(round(ex2)),
+                    int(round(ey2)),
+                )
+                best_ratio = str(ratios[0])
+                best_template_loss = 0.0
+            except Exception:
+                best = (
+                    int(round(x1)),
+                    int(round(y1)),
+                    int(round(x2)),
+                    int(round(y2)),
+                )
+                best_ratio = None
+                best_template_loss = 0.0
+        return best, best_ratio, best_template_loss
 
     def _calc_sharpness(self, bgr):
         if bgr is None or bgr.size == 0:
@@ -2657,6 +2721,19 @@ class Processor(QtCore.QObject):
                             "rot_every_n",
                             "rot_after_hit_frames",
                             "fast_no_face_imgsz",
+                            # new per-frame crop scorer knobs
+                            "lambda_facefrac",
+                            "crop_center_weight",
+                            "face_target_close",
+                            "face_target_upper",
+                            "face_target_cowboy",
+                            "face_target_body",
+                            "face_target_tolerance",
+                            "face_target_close_min_frac",
+                            "w_close",
+                            "w_upper",
+                            "w_cowboy",
+                            "w_body",
                         }
                         rot_keys = {
                             "rot_adaptive",
@@ -2964,7 +3041,7 @@ class Processor(QtCore.QObject):
                             acy = (fy1 + fy2) / 2.0
                             fd_val = self._fd_min(gbest["feat"], ref_face_feat)
                             if fd_val <= float(cfg.face_thresh):
-                                (ex1, ey1, ex2, ey2), chosen_ratio = self._choose_best_ratio(
+                                (ex1, ey1, ex2, ey2), chosen_ratio, chosen_tloss = self._choose_best_ratio(
                                     face_box_abs, ratios, W2, H2, anchor=(acx, acy), face_box=face_box_abs
                                 )
                                 ex1, ey1, ex2, ey2 = self._enforce_scale_and_margins(
@@ -2983,6 +3060,9 @@ class Processor(QtCore.QObject):
                                 if ox2 > ox1 + 1 and oy2 > oy1 + 1:
                                     crop_img = frame[oy1:oy2, ox1:ox2]
                                     sharp = self._calc_sharpness(crop_img)
+                                    carea = max(1.0, float((ex2 - ex1) * (ey2 - ey1)))
+                                    farea = max(1.0, (fx2 - fx1) * (fy2 - fy1))
+                                    face_frac = float(farea) / carea
                                     fx1i = int(round(float(np.clip(fx1 + off_x, 0, W - 1))))
                                     fy1i = int(round(float(np.clip(fy1 + off_y, 0, H - 1))))
                                     fx2i = int(round(float(np.clip(fx2 + off_x, 0, W - 1))))
@@ -3000,6 +3080,8 @@ class Processor(QtCore.QObject):
                                         face_feat=gbest["feat"],
                                         reid_feat=None,
                                         ratio=chosen_ratio,
+                                        face_frac=face_frac,
+                                        tloss=float(chosen_tloss),
                                         reasons=["face_short_circuit"],
                                         face_quality=float(gbest.get("quality", 0.0)),
                                         accept_pre=True,
@@ -3259,7 +3341,7 @@ class Processor(QtCore.QObject):
                         face_box_abs = (fx1, fy1, fx2, fy2)
 
                     # expand to ratio within the DET frame using placement heuristics
-                    (ex1,ey1,ex2,ey2), chosen_ratio = self._choose_best_ratio(
+                    (ex1, ey1, ex2, ey2), chosen_ratio, chosen_tloss = self._choose_best_ratio(
                         (x1,y1,x2,y2), ratios, W2, H2, anchor=anchor, face_box=face_box_abs
                     )
                     ex1, ey1, ex2, ey2 = self._enforce_scale_and_margins(
@@ -3281,8 +3363,12 @@ class Processor(QtCore.QObject):
                     ox1, oy1, ox2, oy2 = ex1+off_x, ey1+off_y, ex2+off_x, ey2+off_y
                     area = (ox2-ox1)*(oy2-oy1)
                     face_box_global = None
+                    face_frac = 0.0
                     if face_box_abs is not None:
                         fx1, fy1, fx2, fy2 = face_box_abs
+                        farea = max(1.0, (fx2 - fx1) * (fy2 - fy1))
+                        carea = max(1.0, float((ex2 - ex1) * (ey2 - ey1)))
+                        face_frac = float(farea) / carea
                         face_box_global = (
                             max(0, min(W, fx1 + off_x)),
                             max(0, min(H, fy1 + off_y)),
@@ -3307,6 +3393,8 @@ class Processor(QtCore.QObject):
                             face_feat=(bf["feat"] if bf is not None else None),
                             reid_feat=(reid_feats[i] if i < len(reid_feats) else None),
                             ratio=chosen_ratio,
+                            face_frac=face_frac,
+                            tloss=float(chosen_tloss),
                             reasons=cand_reason,
                             face_quality=(bf.get('quality', 0.0) if bf is not None else None),
                             accept_pre=accept_before_face_policy,
@@ -3532,12 +3620,13 @@ class Processor(QtCore.QObject):
                             pass
                     reasons_list = c.get("reasons") or []
                     reasons = "|".join(reasons_list)
-                    area = (cx2 - cx1) * (cy2 - cy1)
+                    bx1, by1, bx2, by2 = c["box"]
+                    area = (bx2 - bx1) * (by2 - by1)
                     self._status(
                         (
                             f"CAPTURE idx={idx} t={idx/float(fps):.2f} "
                             f"fd={c.get('fd')} rd={c.get('rd')} score={c.get('score')} "
-                            f"area={area} reasons={reasons}"
+                            f"area={area} ratio={c.get('ratio')} face_frac={c.get('face_frac'):.3f} tloss={c.get('tloss', 0.0):.4f} reasons={reasons}"
                         ),
                         key="cap",
                     )
@@ -3636,7 +3725,7 @@ class Processor(QtCore.QObject):
                                 acx = (fx1 + fx2) / 2.0
                                 acy = (fy1 + fy2) / 2.0
                                 face_box_abs = (fx1, fy1, fx2, fy2)
-                                (ex1, ey1, ex2, ey2), chosen_ratio = self._choose_best_ratio(
+                                (ex1, ey1, ex2, ey2), chosen_ratio, chosen_tloss = self._choose_best_ratio(
                                     face_box_abs, ratios, W2, H2, anchor=(acx, acy), face_box=face_box_abs
                                 )
                                 ex1, ey1, ex2, ey2 = self._enforce_scale_and_margins(
@@ -3659,6 +3748,9 @@ class Processor(QtCore.QObject):
                                     sfy1 = max(0, min(H - 1, int(round(fy1 + off_y))))
                                     sfx2 = max(sfx1 + 1, min(W, int(round(fx2 + off_x))))
                                     sfy2 = max(sfy1 + 1, min(H, int(round(fy2 + off_y))))
+                                    carea = max(1.0, float((ex2 - ex1) * (ey2 - ey1)))
+                                    farea = max(1.0, (fx2 - fx1) * (fy2 - fy1))
+                                    face_frac = float(farea) / carea
                                     fallback_candidate = dict(
                                         score=gfd,
                                         fd=gfd,
@@ -3670,6 +3762,8 @@ class Processor(QtCore.QObject):
                                         face_feat=gbest["feat"],
                                         reid_feat=None,
                                         ratio=chosen_ratio,
+                                        face_frac=face_frac,
+                                        tloss=float(chosen_tloss),
                                         reasons=["global_face"],
                                         face_quality=float(gbest.get("quality", 0.0)),
                                     )
@@ -3707,7 +3801,7 @@ class Processor(QtCore.QObject):
                                 sy1 = max(0, min(H - 1, int(round(by1 + off_y))))
                                 sx2 = max(sx1 + 1, min(W, int(round(bx2 + off_x))))
                                 sy2 = max(sy1 + 1, min(H, int(round(by2 + off_y))))
-                                (ex1, ey1, ex2, ey2), chosen_ratio = self._choose_best_ratio(
+                                (ex1, ey1, ex2, ey2), chosen_ratio, chosen_tloss = self._choose_best_ratio(
                                     (bx1, by1, bx2, by2), ratios, W2, H2, anchor=None
                                 )
                                 ex1, ey1, ex2, ey2 = self._enforce_scale_and_margins(
@@ -3741,6 +3835,8 @@ class Processor(QtCore.QObject):
                                                 face_feat=None,
                                                 reid_feat=(reid_feats_fb[pick] if pick < len(reid_feats_fb) else None),
                                                 ratio=chosen_ratio,
+                                                face_frac=0.0,
+                                                tloss=float(chosen_tloss),
                                                 reasons=reasons,
                                                 face_quality=None,
                                                 accept_pre=True,
@@ -3758,7 +3854,7 @@ class Processor(QtCore.QObject):
                         x2 = max(x1 + 1, min(W, int(round(lx + lw))))
                         y2 = max(y1 + 1, min(H, int(round(ly + lh))))
                         if x2 > x1 + 2 and y2 > y1 + 2:
-                            (ex1, ey1, ex2, ey2), chosen_ratio = self._choose_best_ratio(
+                            (ex1, ey1, ex2, ey2), chosen_ratio, chosen_tloss = self._choose_best_ratio(
                                 (x1, y1, x2, y2), ratios, W, H, anchor=None
                             )
                             ex1, ey1, ex2, ey2 = self._enforce_scale_and_margins(
@@ -3790,6 +3886,8 @@ class Processor(QtCore.QObject):
                                             face_feat=None,
                                             reid_feat=None,
                                             ratio=chosen_ratio,
+                                            face_frac=0.0,
+                                            tloss=float(chosen_tloss),
                                             reasons=["faceless_carry"],
                                             face_quality=None,
                                             accept_pre=True,
