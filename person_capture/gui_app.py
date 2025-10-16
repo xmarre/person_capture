@@ -1761,8 +1761,6 @@ class Processor(QtCore.QObject):
         self._lock_last_seen_idx: int = -10**9
         self._locked_reid_feat: Optional[np.ndarray] = None
         self._prev_gray: Optional[np.ndarray] = None
-        self._cur_reid: Optional[ReIDEmbedder] = None
-        self._cur_face: Optional[FaceEmbedder] = None
 
     def _emit_hit(self, path: str) -> None:
         emit = getattr(self.hit, "emit", None)
@@ -1882,384 +1880,58 @@ class Processor(QtCore.QObject):
                     return False, "motion"
         return True, None
 
-    def _curator_yaw_bin(self, face_dict: Optional[dict]) -> int:
-        """Return yaw bucket (0=frontal, 1=left, 2=right) for a detected face."""
-
-        if not face_dict:
-            return 0
-        kps = face_dict.get("kps") or face_dict.get("landmarks")
-        if kps is None:
-            return 0
-        pts = np.asarray(kps, dtype=np.float32)
-        if pts.ndim != 2 or pts.shape[0] < 3:
-            return 0
-        leye, reye, nose = pts[0], pts[1], pts[2]
-        dx_left = abs(float(nose[0]) - float(leye[0]))
-        dx_right = abs(float(reye[0]) - float(nose[0]))
-        if dx_left > dx_right * 1.15:
-            return 2
-        if dx_right > dx_left * 1.15:
-            return 1
-        return 0
-
-    def _curator_calc_quality(self, bgr: np.ndarray) -> float:
-        """Return a simple sharpness proxy for *bgr* using Laplacian variance."""
-
-        if bgr is None or bgr.size == 0:
-            return 0.0
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        lap = cv2.Laplacian(gray, cv2.CV_32F)
-        variance = float(np.var(lap))
-        mean = float(np.mean(gray))
-        return variance / (mean * mean + 1e-6)
-
-    def _curator_score_pick(
-        self,
-        items: List[dict],
-        candidate_idxs: List[int],
-        selected_idxs: List[int],
-        w_face: float,
-        w_clip: float,
-        w_hash: float,
-        lam: float,
-    ) -> Tuple[int, float]:
-        """Return best candidate index under MMR-style scoring."""
-
-        if not candidate_idxs:
-            return -1, -1e9
-        lam_c = max(0.0, min(1.0, float(lam)))
-        selected_set = set(int(i) for i in selected_idxs)
-        qualities = [max(0.0, float(items[i].get("quality", 0.0))) for i in candidate_idxs]
-        q_min = min(qualities) if qualities else 0.0
-        q_max = max(qualities) if qualities else 1.0
-
-        def norm_quality(q_val: float) -> float:
-            if q_max <= q_min + 1e-9:
-                return 0.0
-            return (q_val - q_min) / (q_max - q_min)
-
-        best_idx, best_score = -1, -1e9
-        for idx in candidate_idxs:
-            if idx in selected_set:
-                continue
-            item = items[idx]
-            rel = 1.0 - float(item.get("fd_anchor", 9.0))
-            redundancy = 0.0
-            if selected_idxs:
-                sims = []
-                for sel_idx in selected_idxs:
-                    peer = items[sel_idx]
-                    face_sim = 0.0
-                    if item.get("face_vec") is not None and peer.get("face_vec") is not None:
-                        face_sim = float(np.dot(item["face_vec"], peer["face_vec"]))
-                    clip_sim = 0.0
-                    if item.get("reid_vec") is not None and peer.get("reid_vec") is not None:
-                        clip_sim = float(np.dot(item["reid_vec"], peer["reid_vec"]))
-                    hash_sim = phash_similarity(item.get("phash", 0), peer.get("phash", 0))
-                    sims.append(w_face * face_sim + w_clip * clip_sim + w_hash * hash_sim)
-                if sims:
-                    redundancy = float(max(sims))
-            score = lam_c * rel - (1.0 - lam_c) * redundancy + 0.02 * norm_quality(float(item.get("quality", 0.0)))
-            if score > best_score:
-                best_idx, best_score = idx, score
-        return best_idx, best_score
-
     @QtCore.Slot()
     def run_curator(self) -> None:
-        """Scan crops/, score them, and export a curated subset."""
+        """Delegate to the shared dataset curator for scoring and export."""
 
         cfg = self.cfg
         if not bool(getattr(cfg, "curate_enable", True)):
             self._status("Curator disabled.", key="curate", interval=5.0)
             return
-        out_dir = Path(cfg.out_dir or "output")
-        crops_dir = out_dir / "crops"
-        if not crops_dir.exists():
+        out_root = Path(cfg.out_dir or "output")
+        pool = out_root / "crops"
+        if not pool.exists():
             self._status("Curator: no crops/ directory found.", key="curate", interval=5.0)
             return
-        if self._cur_face is None:
-            try:
-                self._cur_face = FaceEmbedder(
-                    ctx=cfg.device,
-                    yolo_model=cfg.face_model,
-                    conf=cfg.face_det_conf,
-                    use_arcface=True,
-                    trt_lib_dir=getattr(cfg, "trt_lib_dir", "") or None,
-                )
-            except Exception as exc:  # pragma: no cover
-                self._status(f"Curator: face embedder init failed: {exc}", key="curate", interval=5.0)
-                return
-        if self._cur_reid is None:
-            try:
-                self._cur_reid = ReIDEmbedder(
-                    device=cfg.device,
-                    model_name=cfg.reid_backbone,
-                    pretrained=cfg.reid_pretrained,
-                )
-            except Exception as exc:  # pragma: no cover
-                self._status(f"Curator: ReID embedder init failed: {exc}", key="curate", interval=5.0)
-                return
-        face_embed = self._cur_face
-        face_embed.configure_rotation_strategy(
-            adaptive=getattr(cfg, "rot_adaptive", True),
-            every_n=getattr(cfg, "rot_every_n", 12),
-            after_hit_frames=getattr(cfg, "rot_after_hit_frames", 8),
-            fast_no_face_imgsz=getattr(cfg, "fast_no_face_imgsz", 512),
-        )
-        reid_embed = self._cur_reid
-
         ref_candidates = [p.strip() for p in str(cfg.ref or "").split(";") if p.strip()]
-        ref_path = next((Path(p) for p in ref_candidates if Path(p).exists()), None)
-        if ref_path is None:
+        ref_path = next((str(Path(p)) for p in ref_candidates if Path(p).exists()), "")
+        if not ref_path:
             self._status("Curator: reference image missing.", key="curate", interval=5.0)
             return
-        ref_img = cv2.imread(str(ref_path), cv2.IMREAD_COLOR)
-        if ref_img is None or ref_img.size == 0:
-            self._status("Curator: failed to read reference image.", key="curate", interval=5.0)
-            return
         try:
-            ref_faces = face_embed.extract(ref_img)
+            from .dataset_curator import Curator as _Curator  # type: ignore
         except Exception:
-            ref_faces = []
-        ref_best = None
-        if ref_faces:
-            if hasattr(FaceEmbedder, "best_face"):
-                try:
-                    ref_best = FaceEmbedder.best_face(ref_faces)
-                except Exception:
-                    ref_best = ref_faces[0]
-            else:
-                ref_best = ref_faces[0]
-        ref_face_vec = None
-        if ref_best is not None:
-            feat = ref_best.get("feat")
-            if feat is not None:
-                ref_face_vec = np.asarray(feat, dtype=np.float32).reshape(-1)
-                norm = float(np.linalg.norm(ref_face_vec))
-                if norm > 0:
-                    ref_face_vec = ref_face_vec / norm
-
-        det = PersonDetector(model_name=cfg.yolo_model, device=cfg.device)
-        persons = det.detect(ref_img, conf=0.1)
-        if persons:
-            persons.sort(key=lambda d: (d["xyxy"][2] - d["xyxy"][0]) * (d["xyxy"][3] - d["xyxy"][1]), reverse=True)
-            x1, y1, x2, y2 = [int(v) for v in persons[0]["xyxy"]]
-            ref_crop = ref_img[y1:y2, x1:x2]
-        else:
-            ref_crop = ref_img
-        try:
-            ref_reid_feats = reid_embed.extract([ref_crop])
-        except Exception:
-            ref_reid_feats = []
-        ref_reid_vec = None
-        if ref_reid_feats:
-            vec = np.asarray(ref_reid_feats[0], dtype=np.float32).reshape(-1)
-            norm = float(np.linalg.norm(vec))
-            if norm > 0:
-                ref_reid_vec = vec / norm
-        if ref_reid_vec is None:
-            self._status("Curator: failed to build reference ReID embedding.", key="curate", interval=5.0)
-            return
-
-        extensions = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-        crop_paths = [p for p in sorted(crops_dir.rglob("*")) if p.suffix.lower() in extensions]
-        if not crop_paths:
-            self._status("Curator: no crops to process.", key="curate", interval=5.0)
-            return
-
-        items: List[dict] = []
-        self._status(f"Curator: scanning {len(crop_paths)} crops…", key="curate_scan", interval=1.0)
-        for idx, path in enumerate(crop_paths, start=1):
-            img = cv2.imread(str(path), cv2.IMREAD_COLOR)
-            if img is None or img.size == 0:
-                continue
             try:
-                faces = face_embed.extract(img)
-            except Exception:
-                faces = []
-            best_face = None
-            if faces:
-                if hasattr(FaceEmbedder, "best_face"):
-                    try:
-                        best_face = FaceEmbedder.best_face(faces)
-                    except Exception:
-                        best_face = faces[0]
-                else:
-                    best_face = faces[0]
-            face_vec = None
-            cos_face = 0.0
-            fd_anchor = 9.0
-            yaw_bin = 0
-            if best_face is not None and ref_face_vec is not None:
-                feat = best_face.get("feat")
-                if feat is not None:
-                    face_vec = np.asarray(feat, dtype=np.float32).reshape(-1)
-                    norm = float(np.linalg.norm(face_vec))
-                    if norm > 0:
-                        face_vec = face_vec / norm
-                        cos_face = float(np.clip(np.dot(face_vec, ref_face_vec), -1.0, 1.0))
-                        fd_anchor = float(np.sqrt(max(0.0, 2.0 - 2.0 * cos_face)))
-                yaw_bin = self._curator_yaw_bin(best_face)
-            has_face = bool(best_face is not None and face_vec is not None and ref_face_vec is not None)
+                from dataset_curator import Curator as _Curator  # type: ignore
+            except Exception as exc:  # pragma: no cover
+                self._status(f"Curator import failed: {exc}", key="curate", interval=5.0)
+                return
+        max_imgs = int(getattr(cfg, "curate_max_images", 200))
+        out_dir = out_root / "dataset_out"
 
-            try:
-                reid_feats = reid_embed.extract([img])
-            except Exception:
-                reid_feats = []
-            reid_vec = None
-            cos_clip = 0.0
-            if reid_feats:
-                rv = np.asarray(reid_feats[0], dtype=np.float32).reshape(-1)
-                norm = float(np.linalg.norm(rv))
-                if norm > 0:
-                    reid_vec = rv / norm
-                    cos_clip = float(np.dot(reid_vec, ref_reid_vec))
-
-            phash_val = _phash_bits(img)
-            quality = self._curator_calc_quality(img)
-            items.append(
-                {
-                    "path": str(path),
-                    "fd_anchor": fd_anchor,
-                    "cos_face": cos_face,
-                    "cos_clip": cos_clip,
-                    "phash": int(phash_val),
-                    "quality": quality,
-                    "yaw": yaw_bin,
-                    "has_face": has_face,
-                    "face_vec": face_vec,
-                    "reid_vec": reid_vec,
-                }
+        def _progress(phase: str, done: int, total: int) -> None:
+            self._status(
+                f"Curator {phase}: {done}/{total}",
+                key="curate_prog",
+                interval=0.5,
             )
-            if idx % 200 == 0:
-                self._status(
-                    f"Curator: scanned {idx}/{len(crop_paths)} crops…",
-                    key="curate_scan",
-                    interval=0.5,
-                )
 
-        if not items:
-            self._status("Curator: no readable crops found.", key="curate", interval=5.0)
+        try:
+            curator = _Curator(
+                ref_image=ref_path,
+                device=str(getattr(cfg, "device", "cuda")),
+                trt_lib_dir=(getattr(cfg, "trt_lib_dir", "") or None),
+                progress=_progress,
+            )
+            if getattr(curator, "ref_feat", None) is None:
+                self._status("Curator: no face in the reference image.", key="curate", interval=5.0)
+                return
+            built = curator.run(str(pool), str(out_dir), max_images=max_imgs)
+        except Exception as exc:  # pragma: no cover
+            self._status(f"Curator failed: {exc}", key="curate", interval=5.0)
             return
 
-        gate_fd = float(getattr(cfg, "curate_fd_gate", 0.45))
-        kept: List[dict] = []
-        for item in items:
-            if item["has_face"]:
-                if item["fd_anchor"] <= gate_fd:
-                    kept.append(item)
-            else:
-                item["fd_anchor"] = 1.0
-                kept.append(item)
-        if not kept:
-            self._status("Curator: nothing passed gates.", key="curate", interval=5.0)
-            return
-
-        weights = getattr(cfg, "curate_weights", (0.60, 0.35, 0.05))
-        if isinstance(weights, (list, tuple)) and len(weights) >= 3:
-            w_face, w_clip, w_hash = float(weights[0]), float(weights[1]), float(weights[2])
-        else:
-            w_face, w_clip, w_hash = 0.60, 0.35, 0.05
-        lam = float(getattr(cfg, "curate_lambda", 0.70))
-        max_images = max(1, int(getattr(cfg, "curate_max_images", 200)))
-        quota_cfg = getattr(cfg, "curate_bucket_quota", (0.50, 0.25, 0.25))
-        if isinstance(quota_cfg, (list, tuple)) and len(quota_cfg) >= 3:
-            quotas = [max(0, int(round(max_images * float(q)))) for q in quota_cfg[:3]]
-        else:
-            quotas = [int(max_images * 0.50), int(max_images * 0.25), int(max_images * 0.25)]
-        raw_use_quota = getattr(cfg, "curate_use_yaw_quota", True)
-        use_quota = True if raw_use_quota is None else bool(raw_use_quota)
-
-        buckets = {0: [], 1: [], 2: []}
-        for idx, item in enumerate(kept):
-            buckets.setdefault(int(item.get("yaw", 0)), []).append(idx)
-
-        phash_thr = float(getattr(cfg, "curate_phash_dedup", 0.92))
-        cos_face_thr = float(getattr(cfg, "curate_cos_face_dedup", 0.985))
-
-        def is_duplicate(idx_candidate: int, selected_idxs: List[int]) -> bool:
-            cand = kept[idx_candidate]
-            for sel_idx in selected_idxs:
-                peer = kept[sel_idx]
-                if (
-                    cand.get("face_vec") is not None
-                    and peer.get("face_vec") is not None
-                    and float(np.dot(cand["face_vec"], peer["face_vec"])) >= cos_face_thr
-                ):
-                    return True
-                if phash_similarity(cand.get("phash", 0), peer.get("phash", 0)) >= phash_thr:
-                    return True
-            return False
-
-        selected: List[int] = []
-        for bucket_id in (0, 1, 2):
-            bucket_idxs = list(buckets.get(bucket_id, []))
-            quota = quotas[bucket_id] if use_quota and bucket_id < len(quotas) else max_images
-            taken = 0
-            while bucket_idxs and len(selected) < max_images:
-                if use_quota and taken >= quota:
-                    break
-                idx_best, _ = self._curator_score_pick(kept, bucket_idxs, selected, w_face, w_clip, w_hash, lam)
-                if idx_best < 0:
-                    break
-                bucket_idxs.remove(idx_best)
-                if is_duplicate(idx_best, selected):
-                    continue
-                selected.append(idx_best)
-                taken += 1
-                if len(selected) >= max_images:
-                    break
-
-        if len(selected) < max_images:
-            remaining = [i for i in range(len(kept)) if i not in selected]
-            while remaining and len(selected) < max_images:
-                idx_best, _ = self._curator_score_pick(kept, remaining, selected, w_face, w_clip, w_hash, lam)
-                if idx_best < 0:
-                    break
-                remaining.remove(idx_best)
-                if is_duplicate(idx_best, selected):
-                    continue
-                selected.append(idx_best)
-                if len(selected) >= max_images:
-                    break
-
-        cur_dir = out_dir / "curation"
-        sel_dir = cur_dir / "selected"
-        ensure_dir(str(sel_dir))
-        csv_path = cur_dir / "selected.csv"
-        with open(csv_path, "w", newline="") as fh:
-            writer = csv.writer(fh)
-            writer.writerow(["path", "fd_anchor", "cos_face", "cos_clip", "phash", "quality", "yaw"])
-            for idx in selected:
-                item = kept[idx]
-                writer.writerow(
-                    [
-                        item["path"],
-                        f"{float(item.get('fd_anchor', 0.0)):.4f}",
-                        f"{float(item.get('cos_face', 0.0)):.4f}",
-                        f"{float(item.get('cos_clip', 0.0)):.4f}",
-                        str(int(item.get("phash", 0))),
-                        f"{float(item.get('quality', 0.0)):.6f}",
-                        int(item.get("yaw", 0)),
-                    ]
-                )
-
-        copied = 0
-        for idx in selected:
-            src = Path(kept[idx]["path"])
-            if not src.exists():
-                continue
-            try:
-                shutil.copy2(src, sel_dir / src.name)
-                copied += 1
-            except Exception:
-                continue
-
-        self._status(
-            f"Curator: selected {len(selected)} items • copied={copied} • CSV={csv_path}",
-            key="curate_done",
-            interval=1.0,
-        )
+        self._status(f"Curator: done → {built}", key="curate_done", interval=1.0)
 
     def _combine_scores(self, face_dist, reid_dist, mode='min'):
         vals = []

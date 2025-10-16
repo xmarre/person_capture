@@ -36,16 +36,25 @@ class CurateWorker(QtCore.QObject):
     @QtCore.Slot()
     def run(self):
         try:
-            cur = Curator(ref_image=self.ref_path, device=self.device,
-                          progress=lambda phase, done, total: self.progress.emit(phase, done, total))
+            trt_dir = os.getenv("TRT_LIB_DIR") or os.getenv("TENSORRT_DIR") or ""
+            cur = Curator(
+                ref_image=self.ref_path,
+                device=self.device,
+                trt_lib_dir=(trt_dir or None),
+                progress=lambda phase, done, total: self.progress.emit(phase, done, total),
+            )
             out = cur.run(self.pool_dir, self.out_dir, max_images=self.max_images)
             # read manifest for UI
             rows = []
             mp = Path(out) / "dataset_manifest.csv"
             if mp.exists():
-                for i, line in enumerate(mp.read_text(encoding="utf-8").splitlines()[1:], 1):
-                    parts = [p.strip() for p in line.split(",")]
-                    rows.append(parts)
+                import csv
+
+                with open(mp, "r", encoding="utf-8", newline="") as f:
+                    reader = csv.reader(f)
+                    next(reader, None)
+                    for parts in reader:
+                        rows.append([p.strip() for p in parts])
             self.finished.emit(out, rows)
         except Exception as e:
             self.failed.emit(str(e))
