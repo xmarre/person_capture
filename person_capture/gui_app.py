@@ -2741,6 +2741,10 @@ class Processor(QtCore.QObject):
                             # new per-frame crop scorer knobs
                             "lambda_facefrac",
                             "crop_center_weight",
+                            "area_gamma",
+                            "area_face_scale_weight",
+                            "square_pull_face_min",
+                            "square_pull_weight",
                             "face_target_close",
                             "face_target_upper",
                             "face_target_cowboy",
@@ -4717,6 +4721,60 @@ class MainWindow(QtWidgets.QMainWindow):
         self.crop_penalty_weight_spin.setValue(float(self.cfg.crop_penalty_weight))
         self.face_anchor_down_spin = _mk_fspin(0.0, 2.0, 0.05, 2, "float: face_anchor_down_frac")
         self.face_anchor_down_spin.setValue(float(self.cfg.face_anchor_down_frac))
+
+        # --- Framing scorer knobs ---
+        self.lambda_facefrac_spin = _mk_fspin(0.0, 10.0, 0.1, 2, "float: lambda_facefrac")
+        self.crop_center_weight_spin = _mk_fspin(0.0, 5.0, 0.05, 2, "float: crop_center_weight")
+        self.area_gamma_spin = _mk_fspin(0.1, 2.0, 0.05, 2, "float: area_gamma")
+        self.area_face_scale_w_spin = _mk_fspin(0.0, 1.0, 0.05, 2, "float: area_face_scale_weight")
+        self.square_pull_face_min_spin = _mk_fspin(0.0, 1.0, 0.01, 2, "float: square_pull_face_min")
+        self.square_pull_weight_spin = _mk_fspin(0.0, 2.0, 0.05, 2, "float: square_pull_weight")
+
+        self.face_target_close_spin = _mk_fspin(0.0, 1.0, 0.01, 3, "float: face_target_close")
+        self.face_target_upper_spin = _mk_fspin(0.0, 1.0, 0.01, 3, "float: face_target_upper")
+        self.face_target_cowboy_spin = _mk_fspin(0.0, 1.0, 0.01, 3, "float: face_target_cowboy")
+        self.face_target_body_spin = _mk_fspin(0.0, 1.0, 0.01, 3, "float: face_target_body")
+        self.face_target_tol_spin = _mk_fspin(0.0, 0.5, 0.01, 3, "float: face_target_tolerance")
+        self.face_target_close_min_spin = _mk_fspin(0.0, 1.0, 0.01, 3, "float: face_target_close_min_frac")
+
+        self.w_close_spin = _mk_fspin(0.0, 2.0, 0.05, 2, "float: w_close")
+        self.w_upper_spin = _mk_fspin(0.0, 2.0, 0.05, 2, "float: w_upper")
+        self.w_cowboy_spin = _mk_fspin(0.0, 2.0, 0.05, 2, "float: w_cowboy")
+        self.w_body_spin = _mk_fspin(0.0, 2.0, 0.05, 2, "float: w_body")
+
+        # initialize from cfg
+        self.lambda_facefrac_spin.setValue(float(self.cfg.lambda_facefrac))
+        self.lambda_facefrac_spin.valueChanged.connect(self._on_ui_change)
+        self.crop_center_weight_spin.setValue(float(self.cfg.crop_center_weight))
+        self.crop_center_weight_spin.valueChanged.connect(self._on_ui_change)
+        self.area_gamma_spin.setValue(float(self.cfg.area_gamma))
+        self.area_gamma_spin.valueChanged.connect(self._on_ui_change)
+        self.area_face_scale_w_spin.setValue(float(self.cfg.area_face_scale_weight))
+        self.area_face_scale_w_spin.valueChanged.connect(self._on_ui_change)
+        self.square_pull_face_min_spin.setValue(float(self.cfg.square_pull_face_min))
+        self.square_pull_face_min_spin.valueChanged.connect(self._on_ui_change)
+        self.square_pull_weight_spin.setValue(float(self.cfg.square_pull_weight))
+        self.square_pull_weight_spin.valueChanged.connect(self._on_ui_change)
+        self.face_target_close_spin.setValue(float(self.cfg.face_target_close))
+        self.face_target_close_spin.valueChanged.connect(self._on_ui_change)
+        self.face_target_upper_spin.setValue(float(self.cfg.face_target_upper))
+        self.face_target_upper_spin.valueChanged.connect(self._on_ui_change)
+        self.face_target_cowboy_spin.setValue(float(self.cfg.face_target_cowboy))
+        self.face_target_cowboy_spin.valueChanged.connect(self._on_ui_change)
+        self.face_target_body_spin.setValue(float(self.cfg.face_target_body))
+        self.face_target_body_spin.valueChanged.connect(self._on_ui_change)
+        self.face_target_tol_spin.setValue(float(self.cfg.face_target_tolerance))
+        self.face_target_tol_spin.valueChanged.connect(self._on_ui_change)
+        self.face_target_close_min_spin.setValue(float(self.cfg.face_target_close_min_frac))
+        self.face_target_close_min_spin.valueChanged.connect(self._on_ui_change)
+        self.w_close_spin.setValue(float(self.cfg.w_close))
+        self.w_close_spin.valueChanged.connect(self._on_ui_change)
+        self.w_upper_spin.setValue(float(self.cfg.w_upper))
+        self.w_upper_spin.valueChanged.connect(self._on_ui_change)
+        self.w_cowboy_spin.setValue(float(self.cfg.w_cowboy))
+        self.w_cowboy_spin.valueChanged.connect(self._on_ui_change)
+        self.w_body_spin.setValue(float(self.cfg.w_body))
+        self.w_body_spin.valueChanged.connect(self._on_ui_change)
         self.smart_crop_enable_check = QtWidgets.QCheckBox()
         self.smart_crop_enable_check.setChecked(bool(self.cfg.smart_crop_enable))
         self.smart_crop_enable_check.setToolTip("bool: smart_crop_enable")
@@ -4817,6 +4875,22 @@ class MainWindow(QtWidgets.QMainWindow):
             ("crop_bottom_min_face_heights", self.crop_bottom_min_face_spin),
             ("crop_penalty_weight", self.crop_penalty_weight_spin),
             ("face_anchor_down_frac", self.face_anchor_down_spin),
+            ("λ facefrac", self.lambda_facefrac_spin),
+            ("Face-center weight", self.crop_center_weight_spin),
+            ("Area γ", self.area_gamma_spin),
+            ("Area scale by face", self.area_face_scale_w_spin),
+            ("Square pull min face", self.square_pull_face_min_spin),
+            ("Square pull weight", self.square_pull_weight_spin),
+            ("Target close", self.face_target_close_spin),
+            ("Target upper", self.face_target_upper_spin),
+            ("Target cowboy", self.face_target_cowboy_spin),
+            ("Target body", self.face_target_body_spin),
+            ("Target tolerance", self.face_target_tol_spin),
+            ("Close-up min frac", self.face_target_close_min_spin),
+            ("w_close", self.w_close_spin),
+            ("w_upper", self.w_upper_spin),
+            ("w_cowboy", self.w_cowboy_spin),
+            ("w_body", self.w_body_spin),
             ("smart_crop_enable", self.smart_crop_enable_check),
             ("smart_crop_steps", self.smart_crop_steps_spin),
             ("smart_crop_side_search_frac", self.smart_crop_side_search_spin),
@@ -5560,6 +5634,24 @@ class MainWindow(QtWidgets.QMainWindow):
             "rot_after_hit_frames",
             "fast_no_face_imgsz",
         }
+        live |= {
+            "lambda_facefrac",
+            "crop_center_weight",
+            "area_gamma",
+            "area_face_scale_weight",
+            "square_pull_face_min",
+            "square_pull_weight",
+            "face_target_close",
+            "face_target_upper",
+            "face_target_cowboy",
+            "face_target_body",
+            "face_target_tolerance",
+            "face_target_close_min_frac",
+            "w_close",
+            "w_upper",
+            "w_cowboy",
+            "w_body",
+        }
         delta = {}
         for k in prescan_live | live:
             if hasattr(self._worker.cfg, k) and hasattr(new, k):
@@ -5667,6 +5759,22 @@ class MainWindow(QtWidgets.QMainWindow):
             crop_bottom_min_face_heights=float(self.crop_bottom_min_face_spin.value()) if hasattr(self, "crop_bottom_min_face_spin") else 1.5,
             crop_penalty_weight=float(self.crop_penalty_weight_spin.value()) if hasattr(self, "crop_penalty_weight_spin") else 3.0,
             face_anchor_down_frac=float(self.face_anchor_down_spin.value()) if hasattr(self, "face_anchor_down_spin") else 1.1,
+            lambda_facefrac=float(self.lambda_facefrac_spin.value()),
+            crop_center_weight=float(self.crop_center_weight_spin.value()),
+            area_gamma=float(self.area_gamma_spin.value()),
+            area_face_scale_weight=float(self.area_face_scale_w_spin.value()),
+            square_pull_face_min=float(self.square_pull_face_min_spin.value()),
+            square_pull_weight=float(self.square_pull_weight_spin.value()),
+            face_target_close=float(self.face_target_close_spin.value()),
+            face_target_upper=float(self.face_target_upper_spin.value()),
+            face_target_cowboy=float(self.face_target_cowboy_spin.value()),
+            face_target_body=float(self.face_target_body_spin.value()),
+            face_target_tolerance=float(self.face_target_tol_spin.value()),
+            face_target_close_min_frac=float(self.face_target_close_min_spin.value()),
+            w_close=float(self.w_close_spin.value()),
+            w_upper=float(self.w_upper_spin.value()),
+            w_cowboy=float(self.w_cowboy_spin.value()),
+            w_body=float(self.w_body_spin.value()),
             smart_crop_enable=bool(self.smart_crop_enable_check.isChecked()) if hasattr(self, "smart_crop_enable_check") else True,
             smart_crop_steps=int(self.smart_crop_steps_spin.value()) if hasattr(self, "smart_crop_steps_spin") else 6,
             smart_crop_side_search_frac=float(self.smart_crop_side_search_spin.value()) if hasattr(self, "smart_crop_side_search_spin") else 0.35,
@@ -5832,6 +5940,38 @@ class MainWindow(QtWidgets.QMainWindow):
             self.crop_penalty_weight_spin.setValue(cfg.crop_penalty_weight)
         if hasattr(self, 'face_anchor_down_spin'):
             self.face_anchor_down_spin.setValue(cfg.face_anchor_down_frac)
+        if hasattr(self, 'lambda_facefrac_spin'):
+            self.lambda_facefrac_spin.setValue(cfg.lambda_facefrac)
+        if hasattr(self, 'crop_center_weight_spin'):
+            self.crop_center_weight_spin.setValue(cfg.crop_center_weight)
+        if hasattr(self, 'area_gamma_spin'):
+            self.area_gamma_spin.setValue(cfg.area_gamma)
+        if hasattr(self, 'area_face_scale_w_spin'):
+            self.area_face_scale_w_spin.setValue(cfg.area_face_scale_weight)
+        if hasattr(self, 'square_pull_face_min_spin'):
+            self.square_pull_face_min_spin.setValue(cfg.square_pull_face_min)
+        if hasattr(self, 'square_pull_weight_spin'):
+            self.square_pull_weight_spin.setValue(cfg.square_pull_weight)
+        if hasattr(self, 'face_target_close_spin'):
+            self.face_target_close_spin.setValue(cfg.face_target_close)
+        if hasattr(self, 'face_target_upper_spin'):
+            self.face_target_upper_spin.setValue(cfg.face_target_upper)
+        if hasattr(self, 'face_target_cowboy_spin'):
+            self.face_target_cowboy_spin.setValue(cfg.face_target_cowboy)
+        if hasattr(self, 'face_target_body_spin'):
+            self.face_target_body_spin.setValue(cfg.face_target_body)
+        if hasattr(self, 'face_target_tol_spin'):
+            self.face_target_tol_spin.setValue(cfg.face_target_tolerance)
+        if hasattr(self, 'face_target_close_min_spin'):
+            self.face_target_close_min_spin.setValue(cfg.face_target_close_min_frac)
+        if hasattr(self, 'w_close_spin'):
+            self.w_close_spin.setValue(cfg.w_close)
+        if hasattr(self, 'w_upper_spin'):
+            self.w_upper_spin.setValue(cfg.w_upper)
+        if hasattr(self, 'w_cowboy_spin'):
+            self.w_cowboy_spin.setValue(cfg.w_cowboy)
+        if hasattr(self, 'w_body_spin'):
+            self.w_body_spin.setValue(cfg.w_body)
         if hasattr(self, 'smart_crop_enable_check'):
             self.smart_crop_enable_check.setChecked(bool(cfg.smart_crop_enable))
         if hasattr(self, 'smart_crop_steps_spin'):
@@ -6295,6 +6435,62 @@ class MainWindow(QtWidgets.QMainWindow):
             self.face_anchor_down_spin.setValue(
                 float(s.value("face_anchor_down_frac", self.cfg.face_anchor_down_frac))
             )
+        if hasattr(self, 'lambda_facefrac_spin'):
+            self.lambda_facefrac_spin.setValue(
+                float(s.value("lambda_facefrac", self.cfg.lambda_facefrac))
+            )
+        if hasattr(self, 'crop_center_weight_spin'):
+            self.crop_center_weight_spin.setValue(
+                float(s.value("crop_center_weight", self.cfg.crop_center_weight))
+            )
+        if hasattr(self, 'area_gamma_spin'):
+            self.area_gamma_spin.setValue(
+                float(s.value("area_gamma", self.cfg.area_gamma))
+            )
+        if hasattr(self, 'area_face_scale_w_spin'):
+            self.area_face_scale_w_spin.setValue(
+                float(s.value("area_face_scale_weight", self.cfg.area_face_scale_weight))
+            )
+        if hasattr(self, 'square_pull_face_min_spin'):
+            self.square_pull_face_min_spin.setValue(
+                float(s.value("square_pull_face_min", self.cfg.square_pull_face_min))
+            )
+        if hasattr(self, 'square_pull_weight_spin'):
+            self.square_pull_weight_spin.setValue(
+                float(s.value("square_pull_weight", self.cfg.square_pull_weight))
+            )
+        if hasattr(self, 'face_target_close_spin'):
+            self.face_target_close_spin.setValue(
+                float(s.value("face_target_close", self.cfg.face_target_close))
+            )
+        if hasattr(self, 'face_target_upper_spin'):
+            self.face_target_upper_spin.setValue(
+                float(s.value("face_target_upper", self.cfg.face_target_upper))
+            )
+        if hasattr(self, 'face_target_cowboy_spin'):
+            self.face_target_cowboy_spin.setValue(
+                float(s.value("face_target_cowboy", self.cfg.face_target_cowboy))
+            )
+        if hasattr(self, 'face_target_body_spin'):
+            self.face_target_body_spin.setValue(
+                float(s.value("face_target_body", self.cfg.face_target_body))
+            )
+        if hasattr(self, 'face_target_tol_spin'):
+            self.face_target_tol_spin.setValue(
+                float(s.value("face_target_tolerance", self.cfg.face_target_tolerance))
+            )
+        if hasattr(self, 'face_target_close_min_spin'):
+            self.face_target_close_min_spin.setValue(
+                float(s.value("face_target_close_min_frac", self.cfg.face_target_close_min_frac))
+            )
+        if hasattr(self, 'w_close_spin'):
+            self.w_close_spin.setValue(float(s.value("w_close", self.cfg.w_close)))
+        if hasattr(self, 'w_upper_spin'):
+            self.w_upper_spin.setValue(float(s.value("w_upper", self.cfg.w_upper)))
+        if hasattr(self, 'w_cowboy_spin'):
+            self.w_cowboy_spin.setValue(float(s.value("w_cowboy", self.cfg.w_cowboy)))
+        if hasattr(self, 'w_body_spin'):
+            self.w_body_spin.setValue(float(s.value("w_body", self.cfg.w_body)))
         if hasattr(self, 'smart_crop_enable_check'):
             self.smart_crop_enable_check.setChecked(
                 s.value("smart_crop_enable", self.cfg.smart_crop_enable, type=bool)
@@ -6409,6 +6605,38 @@ class MainWindow(QtWidgets.QMainWindow):
                 "smart_crop_use_grad",
                 bool(self.smart_crop_use_grad_check.isChecked()),
             )
+        if hasattr(self, 'lambda_facefrac_spin'):
+            s.setValue("lambda_facefrac", self.lambda_facefrac_spin.value())
+        if hasattr(self, 'crop_center_weight_spin'):
+            s.setValue("crop_center_weight", self.crop_center_weight_spin.value())
+        if hasattr(self, 'area_gamma_spin'):
+            s.setValue("area_gamma", self.area_gamma_spin.value())
+        if hasattr(self, 'area_face_scale_w_spin'):
+            s.setValue("area_face_scale_weight", self.area_face_scale_w_spin.value())
+        if hasattr(self, 'square_pull_face_min_spin'):
+            s.setValue("square_pull_face_min", self.square_pull_face_min_spin.value())
+        if hasattr(self, 'square_pull_weight_spin'):
+            s.setValue("square_pull_weight", self.square_pull_weight_spin.value())
+        if hasattr(self, 'face_target_close_spin'):
+            s.setValue("face_target_close", self.face_target_close_spin.value())
+        if hasattr(self, 'face_target_upper_spin'):
+            s.setValue("face_target_upper", self.face_target_upper_spin.value())
+        if hasattr(self, 'face_target_cowboy_spin'):
+            s.setValue("face_target_cowboy", self.face_target_cowboy_spin.value())
+        if hasattr(self, 'face_target_body_spin'):
+            s.setValue("face_target_body", self.face_target_body_spin.value())
+        if hasattr(self, 'face_target_tol_spin'):
+            s.setValue("face_target_tolerance", self.face_target_tol_spin.value())
+        if hasattr(self, 'face_target_close_min_spin'):
+            s.setValue("face_target_close_min_frac", self.face_target_close_min_spin.value())
+        if hasattr(self, 'w_close_spin'):
+            s.setValue("w_close", self.w_close_spin.value())
+        if hasattr(self, 'w_upper_spin'):
+            s.setValue("w_upper", self.w_upper_spin.value())
+        if hasattr(self, 'w_cowboy_spin'):
+            s.setValue("w_cowboy", self.w_cowboy_spin.value())
+        if hasattr(self, 'w_body_spin'):
+            s.setValue("w_body", self.w_body_spin.value())
         s.sync()
 
 
