@@ -53,3 +53,5 @@ Thumbs.db
 /TensorrtExecutionProvider_TRTKernel_graph_torch-jit-export_15922919443950522839_0_0.onnx
 /TensorrtExecutionProvider_TRT_Subgraph.onnx
 /scrfd_10g_bnkps.onnx
+/trt_cache
+*.onnx
