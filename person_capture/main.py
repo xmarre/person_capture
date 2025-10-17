@@ -50,26 +50,34 @@ def _enforce_scale_and_margins(
         asp = float(rw) / float(rh)
     except Exception:
         asp = cw / max(ch, 1e-6)
-    need_h = max(ch, float(min_h_frac) * frame_h)
+    min_required_h = max(ch, float(min_h_frac) * frame_h)
+    max_allowed_h = float("inf")
     if face_box is not None:
         fx1, fy1, fx2, fy2 = face_box
         fw, fh = float(fx2 - fx1), float(fy2 - fy1)
-        need_h = max(
-            need_h,
+        min_required_h = max(
+            min_required_h,
             fh / max(face_max_frac, 1e-6),
-            fh / max(min_face_frac, 1e-6),
             (fw + 2.0 * side_margin_frac * fw) / max(asp, 1e-6),
         )
-    if need_h <= ch + 0.5:
+        if min_face_frac > 0:
+            max_allowed_h = min(max_allowed_h, fh / max(min_face_frac, 1e-6))
+    if max_allowed_h < min_required_h:
+        max_allowed_h = min_required_h
+    if ch + 0.5 < min_required_h:
+        new_h = min_required_h
+    elif ch > max_allowed_h + 0.5:
+        new_h = max_allowed_h
+    else:
         return x1, y1, x2, y2
-    need_w = need_h * asp
+    need_w = new_h * asp
     cx = (x1 + x2) / 2.0
     cy = (y1 + y2) / 2.0
     return _clip_to_frame(
         cx - need_w / 2.0,
-        cy - need_h / 2.0,
+        cy - new_h / 2.0,
         cx + need_w / 2.0,
-        cy + need_h / 2.0,
+        cy + new_h / 2.0,
         frame_w,
         frame_h,
     )

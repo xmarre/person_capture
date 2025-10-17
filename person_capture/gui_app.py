@@ -1118,7 +1118,9 @@ class Processor(QtCore.QObject):
         face_box: Optional[Tuple[int, int, int, int]] = None,
         anchor: Optional[Tuple[float, float]] = None,
     ) -> Tuple[int, int, int, int]:
-        """Expand the crop if needed to keep face fraction and min height in check."""
+        """Enforce bounds for face fraction, side margins and min height.
+        Expands when needed (max face frac / min height / side margins), and
+        also *shrinks* when the face is smaller than face_min_frac_in_crop."""
 
         cx1, cy1, cx2, cy2 = map(int, crop_xyxy)
         current_w = float(cx2 - cx1)
@@ -1131,36 +1133,51 @@ class Processor(QtCore.QObject):
             target_aspect = current_aspect if current_aspect > 0 else 1.0
         cfg = self.cfg
 
-        required_h = current_h
+        # lower bound (things that force crop to be at least this tall)
+        min_required_h = current_h
+        # upper bound (things that cap crop height to keep face sufficiently large)
+        max_allowed_h = float("inf")
 
         if face_box is not None:
             fx1, fy1, fx2, fy2 = face_box
             face_w = float(fx2 - fx1)
             face_h = float(fy2 - fy1)
             if face_h > 0:
-                required_h = max(required_h, face_h / max(cfg.face_max_frac_in_crop, 1e-6))
+                # keep face <= max fraction
+                min_required_h = max(min_required_h, face_h / max(cfg.face_max_frac_in_crop, 1e-6))
                 want_side = float(cfg.crop_face_side_margin_frac) * face_w
                 required_w = face_w + 2.0 * want_side
-                required_h = max(required_h, required_w / max(target_aspect, 1e-6))
+                min_required_h = max(min_required_h, required_w / max(target_aspect, 1e-6))
                 if cfg.face_min_frac_in_crop > 0:
-                    required_h = max(required_h, face_h / max(cfg.face_min_frac_in_crop, 1e-6))
+                    # keep face >= min fraction  => crop_h <= face_h / min_frac
+                    max_allowed_h = min(max_allowed_h, face_h / max(cfg.face_min_frac_in_crop, 1e-6))
 
-        required_h = max(required_h, float(cfg.crop_min_height_frac) * float(frame_h))
+        min_required_h = max(min_required_h, float(cfg.crop_min_height_frac) * float(frame_h))
 
-        if required_h <= current_h + 0.5:
+        # If both bounds clash, prefer feasibility
+        if max_allowed_h < min_required_h:
+            max_allowed_h = min_required_h
+
+        # Expand when too small
+        if current_h + 0.5 < min_required_h:
+            new_h = min_required_h
+        # Shrink when too large (face too small)
+        elif current_h > max_allowed_h + 0.5:
+            new_h = max_allowed_h
+        else:
             return cx1, cy1, cx2, cy2
 
-        required_w = required_h * target_aspect
+        new_w = new_h * target_aspect
         if anchor is not None:
             anchor_x, anchor_y = anchor
         else:
             anchor_x = (cx1 + cx2) / 2.0
             anchor_y = (cy1 + cy2) / 2.0
 
-        new_x1 = anchor_x - required_w / 2.0
-        new_x2 = anchor_x + required_w / 2.0
-        new_y1 = anchor_y - required_h / 2.0
-        new_y2 = anchor_y + required_h / 2.0
+        new_x1 = anchor_x - new_w / 2.0
+        new_x2 = anchor_x + new_w / 2.0
+        new_y1 = anchor_y - new_h / 2.0
+        new_y2 = anchor_y + new_h / 2.0
         return self._clip_to_frame(new_x1, new_y1, new_x2, new_y2, frame_w, frame_h)
 
     def _choose_best_ratio(self, det_box, ratios, frame_w, frame_h, anchor=None, face_box=None):
@@ -3485,40 +3502,70 @@ class Processor(QtCore.QObject):
                     cx2 = max(cx1 + 1, min(W, int(round(cx2))))
                     cy2 = max(cy1 + 1, min(H, int(round(cy2))))
 
+                    if bool(getattr(cfg, "auto_crop_borders", False)):
+                        bx1 = int(locals().get("off_x", 0))
+                        by1 = int(locals().get("off_y", 0))
+                        bx2 = int(bx1 + locals().get("W2", W))
+                        by2 = int(by1 + locals().get("H2", H))
+                    else:
+                        bx1, by1, bx2, by2 = 0, 0, W, H
+
                     try:
                         rw, rh = parse_ratio(ratio_str)
                         w = cx2 - cx1
                         h = cy2 - cy1
                         target_w = max(1, int(round(h * float(rw) / float(rh))))
-                        if w != target_w:
-                            cx1 = max(0, min(W - target_w, cx1 + (w - target_w) // 2))
+                        # Only correct if materially off (avoid jitter from rounding)
+                        if abs(w - target_w) > 1:
+                            # Center inside content window, not full frame
+                            cx1 = max(bx1, min(bx2 - target_w, cx1 + (w - target_w) // 2))
                             cx2 = cx1 + target_w
-                            if cx2 > W:
-                                cx1 = max(0, W - target_w)
-                                cx2 = cx1 + target_w
-                            if cx2 - cx1 != target_w:
-                                target_h = max(1, int(round((cx2 - cx1) * float(rh) / float(rw))))
-                                cy1 = max(0, min(H - target_h, cy1 + (h - target_h) // 2))
-                                cy2 = cy1 + target_h
+                        # Height correction stays inside the same content window
+                        target_h = max(1, int(round((cx2 - cx1) * float(rh) / float(rw))))
+                        if abs((cy2 - cy1) - target_h) > 1:
+                            cy1 = max(by1, min(by2 - target_h, cy1 + ((cy2 - cy1) - target_h) // 2))
+                            cy2 = cy1 + target_h
                     except Exception:
                         pass
 
-                    # Side-margin safety drop: avoid saving half-face crops pinned to an edge.
+                    # Edge-aware side-margin safety: avoid saving half-face crops pinned to an edge.
                     fb = c.get("face_box")
                     if fb is not None and bool(getattr(cfg, "side_guard_drop_enable", True)):
-                        fcx = 0.5 * (float(fb[0]) + float(fb[2]))
                         fw = max(1.0, float(fb[2]) - float(fb[0]))
-                        left_margin = max(0.0, fcx - float(cx1))
-                        right_margin = max(0.0, float(cx2) - fcx)
+                        # Use face *edges* vs crop edges
+                        left_margin  = max(0.0, float(fb[0]) - float(cx1))
+                        right_margin = max(0.0, float(cx2) - float(fb[2]))
                         desired = float(cfg.crop_face_side_margin_frac) * fw
                         required = float(getattr(cfg, "side_guard_drop_factor", 0.66)) * desired
+                        # Try a minimal salvage shift before drop
                         if min(left_margin, right_margin) < required:
+                            needL = max(0.0, required - left_margin)
+                            needR = max(0.0, required - right_margin)
+                            if (needL > 0.0) or (needR > 0.0):
+                                width = cx2 - cx1
+                                # positive shift → move right; negative → left
+                                shift = needL - needR
+                                nx1 = max(bx1, min(bx2 - width, int(round(cx1 + shift))))
+                                nx2 = nx1 + width
+                                # recompute
+                                left_margin  = max(0.0, float(fb[0]) - float(nx1))
+                                right_margin = max(0.0, float(nx2) - float(fb[2]))
+                                if min(left_margin, right_margin) >= required:
+                                    cx1, cx2 = nx1, nx2
+                        # final guard (also catches actual face cuts)
+                        if min(left_margin, right_margin) < required or (float(fb[0]) < float(cx1)+1 or float(fb[2]) > float(cx2)-1):
                             self._status(
                                 "skip: side_guard_drop (insufficient face margin)",
                                 key="cap",
                                 interval=1.5,
                             )
                             return False
+
+                    # Final clamp inside de-barred content window (prevents 1px bar re-entry)
+                    cx1 = max(bx1, min(bx2 - 1, cx1))
+                    cy1 = max(by1, min(by2 - 1, cy1))
+                    cx2 = max(cx1 + 1, min(bx2, cx2))
+                    cy2 = max(cy1 + 1, min(by2, cy2))
                     try:
                         rw, rh = parse_ratio(ratio_str)
                         asp = (cx2 - cx1) / float(max(1, cy2 - cy1))
