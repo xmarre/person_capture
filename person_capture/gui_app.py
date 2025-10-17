@@ -1071,7 +1071,9 @@ class Processor(QtCore.QObject):
             face.conf = old_face_conf
         cap.set(cv2.CAP_PROP_POS_FRAMES, pos0)
         try:
-            self.progress.emit(max(0, total_frames - 1))
+            # Restore progress to the position we were at before pre-scan so the UI
+            # doesn't jump to EOF and queue a seek there.
+            self.progress.emit(max(0, pos0))
         except Exception:
             pass
         self._status(
@@ -2405,6 +2407,18 @@ class Processor(QtCore.QObject):
                         fast=bool(getattr(cfg, "seek_fast", True)),
                         max_grabs=int(getattr(cfg, "seek_max_grabs", 45)),
                     )
+                    # Drop any pending UI seeks/steps that accumulated during pre-scan
+                    # progress updates before the main pass begins.
+                    try:
+                        while True:
+                            self._cmd_q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    # Sync the UI to the true starting frame of the main pass.
+                    try:
+                        self.progress.emit(frame_idx)
+                    except Exception:
+                        pass
                     self._status(f"Pre-scan segments: {len(keep_spans)}", key="prescan", interval=30.0)
                 else:
                     self._status("Pre-scan found no matches; full scan", key="prescan", interval=30.0)
