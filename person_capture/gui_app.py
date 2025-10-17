@@ -306,12 +306,15 @@ class SessionConfig:
     prescan_boundary_refine_sec: float = 0.75  # rescan window around each edge
     prescan_refine_stride_min: int = 3         # small stride for edge refine
     prescan_trim_pad: bool = True              # remove pad if refine finds a tighter edge
+    # --- pre-scan refine limits ---
+    prescan_skip_trailing_refine: bool = True      # don’t refine spans that already hit EOF
+    prescan_refine_budget_sec: float = 3.0         # max wall time for refine pass
     # --- pre-scan bank management ---
     prescan_bank_max: int = 64                 # target size
     prescan_diversity_dedup_cos: float = 0.968 # ≥ skip as duplicate
     prescan_replace_margin: float = 0.010      # new score must beat worst by this
     # Early-out on empty frames: skip heavy work when last best fd≈9.00
-    prescan_fd9_skip: bool = False              # disable skip-gate to avoid misses
+    prescan_fd9_skip: bool = True               # re-enable skip-gate to avoid misses
     prescan_fd9_grace: int = 1                  # start skipping after this many consecutive fd≈9 samples
     prescan_fd9_probe_period: int = 3           # while skipping, run a real probe every Nth sample
     prescan_weights: Tuple[float, float, float] = (0.70, 0.25, 0.05)  # (anchor, diversity, quality)
@@ -912,10 +915,11 @@ class Processor(QtCore.QObject):
                 bridged.append((cs, ce))
                 spans = bridged
 
-            # --- boundary refinement: tighten edges to cut dead time ---
+            # --- boundary refinement: tighten edges to cut dead time, but bounded ---
             def _refine_edges(sp_list):
                 if not sp_list:
                     return sp_list
+                import time
                 # smaller stride and stronger probe around edges
                 stride_ref = max(
                     1,
@@ -933,6 +937,12 @@ class Processor(QtCore.QObject):
                 pad_frames = int(round(max(0.0, float(cfg.prescan_pad_sec)) * fps))
                 search = max(pad_frames, win)
                 refined = []
+                budget_s = float(getattr(cfg, "prescan_refine_budget_sec", 0.0))
+                t0 = time.perf_counter()
+
+                def over_budget():
+                    return budget_s > 1e-3 and (time.perf_counter() - t0) > budget_s
+
                 # temporarily crank prescan hints
                 rr_old = getattr(face, "_prescan_rr_mode", "rr")
                 try:
@@ -943,14 +953,21 @@ class Processor(QtCore.QObject):
                     face.set_prescan_hint(escalate=True)
                 except Exception:
                     pass
-                for (s, e) in sp_list:
+                timeout = False
+                for idx, (s, e) in enumerate(sp_list):
                     ls = s
                     le = e
+                    skip_right = bool(getattr(cfg, "prescan_skip_trailing_refine", True)) and (
+                        e >= total_frames - 1
+                    )
                     # LEFT edge: scan forward from s to s+search
                     left_stop = min(e, s + search)
                     j = s
                     best_left = None
                     while j <= left_stop:
+                        if over_budget():
+                            timeout = True
+                            break
                         # keyframe-aware seek for responsiveness
                         self._seek_to(
                             cap,
@@ -982,40 +999,52 @@ class Processor(QtCore.QObject):
                         if best_left is not None:
                             break
                         j += stride_ref
+                    if timeout:
+                        refined.append((ls, le))
+                        refined.extend(sp_list[idx + 1 :])
+                        break
                     if best_left is not None and bool(getattr(cfg, "prescan_trim_pad", True)):
                         ls = max(s, best_left)
                     # RIGHT edge: scan backward region [e-search, e] to last good
-                    right_start = max(ls, e - search)
-                    j = right_start
                     last_good = None
-                    while j <= e:
-                        self._seek_to(
-                            cap,
-                            j,
-                            j,
-                            fast=bool(getattr(cfg, "seek_fast", True)),
-                            max_grabs=int(getattr(cfg, "seek_max_grabs", 45)),
-                        )
-                        ret, frame = cap.read()
-                        if not ret or frame is None:
-                            j += stride_ref
-                            continue
-                        h, w = frame.shape[:2]
-                        if Wmax > 0 and w > Wmax:
-                            scale = float(Wmax) / float(w)
-                            frame = cv2.resize(
-                                frame,
-                                (int(round(w * scale)), int(round(h * scale))),
-                                interpolation=cv2.INTER_AREA,
+                    if not skip_right:
+                        right_start = max(ls, e - search)
+                        j = right_start
+                        while j <= e:
+                            if over_budget():
+                                timeout = True
+                                break
+                            self._seek_to(
+                                cap,
+                                j,
+                                j,
+                                fast=bool(getattr(cfg, "seek_fast", True)),
+                                max_grabs=int(getattr(cfg, "seek_max_grabs", 45)),
                             )
-                        faces = face.extract(frame)
-                        if faces:
-                            bank = ref_feat_local if ref_feat_local is not None else ref_feat
-                            for f in faces:
-                                feat = f.get("feat")
-                                if feat is not None and self._fd_min(feat, bank) <= enter:
-                                    last_good = j
-                        j += stride_ref
+                            ret, frame = cap.read()
+                            if not ret or frame is None:
+                                j += stride_ref
+                                continue
+                            h, w = frame.shape[:2]
+                            if Wmax > 0 and w > Wmax:
+                                scale = float(Wmax) / float(w)
+                                frame = cv2.resize(
+                                    frame,
+                                    (int(round(w * scale)), int(round(h * scale))),
+                                    interpolation=cv2.INTER_AREA,
+                                )
+                            faces = face.extract(frame)
+                            if faces:
+                                bank = ref_feat_local if ref_feat_local is not None else ref_feat
+                                for f in faces:
+                                    feat = f.get("feat")
+                                    if feat is not None and self._fd_min(feat, bank) <= enter:
+                                        last_good = j
+                            j += stride_ref
+                        if timeout:
+                            refined.append((ls, le))
+                            refined.extend(sp_list[idx + 1 :])
+                            break
                     if last_good is not None and bool(getattr(cfg, "prescan_trim_pad", True)):
                         le = min(e, last_good)
                     # keep only if span remains big enough
