@@ -49,14 +49,27 @@ class CurateWorker(QtCore.QObject):
             except Exception:
                 face_model = "scrfd_10g_bnkps"
                 face_det_conf = 0.50
+            if not self.ref_path:
+                try:
+                    self.progress.emit("init: identity gating assumed (no ref)", 0, 0)
+                except Exception:
+                    pass
             cur = Curator(
-                ref_image=self.ref_path,
+                ref_image=(self.ref_path or None),
                 device=self.device,
                 trt_lib_dir=(trt_dir or None),
                 face_model=str(face_model),
                 face_det_conf=float(face_det_conf),
+                assume_identity=bool(not self.ref_path),
                 progress=lambda phase, done, total: self.progress.emit(str(phase), int(done), int(total)),
             )
+            # If user provided a ref but it yielded no face, abort (matches main GUI behavior).
+            if (
+                self.ref_path
+                and not getattr(cur, "id_already_passed", False)
+                and getattr(cur, "ref_feat", None) is None
+            ):
+                raise RuntimeError("No face in the reference image.")
             out = cur.run(self.pool_dir, self.out_dir, max_images=self.max_images)
             # read manifest for UI
             rows = []
@@ -154,7 +167,8 @@ class CurateTab(QtWidgets.QWidget):
         if not pool or not os.path.isdir(pool):
             self._set_status("Invalid pool folder")
             return
-        if not ref or not os.path.isfile(ref):
+        # Reference is optional: if blank, we assume identity is already passed (PersonCapture crops).
+        if ref and not os.path.isfile(ref):
             self._set_status("Invalid reference image")
             return
         if not out:
