@@ -231,9 +231,13 @@ class Item:
 class Curator:
     def __init__(self, ref_image: str, device: str="cuda",
                  trt_lib_dir: Optional[str]=None,
-                 progress: Optional[Callable[[str,int,int], None]]=None):
+                 progress: Optional[Callable[[str,int,int], None]]=None,
+                 face_model: str = "scrfd_10g_bnkps",
+                 face_det_conf: float = 0.50):
         self.device = device
         self._progress = progress
+        self.face_model = face_model
+        self.face_det_conf = float(face_det_conf)
         # identify the module in logs and show immediate heartbeat
         if self._progress:
             mod_path = getattr(sys.modules.get(__name__), "__file__", "<frozen>")
@@ -249,7 +253,16 @@ class Curator:
         if self._progress:
             self._progress("init: loading models", 0, 0)
 
-        self.face = FaceEmbedder(ctx=device, use_arcface=True, progress=_p, trt_lib_dir=trt_lib_dir)
+        self.face = FaceEmbedder(
+            ctx=device,
+            yolo_model=self.face_model,
+            conf=self.face_det_conf,
+            use_arcface=True,
+            progress=_p,
+            trt_lib_dir=trt_lib_dir,
+        )
+        if self._progress:
+            self._progress(f"init: detector={self.face_model} conf={self.face_det_conf:.2f}", 0, 0)
         # CLIP used for diversity (background/pose). Reuse ReIDEmbedder for whole image embeddings.
         self.reid = ReIDEmbedder(device=device)
         if self._progress:
