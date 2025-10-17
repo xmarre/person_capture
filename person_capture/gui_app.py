@@ -2400,6 +2400,38 @@ class Processor(QtCore.QObject):
                 )
                 if keep_spans:
                     s0 = keep_spans[0][0]
+                    #
+                    # Purge only *stale* navigation noise created by pre-scan progress updates.
+                    # Do this *before* the jump so user-issued controls during the jump survive.
+                    #
+                    _buf: list[tuple[str, object]] = []
+                    # Drain only what was present *before* we started purging.
+                    # This avoids consuming fresh user input that arrives mid-purge.
+                    _to_drain = getattr(self._cmd_q, "qsize", lambda: 0)()
+                    for _ in range(max(0, int(_to_drain))):
+                        try:
+                            item = self._cmd_q.get_nowait()
+                        except queue.Empty:
+                            break
+                        # Normalize to (cmd, arg)
+                        if isinstance(item, tuple):
+                            if len(item) == 0:
+                                continue
+                            cmd = item[0]
+                            arg = item[1] if len(item) > 1 else None
+                        else:
+                            cmd, arg = item, None
+                        # Drop only nav spam likely enqueued by UI progress updates.
+                        if cmd in ("seek", "step", "scrub", "seek_abs", "seek_rel"):
+                            continue
+                        _buf.append((cmd, arg))
+                    # Requeue non-navigation commands in original order.
+                    for cmd, arg in _buf:
+                        try:
+                            self._cmd_q.put_nowait((cmd, arg))
+                        except Exception:
+                            pass
+
                     frame_idx = self._seek_to(
                         cap,
                         0,
@@ -2407,16 +2439,25 @@ class Processor(QtCore.QObject):
                         fast=bool(getattr(cfg, "seek_fast", True)),
                         max_grabs=int(getattr(cfg, "seek_max_grabs", 45)),
                     )
-                    # Drop any pending UI seeks/steps that accumulated during pre-scan
-                    # progress updates before the main pass begins.
-                    try:
-                        while True:
-                            self._cmd_q.get_nowait()
-                    except queue.Empty:
-                        pass
+                    # Neutralize any stray cooldown/coalesced state from the jump *before* progress emit.
+                    if hasattr(self, "_seek_cooldown_frames"):
+                        self._seek_cooldown_frames = 0
+                    if hasattr(self, "_pending_seek"):
+                        self._pending_seek = None
                     # Sync the UI to the true starting frame of the main pass.
                     try:
                         self.progress.emit(frame_idx)
+                    except Exception:
+                        pass
+                    # Paint something immediately so the UI isn't black after the jump.
+                    try:
+                        ok = cap.grab()
+                        if ok:
+                            ok, frame = cap.retrieve()
+                            if ok and frame is not None:
+                                self.preview.emit(self._cv_bgr_to_qimage(frame))
+                        # Do not advance past s0 for processing—restore read head.
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
                     except Exception:
                         pass
                     self._status(f"Pre-scan segments: {len(keep_spans)}", key="prescan", interval=30.0)
