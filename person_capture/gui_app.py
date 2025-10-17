@@ -2105,9 +2105,9 @@ class Processor(QtCore.QObject):
             return
         ref_candidates = [p.strip() for p in str(cfg.ref or "").split(";") if p.strip()]
         ref_path = next((str(Path(p)) for p in ref_candidates if Path(p).exists()), "")
-        if not ref_path:
-            self._status("Curator: reference image missing.", key="curate", interval=5.0)
-            return
+        assume_identity = bool(not ref_path)
+        if assume_identity:
+            self._status("Curator: identity gate disabled (no reference).", key="curate", interval=5.0)
         try:
             from .dataset_curator import Curator as _Curator  # type: ignore
         except Exception:
@@ -2136,14 +2136,15 @@ class Processor(QtCore.QObject):
 
         try:
             curator = _Curator(
-                ref_image=ref_path,
+                ref_image=(ref_path or None),
                 device=str(getattr(cfg, "device", "cuda")),
                 trt_lib_dir=(getattr(cfg, "trt_lib_dir", "") or None),
                 face_model=str(getattr(cfg, "face_model", "scrfd_10g_bnkps")),
                 face_det_conf=float(getattr(cfg, "face_det_conf", 0.50)),
+                assume_identity=assume_identity,
                 progress=_progress,
             )
-            if getattr(curator, "ref_feat", None) is None:
+            if not getattr(curator, "id_already_passed", False) and getattr(curator, "ref_feat", None) is None:
                 self._status("Curator: no face in the reference image.", key="curate", interval=5.0)
                 return
             built = curator.run(str(pool), str(out_dir), max_images=max_imgs)

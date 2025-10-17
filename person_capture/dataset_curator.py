@@ -229,15 +229,19 @@ class Item:
 # --------- curator ---------
 
 class Curator:
-    def __init__(self, ref_image: str, device: str="cuda",
-                 trt_lib_dir: Optional[str]=None,
-                 progress: Optional[Callable[[str,int,int], None]]=None,
+    def __init__(self,
+                 ref_image: Optional[str] = None,
+                 device: str = "cuda",
+                 trt_lib_dir: Optional[str] = None,
+                 progress: Optional[Callable[[str,int,int], None]] = None,
                  face_model: str = "scrfd_10g_bnkps",
-                 face_det_conf: float = 0.50):
+                 face_det_conf: float = 0.50,
+                 assume_identity: bool = False):
         self.device = device
         self._progress = progress
         self.face_model = face_model
         self.face_det_conf = float(face_det_conf)
+        self.id_already_passed = bool(assume_identity)
         # identify the module in logs and show immediate heartbeat
         if self._progress:
             mod_path = getattr(sys.modules.get(__name__), "__file__", "<frozen>")
@@ -257,27 +261,47 @@ class Curator:
             ctx=device,
             yolo_model=self.face_model,
             conf=self.face_det_conf,
-            use_arcface=True,
+            use_arcface=not self.id_already_passed,
             progress=_p,
             trt_lib_dir=trt_lib_dir,
         )
-        if self._progress:
-            self._progress(f"init: detector={self.face_model} conf={self.face_det_conf:.2f}", 0, 0)
         # CLIP used for diversity (background/pose). Reuse ReIDEmbedder for whole image embeddings.
         self.reid = ReIDEmbedder(device=device)
         if self._progress:
             self._progress("init: models ready", 0, 0)
 
-        # Build a small bank from the ref image
-        ref_bgr = cv2.imread(ref_image, cv2.IMREAD_COLOR)
-        assert ref_bgr is not None, f"Cannot read ref image: {ref_image}"
-        rfaces = self.face.extract(ref_bgr)
-        if not rfaces:
-            self.ref_feat = None
+        # Build a small bank from the ref image (optional)
+        self.ref_feat = None
+        if ref_image:
+            ref_bgr = cv2.imread(ref_image, cv2.IMREAD_COLOR)
+            if ref_bgr is None:
+                if self._progress:
+                    self._progress(f"warn: cannot read ref image '{ref_image}'", 0, 0)
+            else:
+                rfaces = self.face.extract(ref_bgr)
+                if rfaces:
+                    # take top-1 quality face
+                    rbest = max(rfaces, key=lambda f: f.get("quality", 0.0))
+                    self.ref_feat = rbest.get("feat")
         else:
-            # take top-1 quality face
-            rbest = max(rfaces, key=lambda f: f.get("quality",0.0))
-            self.ref_feat = rbest.get("feat")
+            if self._progress:
+                mode = "assumed" if self.id_already_passed else "disabled"
+                self._progress(f"init: identity gating {mode} (no ref)", 0, 0)
+
+        if self._progress:
+            if self.id_already_passed:
+                mode = "assumed(no-ref)"
+            elif self.ref_feat is not None:
+                mode = "ref-gated"
+            elif ref_image:
+                mode = "ref-missing"
+            else:
+                mode = "disabled(no-ref)"
+            self._progress(
+                f"init: {mode}; detector={self.face_model} conf={self.face_det_conf:.2f}",
+                0,
+                0,
+            )
 
     def _emit_progress(self, phase: str, done: int, total: int, *, force: bool=False) -> None:
         if self._progress is not None:
@@ -286,6 +310,9 @@ class Curator:
             print(f"[curator] {phase}: {done}/{total}")
 
     def _fd_min(self, feat: Optional[np.ndarray]) -> float:
+        if self.id_already_passed:
+            # Identity already validated upstream (PersonCapture crops).
+            return 0.0
         if feat is None or self.ref_feat is None:
             return 9.0
         v = np.asarray(feat, dtype=np.float32)
@@ -304,11 +331,13 @@ class Curator:
         best = FaceEmbedder.best_face(faces) if faces else None
         bbox = None
         kps5 = None
-        fd = 9.0
+        fd = (0.0 if self.id_already_passed else 9.0)
         fq = 0.0
         if best is not None:
             bbox = tuple(int(x) for x in best["bbox"])
-            fd = self._fd_min(best.get("feat"))
+            # In identity-passed mode, fd stays 0.0; else compute vs ref bank.
+            if not self.id_already_passed:
+                fd = self._fd_min(best.get("feat"))
             fq = float(best.get("quality", 0.0))
         # yaw/roll from kps if available
         # FaceEmbedder internally aligns by 5pts; but we can try to recover via _try_keypoints by re-calling detector
@@ -650,8 +679,24 @@ class Curator:
                              for k, x in m.items()}
             return d
 
+        legacy_items = [_serial(it) for it in sel]
         with open(metrics_json, "w", encoding="utf-8") as f:
-            json.dump([_serial(it) for it in sel], f, indent=2)
+            json.dump(legacy_items, f, indent=2)
+
+        # Temporary parallel export with richer metadata (new shape); keep legacy list above for back-compat.
+        metrics_v2 = os.path.join(out_dir, "metrics_v2.json")
+        payload = {
+            "identity_mode": (
+                "assumed"
+                if self.id_already_passed
+                else ("ref" if self.ref_feat is not None else "disabled")
+            ),
+            "detector": self.face_model,
+            "det_conf": round(self.face_det_conf, 3),
+            "items": legacy_items,
+        }
+        with open(metrics_v2, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
         return out_dir
 
 
@@ -661,14 +706,21 @@ def _main():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--pool", required=True, help="folder with candidate images (e.g., output/crops)")
-    ap.add_argument("--ref", required=True, help="reference face image")
+    ap.add_argument("--ref", default="", help="optional reference face image (omit if pool already identity-filtered)")
     ap.add_argument("--out", required=True, help="output folder for curated dataset")
     ap.add_argument("--max", type=int, default=200, help="max images")
     ap.add_argument("--device", default="cuda", choices=["cuda","cpu"], help="device")
     ap.add_argument("--trt-lib-dir", default="", help="TensorRT lib folder if using ArcFace ONNX TRT EP")
+    ap.add_argument("--assume-identity", action="store_true",
+                    help="assume all images already passed identity (skip identity gate; set fd=0.0)")
     args = ap.parse_args()
 
-    cur = Curator(ref_image=args.ref, device=args.device, trt_lib_dir=(args.trt_lib_dir or None))
+    cur = Curator(
+        ref_image=(args.ref or None),
+        device=args.device,
+        trt_lib_dir=(args.trt_lib_dir or None),
+        assume_identity=bool(args.assume_identity or not args.ref),
+    )
     out = cur.run(args.pool, args.out, max_images=int(args.max))
     print(out)
 
