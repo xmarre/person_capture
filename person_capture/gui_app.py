@@ -3610,8 +3610,13 @@ class Processor(QtCore.QObject):
                     else:
                         bx1, by1, bx2, by2 = 0, 0, W, H
 
+                    # Ensure ratio terms exist before using them in corrections
                     try:
                         rw, rh = parse_ratio(ratio_str)
+                    except Exception:
+                        rw, rh = 1, 1  # ultra-safe fallback
+
+                    try:
                         w = cx2 - cx1
                         h = cy2 - cy1
                         target_w = max(1, int(round(h * float(rw) / float(rh))))
@@ -3637,14 +3642,36 @@ class Processor(QtCore.QObject):
                         right_margin = max(0.0, float(cx2) - float(fb[2]))
                         desired = float(cfg.crop_face_side_margin_frac) * fw
                         required = float(getattr(cfg, "side_guard_drop_factor", 0.66)) * desired
+
+                        fd_val = float(c.get("fd")) if c.get("fd") is not None else 9.0
+                        reasons = set(c.get("reasons", []))
+                        is_rescue = ("face_short_circuit" in reasons) or ("global_face" in reasons)
+                        relax_fd = float(getattr(cfg, "side_guard_relax_fd", 0.22))
+                        relax_factor = float(getattr(cfg, "side_guard_relax_factor", 0.50))
+                        if (fd_val <= relax_fd) or is_rescue:
+                            required *= relax_factor
+
+                        inner_px = float(getattr(cfg, "face_edge_inner_px", 1.0))
+                        if (fd_val <= relax_fd) or is_rescue:
+                            inner_px *= float(getattr(cfg, "face_edge_inner_relax", 0.25))
+
+                        self._status(
+                            f"side_guard L={left_margin:.1f} R={right_margin:.1f} "
+                            f"req={required:.1f} fw={fw:.1f} fd={fd_val:.3f} "
+                            f"inner={inner_px:.2f}",
+                            key="side_guard_dbg",
+                            interval=0.8,
+                        )
                         # Try a minimal salvage shift before drop
                         if min(left_margin, right_margin) < required:
-                            needL = max(0.0, required - left_margin)
-                            needR = max(0.0, required - right_margin)
+                            reqL = max(required, inner_px)
+                            reqR = max(required, inner_px)
+                            needL = max(0.0, reqL - left_margin)
+                            needR = max(0.0, reqR - right_margin)
                             if (needL > 0.0) or (needR > 0.0):
                                 width = cx2 - cx1
                                 # positive shift → move right; negative → left
-                                shift = needL - needR
+                                shift = needR - needL
                                 nx1 = max(bx1, min(bx2 - width, int(round(cx1 + shift))))
                                 nx2 = nx1 + width
                                 # recompute
@@ -3652,8 +3679,54 @@ class Processor(QtCore.QObject):
                                 right_margin = max(0.0, float(nx2) - float(fb[2]))
                                 if min(left_margin, right_margin) >= required:
                                     cx1, cx2 = nx1, nx2
+                                    self._status(
+                                        f"side_guard after-shift L={left_margin:.1f} R={right_margin:.1f}",
+                                        key="side_guard_dbg2",
+                                        interval=0.8,
+                                    )
+                        # If we still can't meet margins, try a tiny ratio-preserving shrink around the face.
+                        if (
+                            (min(left_margin, right_margin) < required)
+                            and ((fd_val <= relax_fd) or is_rescue)
+                            and bool(getattr(cfg, "side_guard_allow_shrink", True))
+                        ):
+                            deficit = max(0.0, required - min(left_margin, right_margin))
+                            max_shrink_px = float(getattr(cfg, "side_guard_max_shrink_px", 32))
+                            min_shrink_frac = float(getattr(cfg, "side_guard_min_shrink_frac", 0.02))
+                            shrink_px = min(
+                                max_shrink_px,
+                                max(2.0, max(deficit * 2.0, (cx2 - cx1) * min_shrink_frac)),
+                            )
+
+                            old_w = (cx2 - cx1)
+                            new_w = max(2, int(round(old_w - shrink_px)))
+                            if new_w >= old_w:
+                                new_w = max(2, old_w - 2)
+                            new_h = max(2, int(round(new_w * float(rh) / float(rw))))
+
+                            face_cx = 0.5 * (float(fb[0]) + float(fb[2]))
+                            cx1_try = int(round(face_cx - new_w * 0.5))
+                            cx1_try = max(bx1, min(bx2 - new_w, cx1_try))
+                            cx2_try = cx1_try + new_w
+
+                            cy_mid = int(round((cy1 + cy2) * 0.5))
+                            cy1_try = max(by1, min(by2 - new_h, cy_mid - new_h // 2))
+                            cy2_try = cy1_try + new_h
+
+                            left_margin_try = max(0.0, float(fb[0]) - float(cx1_try))
+                            right_margin_try = max(0.0, float(cx2_try) - float(fb[2]))
+
+                            if min(left_margin_try, right_margin_try) >= required:
+                                cx1, cx2, cy1, cy2 = cx1_try, cx2_try, cy1_try, cy2_try
+                                left_margin, right_margin = left_margin_try, right_margin_try
+                                self._status(
+                                    f"side_guard after-shrink L={left_margin:.1f} R={right_margin:.1f}",
+                                    key="side_guard_dbg2",
+                                    interval=0.8,
+                                )
                         # final guard (also catches actual face cuts)
-                        if min(left_margin, right_margin) < required or (float(fb[0]) < float(cx1)+1 or float(fb[2]) > float(cx2)-1):
+                        edge_cut = (float(fb[0]) < float(cx1) + inner_px) or (float(fb[2]) > float(cx2) - inner_px)
+                        if min(left_margin, right_margin) < required or edge_cut:
                             drop_reasons = ["side_guard_drop", *list(c.get("reasons", []))]
                             self._status(
                                 f"reject_reasons={drop_reasons[:6]}",
