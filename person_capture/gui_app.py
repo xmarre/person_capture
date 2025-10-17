@@ -2139,6 +2139,8 @@ class Processor(QtCore.QObject):
                 ref_image=ref_path,
                 device=str(getattr(cfg, "device", "cuda")),
                 trt_lib_dir=(getattr(cfg, "trt_lib_dir", "") or None),
+                face_model=str(getattr(cfg, "face_model", "scrfd_10g_bnkps")),
+                face_det_conf=float(getattr(cfg, "face_det_conf", 0.50)),
                 progress=_progress,
             )
             if getattr(curator, "ref_feat", None) is None:

@@ -42,10 +42,19 @@ class CurateWorker(QtCore.QObject):
             except Exception:
                 pass
             trt_dir = os.getenv("TRT_LIB_DIR") or os.getenv("TENSORRT_DIR") or ""
+            try:
+                s = QtCore.QSettings("PersonCapture", "PersonCapture GUI")
+                face_model = s.value("face_model", "scrfd_10g_bnkps")
+                face_det_conf = float(s.value("face_det_conf", 0.50))
+            except Exception:
+                face_model = "scrfd_10g_bnkps"
+                face_det_conf = 0.50
             cur = Curator(
                 ref_image=self.ref_path,
                 device=self.device,
                 trt_lib_dir=(trt_dir or None),
+                face_model=str(face_model),
+                face_det_conf=float(face_det_conf),
                 progress=lambda phase, done, total: self.progress.emit(str(phase), int(done), int(total)),
             )
             out = cur.run(self.pool_dir, self.out_dir, max_images=self.max_images)
