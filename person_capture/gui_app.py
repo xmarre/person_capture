@@ -2072,11 +2072,19 @@ class Processor(QtCore.QObject):
         out_dir = out_root / "dataset_out"
 
         def _progress(phase: str, done: int, total: int) -> None:
+            # be robust to numpy scalars etc.
+            try:
+                di, ti = int(done), int(total)
+            except Exception:
+                di, ti = 0, 0
             self._status(
-                f"Curator {phase}: {done}/{total}",
+                f"Curator {phase}: {di}/{ti}",
                 key="curate_prog",
-                interval=0.5,
+                interval=0.2,
             )
+
+        # show *something* instantly in the log/status
+        _progress("init: starting", 0, 0)
 
         try:
             curator = _Curator(

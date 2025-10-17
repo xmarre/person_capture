@@ -1,8 +1,7 @@
 
 from __future__ import annotations
 
-import os, json, threading
-import traceback
+import os, json, threading, traceback
 from pathlib import Path
 from typing import Optional, List
 
@@ -47,7 +46,7 @@ class CurateWorker(QtCore.QObject):
                 ref_image=self.ref_path,
                 device=self.device,
                 trt_lib_dir=(trt_dir or None),
-                progress=lambda phase, done, total: self.progress.emit(phase, done, total),
+                progress=lambda phase, done, total: self.progress.emit(str(phase), int(done), int(total)),
             )
             out = cur.run(self.pool_dir, self.out_dir, max_images=self.max_images)
             # read manifest for UI
@@ -164,7 +163,7 @@ class CurateTab(QtWidgets.QWidget):
         self._worker.finished.connect(self._done)
         self._worker.failed.connect(self._fail)
         self._worker.progress.connect(self._on_progress)
-        # tidy up worker object after completion/failure
+        # cleanup to prevent leaks on repeated runs
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.failed.connect(self._worker.deleteLater)
         self._worker.finished.connect(self._thread.quit)
