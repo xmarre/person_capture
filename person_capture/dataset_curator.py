@@ -12,7 +12,12 @@ Reuses project modules: face_embedder.FaceEmbedder, reid_embedder.ReIDEmbedder, 
 
 from __future__ import annotations
 
-import os, sys, math, csv, json, hashlib
+import csv
+import hashlib
+import json
+import math
+import os
+import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -229,6 +234,10 @@ class Curator:
                  progress: Optional[Callable[[str,int,int], None]]=None):
         self.device = device
         self._progress = progress
+        # identify the module in logs and show immediate heartbeat
+        if self._progress:
+            mod_path = getattr(sys.modules.get(__name__), "__file__", "<frozen>")
+            self._progress(f"init: dataset_curator → {mod_path}", 0, 0)
         # Bridge FaceEmbedder's textual progress into our (phase, done, total) channel.
         def _p(msg: str) -> None:
             try:
