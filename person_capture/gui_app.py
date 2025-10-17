@@ -3216,6 +3216,8 @@ class Processor(QtCore.QObject):
                         min_fd_all = min(face_dists_all)
 
                 # Evaluate candidates
+                last_reject_reasons: list[str] = []
+
                 for i, feat in enumerate(reid_feats):
                     cand_reason = []
                     rd = None
@@ -3280,18 +3282,27 @@ class Processor(QtCore.QObject):
 
                     accept_before_face_policy = accept
 
-                    # Face-first policy: hard gate only when requested and reference face exists
+                    # Face-first policy (revised): do not overrule a solid identity match with
+                    # a quality gate triggered by another face elsewhere in the frame.
                     if (
                         cfg.require_face_if_visible
                         and any_face_visible
                         and (ref_face_feat is not None)
                         and eff_mode in ("both", "face_only")
                     ):
+                        # Only hard-drop when the candidate has no detectable face or the
+                        # detected face fails identity; a low quality score alone is insufficient
+                        # once face_ok is True.
+                        qfail = bf is None
                         if (
-                            bf is None
-                            or bf.get('quality', 0.0) < float(cfg.face_quality_min)
-                            or not face_ok
+                            bf is not None
+                            and bf.get("quality", 0.0)
+                            < float(getattr(cfg, "face_quality_floor_absurd", 15))
                         ):
+                            qfail = True
+                        if (bf is not None) and (not face_ok):
+                            qfail = True
+                        if qfail:
                             accept = False
                             cand_reason.append("hard_gate_face_required")
                     elif (
@@ -3304,6 +3315,7 @@ class Processor(QtCore.QObject):
 
                     if not accept:
                         cand_reason.append("reject")
+                        last_reject_reasons = list(cand_reason)
                         continue
 
                     score = self._combine_scores(fd, rd, mode=cfg.combine)
@@ -3343,6 +3355,10 @@ class Processor(QtCore.QObject):
                     crop_img = frame_for_det[ey1:ey2, ex1:ex2]
                     sharp = self._calc_sharpness(crop_img)
                     if float(cfg.min_sharpness) > 0 and sharp < float(cfg.min_sharpness):
+                        cand_reason.append(
+                            f"sharp={sharp:.1f} min={float(cfg.min_sharpness):.1f}"
+                        )
+                        last_reject_reasons = list(cand_reason)
                         continue
 
                     # Map to original frame coords for annotation
@@ -3638,6 +3654,12 @@ class Processor(QtCore.QObject):
                                     cx1, cx2 = nx1, nx2
                         # final guard (also catches actual face cuts)
                         if min(left_margin, right_margin) < required or (float(fb[0]) < float(cx1)+1 or float(fb[2]) > float(cx2)-1):
+                            drop_reasons = ["side_guard_drop", *list(c.get("reasons", []))]
+                            self._status(
+                                f"reject_reasons={drop_reasons[:6]}",
+                                key="rej_reasons",
+                                interval=1.0,
+                            )
                             self._status(
                                 "skip: side_guard_drop (insufficient face margin)",
                                 key="cap",
@@ -4006,10 +4028,18 @@ class Processor(QtCore.QObject):
                 if fallback_candidate is not None:
                     candidates = [fallback_candidate]
                 else:
+                    if not candidates:
+                        reasons_to_log = (last_reject_reasons or [])[:6]
+                        self._status(
+                            f"reject_reasons={reasons_to_log}",
+                            key="rej_reasons",
+                            interval=1.0,
+                        )
                     extra_note = " (face-only mode; faceless fallback disabled)" if face_only_pipeline else ""
                     self._status(
                         f"No match. persons={diag_persons} faces={faces_detected} pass_q={faces_passing_quality} "
-                        f"visible={any_face_visible} best_fd_qonly={best_face_dist if best_face_dist is not None else 'n/a'} "
+                        f"visible={any_face_visible} thr={float(cfg.face_thresh):.3f} qmin={float(cfg.face_quality_min):.0f} "
+                        f"best_fd_qonly={best_face_dist if best_face_dist is not None else 'n/a'} "
                         f"min_fd_all={min_fd_all if min_fd_all is not None else 'n/a'}{extra_note}",
                         key="no_match",
                         interval=1.0,
@@ -4025,6 +4055,15 @@ class Processor(QtCore.QObject):
                             face_cands.sort(key=lambda d: d['fd'])
                             if (face_cands[1]['fd'] - face_cands[0]['fd']) < float(cfg.face_margin_min):
                                 # ambiguous faces -> drop frame
+                                last_reject_reasons = [
+                                    "ambiguous_face_margin",
+                                    *list(face_cands[0].get("reasons", [])),
+                                ]
+                                self._status(
+                                    f"reject_reasons={last_reject_reasons[:6]}",
+                                    key="rej_reasons",
+                                    interval=1.0,
+                                )
                                 candidates = []
                     def eff_score(c):
                         s = c["score"] if c["score"] is not None else 1e9
