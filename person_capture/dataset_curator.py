@@ -283,6 +283,8 @@ class Curator:
         self.face_model = face_model
         self.face_det_conf = float(face_det_conf)
         self.id_already_passed = bool(assume_identity)
+        # debug: capture per-selection reasoning for last run
+        self._last_selection_debug: List[Dict[str, Any]] = []
         # identify the module in logs and show immediate heartbeat
         if self._progress:
             mod_path = getattr(sys.modules.get(__name__), "__file__", "<frozen>")
@@ -461,6 +463,8 @@ class Curator:
                 return "cowboy"
             return "full"
         if ratio in ("3:2", "wide"):
+            if f >= 0.30:
+                return "closeup"
             return "wide"
         if ratio == "1:1":
             if f >= 0.30:
@@ -616,21 +620,22 @@ class Curator:
         sharp_min: float = 0.10,
         dedup_hamm: int = 7,
         quotas: Optional[Dict[str, Tuple[int, int]]] = None,
-        alpha: float = 0.75,
+        alpha: float = 0.65,
         *,
         scene_aware: bool = True,
         scene_sim: float = 0.92,
         scene_nn_window: int = 64,
         scene_time_gap: float = 4.0,
-        dedup_hamm_scene: int = 4,
-        scene_soft_cap: int = 0,
-        scene_soft_penalty: float = 0.08,
+        dedup_hamm_scene: int = 8,
+        scene_soft_cap: int = 6,
+        scene_soft_penalty: float = 0.15,
         profile_yaw_thresh: float = 50.0,
     ) -> List[Item]:
         """
         quotas: dict of category -> (min, max) counts
         categories: 'portrait', 'closeup', 'cowboy', 'full', 'wide', 'profile'
         """
+        self._last_selection_debug = []
         if not items:
             return []
 
@@ -726,9 +731,10 @@ class Curator:
         # default quotas based on guide:
         # portrait majority, some closeups, some cowboy, few full, few wide, profiles cap low.
         if quotas is None:
+            # Bias toward closer crops so high-detail faces stay represented.
             quotas = {
-                "portrait": (80, 120),
-                "closeup": (25, 45),
+                "portrait": (60, 100),
+                "closeup": (35, 60),
                 "cowboy": (20, 35),
                 "full": (8, 20),
                 "wide": (5, 20),
@@ -762,6 +768,7 @@ class Curator:
 
         # fill respecting quotas
         out_idx: List[int] = []
+        chosen_debug: List[Dict[str, Any]] = []
         counts = {k: 0 for k in quotas.keys()}
         chosen_ph: List[int] = []
         base_vecs: List[np.ndarray] = []
@@ -786,6 +793,19 @@ class Curator:
             if not sims:
                 return 0.0
             return float(max(0.0, max(sims)))
+
+        def record_pick(idx: int, score: float, redundancy: float) -> None:
+            it = pool[idx]
+            chosen_debug.append({
+                "rank": len(out_idx) + 1,
+                "file": it.path,
+                "scene": int(getattr(it, "scene", -1)),
+                "category": cats[idx],
+                "quality": float(it.quality_score),
+                "redundancy": float(redundancy),
+                "mmr_score": float(score),
+                "is_profile": int(abs(it.yaw) >= profile_yaw_thresh),
+            })
 
         def peek_scene_candidate(sid: int, category: str) -> Optional[Tuple[int, int]]:
             lst = scene_lists.get(sid)
@@ -836,6 +856,7 @@ class Curator:
                         best_pos = pos
                 if best_idx is None:
                     break
+                redundancy = red_score(best_idx)
                 out_idx.append(best_idx)
                 if best_sid is not None:
                     scene_counts[best_sid] = scene_counts.get(best_sid, 0) + 1
@@ -844,6 +865,7 @@ class Curator:
                     counts["profile"] = counts.get("profile", 0) + 1
                 chosen_ph.append(pool[best_idx].phash)
                 append_base(best_idx)
+                record_pick(best_idx, best_score, redundancy)
                 if best_sid is not None and scene_lists.get(best_sid):
                     scene_lists[best_sid].pop(best_pos)
                 need -= 1
@@ -893,6 +915,7 @@ class Curator:
             if best_idx is None:
                 break
             cat = cats[best_idx]
+            redundancy = red_score(best_idx)
             out_idx.append(best_idx)
             if best_sid is not None:
                 scene_counts[best_sid] = scene_counts.get(best_sid, 0) + 1
@@ -901,6 +924,7 @@ class Curator:
                 counts["profile"] = counts.get("profile", 0) + 1
             chosen_ph.append(pool[best_idx].phash)
             append_base(best_idx)
+            record_pick(best_idx, best_score, redundancy)
             if best_sid is not None and scene_lists.get(best_sid):
                 scene_lists[best_sid].pop(0)
 
@@ -908,6 +932,7 @@ class Curator:
         # final trim if we exceeded max due to minimum pass
         if len(sel) > max_images:
             sel = sel[:max_images]
+        self._last_selection_debug = chosen_debug
         return sel
 
     # ---- run end-to-end on a folder ----
@@ -1108,6 +1133,32 @@ class Curator:
                     self._categorize(it),
                     1 if abs(it.yaw) >= profile_yaw_thresh else 0,
                 ])
+
+        if self._last_selection_debug:
+            dbg_csv = os.path.join(out_dir, "selection_debug.csv")
+            with open(dbg_csv, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow([
+                    "rank",
+                    "file",
+                    "scene",
+                    "category",
+                    "quality",
+                    "redundancy",
+                    "mmr_score",
+                    "is_profile",
+                ])
+                for row in self._last_selection_debug:
+                    w.writerow([
+                        row["rank"],
+                        row["file"],
+                        row["scene"],
+                        row["category"],
+                        f"{row['quality']:.6f}",
+                        f"{row['redundancy']:.6f}",
+                        f"{row['mmr_score']:.6f}",
+                        row["is_profile"],
+                    ])
 
         debug_flag = os.getenv("PC_DEBUG_SCENES", "0").lower()
         if scene_aware and debug_flag not in {"0", "false", "no"}:
