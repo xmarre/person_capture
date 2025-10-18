@@ -28,6 +28,12 @@ from pathlib import Path
 # Robust imports: support both package ("from .module") and flat files ("import module").
 def _imp():
     try:
+        # --- Updater (new) ---
+        try:
+            from .updater import UpdateManager  # type: ignore
+        except Exception:
+            UpdateManager = None  # type: ignore
+
         from .detectors import PersonDetector  # type: ignore
         from .face_embedder import FaceEmbedder  # type: ignore
         from .reid_embedder import ReIDEmbedder  # type: ignore
@@ -48,6 +54,7 @@ def _imp():
             expand_box_to_ratio,
             phash_similarity,
             _phash_bits,
+            UpdateManager,
         )
     except Exception:
         # Add script dir to sys.path and try again as flat modules
@@ -58,6 +65,11 @@ def _imp():
         from face_embedder import FaceEmbedder  # type: ignore
         from reid_embedder import ReIDEmbedder  # type: ignore
         try:
+            try:
+                from updater import UpdateManager  # type: ignore
+            except Exception:
+                UpdateManager = None  # type: ignore
+
             from .utils import ensure_dir, parse_ratio, expand_box_to_ratio, phash_similarity, _phash_bits  # type: ignore
         except Exception:
             from utils import ensure_dir, parse_ratio, expand_box_to_ratio, phash_similarity, _phash_bits  # type: ignore
@@ -70,6 +82,7 @@ def _imp():
             expand_box_to_ratio,
             phash_similarity,
             _phash_bits,
+            UpdateManager,
         )
 
 (
@@ -81,6 +94,7 @@ def _imp():
     expand_box_to_ratio,
     phash_similarity,
     _phash_bits,
+    UpdateManager,
 ) = _imp()
 # Optional Curate tab
 try:
@@ -4563,6 +4577,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_ui()
         self._load_qsettings()
         self.statusbar = self.statusBar()
+        # --- Updater wiring ---
+        self.updater = UpdateManager(APP_NAME) if "UpdateManager" in globals() and UpdateManager is not None else None
+        self._last_update_compare_url: Optional[str] = None
+        if self.updater:
+            self._connect_updater()
+            self._maybe_auto_check_updates()
         self.statusbar.showMessage("Ready")
         self.safe_fit_window()
         self._install_filter()
@@ -5258,6 +5278,23 @@ class MainWindow(QtWidgets.QMainWindow):
         # Left dock: controls (scrollable, tabs + search)
         controls_container = QtWidgets.QWidget()
         controls_layout = QtWidgets.QVBoxLayout(controls_container); controls_layout.setContentsMargins(6, 6, 6, 6)
+        # show update banner (hidden by default) just above the search/filter
+        self.update_banner = QtWidgets.QFrame()
+        self.update_banner.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self.update_banner.setVisible(False)
+        banner_l = QtWidgets.QHBoxLayout(self.update_banner); banner_l.setContentsMargins(8,4,8,4)
+        self.update_lbl = QtWidgets.QLabel("Update available")
+        self.btn_update_now = QtWidgets.QPushButton("Update")
+        self.btn_update_now.clicked.connect(self._on_update_now)
+        self.btn_update_later = QtWidgets.QPushButton("Later")
+        self.btn_update_later.clicked.connect(lambda: self.update_banner.setVisible(False))
+        self.btn_release_notes = QtWidgets.QPushButton("Release notes")
+        self.btn_release_notes.clicked.connect(self._open_release_notes)
+        banner_l.addWidget(self.update_lbl, 1)
+        banner_l.addWidget(self.btn_update_now, 0)
+        banner_l.addWidget(self.btn_release_notes, 0)
+        banner_l.addWidget(self.btn_update_later, 0)
+        controls_layout.addWidget(self.update_banner)
         self.search_edit = QtWidgets.QLineEdit(); self.search_edit.setPlaceholderText("Filter settings…")
         controls_layout.addWidget(self.search_edit)
         self.tabs = QtWidgets.QTabWidget()
@@ -5571,6 +5608,43 @@ class MainWindow(QtWidgets.QMainWindow):
         help_menu = bar.addMenu("&Help")
         act_about = QtGui.QAction("About", self, triggered=self._about)
         help_menu.addAction(act_about)
+        # --- Updates ---
+        help_menu.addSeparator()
+        self.act_check_updates = QtGui.QAction("Check for updates…", self, triggered=self._manual_check_updates)
+        help_menu.addAction(self.act_check_updates)
+        self.act_auto_check = QtGui.QAction("Auto-check at startup", self)
+        self.act_auto_check.setCheckable(True)
+        try:
+            s = QtCore.QSettings(APP_ORG, APP_NAME)
+            self.act_auto_check.setChecked(s.value("update_auto_check", True, type=bool))
+        except Exception:
+            self.act_auto_check.setChecked(True)
+        self.act_auto_check.toggled.connect(self._toggle_auto_check)
+        help_menu.addAction(self.act_auto_check)
+
+    # ---------- Updater plumbing ----------
+    def _connect_updater(self):
+        if not self.updater:
+            return
+        try:
+            self.updater.progress.connect(lambda m: self._log(f"[Update] {m}"))
+            self.updater.info.connect(lambda m: self._log(f"[Update] {m}"))
+            self.updater.updateAvailable.connect(self._on_update_available)
+            self.updater.upToDate.connect(lambda: self.statusbar.showMessage("Up to date.", 3000))
+            self.updater.updateFailed.connect(lambda m: self._log(f"[Update] FAILED: {m}"))
+            self.updater.updated.connect(self._on_updated)
+        except Exception:
+            pass
+
+    def _maybe_auto_check_updates(self):
+        try:
+            if not self.updater:
+                return
+            s = QtCore.QSettings(APP_ORG, APP_NAME)
+            if s.value("update_auto_check", True, type=bool):
+                self.updater.check_for_updates_async(branch=None, force=False)
+        except Exception:
+            pass
 
     def safe_fit_window(self):
         try:
@@ -5639,6 +5713,103 @@ class MainWindow(QtWidgets.QMainWindow):
                 show = True if not q else (q in lbl.text().lower())
                 lbl.setVisible(show)
                 field.setVisible(show)
+        except Exception:
+            pass
+
+    # ---- Update actions ----------------------------------------------------
+    def _toggle_auto_check(self, on: bool):
+        try:
+            s = QtCore.QSettings(APP_ORG, APP_NAME)
+            s.setValue("update_auto_check", bool(on)); s.sync()
+        except Exception:
+            pass
+
+    def _manual_check_updates(self):
+        if not self.updater:
+            QtWidgets.QMessageBox.information(self, "Updates", "Updater not available in this build.")
+            return
+        self.statusbar.showMessage("Checking for updates…", 2000)
+        self.updater.check_for_updates_async(branch=None, force=True, throttle_sec=0)
+
+    def _on_update_available(self, msg: str):
+        self.update_lbl.setText(msg)
+        self.update_banner.setVisible(True)
+        self.statusbar.showMessage(msg, 7000)
+        self._last_update_compare_url = self._compute_compare_url()
+
+    def _on_update_now(self):
+        if not self.updater:
+            return
+        btn = QtWidgets.QMessageBox.question(
+            self,
+            "Apply update",
+            "Update will be downloaded/applied. Continue?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        )
+        if btn != QtWidgets.QMessageBox.Yes:
+            return
+        self.updater.perform_update_async(prefer_git=True, branch=None)
+
+    def _on_updated(self, msg: str):
+        self._log("[Update] " + msg)
+        self.update_banner.setVisible(False)
+        self._last_update_compare_url = None
+        # Offer restart
+        btn = QtWidgets.QMessageBox.question(
+            self,
+            "Restart required",
+            "Update installed. Restart now to finish?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+        )
+        if btn == QtWidgets.QMessageBox.Yes:
+            try:
+                # Save UI state before restart
+                s = QtCore.QSettings(APP_ORG, APP_NAME)
+                s.setValue("dock_state", self.saveState()); s.sync()
+            except Exception:
+                pass
+            try:
+                self._save_qsettings()
+            except Exception:
+                pass
+            try:
+                self.updater.restart_now()
+            except Exception:
+                # Best-effort fallback
+                QtWidgets.QApplication.quit()
+
+    def _compute_compare_url(self) -> str:
+        try:
+            if self.updater and getattr(self.updater, "repo", None) and (self.updater.repo / ".git").exists():
+                local = subprocess.check_output([
+                    "git",
+                    "rev-parse",
+                    "HEAD",
+                ], cwd=self.updater.repo, text=True).strip()
+                upstream_ref = subprocess.check_output([
+                    "git",
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{u}",
+                ], cwd=self.updater.repo, text=True).strip()
+                remote = subprocess.check_output([
+                    "git",
+                    "rev-parse",
+                    upstream_ref,
+                ], cwd=self.updater.repo, text=True).strip()
+                if local and remote:
+                    return f"https://github.com/xmarre/person_capture/compare/{local}...{remote}"
+        except Exception:
+            pass
+        return "https://github.com/xmarre/person_capture/commits"
+
+    def _open_release_notes(self):
+        import webbrowser
+
+        url = self._last_update_compare_url or self._compute_compare_url()
+        try:
+            webbrowser.open(url)
         except Exception:
             pass
 
@@ -6936,6 +7107,17 @@ def main():
     QtCore.QCoreApplication.setOrganizationName(APP_ORG)
     QtCore.QCoreApplication.setApplicationName(APP_NAME)
     app = QtWidgets.QApplication(sys.argv)
+    # Apply staged updates as early as possible (no windows/dialogs shown yet)
+    try:
+        # Import late to avoid circulars if any
+        try:
+            from .updater import UpdateManager  # type: ignore
+        except Exception:
+            from updater import UpdateManager  # type: ignore
+        if UpdateManager is not None:
+            UpdateManager(APP_NAME).maybe_apply_pending_at_start()
+    except Exception:
+        pass
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
