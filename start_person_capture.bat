@@ -2,9 +2,16 @@
 setlocal EnableExtensions
 set "REPO=%~dp0"
 pushd "%REPO%"
+set "PERSON_CAPTURE_ROOT=%REPO%"
+
+:: (Optional) Lift GitHub API rate limits for update checks.
+:: set "GH_TOKEN=ghp_your_token_here"
+
 set "VENV=%REPO%env"
 set "TRT_LIB_DIR=D:\tensorrt\TensorRT-10.13.3.9\lib"
 set "LOG=%REPO%last_run.log"
+set "PYEXE=%VENV%\Scripts\python.exe"
+if not exist "%PYEXE%" set "PYEXE=python"
 
 set ORT_DISABLE_ALL_DEFAULT_EP=1
 set ORT_LOG_SEVERITY_LEVEL=0
@@ -41,10 +48,10 @@ for %%F in (nvonnxparser.dll nvonnxparser_10.dll) do (
 )
 
 rem --- ORT must expose TensorrtExecutionProvider ---
-python -c "import onnxruntime as ort,sys; p=ort.get_available_providers(); print('ORT providers:',p); sys.exit(0 if 'TensorrtExecutionProvider' in p else 42)" 1>>"%LOG%" 2>&1 || goto FAIL
+"%PYEXE%" -c "import onnxruntime as ort,sys; p=ort.get_available_providers(); print('ORT providers:',p); sys.exit(0 if 'TensorrtExecutionProvider' in p else 42)" 1>>"%LOG%" 2>&1 || goto FAIL
 
 rem --- run GUI; nonzero exit == fail ---
-python -u -Xfaulthandler -m person_capture.gui_app 1>>"%LOG%" 2>&1 || goto FAIL
+"%PYEXE%" -u -Xfaulthandler -m person_capture.gui_app 1>>"%LOG%" 2>&1 || goto FAIL
 
 echo OK >>"%LOG%"
 type "%LOG%"

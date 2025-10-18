@@ -427,20 +427,20 @@ def _restart_self(extra_args: Optional[list[str]] = None) -> None:
         argv.extend(extra_args)
 
     if os.name == "nt":
-        # Force a NEW console window on Windows.
-        # `start "" <cmd> <args>`: empty title arg is required.
+        # Primary strategy: guarantee the new process gets a fresh console.
+        flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
         try:
-            subprocess.Popen(
-                ["cmd.exe", "/c", "start", "", *argv],
-                close_fds=True,
-                cwd=str(cwd),
-            )
-        except Exception:
-            # Fallback: request a new console directly
             subprocess.Popen(
                 argv,
                 close_fds=True,
-                creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+                cwd=str(cwd),
+                creationflags=flags,
+            )
+        except Exception:
+            # Fallback: ask cmd to spawn a separate window (covers exotic terminals).
+            subprocess.Popen(
+                ["cmd.exe", "/c", "start", "PersonCapture Logs", *argv],
+                close_fds=True,
                 cwd=str(cwd),
             )
     else:
@@ -510,6 +510,7 @@ class UpdateManager(QtCore.QObject if QtCore else object):
                 if (not force) and (_now() - last_t < float(throttle_sec)):
                     # silently ignore
                     return
+                self.info.emit("Checking for updates…")
                 # path 1: git
                 if is_git_repo(self.repo):
                     need, local, remote = _git_need_updates(self.repo)

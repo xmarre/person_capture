@@ -5631,7 +5631,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.updater.info.connect(lambda m: self._log(f"[Update] {m}"))
             self.updater.updateAvailable.connect(self._on_update_available)
             self.updater.upToDate.connect(lambda: self.statusbar.showMessage("Up to date.", 3000))
-            self.updater.updateFailed.connect(lambda m: self._log(f"[Update] FAILED: {m}"))
+            def _on_update_failed(message: str) -> None:
+                try:
+                    self._log(f"[Update] FAILED: {message}")
+                except Exception:
+                    pass
+                try:
+                    self.statusbar.showMessage(f"Update check failed: {message}", 6000)
+                except Exception:
+                    pass
+
+            self.updater.updateFailed.connect(_on_update_failed)
             self.updater.updated.connect(self._on_updated)
         except Exception:
             pass
@@ -5642,7 +5652,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             s = QtCore.QSettings(APP_ORG, APP_NAME)
             if s.value("update_auto_check", True, type=bool):
-                self.updater.check_for_updates_async(branch=None, force=False)
+                QtCore.QTimer.singleShot(
+                    0,
+                    lambda: self.updater.check_for_updates_async(
+                        branch=None, force=True, throttle_sec=0
+                    ),
+                )
         except Exception:
             pass
 
