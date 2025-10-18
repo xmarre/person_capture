@@ -299,6 +299,11 @@ def stage_zip_update(repo: Path, branch: Optional[str] = None) -> Tuple[bool, st
         if stage.exists():
             shutil.rmtree(stage, ignore_errors=True)
         _extract_zip(zpath, stage)
+        try:
+            zpath.unlink(missing_ok=True)
+            shutil.rmtree(tmpd, ignore_errors=True)
+        except Exception:
+            pass
         # The archive contains a top-level folder. Normalize: copy its contents up one level.
         entries = list(stage.iterdir())
         top = entries[0] if entries else None
@@ -323,9 +328,11 @@ def _pip_install_requirements(req_file: Path) -> str:
             return "pip skipped (env)"
         if not req_file.exists():
             return "requirements not present"
-        txt = _call([sys.executable, "-m", "pip", "install", "-r", str(req_file),
-                     "--upgrade", "--upgrade-strategy", "only-if-needed"], cwd=req_file.parent).stdout
-        return f"pip ok: {req_file.name}\n{txt}"
+        proc = _call([sys.executable, "-m", "pip", "install", "-r", str(req_file),
+                      "--upgrade", "--upgrade-strategy", "only-if-needed"], cwd=req_file.parent)
+        if proc.returncode == 0:
+            return f"pip ok: {req_file.name}\n{proc.stdout}"
+        return f"pip failed (rc={proc.returncode}): {proc.stderr or proc.stdout}"
     except Exception as e:
         return f"pip failed: {e}"
 
@@ -340,6 +347,7 @@ def apply_staged_update(repo: Path) -> Tuple[bool, str]:
             return False, "no pending update"
         with open(flag, "r", encoding="utf-8") as f:
             info = json.load(f)
+        sha_applied = str(info.get("sha") or "")
         staged = Path(info.get("staged_dir") or (repo / "update_staged"))
         if not staged.exists():
             try:
@@ -373,6 +381,15 @@ def apply_staged_update(repo: Path) -> Tuple[bool, str]:
             pass
         try:
             flag.unlink()
+        except Exception:
+            pass
+        # Persist applied version for non-git installs so future checks don't re-prompt
+        try:
+            if sha_applied and not is_git_repo(repo):
+                ver_tmp = repo / "VERSION.tmp"
+                ver_dst = repo / "VERSION"
+                ver_tmp.write_text(sha_applied + "\n", encoding="utf-8")
+                os.replace(ver_tmp, ver_dst)  # atomic on POSIX/NTFS
         except Exception:
             pass
         # If requirements changed, install now (early in startup).
@@ -481,11 +498,15 @@ class UpdateManager(QtCore.QObject if QtCore else object):
                 # else assume we may be behind.
                 ver = (self.repo / "VERSION")
                 local_sha = ver.read_text(encoding="utf-8").strip()[:40] if ver.exists() else ""
-                s.setValue("update_last_check_t", _now()); s.sync()
-                if remote_sha and local_sha and remote_sha.startswith(local_sha):
-                    self.upToDate.emit()
+                if remote_sha:
+                    s.setValue("update_last_check_t", _now()); s.sync()
+                    if local_sha and remote_sha.startswith(local_sha):
+                        self.upToDate.emit()
+                    else:
+                        self.updateAvailable.emit(f"Update available (zip): {remote_sha[:7]}")
                 else:
-                    self.updateAvailable.emit(f"Update available (zip): {remote_sha[:7] if remote_sha else '?'}")
+                    # Network/rate-limit hiccup — don't show a fake update, don't throttle retries
+                    self.info.emit("Update check skipped (no remote SHA).")
             except Exception as e:
                 self.updateFailed.emit(str(e))
             finally:
@@ -528,5 +549,12 @@ class UpdateManager(QtCore.QObject if QtCore else object):
 
     # Convenience for About box / footer
     def version_string(self) -> str:
-        v = get_git_version(self.repo)
-        return v
+        if is_git_repo(self.repo):
+            return get_git_version(self.repo)
+        try:
+            ver = (self.repo / "VERSION")
+            if ver.exists():
+                return ver.read_text(encoding="utf-8").strip() or "(unknown)"
+        except Exception:
+            pass
+        return "(unknown)"
