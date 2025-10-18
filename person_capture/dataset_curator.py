@@ -13,34 +13,34 @@ Reuses project modules: face_embedder.FaceEmbedder, reid_embedder.ReIDEmbedder, 
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
-import math
 import os
+import re
 import sys
+import time
+from collections import Counter
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import cv2
-from PIL import Image
 
 # Robust local imports (package or flat files)
 def _imp():
     try:
         from .face_embedder import FaceEmbedder  # type: ignore
         from .reid_embedder import ReIDEmbedder  # type: ignore
-        from .utils import detect_black_borders, parse_ratio  # type: ignore
-        return FaceEmbedder, ReIDEmbedder, detect_black_borders, parse_ratio
+        from .utils import detect_black_borders  # type: ignore
+        return FaceEmbedder, ReIDEmbedder, detect_black_borders
     except Exception:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from face_embedder import FaceEmbedder  # type: ignore
         from reid_embedder import ReIDEmbedder  # type: ignore
-        from utils import detect_black_borders, parse_ratio  # type: ignore
-        return FaceEmbedder, ReIDEmbedder, detect_black_borders, parse_ratio
+        from utils import detect_black_borders  # type: ignore
+        return FaceEmbedder, ReIDEmbedder, detect_black_borders
 
-FaceEmbedder, ReIDEmbedder, detect_black_borders, parse_ratio = _imp()
+FaceEmbedder, ReIDEmbedder, detect_black_borders = _imp()
 
 
 # --------- metrics ---------
@@ -65,7 +65,10 @@ def phash64(bgr: np.ndarray) -> int:
 
 
 def hamming64(a: int, b: int) -> int:
-    return int(bin((a ^ b) & ((1<<64)-1)).count("1"))
+    x = (a ^ b) & ((1 << 64) - 1)
+    if hasattr(int, "bit_count"):
+        return x.bit_count()
+    return int(bin(x).count("1"))
 
 
 def sharpness_norm(bgr: np.ndarray) -> float:
@@ -101,22 +104,11 @@ def exposure_score(bgr: np.ndarray) -> float:
     return float(max(0.0, min(1.0, s)))
 
 
-def black_border_frac(bgr: np.ndarray) -> float:
-    try:
-        x1,y1,x2,y2 = detect_black_borders(bgr, thr=10)
-    except Exception:
-        return 0.0
-    H, W = (bgr.shape[:2] if bgr is not None else (1,1))
-    keep = max(1, (x2-x1)*(y2-y1))
-    frac = 1.0 - keep/float(max(1, W*H))
-    return float(max(0.0, min(1.0, frac)))
-
-
 def face_fraction(face_xyxy: Optional[Tuple[int,int,int,int]], crop_w: int, crop_h: int) -> float:
     if face_xyxy is None:
         return 0.0
-    x1,y1,x2,y2 = face_xyxy
-    fw, fh = max(1, x2-x1), max(1, y2-y1)
+    x1, y1, x2, y2 = face_xyxy
+    fh = max(1, y2 - y1)
     return float(fh) / float(max(1, crop_h))  # height fraction is more stable for portrait
 
 
@@ -126,13 +118,13 @@ def yaw_roll_from_5pts(pts5: np.ndarray) -> Tuple[float,float]:
         return 0.0, 0.0
     le, re, nose, lm, rm = pts5
     # roll: angle of eye line
-    roll = math.degrees(math.atan2(re[1]-le[1], re[0]-le[0]))
+    roll = float(np.degrees(np.arctan2(re[1]-le[1], re[0]-le[0])))
     # yaw proxy: horizontal eyes-nose symmetry
     eye_mid = (le + re) * 0.5
     dx = (nose[0] - eye_mid[0])
     # normalize by inter-ocular distance
     iod = np.linalg.norm(re - le) + 1e-6
-    yaw = math.degrees(math.atan(dx / iod))
+    yaw = float(np.degrees(np.arctan2(dx, iod)))
     return float(yaw), float(roll)
 
 
@@ -165,6 +157,44 @@ def textlike_corners_score(bgr: np.ndarray) -> float:
     return float(min(1.0, cnt/25.0))
 
 
+def _bb_frac_from_tuple(bb: Any, W: int, H: int) -> float:
+    """Derive black-border fraction from either (x,y,w,h) or (x1,y1,x2,y2)."""
+    if bb is None:
+        return 0.0
+    if not isinstance(bb, (tuple, list)) or len(bb) != 4:
+        return 0.0
+    x, y, a, b = [float(t) for t in bb]
+
+    # Interpret as (x1, y1, x2, y2)
+    area_xyxy = 0.0
+    if a > x and b > y:
+        x1 = max(0.0, min(float(W), x))
+        y1 = max(0.0, min(float(H), y))
+        x2 = max(0.0, min(float(W), a))
+        y2 = max(0.0, min(float(H), b))
+        w_xyxy = max(0.0, x2 - x1)
+        h_xyxy = max(0.0, y2 - y1)
+        if w_xyxy > 0.0 and h_xyxy > 0.0:
+            area_xyxy = w_xyxy * h_xyxy
+
+    # Interpret as (x, y, w, h)
+    area_xywh = 0.0
+    if a > 0.0 and b > 0.0:
+        x1 = max(0.0, min(float(W), x))
+        y1 = max(0.0, min(float(H), y))
+        x2 = max(0.0, min(float(W), x + a))
+        y2 = max(0.0, min(float(H), y + b))
+        w_xywh = max(0.0, x2 - x1)
+        h_xywh = max(0.0, y2 - y1)
+        if w_xywh > 0.0 and h_xywh > 0.0:
+            area_xywh = w_xywh * h_xywh
+
+    keep = max(area_xyxy, area_xywh)
+    total = max(1.0, float(W) * float(H))
+    frac = 1.0 - (keep / total)
+    return float(max(0.0, min(1.0, frac)))
+
+
 def mmr_select(items: List["Item"], k: int, sim_mat: Optional[np.ndarray], alpha: float=0.75) -> List[int]:
     """
     Greedy Maximal Marginal Relevance.
@@ -184,6 +214,8 @@ def mmr_select(items: List["Item"], k: int, sim_mat: Optional[np.ndarray], alpha
             red = 0.0
             if selected and sim_mat is not None:
                 red = float(sim_mat[i, selected].max())
+                if red < 0.0:
+                    red = 0.0
             s = float(alpha*q[i] - (1.0-alpha)*red)
             if s > best_s:
                 best_s, best_i = s, i
@@ -213,22 +245,31 @@ class Item:
     wmark: float            # watermark likelihood 0..1
     bbox: Optional[Tuple[int,int,int,int]]  # face bbox
     meta: Dict[str, float]  # extra fields for UI
+    ts: float = 0.0         # inferred timestamp / ordering key
+    scene: int = -1         # scene/shot cluster id
 
     @property
     def quality_score(self) -> float:
         # weighted quality: identity gate + image quality + exposure + watermark penalty + border penalty
-        # Map fd in [0, 0.5] to [1..0] clamp; use soft gate
-        fd = max(0.0, min(0.8, float(self.face_fd)))
+        # Map fd in [0, 0.5] to [1..0]; values beyond 0.5 collapse to 0 via clipping
+        fd = max(0.0, float(self.face_fd))
         idq = float(np.clip(1.0 - (fd/0.5), 0.0, 1.0))
         q = 0.45*idq + 0.30*self.sharpness + 0.20*self.exposure + 0.05*min(1.0, self.face_quality/1200.0)
         # penalties
         q *= float(max(0.0, 1.0 - 0.6*self.wmark))
+        bb = float(self.meta.get("black_border_frac", 0.0))
+        bb = float(min(max(bb, 0.0), 0.4))  # clamp to avoid over-penalizing mild pillarboxing
+        q *= float(max(0.0, 1.0 - 0.6*bb))
         return float(max(0.0, min(1.0, q)))
 
 
 # --------- curator ---------
 
 class Curator:
+    _re_frame = re.compile(r"\b(?:frame|f|img|i)[_\-]?\s*(\d{3,})(?!\d)", re.IGNORECASE)
+    _re_time_s = re.compile(r"(?:t|time)[_\-:]?(\d+(?:\.\d+)?)\s*s", re.IGNORECASE)
+    _re_num = re.compile(r"(\d{3,})")
+
     def __init__(self,
                  ref_image: Optional[str] = None,
                  device: str = "cuda",
@@ -302,6 +343,130 @@ class Curator:
                 0,
                 0,
             )
+
+    @staticmethod
+    def _infer_ts_from_name(path: str) -> float:
+        """Best-effort timestamp from filename or mtime."""
+        name = os.path.basename(path)
+        for rx in (Curator._re_time_s, Curator._re_frame):
+            match = rx.search(name)
+            if match:
+                try:
+                    return float(match.group(1))
+                except Exception:
+                    continue
+        hits = Curator._re_num.findall(name)
+        if hits:
+            try:
+                return float(hits[-1])
+            except Exception:
+                pass
+        try:
+            return float(os.path.getmtime(path))
+        except Exception:
+            return time.time()
+
+    @staticmethod
+    def _cos(a: np.ndarray, b: np.ndarray) -> float:
+        na = float(np.linalg.norm(a)) + 1e-6
+        nb = float(np.linalg.norm(b)) + 1e-6
+        return float(np.dot(a, b) / (na * nb))
+
+    def _cluster_scenes(
+        self,
+        items: List["Item"],
+        *,
+        sim_thresh: float = 0.92,
+        hamm_thresh: int = 7,
+        time_gap: float = 4.0,
+        nn_window: int = 64,
+    ) -> List[int]:
+        """Lightweight scene clustering using embeddings, phash, and timestamps."""
+
+        if not items:
+            return []
+
+        order = sorted(range(len(items)), key=lambda i: (items[i].ts, items[i].path))
+        clusters: List[List[int]] = []
+        medoids: List[int] = []
+
+        def same_scene(idx: int, med_idx: int) -> bool:
+            a, b = items[idx], items[med_idx]
+            if hamming64(a.phash, b.phash) <= hamm_thresh:
+                return True
+            if a.bg_clip is None or b.bg_clip is None:
+                return False
+            return self._cos(a.bg_clip, b.bg_clip) >= sim_thresh
+
+        for idx in order:
+            it = items[idx]
+            assigned = False
+            start = max(0, len(clusters) - max(1, nn_window))
+            for cidx in range(len(clusters) - 1, start - 1, -1):
+                last_idx = clusters[cidx][-1]
+                dt = abs(it.ts - items[last_idx].ts)
+                if dt > time_gap and not same_scene(idx, medoids[cidx]):
+                    continue
+                if same_scene(idx, medoids[cidx]):
+                    clusters[cidx].append(idx)
+                    if items[idx].quality_score > items[medoids[cidx]].quality_score:
+                        medoids[cidx] = idx
+                    assigned = True
+                    break
+            if not assigned:
+                clusters.append([idx])
+                medoids.append(idx)
+
+        if nn_window > 0 and len(clusters) > 1:
+            merged: List[List[int]] = []
+            for group in clusters:
+                if not merged:
+                    merged.append(group)
+                    continue
+                prev = merged[-1]
+                ia, ib = items[prev[-1]], items[group[0]]
+                if (
+                    abs(ib.ts - ia.ts) <= time_gap
+                    and (
+                        hamming64(ia.phash, ib.phash) <= hamm_thresh
+                        or (
+                            ia.bg_clip is not None
+                            and ib.bg_clip is not None
+                            and self._cos(ia.bg_clip, ib.bg_clip) >= sim_thresh
+                        )
+                    )
+                ):
+                    prev.extend(group)
+                else:
+                    merged.append(group)
+            clusters = merged
+
+        scene_ids = [-1] * len(items)
+        for sid, group in enumerate(clusters):
+            for idx in group:
+                scene_ids[idx] = sid
+        return scene_ids
+
+    @staticmethod
+    def _categorize(it: Item) -> str:
+        """Assign an item to one of the selection buckets."""
+        f = it.face_frac
+        ratio = it.ratio
+        if ratio == "2:3":
+            if f >= 0.33:
+                return "closeup"
+            if 0.22 <= f < 0.33:
+                return "portrait"
+            if 0.12 <= f < 0.22:
+                return "cowboy"
+            return "full"
+        if ratio in ("3:2", "wide"):
+            return "wide"
+        if ratio == "1:1":
+            if f >= 0.30:
+                return "closeup"
+            return "portrait"
+        return "portrait"
 
     def _emit_progress(self, phase: str, done: int, total: int, *, force: bool=False) -> None:
         if self._progress is not None:
@@ -393,11 +558,18 @@ class Curator:
         sharp = sharpness_norm(bgr)
         expo = exposure_score(bgr)
         wmark = textlike_corners_score(bgr)
-        # detect black borders
-        bb_frac = black_border_frac(bgr)
+        # detect black borders (supports: fraction, (x,y,w,h), or (x1,y1,x2,y2); with/without thr kwarg)
+        try:
+            bb = detect_black_borders(bgr, thr=10)
+        except TypeError:
+            bb = detect_black_borders(bgr)
+        if isinstance(bb, (int, float, np.floating)):
+            bb_frac = float(bb)
+        elif isinstance(bb, (tuple, list)) and len(bb) == 4:
+            bb_frac = _bb_frac_from_tuple(bb, W, H)
+        else:
+            bb_frac = 0.0
 
-        # ratio string
-        r = f"{W}:{H}"
         # reduce to common classes
         def norm_ratio(W,H):
             asp = W/float(H)
@@ -412,6 +584,7 @@ class Curator:
         meta = {
             "black_border_frac": bb_frac,
         }
+        ts = self._infer_ts_from_name(path)
 
         return Item(
             path=str(path),
@@ -429,18 +602,31 @@ class Curator:
             wmark=float(wmark),
             bbox=(bbox if bbox is not None else None),
             meta=meta,
+            ts=float(ts),
+            scene=-1,
         )
 
     # ---- Selection with quotas ----
 
-    def select(self,
-               items: List[Item],
-               max_images: int = 200,
-               fd_max: float = 0.45,
-               sharp_min: float = 0.10,
-               dedup_hamm: int = 6,
-               quotas: Optional[Dict[str, Tuple[int,int]]] = None,
-               alpha: float = 0.75) -> List[Item]:
+    def select(
+        self,
+        items: List[Item],
+        max_images: int = 200,
+        fd_max: float = 0.45,
+        sharp_min: float = 0.10,
+        dedup_hamm: int = 7,
+        quotas: Optional[Dict[str, Tuple[int, int]]] = None,
+        alpha: float = 0.75,
+        *,
+        scene_aware: bool = True,
+        scene_sim: float = 0.92,
+        scene_nn_window: int = 64,
+        scene_time_gap: float = 4.0,
+        dedup_hamm_scene: int = 4,
+        scene_soft_cap: int = 0,
+        scene_soft_penalty: float = 0.08,
+        profile_yaw_thresh: float = 50.0,
+    ) -> List[Item]:
         """
         quotas: dict of category -> (min, max) counts
         categories: 'portrait', 'closeup', 'cowboy', 'full', 'wide', 'profile'
@@ -453,52 +639,88 @@ class Curator:
         if not pool:
             return []
 
-        # 2) near-dup removal by phash clustering
-        pool.sort(key=lambda it: (-it.quality_score, it.face_fd))
-        keep = []
-        seen: List[int] = []
-        for it in pool:
-            ph = it.phash
-            dup = False
-            for sph in seen:
-                if hamming64(ph, sph) <= dedup_hamm:
-                    dup = True
-                    break
-            if not dup:
+        scene_members: Dict[int, List[int]] = {}
+        scene_original_counts: Dict[int, int] = {}
+        scene_kept_counts: Dict[int, int] = {}
+        if scene_aware:
+            scene_ids = self._cluster_scenes(
+                pool,
+                sim_thresh=scene_sim,
+                hamm_thresh=dedup_hamm,
+                time_gap=scene_time_gap,
+                nn_window=scene_nn_window,
+            )
+            for idx, sid in enumerate(scene_ids):
+                pool[idx].scene = int(sid)
+                scene_original_counts[sid] = scene_original_counts.get(sid, 0) + 1
+            dedup_pool: List[Item] = []
+            for sid in sorted(set(scene_ids) or {-1}):
+                idxs = [i for i, sc in enumerate(scene_ids) if sc == sid]
+                idxs.sort(key=lambda k: (-pool[k].quality_score, pool[k].face_fd, pool[k].ts, pool[k].path))
+                seen_ph: List[int] = []
+                for k in idxs:
+                    ph = pool[k].phash
+                    if any(hamming64(ph, sph) <= dedup_hamm_scene for sph in seen_ph):
+                        continue
+                    seen_ph.append(ph)
+                    dedup_pool.append(pool[k])
+                    scene_kept_counts[sid] = scene_kept_counts.get(sid, 0) + 1
+            pool = dedup_pool
+        else:
+            pool.sort(key=lambda it: (-it.quality_score, it.face_fd, it.ts, it.path))
+            keep = []
+            seen: List[int] = []
+            for it in pool:
+                ph = it.phash
+                if any(hamming64(ph, sph) <= dedup_hamm for sph in seen):
+                    continue
                 keep.append(it)
                 seen.append(ph)
-        pool = keep
+            pool = keep
+
+        if not pool:
+            return []
+
+        # rebuild scene membership after deduplication
+        if scene_aware:
+            for idx, it in enumerate(pool):
+                scene_members.setdefault(int(it.scene), []).append(idx)
+        else:
+            scene_members[0] = list(range(len(pool)))
+
+        if self._progress and scene_aware:
+            sizes = sorted((len(v) for v in scene_members.values()), reverse=True)
+            if sizes:
+                arr = np.asarray(sizes, dtype=np.float32)
+                p50 = int(round(float(np.percentile(arr, 50))))
+                p95 = int(round(float(np.percentile(arr, 95))))
+                biggest_sid = max(scene_members, key=lambda s: len(scene_members[s]))
+                kept = sum(len(v) for v in scene_members.values())
+                self._emit_progress(
+                    f"scenes: {len(sizes)} groups; kept={kept} after in-scene dedup; "
+                    f"max={len(scene_members[biggest_sid])} (sid={biggest_sid}) p50={p50} p95={p95}",
+                    0,
+                    0,
+                    force=True,
+                )
+                debug_flag = os.getenv("PC_DEBUG_SCENES", "0").lower()
+                if debug_flag not in {"0", "false", "no"} and scene_original_counts:
+                    removed_msgs = []
+                    for sid, total in sorted(scene_original_counts.items()):
+                        kept_count = scene_kept_counts.get(sid, 0)
+                        removed = total - kept_count
+                        if removed > 0:
+                            removed_msgs.append(f"sid={sid}: -{removed}")
+                    if removed_msgs:
+                        self._emit_progress(
+                            "scene dedup trimmed " + ", ".join(removed_msgs),
+                            0,
+                            0,
+                            force=True,
+                        )
 
         # 3) categorize
-        def categorize(it: Item) -> str:
-            # face fraction based classes
-            f = it.face_frac
-            ratio = it.ratio
-            # profile by yaw
-            if abs(it.yaw) >= 50.0:
-                prof = True
-            else:
-                prof = False
-            if ratio == "2:3":
-                if f >= 0.33:
-                    return "closeup"
-                if 0.22 <= f < 0.33:
-                    return "portrait"
-                if 0.12 <= f < 0.22:
-                    return "cowboy"
-                return "full"
-            elif ratio == "3:2" or ratio == "wide":
-                return "wide"
-            elif ratio == "1:1":
-                if f >= 0.30: return "closeup"
-                return "portrait"
-            else:
-                return "portrait"
-        cats = [categorize(it) for it in pool]
-        # maintain an index per category
-        by_cat: Dict[str, List[int]] = {}
-        for i, c in enumerate(cats):
-            by_cat.setdefault(c, []).append(i)
+        cats = [self._categorize(it) for it in pool]
 
         # 4) per-category MMR, then global fill with quotas
         # default quotas based on guide:
@@ -512,94 +734,175 @@ class Curator:
                 "wide": (5, 20),
                 "profile": (0, 20),  # enforced as a cap below
             }
-        # build sim matrix for diversity using bg_clip cosine
+        # Normalize per-item features once; per-scene similarity built on demand
         feats = [it.bg_clip for it in pool]
-        if any(f is None for f in feats):
-            sim = None
-        else:
-            F = np.stack(feats).astype(np.float32)
-            F /= (np.linalg.norm(F, axis=1, keepdims=True) + 1e-6)
-            sim = (F @ F.T)
+        Fn: List[Optional[np.ndarray]] = []
+        for f in feats:
+            if f is None:
+                Fn.append(None)
+            else:
+                v = np.asarray(f, dtype=np.float32)
+                v /= (np.linalg.norm(v) + 1e-6)
+                Fn.append(v)
 
-        # helper to get ranked indices within a subset
-        def ranked(indices: List[int]) -> List[int]:
-            sub = [pool[i] for i in indices]
-            S = sim[np.ix_(indices, indices)] if sim is not None else None
-            sel_local = mmr_select(sub, k=len(sub), sim_mat=S, alpha=alpha)
-            return [indices[j] for j in sel_local]
-
-        ranked_by_cat: Dict[str, List[int]] = {c: ranked(idx) for c, idx in by_cat.items()}
+        # build per-scene ranked lists using MMR for variety
+        scene_lists: Dict[int, List[int]] = {}
+        if scene_members:
+            for sid, idxs in scene_members.items():
+                if not idxs:
+                    continue
+                if all(Fn[i] is not None for i in idxs):
+                    Fs = np.stack([Fn[i] for i in idxs]).astype(np.float32)
+                    S = Fs @ Fs.T
+                else:
+                    S = None
+                sub = [pool[i] for i in idxs]
+                order = mmr_select(sub, k=len(sub), sim_mat=S, alpha=alpha)
+                scene_lists[sid] = [idxs[j] for j in order]
 
         # fill respecting quotas
         out_idx: List[int] = []
         counts = {k: 0 for k in quotas.keys()}
-        # First pass meet minimums
-        for c, (cmin, cmax) in quotas.items():
-            candidates = ranked_by_cat.get(c, [])
-            take = min(cmin, len(candidates))
-            out_idx.extend(candidates[:take])
-            counts[c] += take
-            ranked_by_cat[c] = candidates[take:]
-        # Second pass fill to max_images without exceeding per-cat max
-        # Also enforce profile cap by skipping items with |yaw|>=50 into "profile" budget.
+        chosen_ph: List[int] = []
+        base_vecs: List[np.ndarray] = []
+        scene_counts: Dict[int, int] = {}
+
         def is_profile(it: Item) -> bool:
-            return abs(it.yaw) >= 50.0
-        # build a flattened ranked list from remaining categories by MMR against already chosen
-        chosen_vecs = [pool[i].bg_clip for i in out_idx if pool[i].bg_clip is not None]
-        if chosen_vecs and sim is not None:
-            base = np.stack(chosen_vecs).astype(np.float32)
-            base /= (np.linalg.norm(base, axis=1, keepdims=True) + 1e-6)
-        else:
-            base = None
+            return abs(it.yaw) >= profile_yaw_thresh
 
-        # function to compute reduction vs chosen set
+        def append_base(idx: int) -> None:
+            vec = Fn[idx]
+            if vec is None:
+                return
+            base_vecs.append(vec)
+
         def red_score(idx: int) -> float:
-            if base is None or pool[idx].bg_clip is None:
+            if not base_vecs:
                 return 0.0
-            v = pool[idx].bg_clip
-            v = v / (np.linalg.norm(v) + 1e-6)
-            return float((v @ base.T).max())
+            vec = Fn[idx]
+            if vec is None:
+                return 0.0
+            sims = [float(np.dot(vec, b)) for b in base_vecs]
+            if not sims:
+                return 0.0
+            return float(max(0.0, max(sims)))
 
-        # global heap-like greedy selection
-        while len(out_idx) < min(max_images, len(pool)):
-            # candidate pool across all categories
-            cand = []
-            for c, lst in ranked_by_cat.items():
-                if not lst: continue
-                # skip if category already at max
-                cmin, cmax = quotas.get(c, (0, max_images))
-                if counts.get(c, 0) >= cmax:
+        def peek_scene_candidate(sid: int, category: str) -> Optional[Tuple[int, int]]:
+            lst = scene_lists.get(sid)
+            if not lst:
+                return None
+            pos = 0
+            while pos < len(lst):
+                idx = lst[pos]
+                if cats[idx] != category:
+                    pos += 1
                     continue
-                # consider head of list
-                cand.append(lst[0])
-            if not cand:
-                break
-            # pick the one with best MMR score against chosen
-            best_i = None
-            best_s = -1e9
-            for i in cand:
-                it = pool[i]
-                # if profile, ensure we have budget
-                if is_profile(it):
-                    pmin, pmax = quotas.get("profile", (0, 0))
+                _, cmax = quotas.get(category, (0, max_images))
+                if counts.get(category, 0) >= cmax:
+                    return None
+                if any(hamming64(pool[idx].phash, sph) <= dedup_hamm for sph in chosen_ph):
+                    lst.pop(pos)
+                    continue
+                if is_profile(pool[idx]):
+                    _, pmax = quotas.get("profile", (0, 0))
                     if counts.get("profile", 0) >= pmax:
-                        # try to skip profile if over cap
+                        lst.pop(pos)
                         continue
-                q = it.quality_score
-                r = red_score(i)
-                s = float(alpha*q - (1.0-alpha)*r)
-                if s > best_s:
-                    best_s, best_i = s, i
-            if best_i is None:
+                return idx, pos
+            return None
+
+        # First pass: meet minimums while spreading across scenes
+        for cat, (cmin, cmax) in quotas.items():
+            if cat == "profile":
+                cmin = 0  # profiles are a cap, not a target
+            if cmin <= 0:
+                continue
+            need = min(cmin, max_images)
+            while need > 0:
+                best_idx = None
+                best_sid = None
+                best_pos = None
+                best_score = -1e9
+                for sid in list(scene_lists.keys()):
+                    peek = peek_scene_candidate(sid, cat)
+                    if peek is None:
+                        continue
+                    idx, pos = peek
+                    score = float(alpha * pool[idx].quality_score - (1.0 - alpha) * red_score(idx))
+                    if score > best_score:
+                        best_score = score
+                        best_idx = idx
+                        best_sid = sid
+                        best_pos = pos
+                if best_idx is None:
+                    break
+                out_idx.append(best_idx)
+                if best_sid is not None:
+                    scene_counts[best_sid] = scene_counts.get(best_sid, 0) + 1
+                counts[cat] = counts.get(cat, 0) + 1
+                if is_profile(pool[best_idx]):
+                    counts["profile"] = counts.get("profile", 0) + 1
+                chosen_ph.append(pool[best_idx].phash)
+                append_base(best_idx)
+                if best_sid is not None and scene_lists.get(best_sid):
+                    scene_lists[best_sid].pop(best_pos)
+                need -= 1
+
+        def pop_head_candidate(sid: int) -> Optional[int]:
+            lst = scene_lists.get(sid)
+            if not lst:
+                return None
+            while lst:
+                idx = lst[0]
+                cat = cats[idx]
+                _, cmax = quotas.get(cat, (0, max_images))
+                if counts.get(cat, 0) >= cmax:
+                    lst.pop(0)
+                    continue
+                if any(hamming64(pool[idx].phash, sph) <= dedup_hamm for sph in chosen_ph):
+                    lst.pop(0)
+                    continue
+                if is_profile(pool[idx]):
+                    _, pmax = quotas.get("profile", (0, 0))
+                    if counts.get("profile", 0) >= pmax:
+                        lst.pop(0)
+                        continue
+                return idx
+            return None
+
+        # Second pass: water-fill by scenes until quotas or max_images reached
+        while len(out_idx) < min(max_images, len(pool)):
+            candidates: List[Tuple[int, int]] = []
+            for sid in list(scene_lists.keys()):
+                idx = pop_head_candidate(sid)
+                if idx is not None:
+                    candidates.append((sid, idx))
+            if not candidates:
                 break
-            # accept
-            c = cats[best_i]
-            out_idx.append(best_i)
-            counts[c] = counts.get(c, 0) + 1
-            if is_profile(pool[best_i]):
+            best_sid = None
+            best_idx = None
+            best_score = -1e9
+            for sid, idx in candidates:
+                score = float(alpha * pool[idx].quality_score - (1.0 - alpha) * red_score(idx))
+                if int(scene_soft_cap) > 0 and scene_counts.get(sid, 0) >= int(scene_soft_cap):
+                    score -= scene_soft_penalty
+                if score > best_score:
+                    best_score = score
+                    best_sid = sid
+                    best_idx = idx
+            if best_idx is None:
+                break
+            cat = cats[best_idx]
+            out_idx.append(best_idx)
+            if best_sid is not None:
+                scene_counts[best_sid] = scene_counts.get(best_sid, 0) + 1
+            counts[cat] = counts.get(cat, 0) + 1
+            if is_profile(pool[best_idx]):
                 counts["profile"] = counts.get("profile", 0) + 1
-            # pop from its category list
-            ranked_by_cat[c].pop(0)
+            chosen_ph.append(pool[best_idx].phash)
+            append_base(best_idx)
+            if best_sid is not None and scene_lists.get(best_sid):
+                scene_lists[best_sid].pop(0)
 
         sel = [pool[i] for i in out_idx]
         # final trim if we exceeded max due to minimum pass
@@ -609,8 +912,24 @@ class Curator:
 
     # ---- run end-to-end on a folder ----
 
-    def run(self, pool_dir: str, out_dir: str, max_images: int = 200,
-            quotas: Optional[Dict[str, Tuple[int,int]]] = None) -> str:
+    def run(
+        self,
+        pool_dir: str,
+        out_dir: str,
+        max_images: int = 200,
+        quotas: Optional[Dict[str, Tuple[int, int]]] = None,
+        *,
+        scene_aware_override: Optional[bool] = None,
+        scene_sim_override: Optional[float] = None,
+        scene_time_gap_override: Optional[float] = None,
+        scene_nn_window_override: Optional[int] = None,
+        dedup_hamm_override: Optional[int] = None,
+        scene_dedup_override: Optional[int] = None,
+        scene_soft_cap_override: Optional[int] = None,
+        scene_soft_penalty_override: Optional[float] = None,
+        alpha_override: Optional[float] = None,
+        profile_yaw_override: Optional[float] = None,
+    ) -> str:
         paths: List[str] = []
         for ext in ("*.jpg","*.jpeg","*.png","*.webp","*.bmp",
                     "*.JPG","*.JPEG","*.PNG","*.WEBP","*.BMP"):
@@ -627,22 +946,184 @@ class Curator:
                 items.append(it)
             if (i % 25 == 0) or (i == total):
                 self._emit_progress("scan", i, total, force=True)
-        sel = self.select(items, max_images=max_images, quotas=quotas)
+        def _float_env(name: str, default: float) -> float:
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            raw = raw.strip()
+            if not raw:
+                return default
+            try:
+                return float(raw)
+            except Exception:
+                return default
+
+        def _int_env(name: str, default: int) -> int:
+            raw = os.getenv(name)
+            if raw is None:
+                return default
+            raw = raw.strip()
+            if not raw:
+                return default
+            try:
+                return int(float(raw))
+            except Exception:
+                return default
+
+        def _first_float_env(keys: Tuple[str, ...], default: float) -> float:
+            for key in keys:
+                raw = os.getenv(key)
+                if raw is None:
+                    continue
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    return float(raw)
+                except Exception:
+                    continue
+            return default
+
+        scene_aware_env = os.getenv("PC_SCENE_AWARE", "1").lower()
+        scene_aware = scene_aware_env not in {"0", "false", "no"}
+        if scene_aware_override is not None:
+            scene_aware = bool(scene_aware_override)
+
+        scene_sim = _float_env("PC_SCENE_SIM", 0.92)
+        if scene_sim_override is not None:
+            scene_sim = float(scene_sim_override)
+
+        scene_time_gap = _float_env("PC_SCENE_TIME_GAP", 4.0)
+        if scene_time_gap_override is not None:
+            scene_time_gap = float(scene_time_gap_override)
+
+        scene_nn_window = max(0, _int_env("PC_SCENE_NN_WINDOW", 64))
+        if scene_nn_window_override is not None:
+            scene_nn_window = max(0, int(scene_nn_window_override))
+
+        dedup_hamm_global = max(0, _int_env("PC_DEDUP_HAMM", 7))
+        if dedup_hamm_override is not None:
+            dedup_hamm_global = max(0, int(dedup_hamm_override))
+
+        dedup_hamm_scene = max(0, _int_env("PC_SCENE_DEDUP", 4))
+        if scene_dedup_override is not None:
+            dedup_hamm_scene = max(0, int(scene_dedup_override))
+
+        scene_soft_cap = max(0, _int_env("PC_SCENE_SOFT_CAP", 0))
+        if scene_soft_cap_override is not None:
+            scene_soft_cap = max(0, int(scene_soft_cap_override))
+        scene_soft_penalty = _first_float_env(("PC_SCENE_SOFT_PENALTY", "PC_SCENE_SOFT_BONUS"), 0.08)
+        if scene_soft_penalty_override is not None:
+            scene_soft_penalty = float(scene_soft_penalty_override)
+        scene_soft_penalty = float(max(0.0, scene_soft_penalty))
+
+        alpha = _float_env("PC_MMR_ALPHA", 0.75)
+        if alpha_override is not None:
+            alpha = float(alpha_override)
+        alpha = float(min(1.0, max(0.0, alpha)))
+
+        profile_yaw_thresh = _float_env("PC_PROFILE_YAW", 50.0)
+        if profile_yaw_override is not None:
+            profile_yaw_thresh = float(profile_yaw_override)
+        profile_yaw_thresh = float(max(0.0, profile_yaw_thresh))
+
+        sel = self.select(
+            items,
+            max_images=max_images,
+            quotas=quotas,
+            dedup_hamm=dedup_hamm_global,
+            scene_aware=scene_aware,
+            scene_sim=scene_sim,
+            scene_nn_window=scene_nn_window,
+            scene_time_gap=scene_time_gap,
+            dedup_hamm_scene=dedup_hamm_scene,
+            scene_soft_cap=scene_soft_cap,
+            scene_soft_penalty=scene_soft_penalty,
+            profile_yaw_thresh=profile_yaw_thresh,
+            alpha=alpha,
+        )
         if not items:
             self._emit_progress("select", 0, 0, force=True)
         elif not sel:
             self._emit_progress("select", 0, len(items), force=True)
         else:
             self._emit_progress("select", len(sel), len(items), force=True)
+            if scene_aware:
+                scene_ids = {it.scene for it in sel if it.scene >= 0}
+                scene_total = max(1, len(scene_ids))
+            else:
+                scene_total = 1
+            summary = (
+                f"select summary: picked {len(sel)} of {len(items)} across "
+                f"{scene_total} scene{'s' if scene_total != 1 else ''}"
+            )
+            self._emit_progress(summary, len(sel), len(items), force=True)
+            cat_counts = Counter(self._categorize(it) for it in sel)
+            profile_count = sum(1 for it in sel if abs(it.yaw) >= profile_yaw_thresh)
+            if cat_counts or profile_count:
+                order = ["closeup", "portrait", "cowboy", "full", "wide"]
+                parts = [f"{cat}={cat_counts[cat]}" for cat in order if cat_counts.get(cat)]
+                extra = [c for c in sorted(cat_counts.keys()) if c not in order]
+                parts.extend(f"{cat}={cat_counts[cat]}" for cat in extra)
+                if profile_count:
+                    parts.append(f"profile={profile_count}")
+                if parts:
+                    self._emit_progress(
+                        "categories: " + ", ".join(parts),
+                        len(sel),
+                        len(items),
+                        force=True,
+                    )
         # write manifest and copy hardlinks
         os.makedirs(out_dir, exist_ok=True)
         man_csv = os.path.join(out_dir, "dataset_manifest.csv")
         with open(man_csv, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["rank","file","face_fd","sharpness","exposure","face_frac","yaw","roll","ratio","quality","category"])
+            w.writerow([
+                "rank",
+                "file",
+                "face_fd",
+                "sharpness",
+                "exposure",
+                "face_frac",
+                "yaw",
+                "roll",
+                "ratio",
+                "quality",
+                "category",
+                "is_profile",
+            ])
             for i, it in enumerate(sel):
-                w.writerow([i+1, it.path, it.face_fd, it.sharpness, it.exposure, it.face_frac, it.yaw, it.roll, it.ratio, it.quality_score,
-                            "profile" if abs(it.yaw)>=50.0 else ""])
+                w.writerow([
+                    i + 1,
+                    it.path,
+                    it.face_fd,
+                    it.sharpness,
+                    it.exposure,
+                    it.face_frac,
+                    it.yaw,
+                    it.roll,
+                    it.ratio,
+                    it.quality_score,
+                    self._categorize(it),
+                    1 if abs(it.yaw) >= profile_yaw_thresh else 0,
+                ])
+
+        debug_flag = os.getenv("PC_DEBUG_SCENES", "0").lower()
+        if scene_aware and debug_flag not in {"0", "false", "no"}:
+            debug_csv = os.path.join(out_dir, "scenes_debug.csv")
+            with open(debug_csv, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["file", "scene", "ts", "quality", "category", "is_profile"])
+                for it in sel:
+                    w.writerow([
+                        it.path,
+                        it.scene,
+                        it.ts,
+                        it.quality_score,
+                        self._categorize(it),
+                        1 if abs(it.yaw) >= profile_yaw_thresh else 0,
+                    ])
         # materialize numbered copies for LoRA trainer
         self._emit_progress("write", 0, len(sel), force=True)
         for i, it in enumerate(sel, start=1):
@@ -693,6 +1174,18 @@ class Curator:
             ),
             "detector": self.face_model,
             "det_conf": round(self.face_det_conf, 3),
+            "scene_aware": bool(scene_aware),
+            "scene_sim": float(scene_sim),
+            "scene_nn_window": int(scene_nn_window),
+            "scene_time_gap": float(scene_time_gap),
+            "dedup_hamm": int(dedup_hamm_global),
+            "dedup_hamm_scene": int(dedup_hamm_scene),
+            "scene_soft_cap": int(scene_soft_cap),
+            # keep both keys so older builds reading *_bonus continue to work
+            "scene_soft_penalty": float(scene_soft_penalty),
+            "scene_soft_bonus": float(scene_soft_penalty),
+            "mmr_alpha": float(alpha),
+            "profile_yaw_thresh": float(profile_yaw_thresh),
             "items": legacy_items,
         }
         with open(metrics_v2, "w", encoding="utf-8") as f:
@@ -711,8 +1204,50 @@ def _main():
     ap.add_argument("--max", type=int, default=200, help="max images")
     ap.add_argument("--device", default="cuda", choices=["cuda","cpu"], help="device")
     ap.add_argument("--trt-lib-dir", default="", help="TensorRT lib folder if using ArcFace ONNX TRT EP")
-    ap.add_argument("--assume-identity", action="store_true",
-                    help="assume all images already passed identity (skip identity gate; set fd=0.0)")
+    ap.add_argument(
+        "--assume-identity",
+        action="store_true",
+        help="assume all images already passed identity (skip identity gate; set fd=0.0). Defaults to on when --ref omitted.",
+    )
+    ap.add_argument(
+        "--scene-aware",
+        type=int,
+        choices=[0, 1],
+        default=None,
+        help="override scene-aware selection (1=on, 0=off)",
+    )
+    ap.add_argument("--scene-sim", type=float, default=None, help="override scene similarity threshold")
+    ap.add_argument("--scene-time-gap", type=float, default=None, help="override max time gap when clustering scenes")
+    ap.add_argument("--scene-nn-window", type=int, default=None, help="override scene stitching window")
+    ap.add_argument(
+        "--dedup-hamm",
+        type=int,
+        default=None,
+        help="override global dedup hamming threshold (default 7; keep ≥ in-scene)",
+    )
+    ap.add_argument(
+        "--scene-dedup",
+        type=int,
+        default=None,
+        help="override in-scene dedup hamming threshold (default 4)",
+    )
+    ap.add_argument("--scene-soft-cap", type=int, default=None, help="soft cap per scene (0 disables)")
+    ap.add_argument(
+        "--scene-soft-penalty",
+        dest="scene_soft_penalty",
+        type=float,
+        default=None,
+        help="penalty applied when soft cap exceeded (alias: --scene-soft-bonus)",
+    )
+    ap.add_argument(
+        "--scene-soft-bonus",
+        dest="scene_soft_penalty",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    ap.add_argument("--mmr-alpha", type=float, default=None, help="MMR trade-off between quality and diversity (0..1)")
+    ap.add_argument("--profile-yaw", type=float, default=None, help="Yaw threshold in degrees for treating a face as profile")
     args = ap.parse_args()
 
     cur = Curator(
@@ -721,7 +1256,22 @@ def _main():
         trt_lib_dir=(args.trt_lib_dir or None),
         assume_identity=bool(args.assume_identity or not args.ref),
     )
-    out = cur.run(args.pool, args.out, max_images=int(args.max))
+    scene_aware_override = None if args.scene_aware is None else bool(args.scene_aware)
+    out = cur.run(
+        args.pool,
+        args.out,
+        max_images=int(args.max),
+        scene_aware_override=scene_aware_override,
+        scene_sim_override=args.scene_sim,
+        scene_time_gap_override=args.scene_time_gap,
+        scene_nn_window_override=args.scene_nn_window,
+        dedup_hamm_override=args.dedup_hamm,
+        scene_dedup_override=args.scene_dedup,
+        scene_soft_cap_override=args.scene_soft_cap,
+        scene_soft_penalty_override=args.scene_soft_penalty,
+        alpha_override=args.mmr_alpha,
+        profile_yaw_override=args.profile_yaw,
+    )
     print(out)
 
 
