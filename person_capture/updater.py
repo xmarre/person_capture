@@ -405,19 +405,47 @@ def apply_staged_update(repo: Path) -> Tuple[bool, str]:
         return False, f"swap error: {e}"
 
 def _restart_self(extra_args: Optional[list[str]] = None) -> None:
-    # Supports both "python script.py" and frozen exe bundles.
+    """Restart the app, forcing a fresh terminal on Windows."""
+
+    # Build argv & stable CWD
     if getattr(sys, "frozen", False):
-        # In frozen apps, sys.executable IS the executable.
-        args = [sys.executable, *(sys.argv[1:] or [])]
+        exe = Path(sys.executable).resolve()
+        argv = [str(exe), *(sys.argv[1:] or [])]
+        cwd = exe.parent
     else:
-        py = sys.executable
-        args = [py, sys.argv[0], *(sys.argv[1:] or [])]
+        script = Path(sys.argv[0]).resolve()
+        py = Path(sys.executable)
+        # If we’re on Windows and got pythonw.exe, prefer python.exe so a console appears.
+        if os.name == "nt" and py.name.lower() == "pythonw.exe":
+            cand = py.with_name("python.exe")
+            if cand.exists():
+                py = cand
+        # -u = unbuffered so logs flush to the new console
+        argv = [str(py), "-u", str(script), *(sys.argv[1:] or [])]
+        cwd = script.parent
     if extra_args:
-        args.extend(extra_args)
-    creationflags = 0
+        argv.extend(extra_args)
+
     if os.name == "nt":
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    subprocess.Popen(args, close_fds=True, creationflags=creationflags)
+        # Force a NEW console window on Windows.
+        # `start "" <cmd> <args>`: empty title arg is required.
+        try:
+            subprocess.Popen(
+                ["cmd.exe", "/c", "start", "", *argv],
+                close_fds=True,
+                cwd=str(cwd),
+            )
+        except Exception:
+            # Fallback: request a new console directly
+            subprocess.Popen(
+                argv,
+                close_fds=True,
+                creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+                cwd=str(cwd),
+            )
+    else:
+        # Non-Windows: keep behavior (opening a brand-new terminal is DE/OS-specific).
+        subprocess.Popen(argv, close_fds=True, cwd=str(cwd))
 
 # ------------------ Qt Integration ------------------
 
