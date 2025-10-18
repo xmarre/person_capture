@@ -78,48 +78,92 @@ def _round32(x: int) -> int:
 
 
 def _ensure_file(path: str, urls, progress=None) -> str:
+    """Return a local path to `path`, trying common roots before downloading."""
+
     p = Path(path)
     if p.exists():
         return str(p.resolve())
-    if p.parent and not p.parent.exists():
-        p.parent.mkdir(parents=True, exist_ok=True)
+
+    pkg = Path(__file__).resolve().parent
+    roots = [pkg, pkg.parent]
+    try:
+        roots.append(Path(sys.argv[0]).resolve().parent)
+    except Exception:
+        pass
+
+    rel = p if not p.is_absolute() else Path(p.name)
+    candidates = []
+    if rel and rel != Path('.'):
+        candidates.append(rel)
+    if rel.name:
+        candidates.append(Path(rel.name))
+
+    seen: set[Path] = set()
+    for base in roots:
+        for name in candidates:
+            cand = (base / name).resolve()
+            if cand in seen:
+                continue
+            seen.add(cand)
+            if cand.exists():
+                return str(cand)
+
+    target = p
+    if not p.is_absolute() and (not p.parent or str(p.parent) in ('', '.')):
+        target = (pkg.parent / p.name).resolve()
+
+    if target.parent and not target.parent.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+
     last_err = None
     for url in urls:
         try:
-            if progress: progress(f"Downloading: {url}")
+            if progress:
+                progress(f"Downloading: {url}")
             req = Request(url, headers={"User-Agent": "Mozilla/5.0 PersonCapture"})
             with urlopen(req, timeout=90) as r:
-                total = int(r.headers.get('Content-Length') or 0)
+                total = int(r.headers.get("Content-Length") or 0)
                 tmp = tempfile.NamedTemporaryFile(delete=False)
                 downloaded = 0
                 while True:
-                    chunk = r.read(1024*1024)
+                    chunk = r.read(1024 * 1024)
                     if not chunk:
                         break
                     tmp.write(chunk)
                     downloaded += len(chunk)
                     if progress and total:
-                        progress(f"Downloading: {url}  {downloaded/total*100:.1f}%")
+                        progress(f"Downloading: {url}  {downloaded / total * 100:.1f}%")
                 tmp.close()
                 tmp_path = Path(tmp.name)
-            shutil.move(str(tmp_path), str(p))
-            if progress: progress(f"Saved: {p}")
+            shutil.move(str(tmp_path), str(target))
+            if progress:
+                progress(f"Saved: {target}")
             # minimal integrity: require > 50MB (real models are ~160–260MB)
-            if p.stat().st_size < 50 * 1024 * 1024:
-                raise OSError(f"Downloaded file too small: {p} ({p.stat().st_size} bytes)")
-            return str(p.resolve())
+            if target.stat().st_size < 50 * 1024 * 1024:
+                raise OSError(
+                    f"Downloaded file too small: {target} ({target.stat().st_size} bytes)"
+                )
+            return str(target)
         except (URLError, HTTPError, SocketTimeout, OSError) as e:
             last_err = e
             continue
-    raise FileNotFoundError(f"Could not obtain '{path}'. Tried: {', '.join(urls)}. Last error: {last_err}")
+    raise FileNotFoundError(
+        f"Could not obtain '{path}'. Tried: {', '.join(urls)}. Last error: {last_err}"
+    )
 
 
 def _ensure_from_zip(out_path: str, zip_urls, want_suffix="glintr100.onnx", progress=None) -> str:
     p = Path(out_path)
     if p.exists():
         return str(p.resolve())
-    if p.parent and not p.parent.exists():
-        p.parent.mkdir(parents=True, exist_ok=True)
+
+    pkg = Path(__file__).resolve().parent
+    target = p
+    if not p.is_absolute() and (not p.parent or str(p.parent) in ("", ".")):
+        target = (pkg.parent / p.name).resolve()
+
+    if target.parent and not target.parent.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
     tmpzip = None
     last_err = None
     for url in zip_urls:
@@ -137,11 +181,13 @@ def _ensure_from_zip(out_path: str, zip_urls, want_suffix="glintr100.onnx", prog
                     raise FileNotFoundError(f"{want_suffix} not found in ZIP")
                 member = max(cand, key=len)
                 if progress: progress(f"Extracting: {member}")
-                with zf.open(member) as src, open(p, "wb") as dst:
+                with zf.open(member) as src, open(target, "wb") as dst:
                     shutil.copyfileobj(src, dst)
-                if p.stat().st_size < 50 * 1024 * 1024:
-                    raise OSError(f"Extracted file too small: {p} ({p.stat().st_size} bytes)")
-                return str(p.resolve())
+                if target.stat().st_size < 50 * 1024 * 1024:
+                    raise OSError(
+                        f"Extracted file too small: {target} ({target.stat().st_size} bytes)"
+                    )
+                return str(target.resolve())
         except (URLError, HTTPError, SocketTimeout, OSError, Exception) as e:
             last_err = e
             continue
