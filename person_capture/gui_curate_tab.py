@@ -1,11 +1,11 @@
-
 from __future__ import annotations
 
 import os, traceback
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict, Tuple
 
 from PySide6 import QtCore, QtWidgets
+
 
 # robust imports
 def _imp():
@@ -13,15 +13,17 @@ def _imp():
         from .dataset_curator import Curator  # type: ignore
     except Exception:
         import sys
+
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from dataset_curator import Curator  # type: ignore
     return Curator
+
 
 Curator = _imp()
 
 
 class CurateWorker(QtCore.QObject):
-    progress = QtCore.Signal(str, int, int)   # phase, done, total
+    progress = QtCore.Signal(str, int, int)  # phase, done, total
     finished = QtCore.Signal(str, list)  # out_dir, manifest rows
     failed = QtCore.Signal(str)
 
@@ -38,11 +40,18 @@ class CurateWorker(QtCore.QObject):
         scene_time_gap: float = 4.0,
         scene_nn_window: int = 64,
         dedup_hamm: int = 7,
-        scene_dedup: int = 4,
+        scene_dedup: int = 8,
         scene_soft_cap: int = 0,
         scene_soft_penalty: float = 0.08,
         mmr_alpha: float = 0.75,
         profile_yaw: float = 50.0,
+        div_bg: float = 1.0,
+        div_face: float = 0.6,
+        closeup_boost: float = 0.25,
+        closeup_thr: float = 0.33,
+        quotas: Optional[Dict[str, Tuple[int, int]]] = None,
+        fd_max: float = 0.45,
+        sharp_min: float = 0.10,
     ):
         super().__init__()
         self.pool_dir = pool_dir
@@ -60,6 +69,13 @@ class CurateWorker(QtCore.QObject):
         self.scene_soft_penalty = float(scene_soft_penalty)
         self.mmr_alpha = float(mmr_alpha)
         self.profile_yaw = float(profile_yaw)
+        self.div_bg = float(div_bg)
+        self.div_face = float(div_face)
+        self.closeup_boost = float(closeup_boost)
+        self.closeup_thr = float(closeup_thr)
+        self.quotas = quotas or None
+        self.fd_max = float(fd_max)
+        self.sharp_min = float(sharp_min)
 
     @QtCore.Slot()
     def run(self):
@@ -89,7 +105,9 @@ class CurateWorker(QtCore.QObject):
                 face_model=str(face_model),
                 face_det_conf=float(face_det_conf),
                 assume_identity=bool(not self.ref_path),
-                progress=lambda phase, done, total: self.progress.emit(str(phase), int(done), int(total)),
+                progress=lambda phase, done, total: self.progress.emit(
+                    str(phase), int(done), int(total)
+                ),
             )
             # If user provided a ref but it yielded no face, abort (matches main GUI behavior).
             if (
@@ -112,6 +130,13 @@ class CurateWorker(QtCore.QObject):
                 scene_soft_penalty_override=self.scene_soft_penalty,
                 alpha_override=self.mmr_alpha,
                 profile_yaw_override=self.profile_yaw,
+                diversity_bg_weight_override=self.div_bg,
+                diversity_face_weight_override=self.div_face,
+                closeup_boost_override=self.closeup_boost,
+                closeup_thr_override=self.closeup_thr,
+                quotas_override=self.quotas,
+                fd_max_override=self.fd_max,
+                sharp_min_override=self.sharp_min,
             )
             # read manifest for UI
             rows = []
@@ -120,17 +145,26 @@ class CurateWorker(QtCore.QObject):
                 import csv
 
                 with open(mp, "r", encoding="utf-8", newline="") as f:
-                    reader = csv.reader(f)
-                    next(reader, None)
-                    for parts in reader:
-                        rows.append([p.strip() for p in parts])
+                    reader = csv.DictReader(f)
+                    for rec in reader:
+                        rows.append(
+                            [
+                                (rec.get("rank") or "").strip(),
+                                (rec.get("dst_file") or "").strip(),
+                                (rec.get("file") or "").strip(),
+                                (rec.get("face_fd") or "").strip(),
+                                (rec.get("sharpness") or "").strip(),
+                                (rec.get("face_frac") or "").strip(),
+                                (rec.get("ratio") or "").strip(),
+                            ]
+                        )
             self.finished.emit(out, rows)
         except Exception:
             self.failed.emit(traceback.format_exc())
 
 
 class CurateTab(QtWidgets.QWidget):
-    def __init__(self, parent=None, default_pool:str="", default_ref:str=""):
+    def __init__(self, parent=None, default_pool: str = "", default_ref: str = ""):
         super().__init__(parent)
         self.setObjectName("CurateTab")
         self._build_ui(default_pool, default_ref)
@@ -144,21 +178,24 @@ class CurateTab(QtWidgets.QWidget):
         self.btnPool = QtWidgets.QPushButton("Browse…")
         self.btnPool.clicked.connect(self._pick_pool)
         row = QtWidgets.QHBoxLayout()
-        row.addWidget(self.editPool, 1); row.addWidget(self.btnPool, 0)
+        row.addWidget(self.editPool, 1)
+        row.addWidget(self.btnPool, 0)
         L.addRow("Pool folder:", row)
 
         self.editRef = QtWidgets.QLineEdit(default_ref)
         self.btnRef = QtWidgets.QPushButton("Browse…")
         self.btnRef.clicked.connect(self._pick_ref)
         row = QtWidgets.QHBoxLayout()
-        row.addWidget(self.editRef, 1); row.addWidget(self.btnRef, 0)
+        row.addWidget(self.editRef, 1)
+        row.addWidget(self.btnRef, 0)
         L.addRow("Reference image:", row)
 
         self.editOut = QtWidgets.QLineEdit("dataset_out")
         self.btnOut = QtWidgets.QPushButton("Browse…")
         self.btnOut.clicked.connect(self._pick_out)
         row = QtWidgets.QHBoxLayout()
-        row.addWidget(self.editOut, 1); row.addWidget(self.btnOut, 0)
+        row.addWidget(self.editOut, 1)
+        row.addWidget(self.btnOut, 0)
         L.addRow("Output folder:", row)
 
         self.spinMax = QtWidgets.QSpinBox()
@@ -167,11 +204,13 @@ class CurateTab(QtWidgets.QWidget):
         L.addRow("Max images:", self.spinMax)
 
         self.comboDevice = QtWidgets.QComboBox()
-        self.comboDevice.addItems(["cuda","cpu"])
+        self.comboDevice.addItems(["cuda", "cpu"])
         self.comboDevice.setCurrentText("cuda")
         L.addRow("Device:", self.comboDevice)
 
-        self.chkScene = QtWidgets.QCheckBox("Scene-aware variety (group shots, pick best per scene)")
+        self.chkScene = QtWidgets.QCheckBox(
+            "Scene-aware variety (group shots, pick best per scene)"
+        )
         self.chkScene.setChecked(True)
         L.addRow(self.chkScene)
 
@@ -180,7 +219,9 @@ class CurateTab(QtWidgets.QWidget):
         self.dspinSceneSim.setDecimals(3)
         self.dspinSceneSim.setSingleStep(0.01)
         self.dspinSceneSim.setValue(0.92)
-        self.dspinSceneSim.setToolTip("Cosine similarity threshold for grouping scenes (higher = stricter)")
+        self.dspinSceneSim.setToolTip(
+            "Cosine similarity threshold for grouping scenes (higher = stricter)"
+        )
         L.addRow("Scene similarity:", self.dspinSceneSim)
 
         self.dspinTimeGap = QtWidgets.QDoubleSpinBox()
@@ -188,25 +229,33 @@ class CurateTab(QtWidgets.QWidget):
         self.dspinTimeGap.setDecimals(2)
         self.dspinTimeGap.setSingleStep(0.25)
         self.dspinTimeGap.setValue(4.0)
-        self.dspinTimeGap.setToolTip("Max seconds gap when stitching adjacent frames into a scene")
+        self.dspinTimeGap.setToolTip(
+            "Max seconds gap when stitching adjacent frames into a scene"
+        )
         L.addRow("Scene time gap (s):", self.dspinTimeGap)
 
         self.spinNNWindow = QtWidgets.QSpinBox()
         self.spinNNWindow.setRange(0, 4096)
         self.spinNNWindow.setValue(64)
-        self.spinNNWindow.setToolTip("Neighbor window when merging nearby scenes (0 disables)")
+        self.spinNNWindow.setToolTip(
+            "Neighbor window when merging nearby scenes (0 disables)"
+        )
         L.addRow("Scene stitch window:", self.spinNNWindow)
 
         self.spinDedupGlobal = QtWidgets.QSpinBox()
         self.spinDedupGlobal.setRange(0, 64)
         self.spinDedupGlobal.setValue(7)
-        self.spinDedupGlobal.setToolTip("Global pHash dedup threshold (Hamming distance)")
+        self.spinDedupGlobal.setToolTip(
+            "Global pHash dedup threshold (Hamming distance)"
+        )
         L.addRow("Dedup Hamming (global):", self.spinDedupGlobal)
 
         self.spinDedupScene = QtWidgets.QSpinBox()
         self.spinDedupScene.setRange(0, 64)
-        self.spinDedupScene.setValue(4)
-        self.spinDedupScene.setToolTip("In-scene pHash dedup threshold (Hamming distance)")
+        self.spinDedupScene.setValue(8)
+        self.spinDedupScene.setToolTip(
+            "In-scene pHash dedup threshold (Hamming distance)"
+        )
         L.addRow("Dedup Hamming (in-scene):", self.spinDedupScene)
 
         self.spinSceneSoftCap = QtWidgets.QSpinBox()
@@ -220,7 +269,9 @@ class CurateTab(QtWidgets.QWidget):
         self.dspinSceneSoftPenalty.setDecimals(3)
         self.dspinSceneSoftPenalty.setSingleStep(0.01)
         self.dspinSceneSoftPenalty.setValue(0.08)
-        self.dspinSceneSoftPenalty.setToolTip("Penalty subtracted when a scene exceeds the soft cap")
+        self.dspinSceneSoftPenalty.setToolTip(
+            "Penalty subtracted when a scene exceeds the soft cap"
+        )
         L.addRow("Scene soft penalty:", self.dspinSceneSoftPenalty)
 
         self.dspinAlpha = QtWidgets.QDoubleSpinBox()
@@ -228,7 +279,9 @@ class CurateTab(QtWidgets.QWidget):
         self.dspinAlpha.setDecimals(2)
         self.dspinAlpha.setSingleStep(0.05)
         self.dspinAlpha.setValue(0.75)
-        self.dspinAlpha.setToolTip("MMR trade-off between quality (1) and diversity (0)")
+        self.dspinAlpha.setToolTip(
+            "MMR trade-off between quality (1) and diversity (0)"
+        )
         L.addRow("MMR alpha:", self.dspinAlpha)
 
         self.dspinProfileYaw = QtWidgets.QDoubleSpinBox()
@@ -236,8 +289,141 @@ class CurateTab(QtWidgets.QWidget):
         self.dspinProfileYaw.setDecimals(1)
         self.dspinProfileYaw.setSingleStep(1.0)
         self.dspinProfileYaw.setValue(50.0)
-        self.dspinProfileYaw.setToolTip("Yaw threshold (degrees) for treating a face as profile")
+        self.dspinProfileYaw.setToolTip(
+            "Yaw threshold (degrees) for treating a face as profile"
+        )
         L.addRow("Profile yaw (deg):", self.dspinProfileYaw)
+
+        self.dspinFdMax = QtWidgets.QDoubleSpinBox()
+        self.dspinFdMax.setRange(0.0, 2.0)
+        self.dspinFdMax.setDecimals(3)
+        self.dspinFdMax.setSingleStep(0.01)
+        self.dspinFdMax.setValue(0.45)
+        self.dspinFdMax.setToolTip(
+            "Maximum allowed identity distance (lower = stricter same-person gate)"
+        )
+        L.addRow("Face distance max:", self.dspinFdMax)
+
+        self.dspinSharpMin = QtWidgets.QDoubleSpinBox()
+        self.dspinSharpMin.setRange(0.0, 1.0)
+        self.dspinSharpMin.setDecimals(2)
+        self.dspinSharpMin.setSingleStep(0.01)
+        self.dspinSharpMin.setValue(0.10)
+        self.dspinSharpMin.setToolTip(
+            "Discard frames with normalized sharpness below this threshold"
+        )
+        L.addRow("Sharpness min:", self.dspinSharpMin)
+
+        # Diversity weighting
+        self.grpDiversity = QtWidgets.QGroupBox("Diversity weights")
+        lay_div = QtWidgets.QFormLayout(self.grpDiversity)
+        self.dspinDivBG = QtWidgets.QDoubleSpinBox()
+        self.dspinDivBG.setRange(0.0, 5.0)
+        self.dspinDivBG.setDecimals(2)
+        self.dspinDivBG.setSingleStep(0.05)
+        self.dspinDivBG.setValue(1.0)
+        self.dspinDivBG.setToolTip(
+            "Weight for background/pose CLIP embedding diversity"
+        )
+        self.dspinDivFace = QtWidgets.QDoubleSpinBox()
+        self.dspinDivFace.setRange(0.0, 5.0)
+        self.dspinDivFace.setDecimals(2)
+        self.dspinDivFace.setSingleStep(0.05)
+        self.dspinDivFace.setValue(0.6)
+        self.dspinDivFace.setToolTip("Weight for face embedding diversity")
+        lay_div.addRow("Background weight:", self.dspinDivBG)
+        lay_div.addRow("Face weight:", self.dspinDivFace)
+        L.addRow(self.grpDiversity)
+
+        # Close-up favoritism controls
+        self.grpCloseup = QtWidgets.QGroupBox("Close-up boost")
+        lay_close = QtWidgets.QFormLayout(self.grpCloseup)
+        self.dspinCloseBoost = QtWidgets.QDoubleSpinBox()
+        self.dspinCloseBoost.setRange(0.0, 2.0)
+        self.dspinCloseBoost.setDecimals(2)
+        self.dspinCloseBoost.setSingleStep(0.05)
+        self.dspinCloseBoost.setValue(0.25)
+        self.dspinCloseBoost.setToolTip(
+            "Multiplier applied once face fraction exceeds the threshold"
+        )
+        self.dspinCloseThr = QtWidgets.QDoubleSpinBox()
+        self.dspinCloseThr.setRange(0.0, 1.0)
+        self.dspinCloseThr.setDecimals(2)
+        self.dspinCloseThr.setSingleStep(0.01)
+        self.dspinCloseThr.setValue(0.33)
+        self.dspinCloseThr.setToolTip(
+            "Face fraction threshold for enabling the close-up boost"
+        )
+        lay_close.addRow("Boost amount:", self.dspinCloseBoost)
+        lay_close.addRow("Face fraction threshold:", self.dspinCloseThr)
+        L.addRow(self.grpCloseup)
+
+        # Quotas per category
+        self.grpQuotas = QtWidgets.QGroupBox("Category quotas (min/max)")
+        self.grpQuotas.setToolTip(
+            "Minimums are best effort; totals may be clipped to the requested max images."
+        )
+        lay_quota = QtWidgets.QGridLayout(self.grpQuotas)
+        lay_quota.addWidget(QtWidgets.QLabel("Category"), 0, 0)
+        lay_quota.addWidget(QtWidgets.QLabel("Min"), 0, 1)
+        lay_quota.addWidget(QtWidgets.QLabel("Max"), 0, 2)
+
+        def _mk_quota(
+            default_min: int, default_max: int
+        ) -> Tuple[QtWidgets.QSpinBox, QtWidgets.QSpinBox]:
+            spin_min = QtWidgets.QSpinBox()
+            spin_min.setRange(0, 999)
+            spin_min.setValue(default_min)
+            spin_max = QtWidgets.QSpinBox()
+            spin_max.setRange(0, 999)
+            spin_max.setValue(default_max)
+            return spin_min, spin_max
+
+        def _bind_quota_pair(
+            spin_min: QtWidgets.QSpinBox, spin_max: QtWidgets.QSpinBox
+        ) -> None:
+            def _on_min(val: int) -> None:
+                if val > spin_max.value():
+                    with QtCore.QSignalBlocker(spin_max):
+                        spin_max.setValue(val)
+
+            def _on_max(val: int) -> None:
+                if val < spin_min.value():
+                    with QtCore.QSignalBlocker(spin_min):
+                        spin_min.setValue(val)
+
+            spin_min.valueChanged.connect(_on_min)
+            spin_max.valueChanged.connect(_on_max)
+
+        self.qCloseMin, self.qCloseMax = _mk_quota(35, 60)
+        self.qPortraitMin, self.qPortraitMax = _mk_quota(60, 100)
+        self.qCowboyMin, self.qCowboyMax = _mk_quota(20, 35)
+        self.qFullMin, self.qFullMax = _mk_quota(8, 20)
+        self.qWideMin, self.qWideMax = _mk_quota(5, 20)
+        self.qProfileMin, self.qProfileMax = _mk_quota(0, 20)
+        self.qProfileMin.setEnabled(False)
+        self.qProfileMin.setToolTip(
+            "Minimum ignored; profile quota acts as a cap only."
+        )
+        self.qProfileMax.setToolTip("Maximum number of profile picks allowed (cap).")
+
+        labels = [
+            ("Close-up", self.qCloseMin, self.qCloseMax),
+            ("Portrait", self.qPortraitMin, self.qPortraitMax),
+            ("Cowboy", self.qCowboyMin, self.qCowboyMax),
+            ("Full", self.qFullMin, self.qFullMax),
+            ("Wide", self.qWideMin, self.qWideMax),
+            ("Profile cap", self.qProfileMin, self.qProfileMax),
+        ]
+        for row_idx, (label, spin_min, spin_max) in enumerate(labels, start=1):
+            lay_quota.addWidget(QtWidgets.QLabel(label), row_idx, 0)
+            lay_quota.addWidget(spin_min, row_idx, 1)
+            lay_quota.addWidget(spin_max, row_idx, 2)
+            _bind_quota_pair(spin_min, spin_max)
+        lay_quota.setColumnStretch(0, 1)
+        lay_quota.setColumnStretch(1, 1)
+        lay_quota.setColumnStretch(2, 1)
+        L.addRow(self.grpQuotas)
 
         # Load persisted values
         self._load_settings()
@@ -264,9 +450,13 @@ class CurateTab(QtWidgets.QWidget):
         self.prog.setValue(0)
         L.addRow(self.prog)
 
-        self.table = QtWidgets.QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["#", "file", "fd", "sharp", "face_frac", "ratio"])
-        self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        self.table = QtWidgets.QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(
+            ["#", "dst", "source", "fd", "sharp", "face_frac", "ratio"]
+        )
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
         L.addRow(self.table)
 
         self.status = QtWidgets.QLabel("Idle")
@@ -278,7 +468,9 @@ class CurateTab(QtWidgets.QWidget):
             self.editPool.setText(d)
 
     def _pick_ref(self):
-        f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Pick reference image", "", "Images (*.jpg *.jpeg *.png *.webp)")
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Pick reference image", "", "Images (*.jpg *.jpeg *.png *.webp)"
+        )
         if f:
             self.editRef.setText(f)
 
@@ -305,10 +497,22 @@ class CurateTab(QtWidgets.QWidget):
             return
         self.btnRun.setEnabled(False)
         # show activity immediately; _on_progress will keep it busy during init
-        self.prog.setRange(0, 0); self.prog.setValue(0)
+        self.prog.setRange(0, 0)
+        self.prog.setValue(0)
         self._set_status("Running…")
 
         self._thread = QtCore.QThread(self)
+        quotas = {
+            "closeup": (int(self.qCloseMin.value()), int(self.qCloseMax.value())),
+            "portrait": (
+                int(self.qPortraitMin.value()),
+                int(self.qPortraitMax.value()),
+            ),
+            "cowboy": (int(self.qCowboyMin.value()), int(self.qCowboyMax.value())),
+            "full": (int(self.qFullMin.value()), int(self.qFullMax.value())),
+            "wide": (int(self.qWideMin.value()), int(self.qWideMax.value())),
+            "profile": (0, int(self.qProfileMax.value())),
+        }
         self._worker = CurateWorker(
             pool,
             ref,
@@ -325,6 +529,13 @@ class CurateTab(QtWidgets.QWidget):
             scene_soft_penalty=float(self.dspinSceneSoftPenalty.value()),
             mmr_alpha=float(self.dspinAlpha.value()),
             profile_yaw=float(self.dspinProfileYaw.value()),
+            div_bg=float(self.dspinDivBG.value()),
+            div_face=float(self.dspinDivFace.value()),
+            closeup_boost=float(self.dspinCloseBoost.value()),
+            closeup_thr=float(self.dspinCloseThr.value()),
+            quotas=quotas,
+            fd_max=float(self.dspinFdMax.value()),
+            sharp_min=float(self.dspinSharpMin.value()),
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -365,7 +576,7 @@ class CurateTab(QtWidgets.QWidget):
         self.dspinTimeGap.setValue(_float("scene_time_gap", 4.0))
         self.spinNNWindow.setValue(_int("scene_nn_window", 64))
         self.spinDedupGlobal.setValue(_int("dedup_hamm", 7))
-        self.spinDedupScene.setValue(_int("scene_dedup", 4))
+        self.spinDedupScene.setValue(_int("scene_dedup", 8))
         self.spinSceneSoftCap.setValue(_int("scene_soft_cap", 0))
         try:
             raw_pen = s.value("scene_soft_penalty", "")
@@ -376,6 +587,30 @@ class CurateTab(QtWidgets.QWidget):
             self.dspinSceneSoftPenalty.setValue(0.08)
         self.dspinAlpha.setValue(_float("mmr_alpha", 0.75))
         self.dspinProfileYaw.setValue(_float("profile_yaw", 50.0))
+        self.dspinFdMax.setValue(_float("fd_max", 0.45))
+        self.dspinSharpMin.setValue(_float("sharp_min", 0.10))
+        self.dspinDivBG.setValue(_float("div_bg", 1.0))
+        self.dspinDivFace.setValue(_float("div_face", 0.6))
+        self.dspinCloseBoost.setValue(_float("closeup_boost", 0.25))
+        self.dspinCloseThr.setValue(_float("closeup_thr", 0.33))
+
+        quota_widgets = {
+            "q_close_min": self.qCloseMin,
+            "q_close_max": self.qCloseMax,
+            "q_portrait_min": self.qPortraitMin,
+            "q_portrait_max": self.qPortraitMax,
+            "q_cowboy_min": self.qCowboyMin,
+            "q_cowboy_max": self.qCowboyMax,
+            "q_full_min": self.qFullMin,
+            "q_full_max": self.qFullMax,
+            "q_wide_min": self.qWideMin,
+            "q_wide_max": self.qWideMax,
+            "q_profile_min": self.qProfileMin,
+            "q_profile_max": self.qProfileMax,
+        }
+        for key, widget in quota_widgets.items():
+            widget.setValue(_int(key, widget.value()))
+        self.qProfileMin.setValue(0)
 
     def _save_settings(self) -> None:
         s = QtCore.QSettings("PersonCapture", "CurateTab")
@@ -390,6 +625,30 @@ class CurateTab(QtWidgets.QWidget):
         s.setValue("scene_soft_bonus", self.dspinSceneSoftPenalty.value())
         s.setValue("mmr_alpha", self.dspinAlpha.value())
         s.setValue("profile_yaw", self.dspinProfileYaw.value())
+        s.setValue("fd_max", self.dspinFdMax.value())
+        s.setValue("sharp_min", self.dspinSharpMin.value())
+        s.setValue("div_bg", self.dspinDivBG.value())
+        s.setValue("div_face", self.dspinDivFace.value())
+        s.setValue("closeup_boost", self.dspinCloseBoost.value())
+        s.setValue("closeup_thr", self.dspinCloseThr.value())
+        for key, widget in (
+            ("q_close_min", self.qCloseMin),
+            ("q_close_max", self.qCloseMax),
+            ("q_portrait_min", self.qPortraitMin),
+            ("q_portrait_max", self.qPortraitMax),
+            ("q_cowboy_min", self.qCowboyMin),
+            ("q_cowboy_max", self.qCowboyMax),
+            ("q_full_min", self.qFullMin),
+            ("q_full_max", self.qFullMax),
+            ("q_wide_min", self.qWideMin),
+            ("q_wide_max", self.qWideMax),
+            ("q_profile_min", self.qProfileMin),
+            ("q_profile_max", self.qProfileMax),
+        ):
+            if key == "q_profile_min":
+                s.setValue(key, 0)
+            else:
+                s.setValue(key, widget.value())
 
     def _done(self, out_dir: str, rows: List[List[str]]):
         self._thread = None
@@ -399,16 +658,12 @@ class CurateTab(QtWidgets.QWidget):
         self.prog.setValue(100)
         self.btnRun.setEnabled(True)
         self.table.setRowCount(0)
-        for i, parts in enumerate(rows, 0):
+        for parts in rows:
             r = self.table.rowCount()
             self.table.insertRow(r)
-            # parts: [rank,file,face_fd,sharpness,exposure,face_frac,yaw,roll,ratio,quality,category,is_profile]
-            self.table.setItem(r, 0, QtWidgets.QTableWidgetItem(parts[0]))
-            self.table.setItem(r, 1, QtWidgets.QTableWidgetItem(parts[1]))
-            self.table.setItem(r, 2, QtWidgets.QTableWidgetItem(parts[2]))
-            self.table.setItem(r, 3, QtWidgets.QTableWidgetItem(parts[3]))
-            self.table.setItem(r, 4, QtWidgets.QTableWidgetItem(parts[5]))
-            self.table.setItem(r, 5, QtWidgets.QTableWidgetItem(parts[8]))
+            # parts: [rank, dst, source, face_fd, sharpness, face_frac, ratio]
+            for c, text in enumerate(parts):
+                self.table.setItem(r, c, QtWidgets.QTableWidgetItem(text))
 
     def _fail(self, msg: str):
         self._thread = None
@@ -437,7 +692,7 @@ class CurateTab(QtWidgets.QWidget):
         self._set_status(f"{phase}: {done}/{total}")
 
 
-def add_tab_to(main_window, default_pool:str="", default_ref:str=""):
+def add_tab_to(main_window, default_pool: str = "", default_ref: str = ""):
     """
     Call from your MainWindow after constructing QTabWidget 'tabs' or similar.
     Example:
