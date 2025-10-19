@@ -372,6 +372,59 @@ class Curator:
                 0,
             )
 
+        self._det_square: bool = (
+            os.getenv("PC_CURATE_DET_SQUARE", "1").strip().lower()
+            not in {"0", "false", "no"}
+        )
+        self._kps_enabled: bool = (
+            os.getenv("PC_CURATE_KPS", "0").strip().lower()
+            not in {"0", "false", "no"}
+        )
+
+    # ---- detector helpers ----
+    @staticmethod
+    def _letterbox_square(
+        bgr: np.ndarray, size: int = 640
+    ) -> Tuple[np.ndarray, float, int, int]:
+        """Resize with padding to a square canvas."""
+
+        height, width = bgr.shape[:2]
+        if height == 0 or width == 0:
+            return np.zeros((size, size, 3), dtype=np.uint8), 1.0, 0, 0
+
+        scale = min(size / float(width), size / float(height))
+        new_w, new_h = int(round(width * scale)), int(round(height * scale))
+        resized = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        canvas = np.zeros((size, size, 3), dtype=bgr.dtype)
+        dx = (size - new_w) // 2
+        dy = (size - new_h) // 2
+        canvas[dy : dy + new_h, dx : dx + new_w] = resized
+        return canvas, float(scale), int(dx), int(dy)
+
+    def _detect_best_face(self, bgr: np.ndarray) -> Optional[Dict[str, Any]]:
+        """Run the face detector, remapping boxes if square letterbox is enabled."""
+
+        height, width = bgr.shape[:2]
+        if self._det_square:
+            canvas, scale, dx, dy = self._letterbox_square(bgr, 640)
+            faces = self.face.extract(canvas)
+            best = FaceEmbedder.best_face(faces) if faces else None
+            if best is None or "bbox" not in best:
+                return None
+
+            x1, y1, x2, y2 = [float(v) for v in best["bbox"]]
+            inv_scale = 1.0 / max(scale, 1e-6)
+            ox1 = max(0, min(width, int(round((x1 - dx) * inv_scale))))
+            oy1 = max(0, min(height, int(round((y1 - dy) * inv_scale))))
+            ox2 = max(ox1 + 1, min(width, int(round((x2 - dx) * inv_scale))))
+            oy2 = max(oy1 + 1, min(height, int(round((y2 - dy) * inv_scale))))
+            result = dict(best)
+            result["bbox"] = (int(ox1), int(oy1), int(ox2), int(oy2))
+            return result
+
+        faces = self.face.extract(bgr)
+        return FaceEmbedder.best_face(faces) if faces else None
+
     @staticmethod
     def _infer_ts_from_name(path: str) -> float:
         """Best-effort timestamp from filename or mtime."""
@@ -578,9 +631,8 @@ class Curator:
         if bgr is None:
             return None
         H, W = bgr.shape[:2]
-        # face detect in crop
-        faces = self.face.extract(bgr)
-        best = FaceEmbedder.best_face(faces) if faces else None
+        # face detect in crop (force 640x640 square input by default to calm ORT warnings)
+        best = self._detect_best_face(bgr)
         bbox = None
         kps5 = None
         fd = 0.0 if self.id_already_passed else 9.0
@@ -605,53 +657,54 @@ class Curator:
         # landmarks: re-run the detector with keypoints if present (a second pass for
         # yaw/roll—slower but keeps classification accurate until the embedder exposes them)
         yaw, roll = 0.0, 0.0
-        try:
-            # Try to get keypoints via private helper by forcing a predict() call here
-            conf_val = getattr(self.face, "conf", self.face_det_conf)
-            res = self.face.det.predict(
-                bgr,
-                conf=max(0.15, float(conf_val)),
-                verbose=False,
-                device=self.face.device,
-            )[0]
-            kps = getattr(res, "keypoints", None)
-            if kps is not None and len(res.boxes) > 0:
-                # pick the face box with max IoU to bbox
-                i_best, iou_best = -1, -1.0
-                for i, bb in enumerate(res.boxes.xyxy.cpu().numpy().astype(int)):
-                    if bbox is None:
-                        i_best = 0
-                        break
-                    x1, y1, x2, y2 = [int(t) for t in bb]
-                    bx1, by1, bx2, by2 = bbox
-                    ix1, iy1 = max(x1, bx1), max(y1, by1)
-                    ix2, iy2 = min(x2, bx2), min(y2, by2)
-                    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-                    area = (
-                        (x2 - x1) * (y2 - y1) + (bx2 - bx1) * (by2 - by1) - inter + 1e-6
-                    )
-                    iou = inter / area
-                    if iou > iou_best:
-                        i_best, iou_best = i, iou
-                if i_best >= 0:
-                    pts = kps[i_best].cpu().numpy().astype(np.float32)
-                    # reorder to ArcFace 5pts if at least 5 provided
-                    if pts.shape[0] >= 5:
-                        # sort by y then map as in FaceEmbedder._canon_5pts
-                        order_y = np.argsort(pts[:, 1])
-                        eyes_idx = order_y[:2]
-                        nose_idx = order_y[2]
-                        mouth_idx = order_y[3:]
-                        if mouth_idx.size == 2:
-                            eyes = pts[eyes_idx]
-                            mouth = pts[mouth_idx]
-                            le, re = eyes[np.argsort(eyes[:, 0])]
-                            lm, rm = mouth[np.argsort(mouth[:, 0])]
-                            nose = pts[nose_idx]
-                            kps5 = np.stack([le, re, nose, lm, rm], axis=0)
-                            yaw, roll = yaw_roll_from_5pts(kps5)
-        except Exception:
-            pass
+        if self._kps_enabled:
+            try:
+                # Try to get keypoints via private helper by forcing a predict() call here
+                conf_val = getattr(self.face, "conf", self.face_det_conf)
+                res = self.face.det.predict(
+                    bgr,
+                    conf=max(0.15, float(conf_val)),
+                    verbose=False,
+                    device=self.face.device,
+                )[0]
+                kps = getattr(res, "keypoints", None)
+                if kps is not None and len(res.boxes) > 0:
+                    # pick the face box with max IoU to bbox
+                    i_best, iou_best = -1, -1.0
+                    for i, bb in enumerate(res.boxes.xyxy.cpu().numpy().astype(int)):
+                        if bbox is None:
+                            i_best = 0
+                            break
+                        x1, y1, x2, y2 = [int(t) for t in bb]
+                        bx1, by1, bx2, by2 = bbox
+                        ix1, iy1 = max(x1, bx1), max(y1, by1)
+                        ix2, iy2 = min(x2, bx2), min(y2, by2)
+                        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                        area = (
+                            (x2 - x1) * (y2 - y1) + (bx2 - bx1) * (by2 - by1) - inter + 1e-6
+                        )
+                        iou = inter / area
+                        if iou > iou_best:
+                            i_best, iou_best = i, iou
+                    if i_best >= 0:
+                        pts = kps[i_best].cpu().numpy().astype(np.float32)
+                        # reorder to ArcFace 5pts if at least 5 provided
+                        if pts.shape[0] >= 5:
+                            # sort by y then map as in FaceEmbedder._canon_5pts
+                            order_y = np.argsort(pts[:, 1])
+                            eyes_idx = order_y[:2]
+                            nose_idx = order_y[2]
+                            mouth_idx = order_y[3:]
+                            if mouth_idx.size == 2:
+                                eyes = pts[eyes_idx]
+                                mouth = pts[mouth_idx]
+                                le, re = eyes[np.argsort(eyes[:, 0])]
+                                lm, rm = mouth[np.argsort(mouth[:, 0])]
+                                nose = pts[nose_idx]
+                                kps5 = np.stack([le, re, nose, lm, rm], axis=0)
+                                yaw, roll = yaw_roll_from_5pts(kps5)
+            except Exception:
+                pass
 
         # CLIP embedding of full crop for diversity
         clip_vec = self.reid.extract([bgr])
