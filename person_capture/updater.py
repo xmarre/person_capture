@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import os, sys, time, json, shutil, zipfile, subprocess, tempfile, threading, fnmatch
+from subprocess import list2cmdline
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
@@ -437,12 +438,24 @@ def _restart_self(extra_args: Optional[list[str]] = None) -> None:
                 creationflags=flags,
             )
         except Exception:
-            # Fallback: ask cmd to spawn a separate window (covers exotic terminals).
-            subprocess.Popen(
-                ["cmd.exe", "/c", "start", "PersonCapture Logs", *argv],
-                close_fds=True,
-                cwd=str(cwd),
-            )
+            # Fallback: go through cmd.exe, ensuring arguments are safely quoted.
+            try:
+                cmdline = 'start "PersonCapture Logs" /D "{}" {}'.format(
+                    str(cwd).replace('"', '""'),
+                    list2cmdline(argv),
+                )
+                subprocess.Popen(
+                    ["cmd.exe", "/c", cmdline],
+                    close_fds=True,
+                )
+            except Exception:
+                # Last-ditch: try again without START while still forcing a new console.
+                subprocess.Popen(
+                    argv,
+                    close_fds=True,
+                    cwd=str(cwd),
+                    creationflags=flags,
+                )
     else:
         # Non-Windows: keep behavior (opening a brand-new terminal is DE/OS-specific).
         subprocess.Popen(argv, close_fds=True, cwd=str(cwd))
