@@ -187,7 +187,7 @@ class SessionConfig:
     seek_fast: bool = True
     # Max frames to grab forward after landing on a keyframe during seek.
     # ≤0 uses fps-derived auto cap (~1s of decoding) to avoid long stalls.
-    seek_max_grabs: int = 45
+    seek_max_grabs: int = 12
     out_dir: str = "output"
     ratio: str = "2:3,1:1,3:2"
     frame_stride: int = 2
@@ -236,7 +236,7 @@ class SessionConfig:
     yolo_model: str = "yolov8n.pt"
     face_model: str = "scrfd_10g_bnkps"
     save_annot: bool = False
-    preview_every: int = 120
+    preview_every: int = 3
     # I/O
     async_save: bool = True                # write crops/CSV on a background thread
     jpg_quality: int = 85                  # JPEG quality (lower = faster, smaller)
@@ -283,14 +283,16 @@ class SessionConfig:
     # Debug/diagnostics
     debug_dump: bool = True
     debug_dir: str = "debug"
-    overlay_scores: bool = True
+    overlay_scores: bool = False
     overlay_face_fd: bool = True
     lock_momentum: float = 0.7
     suppress_negatives: bool = False
     neg_tolerance: float = 0.35
     max_negatives: int = 5         # emit preview every N processed frames
-    preview_max_dim: int = 1920
-    preview_drop_when_busy: bool = True
+    # Preview controls
+    preview_max_dim: int = 1280        # downscale UI preview; keeps 4K snappy
+    preview_fps_cap: int = 20          # max UI preview fps (time-based throttle)
+    seek_preview_peek_every: int = 16  # during fast-seek, retrieve every N grabs
     # --- faceless fallback controls ---
     allow_faceless_when_locked: bool = True
     faceless_reid_thresh: float = 0.40      # <= lock if ReID distance <= this
@@ -551,7 +553,7 @@ class Processor(QtCore.QObject):
             total_samples = max(1, (total_frames + stride - 1) // stride)
             progress_step = max(1, total_samples // 50)
             next_progress_sample = 0
-            preview_step = max(stride, int(getattr(cfg, "preview_every", 120)))
+            preview_step = max(stride, int(getattr(cfg, "preview_every", 3)))
             last_preview_idx = -preview_step
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             processed_samples = 0
@@ -623,7 +625,7 @@ class Processor(QtCore.QObject):
                         i,
                         tgt,
                         fast=bool(getattr(cfg, "seek_fast", True)),
-                        max_grabs=int(getattr(cfg, "seek_max_grabs", 45)),
+                        max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
                     )
                     i = (new_pos // stride) * stride
                     processed_samples = i // stride
@@ -652,7 +654,7 @@ class Processor(QtCore.QObject):
                         i,
                         next_i,
                         fast=bool(getattr(cfg, "seek_fast", True)),
-                        max_grabs=int(getattr(cfg, "seek_max_grabs", 45)),
+                        max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
                     )
                     continue
                 # Preempt before IO to honor newly queued seeks/steps
@@ -712,7 +714,7 @@ class Processor(QtCore.QObject):
                         i,
                         tgt,
                         fast=bool(getattr(cfg, "seek_fast", True)),
-                        max_grabs=int(getattr(cfg, "seek_max_grabs", 45)),
+                        max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
                     )
                     i = (new_pos // stride) * stride
                     processed_samples = i // stride
@@ -990,7 +992,7 @@ class Processor(QtCore.QObject):
                             j,
                             j,
                             fast=bool(getattr(cfg, "seek_fast", True)),
-                            max_grabs=int(getattr(cfg, "seek_max_grabs", 45)),
+                            max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
                         )
                         ret, frame = cap.read()
                         if not ret or frame is None:
@@ -1035,7 +1037,7 @@ class Processor(QtCore.QObject):
                                 j,
                                 j,
                                 fast=bool(getattr(cfg, "seek_fast", True)),
-                                max_grabs=int(getattr(cfg, "seek_max_grabs", 45)),
+                                max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
                             )
                             ret, frame = cap.read()
                             if not ret or frame is None:
@@ -1955,7 +1957,9 @@ class Processor(QtCore.QObject):
             if not cap.grab():
                 break
             idx += 1
-            if fast and (i & 0x7) == 0:
+            # Light preview peek while seeking (configurable)
+            peek_n = max(1, int(getattr(self.cfg, "seek_preview_peek_every", 16)))
+            if fast and (i % peek_n) == 0:
                 ok, frame = cap.retrieve()
                 if ok:
                     try:
@@ -1994,7 +1998,7 @@ class Processor(QtCore.QObject):
         self._lock_last_seen_idx: int = -10**9
         self._locked_reid_feat: Optional[np.ndarray] = None
         self._prev_gray: Optional[np.ndarray] = None
-        self._preview_busy: bool = False
+        self._last_preview_t: float = 0.0
 
     def _emit_hit(self, path: str) -> None:
         emit = getattr(self.hit, "emit", None)
@@ -2493,7 +2497,7 @@ class Processor(QtCore.QObject):
                         0,
                         s0,
                         fast=bool(getattr(cfg, "seek_fast", True)),
-                        max_grabs=int(getattr(cfg, "seek_max_grabs", 45)),
+                        max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
                     )
                     # Neutralize any stray cooldown/coalesced state from the jump *before* progress emit.
                     if hasattr(self, "_seek_cooldown_frames"):
@@ -2679,6 +2683,8 @@ class Processor(QtCore.QObject):
                             "score_margin",
                             "iou_gate",
                             "preview_every",
+                            "preview_max_dim",
+                            "preview_fps_cap",
                             "require_face_if_visible",
                             "prefer_face_when_available",
                             "suppress_negatives",
@@ -2699,6 +2705,9 @@ class Processor(QtCore.QObject):
                             "faceless_max_area_frac",
                             "faceless_center_max_frac",
                             "faceless_min_motion_frac",
+                            "seek_fast",
+                            "seek_max_grabs",
+                            "seek_preview_peek_every",
                             "crop_face_side_margin_frac",
                             "crop_top_headroom_max_frac",
                             "crop_bottom_min_face_heights",
@@ -2733,6 +2742,7 @@ class Processor(QtCore.QObject):
                             "w_upper",
                             "w_cowboy",
                             "w_body",
+                            "overlay_scores",
                         }
                         rot_keys = {
                             "rot_adaptive",
@@ -2804,7 +2814,7 @@ class Processor(QtCore.QObject):
                         frame_idx,
                         tgt,
                         fast=bool(getattr(self.cfg, "seek_fast", True)),
-                        max_grabs=int(getattr(self.cfg, "seek_max_grabs", 45)),
+                        max_grabs=int(getattr(self.cfg, "seek_max_grabs", 12)),
                     )
                     self.progress.emit(frame_idx)
                     # reset temporal gates so back/forward scrubs work
@@ -2846,7 +2856,7 @@ class Processor(QtCore.QObject):
                             frame_idx,
                             s,
                             fast=bool(getattr(self.cfg, "seek_fast", True)),
-                            max_grabs=int(getattr(self.cfg, "seek_max_grabs", 45)),
+                            max_grabs=int(getattr(self.cfg, "seek_max_grabs", 12)),
                         )
                         self._seek_cooldown_frames = int(max(2, (self._fps or 30) * 0.25))
                         continue
@@ -2860,7 +2870,7 @@ class Processor(QtCore.QObject):
                             frame_idx,
                             s2,
                             fast=bool(getattr(self.cfg, "seek_fast", True)),
-                            max_grabs=int(getattr(self.cfg, "seek_max_grabs", 45)),
+                            max_grabs=int(getattr(self.cfg, "seek_max_grabs", 12)),
                         )
                         self._seek_cooldown_frames = int(max(2, (self._fps or 30) * 0.25))
                         continue
@@ -4554,9 +4564,17 @@ class Processor(QtCore.QObject):
         emit = getattr(self.preview, "emit", None)
         if emit is None or bgr is None:
             return
-        drop_busy = bool(getattr(self.cfg, "preview_drop_when_busy", True))
-        if drop_busy and getattr(self, "_preview_busy", False):
-            return
+        # time-based throttle
+        try:
+            cap_fps = int(getattr(self.cfg, "preview_fps_cap", 20))
+        except Exception:
+            cap_fps = 20
+        if cap_fps > 0:
+            now = time.perf_counter()
+            min_dt = 1.0 / float(cap_fps)
+            if (now - self._last_preview_t) < min_dt:
+                return
+            self._last_preview_t = now
         try:
             arr = np.asarray(bgr)
         except Exception:
@@ -4953,7 +4971,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self.yolo_edit = QtWidgets.QLineEdit("yolov8n.pt")
         self.face_yolo_edit = QtWidgets.QLineEdit("scrfd_10g_bnkps")
         self.annot_check = QtWidgets.QCheckBox("Save annotated frames")
-        self.preview_every_spin = QtWidgets.QSpinBox(); self.preview_every_spin.setRange(0, 5000); self.preview_every_spin.setValue(120)
+        self.preview_every_spin = QtWidgets.QSpinBox(); self.preview_every_spin.setRange(0, 5000); self.preview_every_spin.setValue(3)
+        self.preview_every_spin.valueChanged.connect(self._on_ui_change)
+        self.preview_max_dim_spin = QtWidgets.QSpinBox()
+        self.preview_max_dim_spin.setRange(0, 7680)
+        self.preview_max_dim_spin.setValue(int(self.cfg.preview_max_dim))
+        self.preview_max_dim_spin.setToolTip("int: preview_max_dim (0 = no limit)")
+        self.preview_max_dim_spin.valueChanged.connect(self._on_ui_change)
+        self.preview_fps_cap_spin = QtWidgets.QSpinBox()
+        self.preview_fps_cap_spin.setRange(0, 240)
+        self.preview_fps_cap_spin.setValue(int(self.cfg.preview_fps_cap))
+        self.preview_fps_cap_spin.setToolTip("int: preview_fps_cap (0 = unlimited)")
+        self.preview_fps_cap_spin.valueChanged.connect(self._on_ui_change)
+        self.seek_fast_check = QtWidgets.QCheckBox()
+        self.seek_fast_check.setChecked(bool(self.cfg.seek_fast))
+        self.seek_fast_check.setToolTip("bool: seek_fast")
+        self.seek_fast_check.stateChanged.connect(self._on_ui_change)
+        self.seek_max_grabs_spin = QtWidgets.QSpinBox()
+        self.seek_max_grabs_spin.setRange(0, 480)
+        self.seek_max_grabs_spin.setValue(int(self.cfg.seek_max_grabs))
+        self.seek_max_grabs_spin.setToolTip("int: seek_max_grabs")
+        self.seek_max_grabs_spin.valueChanged.connect(self._on_ui_change)
+        self.seek_preview_peek_spin = QtWidgets.QSpinBox()
+        self.seek_preview_peek_spin.setRange(1, 120)
+        self.seek_preview_peek_spin.setValue(int(self.cfg.seek_preview_peek_every))
+        self.seek_preview_peek_spin.setToolTip("int: seek_preview_peek_every")
+        self.seek_preview_peek_spin.valueChanged.connect(self._on_ui_change)
+        self.overlay_scores_check = QtWidgets.QCheckBox()
+        self.overlay_scores_check.setChecked(bool(self.cfg.overlay_scores))
+        self.overlay_scores_check.setToolTip("bool: overlay_scores")
+        self.overlay_scores_check.stateChanged.connect(self._on_ui_change)
 
         # --- Speed / I/O controls ---
         self.skip_yolo_faceonly_check = QtWidgets.QCheckBox()
@@ -5155,6 +5202,12 @@ class MainWindow(QtWidgets.QMainWindow):
             ("YOLO model", self.yolo_edit),
             ("Face YOLO model", self.face_yolo_edit),
             ("Preview every N frames", self.preview_every_spin),
+            ("Preview max dimension", self.preview_max_dim_spin),
+            ("Preview FPS cap", self.preview_fps_cap_spin),
+            ("Seek fast", self.seek_fast_check),
+            ("Seek max grabs", self.seek_max_grabs_spin),
+            ("Seek preview peek every", self.seek_preview_peek_spin),
+            ("Overlay scores", self.overlay_scores_check),
             ("Skip YOLO when faces visible (face-only)", self.skip_yolo_faceonly_check),
             ("Async save crops/CSV", self.async_save_check),
             ("JPEG quality", self.jpg_quality_spin),
@@ -6140,8 +6193,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ref=ref_join,
             out_dir=self.out_edit.text().strip() or "output",
             ratio=self.ratio_edit.text().strip() or "2:3",
-            seek_fast=bool(getattr(self.cfg, "seek_fast", True)),
-            seek_max_grabs=max(0, int(getattr(self.cfg, "seek_max_grabs", 45))),
+            seek_fast=bool(self.seek_fast_check.isChecked()) if hasattr(self, "seek_fast_check") else bool(getattr(self.cfg, "seek_fast", True)),
+            seek_max_grabs=max(0, int(self.seek_max_grabs_spin.value())) if hasattr(self, "seek_max_grabs_spin") else max(0, int(getattr(self.cfg, "seek_max_grabs", 12))),
             frame_stride=int(self.stride_spin.value()),
             min_det_conf=float(self.det_conf_spin.value()),
             face_thresh=float(self.face_thr_spin.value()),
@@ -6201,7 +6254,11 @@ class MainWindow(QtWidgets.QMainWindow):
             yolo_model=self.yolo_edit.text().strip() or "yolov8n.pt",
             face_model=self.face_yolo_edit.text().strip() or "scrfd_10g_bnkps",
             save_annot=bool(self.annot_check.isChecked()),
-            preview_every=int(self.preview_every_spin.value()),
+            preview_every=int(self.preview_every_spin.value()) if hasattr(self, "preview_every_spin") else int(getattr(self.cfg, "preview_every", 3)),
+            preview_max_dim=int(self.preview_max_dim_spin.value()) if hasattr(self, "preview_max_dim_spin") else int(getattr(self.cfg, "preview_max_dim", 1280)),
+            preview_fps_cap=int(self.preview_fps_cap_spin.value()) if hasattr(self, "preview_fps_cap_spin") else int(getattr(self.cfg, "preview_fps_cap", 20)),
+            seek_preview_peek_every=int(self.seek_preview_peek_spin.value()) if hasattr(self, "seek_preview_peek_spin") else int(getattr(self.cfg, "seek_preview_peek_every", 16)),
+            overlay_scores=bool(self.overlay_scores_check.isChecked()) if hasattr(self, "overlay_scores_check") else bool(getattr(self.cfg, "overlay_scores", False)),
             prefer_face_when_available=bool(self.pref_face_check.isChecked()) if hasattr(self, "pref_face_check") else True,
             face_quality_min=float(self.face_quality_spin.value()) if hasattr(self, "face_quality_spin") else 70.0,
             face_visible_uses_quality=bool(self.face_vis_quality_check.isChecked()) if hasattr(self, "face_vis_quality_check") else True,
@@ -6261,9 +6318,26 @@ class MainWindow(QtWidgets.QMainWindow):
     def _apply_cfg(self, cfg: SessionConfig):
         self.cfg.seek_fast = bool(getattr(cfg, "seek_fast", True))
         try:
-            self.cfg.seek_max_grabs = int(getattr(cfg, "seek_max_grabs", 45))
+            self.cfg.seek_max_grabs = int(getattr(cfg, "seek_max_grabs", 12))
         except Exception:
-            self.cfg.seek_max_grabs = 45
+            self.cfg.seek_max_grabs = 12
+        try:
+            self.cfg.preview_max_dim = int(getattr(cfg, "preview_max_dim", 1280))
+        except Exception:
+            self.cfg.preview_max_dim = 1280
+        try:
+            self.cfg.preview_fps_cap = int(getattr(cfg, "preview_fps_cap", 20))
+        except Exception:
+            self.cfg.preview_fps_cap = 20
+        try:
+            self.cfg.seek_preview_peek_every = int(getattr(cfg, "seek_preview_peek_every", 16))
+        except Exception:
+            self.cfg.seek_preview_peek_every = 16
+        self.cfg.overlay_scores = bool(getattr(cfg, "overlay_scores", False))
+        try:
+            self.cfg.preview_every = int(getattr(cfg, "preview_every", 3))
+        except Exception:
+            self.cfg.preview_every = 3
         self.video_edit.setText(cfg.video)
         paths = [part.strip() for part in (cfg.ref or "").split(';') if part.strip()]
         self._set_ref_paths(paths)
@@ -6379,6 +6453,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.face_yolo_edit.setText(cfg.face_model)
         self.annot_check.setChecked(cfg.save_annot)
         self.preview_every_spin.setValue(cfg.preview_every)
+        if hasattr(self, 'preview_max_dim_spin'):
+            self.preview_max_dim_spin.setValue(int(getattr(cfg, 'preview_max_dim', self.cfg.preview_max_dim)))
+        if hasattr(self, 'preview_fps_cap_spin'):
+            self.preview_fps_cap_spin.setValue(int(getattr(cfg, 'preview_fps_cap', self.cfg.preview_fps_cap)))
+        if hasattr(self, 'seek_fast_check'):
+            self.seek_fast_check.setChecked(bool(getattr(cfg, 'seek_fast', self.cfg.seek_fast)))
+        if hasattr(self, 'seek_max_grabs_spin'):
+            self.seek_max_grabs_spin.setValue(int(getattr(cfg, 'seek_max_grabs', self.cfg.seek_max_grabs)))
+        if hasattr(self, 'seek_preview_peek_spin'):
+            self.seek_preview_peek_spin.setValue(int(getattr(cfg, 'seek_preview_peek_every', self.cfg.seek_preview_peek_every)))
+        if hasattr(self, 'overlay_scores_check'):
+            self.overlay_scores_check.setChecked(bool(getattr(cfg, 'overlay_scores', self.cfg.overlay_scores)))
         if hasattr(self, 'pref_face_check'):
             self.pref_face_check.setChecked(cfg.prefer_face_when_available)
         if hasattr(self, 'face_quality_spin'):
@@ -6565,27 +6651,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log(txt)
 
     def _on_preview(self, img: QtGui.QImage):
-        sender = self.sender()
-        proc = sender if isinstance(sender, Processor) else None
-        if proc is None:
-            if isinstance(self._worker, Processor):
-                proc = self._worker
-            elif isinstance(self._curator_fallback, Processor):
-                proc = self._curator_fallback
-        if proc is not None and hasattr(proc, "_preview_busy"):
-            proc._preview_busy = True
-        try:
-            pix = QtGui.QPixmap.fromImage(img)
-            self.preview_label.setPixmap(
-                pix.scaled(
-                    self.preview_label.size(),
-                    QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-                    QtCore.Qt.TransformationMode.FastTransformation,
-                )
+        # Robust scaling even if label is 0×0 early in layout
+        pix = QtGui.QPixmap.fromImage(img)
+        w = max(8, self.preview_label.width())
+        h = max(8, self.preview_label.height())
+        self.preview_label.setPixmap(
+            pix.scaled(
+                w,
+                h,
+                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                QtCore.Qt.TransformationMode.FastTransformation,
             )
-        finally:
-            if proc is not None and hasattr(proc, "_preview_busy"):
-                proc._preview_busy = False
+        )
 
     def _on_hit(self, crop_path: str):
         def _set(img: QtGui.QImage) -> bool:
@@ -6791,9 +6868,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ratio_edit.setText(s.value("ratio", "2:3"))
         self.cfg.seek_fast = s.value("seek_fast", True, type=bool)
         try:
-            self.cfg.seek_max_grabs = int(s.value("seek_max_grabs", 45))
+            self.cfg.seek_max_grabs = int(s.value("seek_max_grabs", 12))
         except Exception:
-            self.cfg.seek_max_grabs = 45
+            self.cfg.seek_max_grabs = 12
+        try:
+            self.cfg.preview_max_dim = int(s.value("preview_max_dim", 1280))
+        except Exception:
+            self.cfg.preview_max_dim = 1280
+        try:
+            self.cfg.preview_fps_cap = int(s.value("preview_fps_cap", 20))
+        except Exception:
+            self.cfg.preview_fps_cap = 20
+        try:
+            self.cfg.seek_preview_peek_every = int(s.value("seek_preview_peek_every", 16))
+        except Exception:
+            self.cfg.seek_preview_peek_every = 16
+        self.cfg.overlay_scores = s.value("overlay_scores", False, type=bool)
+        try:
+            self.cfg.preview_every = int(s.value("preview_every", 3))
+        except Exception:
+            self.cfg.preview_every = 3
         self.stride_spin.setValue(int(s.value("frame_stride", 2)))
         self.det_conf_spin.setValue(float(s.value("min_det_conf", 0.35)))
         self.face_thr_spin.setValue(float(s.value("face_thresh", 0.45)))
@@ -6892,7 +6986,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.yolo_edit.setText(s.value("yolo_model", "yolov8n.pt"))
         self.face_yolo_edit.setText(s.value("face_model", "scrfd_10g_bnkps"))
         self.annot_check.setChecked(s.value("save_annot", False, type=bool))
-        self.preview_every_spin.setValue(int(s.value("preview_every", 120)))
+        self.preview_every_spin.setValue(int(s.value("preview_every", self.cfg.preview_every)))
+        if hasattr(self, 'preview_max_dim_spin'):
+            self.preview_max_dim_spin.setValue(int(s.value("preview_max_dim", self.cfg.preview_max_dim)))
+        if hasattr(self, 'preview_fps_cap_spin'):
+            self.preview_fps_cap_spin.setValue(int(s.value("preview_fps_cap", self.cfg.preview_fps_cap)))
+        if hasattr(self, 'seek_fast_check'):
+            self.seek_fast_check.setChecked(s.value("seek_fast", self.cfg.seek_fast, type=bool))
+        if hasattr(self, 'seek_max_grabs_spin'):
+            self.seek_max_grabs_spin.setValue(int(s.value("seek_max_grabs", self.cfg.seek_max_grabs)))
+        if hasattr(self, 'seek_preview_peek_spin'):
+            self.seek_preview_peek_spin.setValue(int(s.value("seek_preview_peek_every", self.cfg.seek_preview_peek_every)))
+        if hasattr(self, 'overlay_scores_check'):
+            self.overlay_scores_check.setChecked(s.value("overlay_scores", self.cfg.overlay_scores, type=bool))
         if hasattr(self, 'faceless_allow_check'):
             self.faceless_allow_check.setChecked(
                 s.value(
@@ -7067,6 +7173,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 "prescan_exit_cooldown_sec",
                 float(self.spin_prescan_exit_cooldown.value()),
             )
+        if hasattr(self, 'preview_max_dim_spin'):
+            s.setValue("preview_max_dim", int(self.preview_max_dim_spin.value()))
+        if hasattr(self, 'preview_fps_cap_spin'):
+            s.setValue("preview_fps_cap", int(self.preview_fps_cap_spin.value()))
+        if hasattr(self, 'seek_fast_check'):
+            s.setValue("seek_fast", bool(self.seek_fast_check.isChecked()))
+        if hasattr(self, 'seek_max_grabs_spin'):
+            s.setValue("seek_max_grabs", int(self.seek_max_grabs_spin.value()))
+        if hasattr(self, 'seek_preview_peek_spin'):
+            s.setValue("seek_preview_peek_every", int(self.seek_preview_peek_spin.value()))
+        if hasattr(self, 'overlay_scores_check'):
+            s.setValue("overlay_scores", bool(self.overlay_scores_check.isChecked()))
+        if hasattr(self, 'preview_every_spin'):
+            s.setValue("preview_every", int(self.preview_every_spin.value()))
         if hasattr(self, 'spin_prescan_refine_window'):
             s.setValue(
                 "prescan_boundary_refine_sec",
