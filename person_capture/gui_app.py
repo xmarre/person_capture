@@ -1907,6 +1907,7 @@ class Processor(QtCore.QObject):
         *,
         fast: bool = False,
         max_grabs: int = 0,
+        peek_preview: bool = False,
     ) -> int:
         """Keyframe-aware seek. If fast=True, cap forward grabs to max_grabs to avoid long stalls."""
         if self._total_frames is not None:
@@ -1957,9 +1958,9 @@ class Processor(QtCore.QObject):
             if not cap.grab():
                 break
             idx += 1
-            # Light preview peek while seeking (configurable)
+            # Light preview peek only when explicitly enabled (UI scrubs)
             peek_n = max(1, int(getattr(self.cfg, "seek_preview_peek_every", 16)))
-            if fast and (i % peek_n) == 0:
+            if peek_preview and fast and (i % peek_n) == 0:
                 ok, frame = cap.retrieve()
                 if ok:
                     try:
@@ -2498,6 +2499,7 @@ class Processor(QtCore.QObject):
                         s0,
                         fast=bool(getattr(cfg, "seek_fast", True)),
                         max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
+                        peek_preview=False,  # segment jump: no peeks
                     )
                     # Neutralize any stray cooldown/coalesced state from the jump *before* progress emit.
                     if hasattr(self, "_seek_cooldown_frames"):
@@ -2815,6 +2817,7 @@ class Processor(QtCore.QObject):
                         tgt,
                         fast=bool(getattr(self.cfg, "seek_fast", True)),
                         max_grabs=int(getattr(self.cfg, "seek_max_grabs", 12)),
+                        peek_preview=True,  # UI scrub: allow peeks
                     )
                     self.progress.emit(frame_idx)
                     # reset temporal gates so back/forward scrubs work
@@ -2857,6 +2860,7 @@ class Processor(QtCore.QObject):
                             s,
                             fast=bool(getattr(self.cfg, "seek_fast", True)),
                             max_grabs=int(getattr(self.cfg, "seek_max_grabs", 12)),
+                            peek_preview=False,  # segment jump: no peeks
                         )
                         self._seek_cooldown_frames = int(max(2, (self._fps or 30) * 0.25))
                         continue
@@ -2871,6 +2875,7 @@ class Processor(QtCore.QObject):
                             s2,
                             fast=bool(getattr(self.cfg, "seek_fast", True)),
                             max_grabs=int(getattr(self.cfg, "seek_max_grabs", 12)),
+                            peek_preview=False,  # segment jump: no peeks
                         )
                         self._seek_cooldown_frames = int(max(2, (self._fps or 30) * 0.25))
                         continue
