@@ -627,7 +627,12 @@ class Processor(QtCore.QObject):
                         fast=bool(getattr(cfg, "seek_fast", True)),
                         max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
                     )
-                    i = (new_pos // stride) * stride
+                    # ensure forward progress even if seek advanced < stride
+                    i_floor = (new_pos // stride) * stride
+                    if i_floor <= i:
+                        i = i + stride
+                    else:
+                        i = i_floor
                     processed_samples = i // stride
                     active = False
                     neg_run = 0
@@ -649,13 +654,16 @@ class Processor(QtCore.QObject):
                     next_i = ((i // stride) + 1) * stride
                     if next_i >= total_frames:
                         break
-                    i = self._seek_to(
+                    old_i = i
+                    i2 = self._seek_to(
                         cap,
                         i,
                         next_i,
                         fast=bool(getattr(cfg, "seek_fast", True)),
                         max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
                     )
+                    # if capped seek didn't reach next_i, still advance one stride to avoid stalls
+                    i = i2 if i2 > old_i else old_i + stride
                     continue
                 # Preempt before IO to honor newly queued seeks/steps
                 try:
@@ -716,7 +724,11 @@ class Processor(QtCore.QObject):
                         fast=bool(getattr(cfg, "seek_fast", True)),
                         max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
                     )
-                    i = (new_pos // stride) * stride
+                    i_floor = (new_pos // stride) * stride
+                    if i_floor <= i:
+                        i = i + stride
+                    else:
+                        i = i_floor
                     processed_samples = i // stride
                     active = False
                     neg_run = 0
