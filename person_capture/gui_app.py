@@ -289,6 +289,8 @@ class SessionConfig:
     suppress_negatives: bool = False
     neg_tolerance: float = 0.35
     max_negatives: int = 5         # emit preview every N processed frames
+    preview_max_dim: int = 1920
+    preview_drop_when_busy: bool = True
     # --- faceless fallback controls ---
     allow_faceless_when_locked: bool = True
     faceless_reid_thresh: float = 0.40      # <= lock if ReID distance <= this
@@ -903,7 +905,7 @@ class Processor(QtCore.QObject):
                             2,
                             cv2.LINE_AA,
                         )
-                        self.preview.emit(self._cv_bgr_to_qimage(vis))
+                        self._emit_preview_bgr(vis)
                     except Exception:
                         pass
                 i += 1
@@ -1949,10 +1951,17 @@ class Processor(QtCore.QObject):
         # Time-budgeted forward grabs to avoid long decode stalls
         t0 = time.perf_counter() if fast else None
         budget = 0.15  # ~150 ms max spent per seek
-        for _ in range(limit):
+        for i in range(limit):
             if not cap.grab():
                 break
             idx += 1
+            if fast and (i & 0x7) == 0:
+                ok, frame = cap.retrieve()
+                if ok:
+                    try:
+                        self._emit_preview_bgr(frame)
+                    except Exception:
+                        pass
             if fast and (time.perf_counter() - t0) > budget:
                 try:
                     self._status(
@@ -1985,6 +1994,7 @@ class Processor(QtCore.QObject):
         self._lock_last_seen_idx: int = -10**9
         self._locked_reid_feat: Optional[np.ndarray] = None
         self._prev_gray: Optional[np.ndarray] = None
+        self._preview_busy: bool = False
 
     def _emit_hit(self, path: str) -> None:
         emit = getattr(self.hit, "emit", None)
@@ -2501,7 +2511,7 @@ class Processor(QtCore.QObject):
                         if ok:
                             ok, frame = cap.retrieve()
                             if ok and frame is not None:
-                                self.preview.emit(self._cv_bgr_to_qimage(frame))
+                                self._emit_preview_bgr(frame)
                         # Do not advance past s0 for processing—restore read head.
                         cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
                     except Exception:
@@ -4306,8 +4316,7 @@ class Processor(QtCore.QObject):
                                 key="save_err_ann",
                                 interval=1.0,
                             )
-                    qimg = self._cv_bgr_to_qimage(show)
-                    self.preview.emit(qimg)
+                    self._emit_preview_bgr(show)
 
                 # drain any pending hit notifications (async saver)
                 if hit_q is not None:
@@ -4323,8 +4332,7 @@ class Processor(QtCore.QObject):
                 # Always-on preview cadence
                 if preview_due:
                     base = frame.copy()
-                    qimg = self._cv_bgr_to_qimage(base)
-                    self.preview.emit(qimg)
+                    self._emit_preview_bgr(base)
 
                 # single progress update per loop
                 self._prev_gray = gray.copy()
@@ -4541,6 +4549,46 @@ class Processor(QtCore.QObject):
             self.status.emit(msg)
             self._status_last_time[k] = now
             self._status_last_text[k] = msg
+
+    def _emit_preview_bgr(self, bgr) -> None:
+        emit = getattr(self.preview, "emit", None)
+        if emit is None or bgr is None:
+            return
+        drop_busy = bool(getattr(self.cfg, "preview_drop_when_busy", True))
+        if drop_busy and getattr(self, "_preview_busy", False):
+            return
+        try:
+            arr = np.asarray(bgr)
+        except Exception:
+            return
+        if arr.ndim != 3 or arr.shape[2] != 3:
+            return
+        h, w = arr.shape[:2]
+        try:
+            max_dim = int(getattr(self.cfg, "preview_max_dim", 0) or 0)
+        except Exception:
+            max_dim = 0
+        if max_dim > 0:
+            max_dim = max(1, max_dim)
+            longest = max(h, w)
+            if longest > max_dim:
+                scale = float(max_dim) / float(longest)
+                new_w = max(1, int(round(w * scale)))
+                new_h = max(1, int(round(h * scale)))
+                arr = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                h, w = arr.shape[:2]
+        rgb = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+        qimg = QtGui.QImage(
+            rgb.data,
+            int(w),
+            int(h),
+            int(rgb.strides[0]),
+            QtGui.QImage.Format.Format_RGB888,
+        ).copy()
+        try:
+            emit(qimg)
+        except Exception:
+            logger.debug("Failed to emit preview frame", exc_info=True)
 
     def _cv_bgr_to_qimage(self, bgr) -> QtGui.QImage:
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -6517,8 +6565,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log(txt)
 
     def _on_preview(self, img: QtGui.QImage):
-        pix = QtGui.QPixmap.fromImage(img)
-        self.preview_label.setPixmap(pix.scaled(self.preview_label.size(), QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation))
+        sender = self.sender()
+        proc = sender if isinstance(sender, Processor) else None
+        if proc is None:
+            if isinstance(self._worker, Processor):
+                proc = self._worker
+            elif isinstance(self._curator_fallback, Processor):
+                proc = self._curator_fallback
+        if proc is not None and hasattr(proc, "_preview_busy"):
+            proc._preview_busy = True
+        try:
+            pix = QtGui.QPixmap.fromImage(img)
+            self.preview_label.setPixmap(
+                pix.scaled(
+                    self.preview_label.size(),
+                    QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                    QtCore.Qt.TransformationMode.FastTransformation,
+                )
+            )
+        finally:
+            if proc is not None and hasattr(proc, "_preview_busy"):
+                proc._preview_busy = False
 
     def _on_hit(self, crop_path: str):
         def _set(img: QtGui.QImage) -> bool:
