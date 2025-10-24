@@ -188,9 +188,14 @@ class _BaseAvReader:
             for pkt in self._ct.demux(self._vs):
                 for frame in pkt.decode():
                     if self._drop_until is not None:
+                        # Use PTS when available, else fall back to sequential counting.
                         idx = _index_from_pts(self._vs, frame.pts, self._fps)
-                        # Skip until we reach the target index; if idx is unknown, keep skipping.
-                        if idx is None or idx < self._drop_until:
+                        if idx is None:
+                            idx = self._pos + 1
+                        # Skip until we reach the requested target index.
+                        if idx < self._drop_until:
+                            # Keep the counter in sync while skipping frames with no timestamps.
+                            self._pos = idx
                             continue
                         self._drop_until = None
                     if self._graph is None or self._src is None:
@@ -200,7 +205,7 @@ class _BaseAvReader:
                         arr = of.to_ndarray(format="bgr24")
                         idx = _index_from_pts(self._vs, getattr(of, "pts", None), self._fps)
                         if idx is None:
-                            idx = self._pos + 1
+                            idx = self._pos + 1  # sequential fallback for filters without PTS
                         self._pos = idx
                         self._buf.arr = arr
                         return True
