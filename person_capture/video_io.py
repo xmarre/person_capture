@@ -13,6 +13,8 @@ try:
     CV_CAP_PROP_POS_FRAMES = int(cv2.CAP_PROP_POS_FRAMES)
     CV_CAP_PROP_FPS = int(cv2.CAP_PROP_FPS)
     CV_CAP_PROP_FRAME_COUNT = int(cv2.CAP_PROP_FRAME_COUNT)
+    CV_CAP_PROP_FRAME_WIDTH = int(cv2.CAP_PROP_FRAME_WIDTH)
+    CV_CAP_PROP_FRAME_HEIGHT = int(cv2.CAP_PROP_FRAME_HEIGHT)
 except Exception:
     CV_CAP_PROP_POS_FRAMES = 1
     CV_CAP_PROP_FPS = 5
@@ -99,6 +101,14 @@ def _nb_frames_guess(ct, vs) -> int:
     return 0
 
 
+def _index_from_pts(vs, pts: Optional[int], fps: float) -> Optional[int]:
+    """Map stream pts to an integer frame index using stream time_base and fps."""
+    if pts is None:
+        return None
+    tb = vs.time_base
+    return int(round((pts * tb) * fps))
+
+
 @dataclass
 class _FrameBuf:
     arr: Optional[np.ndarray] = None
@@ -116,6 +126,7 @@ class _BaseAvReader:
         self._graph = None
         self._src = None
         self._sink = None
+        self._drop_until: Optional[int] = None
 
     def isOpened(self) -> bool:
         return True
@@ -130,6 +141,10 @@ class _BaseAvReader:
     def get(self, prop_id: int) -> float:
         if prop_id == CV_CAP_PROP_FPS:
             return float(self._fps)
+        if prop_id == CV_CAP_PROP_FRAME_WIDTH:
+            return float(self._vs.width)
+        if prop_id == CV_CAP_PROP_FRAME_HEIGHT:
+            return float(self._vs.height)
         if prop_id == CV_CAP_PROP_FRAME_COUNT:
             return float(self._total)
         if prop_id == CV_CAP_PROP_POS_FRAMES:
@@ -143,9 +158,13 @@ class _BaseAvReader:
         return False
 
     def _seek_to(self, index: int):
-        index = max(0, index)
+        # Clamp to valid range if total is known
+        if self._total and self._total > 0:
+            index = min(max(0, index), self._total - 1)
+        else:
+            index = max(0, index)
         tb = self._vs.time_base
-        ts = int(index / max(self._fps, 1e-6) / tb)
+        ts = int(round((index / max(self._fps, 1e-6)) / tb))
         try:
             self._ct.seek(ts, stream=self._vs, any_frame=False)
         except Exception:
@@ -153,7 +172,8 @@ class _BaseAvReader:
                 self._ct.seek(ts, any_frame=True)
             except Exception:
                 pass
-        self._pos = index
+        self._drop_until = index
+        self._pos = max(0, index - 1)
         try:
             if self._graph:
                 self._configure_graph(reset=True)
@@ -167,13 +187,22 @@ class _BaseAvReader:
         try:
             for pkt in self._ct.demux(self._vs):
                 for frame in pkt.decode():
+                    if self._drop_until is not None:
+                        idx = _index_from_pts(self._vs, frame.pts, self._fps)
+                        # Skip until we reach the target index; if idx is unknown, keep skipping.
+                        if idx is None or idx < self._drop_until:
+                            continue
+                        self._drop_until = None
                     if self._graph is None or self._src is None:
                         self._configure_graph(reset=False)
                     self._graph.push(frame)
                     for of in self._graph:
                         arr = of.to_ndarray(format="bgr24")
+                        idx = _index_from_pts(self._vs, getattr(of, "pts", None), self._fps)
+                        if idx is None:
+                            idx = self._pos + 1
+                        self._pos = idx
                         self._buf.arr = arr
-                        self._pos += 1
                         return True
             return False
         except Exception:
