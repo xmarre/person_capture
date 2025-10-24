@@ -34,6 +34,12 @@ def _imp():
         except Exception:
             UpdateManager = None  # type: ignore
 
+        try:
+            from .video_io import open_video_with_tonemap  # type: ignore
+        except Exception:
+            def open_video_with_tonemap(_path: str):
+                return None
+
         from .detectors import PersonDetector  # type: ignore
         from .face_embedder import FaceEmbedder  # type: ignore
         from .reid_embedder import ReIDEmbedder  # type: ignore
@@ -54,6 +60,7 @@ def _imp():
             expand_box_to_ratio,
             phash_similarity,
             _phash_bits,
+            open_video_with_tonemap,
             UpdateManager,
         )
     except Exception:
@@ -70,6 +77,11 @@ def _imp():
             except Exception:
                 UpdateManager = None  # type: ignore
 
+            from video_io import open_video_with_tonemap  # type: ignore
+        except Exception:
+            def open_video_with_tonemap(_path: str):
+                return None
+        try:
             from .utils import ensure_dir, parse_ratio, expand_box_to_ratio, phash_similarity, _phash_bits  # type: ignore
         except Exception:
             from utils import ensure_dir, parse_ratio, expand_box_to_ratio, phash_similarity, _phash_bits  # type: ignore
@@ -82,6 +94,7 @@ def _imp():
             expand_box_to_ratio,
             phash_similarity,
             _phash_bits,
+            open_video_with_tonemap,
             UpdateManager,
         )
 
@@ -94,6 +107,7 @@ def _imp():
     expand_box_to_ratio,
     phash_similarity,
     _phash_bits,
+    open_video_with_tonemap,
     UpdateManager,
 ) = _imp()
 # Optional Curate tab
@@ -2422,15 +2436,23 @@ class Processor(QtCore.QObject):
 
             # Video
             try:
-                os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
-                cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
+                # Prefer HDR->SDR via libplacebo if HDR; else OpenCV path.
                 try:
-                    cap.set(cv2.CAP_PROP_HW_ACCELERATION, 1)
+                    tonemap_cap = open_video_with_tonemap(cfg.video)
                 except Exception:
-                    pass
-                if not cap.isOpened():
-                    cap.release()
-                    cap = cv2.VideoCapture(cfg.video)
+                    tonemap_cap = None
+                if tonemap_cap is not None:
+                    cap = tonemap_cap
+                else:
+                    os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
+                    cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
+                    try:
+                        cap.set(cv2.CAP_PROP_HW_ACCELERATION, 1)
+                    except Exception:
+                        pass
+                    if not cap.isOpened():
+                        cap.release()
+                        cap = cv2.VideoCapture(cfg.video)
             except Exception:
                 cap = cv2.VideoCapture(cfg.video)
             if not cap.isOpened():
