@@ -42,6 +42,25 @@ _log.info("INIT TRT cache root=%s", os.getenv("PERSON_CAPTURE_TRT_CACHE_ROOT"))
 _log.info("INIT ULTRALYTICS_HOME=%s", os.getenv("ULTRALYTICS_HOME"))
 # -----------------------------------------------------------------------------------
 
+
+# Robust getter for HDR helper (try package then flat before stubbing)
+def _get_open_video_with_tonemap():
+    lg = logging.getLogger(__name__)
+    try:
+        from .video_io import open_video_with_tonemap as _fn  # type: ignore
+        lg.info("HDR: using package video_io")
+        return _fn
+    except Exception as e1:
+        lg.warning("HDR: package video_io import failed (%s), trying flat", e1)
+        try:
+            from video_io import open_video_with_tonemap as _fn  # type: ignore
+            lg.info("HDR: using flat video_io")
+            return _fn
+        except Exception as e2:
+            lg.warning("HDR disabled: cannot import video_io (%s)", e2)
+            return lambda _path: None
+
+
 # Robust imports: support both package ("from .module") and flat files ("import module").
 def _imp():
     try:
@@ -50,14 +69,7 @@ def _imp():
             from .updater import UpdateManager  # type: ignore
         except Exception:
             UpdateManager = None  # type: ignore
-
-        try:
-            from .video_io import open_video_with_tonemap  # type: ignore
-        except Exception as e:
-            logging.getLogger(__name__).warning("HDR disabled: failed to import .video_io (%s)", e)
-
-            def open_video_with_tonemap(_path: str):
-                return None
+        open_video_with_tonemap = _get_open_video_with_tonemap()
 
         from .detectors import PersonDetector  # type: ignore
         from .face_embedder import FaceEmbedder  # type: ignore
@@ -91,17 +103,10 @@ def _imp():
         from face_embedder import FaceEmbedder  # type: ignore
         from reid_embedder import ReIDEmbedder  # type: ignore
         try:
-            try:
-                from updater import UpdateManager  # type: ignore
-            except Exception:
-                UpdateManager = None  # type: ignore
-
-            from video_io import open_video_with_tonemap  # type: ignore
-        except Exception as e:
-            logging.getLogger(__name__).warning("HDR disabled: failed to import video_io (%s)", e)
-
-            def open_video_with_tonemap(_path: str):
-                return None
+            from updater import UpdateManager  # type: ignore
+        except Exception:
+            UpdateManager = None  # type: ignore
+        open_video_with_tonemap = _get_open_video_with_tonemap()
         try:
             from .utils import ensure_dir, parse_ratio, expand_box_to_ratio, phash_similarity, _phash_bits  # type: ignore
         except Exception:
