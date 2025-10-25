@@ -25,6 +25,14 @@ from dataclasses import dataclass, asdict
 from typing import Optional, Tuple, List
 from pathlib import Path
 
+# Ensure caches resolve to REPO ROOT before any Ultralytics import happens
+_PKG_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _PKG_DIR.parent if _PKG_DIR.name == "person_capture" else _PKG_DIR
+os.environ.setdefault("ULTRALYTICS_HOME", str(_REPO_ROOT / ".ultralytics"))
+os.environ.setdefault("HF_HOME", str(_REPO_ROOT / ".cache" / "huggingface"))
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(_REPO_ROOT / ".cache" / "huggingface"))
+# PERSON_CAPTURE_TRT_CACHE_ROOT remains set inside run() from cfg
+
 # Robust imports: support both package ("from .module") and flat files ("import module").
 def _imp():
     try:
@@ -2238,7 +2246,18 @@ class Processor(QtCore.QObject):
                     return
                 os.environ[k] = str(v)
 
-            _env_set("PERSON_CAPTURE_TRT_CACHE_ROOT", getattr(self.cfg, "trt_cache_root", "trt_cache"))
+            # Resolve caches against REPO ROOT, not package dir
+
+            def _abs_repo(p: str) -> str:
+                q = Path(p)
+                return str(q if q.is_absolute() else (_REPO_ROOT / q))
+
+            trt_cache_root = _abs_repo(getattr(self.cfg, "trt_cache_root", "trt_cache"))
+            _env_set("PERSON_CAPTURE_TRT_CACHE_ROOT", trt_cache_root)
+
+            logging.getLogger(__name__).info("Repo root=%s", _REPO_ROOT)
+            logging.getLogger(__name__).info("TRT cache root=%s", trt_cache_root)
+            logging.getLogger(__name__).info("ULTRALYTICS_HOME=%s", os.environ.get("ULTRALYTICS_HOME"))
             _env_set("PERSON_CAPTURE_TRT_FP16", "1" if getattr(self.cfg, "trt_fp16_enable", True) else "0")
             _env_set("PERSON_CAPTURE_TRT_TIMING_CACHE_ENABLE", "1" if getattr(self.cfg, "trt_timing_cache_enable", True) else "0")
             _env_set("PERSON_CAPTURE_TRT_ENGINE_CACHE_ENABLE", "1" if getattr(self.cfg, "trt_engine_cache_enable", True) else "0")
