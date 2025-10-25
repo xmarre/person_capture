@@ -25,13 +25,22 @@ from dataclasses import dataclass, asdict
 from typing import Optional, Tuple, List
 from pathlib import Path
 
-# Ensure caches resolve to REPO ROOT before any Ultralytics import happens
+# ---------- Repo root + caches MUST be set before any model/video imports ----------
 _PKG_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _PKG_DIR.parent if _PKG_DIR.name == "person_capture" else _PKG_DIR
+# Ensure logging is live early so video_io can emit
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO)
+_log = logging.getLogger(__name__)
+# Defaults; run() may override from cfg
+os.environ.setdefault("PERSON_CAPTURE_TRT_CACHE_ROOT", str(_REPO_ROOT / "trt_cache"))
 os.environ.setdefault("ULTRALYTICS_HOME", str(_REPO_ROOT / ".ultralytics"))
 os.environ.setdefault("HF_HOME", str(_REPO_ROOT / ".cache" / "huggingface"))
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(_REPO_ROOT / ".cache" / "huggingface"))
-# PERSON_CAPTURE_TRT_CACHE_ROOT remains set inside run() from cfg
+_log.info("INIT Repo root=%s", _REPO_ROOT)
+_log.info("INIT TRT cache root=%s", os.getenv("PERSON_CAPTURE_TRT_CACHE_ROOT"))
+_log.info("INIT ULTRALYTICS_HOME=%s", os.getenv("ULTRALYTICS_HOME"))
+# -----------------------------------------------------------------------------------
 
 # Robust imports: support both package ("from .module") and flat files ("import module").
 def _imp():
@@ -44,7 +53,9 @@ def _imp():
 
         try:
             from .video_io import open_video_with_tonemap  # type: ignore
-        except Exception:
+        except Exception as e:
+            logging.getLogger(__name__).warning("HDR disabled: failed to import .video_io (%s)", e)
+
             def open_video_with_tonemap(_path: str):
                 return None
 
@@ -86,7 +97,9 @@ def _imp():
                 UpdateManager = None  # type: ignore
 
             from video_io import open_video_with_tonemap  # type: ignore
-        except Exception:
+        except Exception as e:
+            logging.getLogger(__name__).warning("HDR disabled: failed to import video_io (%s)", e)
+
             def open_video_with_tonemap(_path: str):
                 return None
         try:
@@ -129,9 +142,6 @@ except Exception:
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtWidgets import QDockWidget
 
-
-if not logging.getLogger().handlers:
-    logging.basicConfig(level=logging.INFO)
 
 logger = logging.getLogger(__name__)
 
@@ -2259,9 +2269,9 @@ class Processor(QtCore.QObject):
             trt_cache_root = _abs_repo(_cfg_trt) or str(_REPO_ROOT / "trt_cache")
             _env_set("PERSON_CAPTURE_TRT_CACHE_ROOT", trt_cache_root)
 
-            logging.getLogger(__name__).info("Repo root=%s", _REPO_ROOT)
-            logging.getLogger(__name__).info("TRT cache root=%s", trt_cache_root)
-            logging.getLogger(__name__).info("ULTRALYTICS_HOME=%s", os.environ.get("ULTRALYTICS_HOME"))
+            logger.info("Repo root=%s", _REPO_ROOT)
+            logger.info("TRT cache root=%s", trt_cache_root)
+            logger.info("ULTRALYTICS_HOME=%s", os.environ.get("ULTRALYTICS_HOME"))
             _env_set("PERSON_CAPTURE_TRT_FP16", "1" if getattr(self.cfg, "trt_fp16_enable", True) else "0")
             _env_set("PERSON_CAPTURE_TRT_TIMING_CACHE_ENABLE", "1" if getattr(self.cfg, "trt_timing_cache_enable", True) else "0")
             _env_set("PERSON_CAPTURE_TRT_ENGINE_CACHE_ENABLE", "1" if getattr(self.cfg, "trt_engine_cache_enable", True) else "0")
