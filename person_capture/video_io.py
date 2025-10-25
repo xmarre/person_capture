@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import subprocess, json
+import subprocess, json, os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -51,6 +51,31 @@ def _probe_colors(path: str) -> tuple[str, str]:
     meta = _ffprobe_json(path)
     s = (meta.get("streams") or [{}])[0]
     return str(s.get("color_transfer") or "").lower(), str(s.get("color_primaries") or "").lower()
+
+
+def _probe_pixfmt_av(path: str) -> tuple[Optional[str], Optional[int], Optional[int]]:
+    """Return (pix_fmt, width, height) via PyAV, or (None,None,None) on failure."""
+    try:
+        ct = av.open(path)
+        vs = ct.streams.video[0]
+        fmt = getattr(vs.format, "name", None)
+        w, h = vs.width, vs.height
+        ct.close()
+        return fmt, w, h
+    except Exception:
+        return None, None, None
+
+
+def _detect_hdr(path: str) -> tuple[bool, str]:
+    t, p = _probe_colors(path)
+    if t in ("smpte2084", "arib-std-b67"):
+        return True, f"ffprobe transfer={t}"
+    if p == "bt2020":
+        return True, "ffprobe primaries=bt2020"
+    pixfmt, w, h = _probe_pixfmt_av(path)
+    if pixfmt and ("p10" in pixfmt or "p12" in pixfmt or "yuv420p16" in pixfmt):
+        return True, f"heuristic pix_fmt={pixfmt} {w}x{h}"
+    return False, "no HDR color tags and no 10/12/16-bit pix_fmt"
 
 
 def _probe_range(path: str) -> str:
@@ -242,11 +267,17 @@ class AvLibplaceboReader(_BaseAvReader):
         self._log = logging.getLogger(__name__)
         self._transfer, self._primaries = _probe_colors(path)
         self._range_in = _probe_range(path)
+        self._log.info(
+            "HDR detect: transfer=%s primaries=%s range=%s",
+            self._transfer or "unknown",
+            self._primaries or "unknown",
+            self._range_in,
+        )
         try:
             self._configure_graph(reset=False)
         except Exception:
             self._use_fallback = True
-            self._configure_graph(reset=False)
+            self._configure_graph(reset=True)
         self._log.info(
             "HDR preview path: %s",
             "libplacebo" if not self._use_fallback else "CPU fallback",
@@ -327,7 +358,25 @@ class AvLibplaceboReader(_BaseAvReader):
 
 def open_video_with_tonemap(path: str):
     """Return a cv2.VideoCapture-like object for HDR streams, else None."""
-
-    if not is_hdr_stream(path):
+    log = logging.getLogger(__name__)
+    # Env override
+    force = os.getenv("PERSON_CAPTURE_FORCE_HDR", "").lower() in ("1","true","yes")
+    if force:
+        log.info("HDR detect: forced by PERSON_CAPTURE_FORCE_HDR=1")
+        try:
+            return AvLibplaceboReader(path)
+        except Exception as e:
+            log.error("HDR forced but libplacebo path failed: %s", e, exc_info=True)
+            return None
+    # Robust detect
+    is_hdr, reason = _detect_hdr(path)
+    if is_hdr:
+        log.info("HDR detect: %s → enabling tone-map path", reason)
+        try:
+            return AvLibplaceboReader(path)
+        except Exception as e:
+            log.error("HDR path init failed (falling back to SDR). Error: %s", e, exc_info=True)
+            return None
+    else:
+        log.info("HDR detect: %s → using OpenCV SDR path", reason)
         return None
-    return AvLibplaceboReader(path)

@@ -2248,11 +2248,15 @@ class Processor(QtCore.QObject):
 
             # Resolve caches against REPO ROOT, not package dir
 
-            def _abs_repo(p: str) -> str:
+            def _abs_repo(p: Optional[str]) -> Optional[str]:
+                if not p:
+                    return None
                 q = Path(p)
                 return str(q if q.is_absolute() else (_REPO_ROOT / q))
 
-            trt_cache_root = _abs_repo(getattr(self.cfg, "trt_cache_root", "trt_cache"))
+            # Allow null/empty in cfg, then fall back to default under repo root
+            _cfg_trt = getattr(self.cfg, "trt_cache_root", None)
+            trt_cache_root = _abs_repo(_cfg_trt) or str(_REPO_ROOT / "trt_cache")
             _env_set("PERSON_CAPTURE_TRT_CACHE_ROOT", trt_cache_root)
 
             logging.getLogger(__name__).info("Repo root=%s", _REPO_ROOT)
@@ -2461,8 +2465,10 @@ class Processor(QtCore.QObject):
                 except Exception:
                     tonemap_cap = None
                 if tonemap_cap is not None:
+                    logger.info("Video open: HDR tone-map reader selected")
                     cap = tonemap_cap
                 else:
+                    logger.info("Video open: OpenCV/FFmpeg reader selected")
                     os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
                     cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
                     try:
