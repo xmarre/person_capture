@@ -32,7 +32,7 @@ def _ffprobe_json(path: str) -> dict:
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=color_space,color_transfer,color_primaries,avg_frame_rate,nb_frames,duration,time_base",
+            "stream=color_space,color_transfer,color_primaries,color_range,avg_frame_rate,nb_frames,duration,time_base",
             "-of",
             "json",
             path,
@@ -51,6 +51,14 @@ def _probe_colors(path: str) -> tuple[str, str]:
     meta = _ffprobe_json(path)
     s = (meta.get("streams") or [{}])[0]
     return str(s.get("color_transfer") or "").lower(), str(s.get("color_primaries") or "").lower()
+
+
+def _probe_range(path: str) -> str:
+    """Return 'limited' or 'full' (default limited when unknown)."""
+    meta = _ffprobe_json(path)
+    s = (meta.get("streams") or [{}])[0]
+    r = str(s.get("color_range") or "").lower()
+    return "full" if r in ("pc", "jpeg", "full") else "limited"
 
 
 def is_hdr_stream(path: str) -> bool:
@@ -233,6 +241,7 @@ class AvLibplaceboReader(_BaseAvReader):
         self._use_fallback = False
         self._log = logging.getLogger(__name__)
         self._transfer, self._primaries = _probe_colors(path)
+        self._range_in = _probe_range(path)
         try:
             self._configure_graph(reset=False)
         except Exception:
@@ -247,6 +256,7 @@ class AvLibplaceboReader(_BaseAvReader):
             self._transfer or "unknown",
             self._primaries or "unknown",
         )
+        self._log.info("Input range=%s (expanding to full for preview)", self._range_in)
 
     def _configure_graph(self, reset: bool = False):
         if reset or self._graph is None:
@@ -262,11 +272,11 @@ class AvLibplaceboReader(_BaseAvReader):
                 f"pixel_aspect={(sar.numerator if sar else 1)}/{(sar.denominator if sar else 1)}",
             )
             if not self._use_fallback:
+                # Let libplacebo tone-map into RGB; then convert directly to BGR24.
+                # This avoids YUV range ambiguities entirely.
                 f1 = g.add(
                     "libplacebo",
-                    "tonemapping=auto:gamut_mode=perceptual:"
-                    "target_trc=bt709:target_primaries=bt709:"
-                    "deband=yes:dither=yes",
+                    "tonemapping=auto:gamut_mode=perceptual:target_trc=bt709:target_primaries=bt709:deband=yes:dither=yes",
                 )
                 f2 = g.add("format", "bgr24")
                 sink = g.add("buffersink")
@@ -284,7 +294,9 @@ class AvLibplaceboReader(_BaseAvReader):
                     "zscale",
                     "transfer=bt709:primaries=bt709:matrix=bt709:dither=error_diffusion",
                 )
-                f6 = g.add("format", "bgr24")
+                # Expand to full-range before RGB conversion
+                f6 = g.add("zscale", f"rangein={self._range_in}:range=full")
+                f7 = g.add("format", "bgr24")
                 sink = g.add("buffersink")
                 src.link_to(f1)
                 f1.link_to(f2)
@@ -292,11 +304,25 @@ class AvLibplaceboReader(_BaseAvReader):
                 f3.link_to(f4)
                 f4.link_to(f5)
                 f5.link_to(f6)
-                f6.link_to(sink)
+                f6.link_to(f7)
+                f7.link_to(sink)
             g.configure()
             self._graph = g
             self._src = src
             self._sink = sink
+
+        path = (
+            "libplacebo→BGR24"
+            if not self._use_fallback
+            else "zscale→tonemap(mobius)→zscale(709+dither)→zscale(range expand)→BGR24"
+        )
+        self._log.info(
+            "HDR pipeline: %s | src: tr=%s prim=%s range=%s | out: BT.709 full-range BGR",
+            path,
+            self._transfer or "unknown",
+            self._primaries or "unknown",
+            self._range_in,
+        )
 
 
 def open_video_with_tonemap(path: str):
