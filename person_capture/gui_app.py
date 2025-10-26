@@ -34,15 +34,26 @@ if not logging.getLogger().handlers:
 _log = logging.getLogger(__name__)
 # Defaults; run() may override from cfg
 os.environ.setdefault("PERSON_CAPTURE_TRT_CACHE_ROOT", str(_REPO_ROOT / "trt_cache"))
-os.environ.setdefault("ULTRALYTICS_HOME", str(_REPO_ROOT / ".ultralytics"))
-os.environ.setdefault("ULTRALYTICS_SETTINGS", str(_REPO_ROOT / ".ultralytics" / "settings.yaml"))
-(_REPO_ROOT / ".ultralytics").mkdir(parents=True, exist_ok=True)
-(_REPO_ROOT / ".ultralytics" / "settings.yaml").touch(exist_ok=True)
+
+# Respect overrides: derive paths from env, then create those paths only
+_UL_HOME = Path(os.environ.get("ULTRALYTICS_HOME", str(_REPO_ROOT / ".ultralytics")))
+os.environ.setdefault("ULTRALYTICS_HOME", str(_UL_HOME))
+
+_UL_SETTINGS = os.environ.get("ULTRALYTICS_SETTINGS")
+if not _UL_SETTINGS:
+    _UL_SETTINGS = str(_UL_HOME / "settings.yaml")
+    os.environ["ULTRALYTICS_SETTINGS"] = _UL_SETTINGS
+
+# Create exactly the chosen paths
+_UL_HOME.mkdir(parents=True, exist_ok=True)
+Path(_UL_SETTINGS).parent.mkdir(parents=True, exist_ok=True)
+Path(_UL_SETTINGS).touch(exist_ok=True)
 os.environ.setdefault("HF_HOME", str(_REPO_ROOT / ".cache" / "huggingface"))
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(_REPO_ROOT / ".cache" / "huggingface"))
 _log.info("INIT Repo root=%s", _REPO_ROOT)
 _log.info("INIT TRT cache root=%s", os.getenv("PERSON_CAPTURE_TRT_CACHE_ROOT"))
 _log.info("INIT ULTRALYTICS_HOME=%s", os.getenv("ULTRALYTICS_HOME"))
+_log.info("INIT ULTRALYTICS_SETTINGS=%s", os.getenv("ULTRALYTICS_SETTINGS"))
 # -----------------------------------------------------------------------------------
 
 
