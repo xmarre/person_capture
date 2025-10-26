@@ -2,51 +2,24 @@ import logging
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
-
 if TYPE_CHECKING:  # pragma: no cover
-    import torch
-    from ultralytics import YOLO as YOLOType
+    import torch; from ultralytics import YOLO as YOLOType
 
 class PersonDetector:
     def __init__(self, model_name='yolov8n.pt', device='cuda', progress=None):
         try:
             import torch as _torch
-            # Ensure home/settings before Ultralytics reads them
+            # Ensure Ultralytics home before it initializes internal paths
             _pkg_dir = Path(__file__).resolve().parent
             _repo_root = _pkg_dir.parent if _pkg_dir.name == "person_capture" else _pkg_dir
             os.environ.setdefault("ULTRALYTICS_HOME", str(_repo_root / ".ultralytics"))
-            os.environ.setdefault(
-                "ULTRALYTICS_SETTINGS", str(_repo_root / ".ultralytics" / "settings.yaml")
-            )
             Path(os.environ["ULTRALYTICS_HOME"]).mkdir(parents=True, exist_ok=True)
-            settings_path = Path(os.environ["ULTRALYTICS_SETTINGS"])
-            settings_path.parent.mkdir(parents=True, exist_ok=True)
-            settings_path.touch(exist_ok=True)
             from ultralytics import YOLO as _YOLO
-            from ultralytics.utils import SETTINGS
-            # Point all Ultralytics dirs into repo root to avoid global/user/cache drift
+            # Point Ultralytics HOME into repo root to avoid user roaming caches
             _home = Path(os.environ["ULTRALYTICS_HOME"])
-            _weights = _home / "weights"
-            _datasets = _home / "datasets"
-            _downloads = _home / "downloads"
-            for d in (_weights, _datasets, _downloads):
-                d.mkdir(parents=True, exist_ok=True)
-            dirty = False
-            if str(SETTINGS.get("weights_dir", "")) != str(_weights):
-                SETTINGS["weights_dir"] = str(_weights)
-                dirty = True
-            if str(SETTINGS.get("datasets_dir", "")) != str(_datasets):
-                SETTINGS["datasets_dir"] = str(_datasets)
-                dirty = True
-            if str(SETTINGS.get("downloads_dir", "")) != str(_downloads):
-                SETTINGS["downloads_dir"] = str(_downloads)
-                dirty = True
-            if dirty:
-                try:
-                    SETTINGS.save()
-                except Exception:
-                    pass
-            logging.getLogger(__name__).info("YOLO paths: home=%s weights=%s", _home, _weights)
+            (_home / "weights").mkdir(parents=True, exist_ok=True)
+            (_home / "datasets").mkdir(parents=True, exist_ok=True)
+            logging.getLogger(__name__).info("YOLO home=%s", _home)
         except Exception as e:  # pragma: no cover - executed only when deps missing
             raise RuntimeError(
                 "Heavy dependencies not installed; install requirements.txt to run detection."
@@ -58,6 +31,18 @@ class PersonDetector:
         self.progress = progress
         self.model = self._load_model(model_name)
         try:
+            # show exactly where weights came from
+            m = Path(model_name)
+            if m.is_file():
+                resolved = m
+            else:
+                base = m.name.lower()
+                hub = base if base.endswith(".pt") else "yolov8n.pt"
+                resolved = Path(os.environ["ULTRALYTICS_HOME"]) / "weights" / Path(hub)
+            logging.getLogger(__name__).info("YOLO weights=%s", resolved)
+        except Exception:
+            pass
+        try:
             self.model.fuse()
             if self.device == 'cuda':
                 self.model.model.half()
@@ -65,10 +50,17 @@ class PersonDetector:
             pass
 
     def _load_model(self, model_name: str):
-        weights_root = Path(os.environ.get("ULTRALYTICS_HOME", ".")) / "weights"
-        weights_root.mkdir(parents=True, exist_ok=True)
         m = Path(model_name)
-        model_arg = str(m) if m.is_file() else str(weights_root / m.name)
+        # If user gave a real file, load it. Otherwise use hub name to honor ULTRALYTICS_HOME.
+        if m.is_file():
+            model_arg = str(m)
+        else:
+            base = m.name.lower()
+            hub = base if base.endswith(".pt") else "yolov8n.pt"
+            local = Path(os.environ.get("ULTRALYTICS_HOME", ".")) / "weights" / hub
+            if not local.is_file():
+                logging.getLogger(__name__).info("YOLO cache miss for %s → downloading from hub", hub)
+            model_arg = str(local) if local.is_file() else hub
         try:
             return self._YOLO(model_arg)
         except Exception as e:
@@ -76,7 +68,7 @@ class PersonDetector:
                 self.progress(f"YOLO load failed ({e}). Recovering...")
             # If user pointed to a local file, quarantine it and try hub name
             try:
-                p = Path(model_arg)
+                p = m if m.is_file() else Path()
                 if p.is_file():
                     bad = p.with_suffix(p.suffix + '.bad')
                     p.rename(bad)
@@ -86,8 +78,7 @@ class PersonDetector:
                 pass
             # Derive a clean hub model name
             base = Path(model_name).name.lower()
-            hub = base if base.startswith('yolov8') and base.endswith('.pt') else 'yolov8n.pt'
-            # Use hub name so Ultralytics resolves to SETTINGS["weights_dir"] (repo .ultralytics/weights)
+            hub = base if base.endswith('.pt') else 'yolov8n.pt'
             return self._YOLO(hub)
 
     def detect(self, frame, conf=0.35):
