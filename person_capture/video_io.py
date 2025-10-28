@@ -302,6 +302,31 @@ class AvLibplaceboReader(_BaseAvReader):
         self._log = logging.getLogger(__name__)
         self._transfer, self._primaries = _probe_colors(path)
         self._range_in = _probe_range(path)
+        meta_stream: Optional[dict] = None
+
+        def _stream_meta() -> dict:
+            nonlocal meta_stream
+            if meta_stream is None:
+                meta = _ffprobe_json(self._path)
+                meta_stream = (meta.get("streams") or [{}])[0]
+            return meta_stream
+
+        try:
+            if not self._fps or self._fps <= 0 or not math.isfinite(self._fps):
+                s = _stream_meta()
+                self._fps = _safe_fps(s.get("avg_frame_rate") or "0/1")
+                if not self._fps or not math.isfinite(self._fps):
+                    self._fps = 30.0
+        except Exception:
+            pass
+        try:
+            if not self._total or self._total <= 0:
+                s = _stream_meta()
+                dur = float(s.get("duration") or 0.0)
+                if dur > 0.0 and self._fps and self._fps > 0.0 and math.isfinite(self._fps):
+                    self._total = int(dur * self._fps + 0.5)
+        except Exception:
+            pass
         self._log.info(
             "HDR detect: transfer=%s primaries=%s range=%s",
             self._transfer or "unknown",
@@ -438,6 +463,7 @@ class FfmpegPipeReader:
         self._fps = _safe_fps(s.get("avg_frame_rate") or "0/1")
         self._nb = int(s.get("nb_frames") or 0)
         if self._nb <= 0:
+            # mkv often omits nb_frames; estimate from duration * fps
             try:
                 dur = float(s.get("duration") or 0.0)
                 if dur > 0 and self._fps > 0:
