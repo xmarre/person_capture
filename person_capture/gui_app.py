@@ -61,18 +61,18 @@ _log.info("INIT ULTRALYTICS_SETTINGS=%s", os.getenv("ULTRALYTICS_SETTINGS"))
 def _get_open_video_with_tonemap():
     lg = logging.getLogger(__name__)
     try:
-        from .video_io import open_video_with_tonemap as _fn  # type: ignore
+        from .video_io import open_video_with_tonemap as _fn, hdr_detect_reason as _reason  # type: ignore
         lg.info("HDR: using package video_io")
-        return _fn
+        return _fn, _reason
     except Exception as e1:
         lg.warning("HDR: package video_io import failed (%s), trying flat", e1)
         try:
-            from video_io import open_video_with_tonemap as _fn  # type: ignore
+            from video_io import open_video_with_tonemap as _fn, hdr_detect_reason as _reason  # type: ignore
             lg.info("HDR: using flat video_io")
-            return _fn
+            return _fn, _reason
         except Exception as e2:
             lg.warning("HDR disabled: cannot import video_io (%s)", e2)
-            return lambda _path: None
+            return (lambda _path: None, lambda _path: "unknown")
 
 
 # Robust imports: support both package ("from .module") and flat files ("import module").
@@ -83,7 +83,7 @@ def _imp():
             from .updater import UpdateManager  # type: ignore
         except Exception:
             UpdateManager = None  # type: ignore
-        open_video_with_tonemap = _get_open_video_with_tonemap()
+        open_video_with_tonemap, hdr_detect_reason = _get_open_video_with_tonemap()
 
         from .detectors import PersonDetector  # type: ignore
         from .face_embedder import FaceEmbedder  # type: ignore
@@ -106,6 +106,7 @@ def _imp():
             phash_similarity,
             _phash_bits,
             open_video_with_tonemap,
+            hdr_detect_reason,
             UpdateManager,
         )
     except Exception:
@@ -120,7 +121,7 @@ def _imp():
             from updater import UpdateManager  # type: ignore
         except Exception:
             UpdateManager = None  # type: ignore
-        open_video_with_tonemap = _get_open_video_with_tonemap()
+        open_video_with_tonemap, hdr_detect_reason = _get_open_video_with_tonemap()
         try:
             from .utils import ensure_dir, parse_ratio, expand_box_to_ratio, phash_similarity, _phash_bits  # type: ignore
         except Exception:
@@ -135,6 +136,7 @@ def _imp():
             phash_similarity,
             _phash_bits,
             open_video_with_tonemap,
+            hdr_detect_reason,
             UpdateManager,
         )
 
@@ -148,6 +150,7 @@ def _imp():
     phash_similarity,
     _phash_bits,
     open_video_with_tonemap,
+    hdr_detect_reason,
     UpdateManager,
 ) = _imp()
 # Optional Curate tab
@@ -2493,11 +2496,18 @@ class Processor(QtCore.QObject):
                     tonemap_cap = open_video_with_tonemap(cfg.video)
                 except Exception:
                     tonemap_cap = None
+                hdr_reason = "unknown"
+                try:
+                    hdr_reason = hdr_detect_reason(cfg.video)
+                except Exception:
+                    pass
                 if tonemap_cap is not None:
                     logger.info("Video open: HDR tone-map reader selected")
+                    self._status(f"HDR: active ({hdr_reason})")
                     cap = tonemap_cap
                 else:
                     logger.info("Video open: OpenCV/FFmpeg reader selected")
+                    self._status(f"HDR: inactive ({hdr_reason})")
                     os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
                     cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
                     try:
