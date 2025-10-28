@@ -57,10 +57,35 @@ class PersonDetector:
         else:
             base = m.name.lower()
             hub = base if base.endswith(".pt") else "yolov8n.pt"
-            local = Path(os.environ.get("ULTRALYTICS_HOME", ".")) / "weights" / hub
-            if not local.is_file():
-                logging.getLogger(__name__).info("YOLO cache miss for %s → downloading from hub", hub)
-            model_arg = str(local) if local.is_file() else hub
+            weights_dir = Path(os.environ.get("ULTRALYTICS_HOME", ".")) / "weights"
+            local = weights_dir / hub
+            if local.is_file():
+                return self._YOLO(str(local))
+            log = logging.getLogger(__name__)
+            log.info("YOLO cache miss for %s → seeding %s", hub, local)
+            try:
+                weights_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            cwd_candidate = Path.cwd() / hub
+            if cwd_candidate.is_file():
+                try:
+                    cwd_candidate.replace(local)
+                    return self._YOLO(str(local))
+                except Exception:
+                    pass
+            wd = os.getcwd()
+            try:
+                os.chdir(str(weights_dir))
+                model = self._YOLO(hub)
+            finally:
+                os.chdir(wd)
+            try:
+                if local.is_file():
+                    log.info("YOLO cached at %s", local)
+            except Exception:
+                pass
+            return model
         try:
             return self._YOLO(model_arg)
         except Exception as e:
@@ -79,7 +104,14 @@ class PersonDetector:
             # Derive a clean hub model name
             base = Path(model_name).name.lower()
             hub = base if base.endswith('.pt') else 'yolov8n.pt'
-            return self._YOLO(hub)
+            weights_dir = Path(os.environ.get("ULTRALYTICS_HOME", ".")) / "weights"
+            wd = os.getcwd()
+            try:
+                weights_dir.mkdir(parents=True, exist_ok=True)
+                os.chdir(str(weights_dir))
+                return self._YOLO(hub)
+            finally:
+                os.chdir(wd)
 
     def detect(self, frame, conf=0.35):
         """Return list of dicts for class=person only."""

@@ -210,11 +210,12 @@ class _BaseAvReader:
         if prop_id == CV_CAP_PROP_FPS:
             return float(self._fps)
         if prop_id == CV_CAP_PROP_FRAME_WIDTH:
-            return float(self._vs.width)
+            return float(getattr(self, "_w", self._vs.width))
         if prop_id == CV_CAP_PROP_FRAME_HEIGHT:
-            return float(self._vs.height)
+            return float(getattr(self, "_h", self._vs.height))
         if prop_id == CV_CAP_PROP_FRAME_COUNT:
-            return float(self._total)
+            total = getattr(self, "_total", 0) or getattr(self, "_nb", 0)
+            return float(total)
         if prop_id == CV_CAP_PROP_POS_FRAMES:
             return float(self._pos)
         return 0.0
@@ -324,7 +325,9 @@ class AvLibplaceboReader(_BaseAvReader):
                 s = _stream_meta()
                 dur = float(s.get("duration") or 0.0)
                 if dur > 0.0 and self._fps and self._fps > 0.0 and math.isfinite(self._fps):
-                    self._total = int(dur * self._fps + 0.5)
+                    n = int(dur * self._fps + 0.5)
+                    self._total = n
+                    self._nb = n
         except Exception:
             pass
         self._log.info(
@@ -551,7 +554,8 @@ class FfmpegPipeReader:
         if prop == CV_CAP_PROP_FPS:
             return float(self._fps)
         if prop == CV_CAP_PROP_FRAME_COUNT:
-            return float(self._nb)
+            total = getattr(self, "_nb", 0) or getattr(self, "_total", 0)
+            return float(total)
         if prop == CV_CAP_PROP_POS_FRAMES:
             return float(max(self._pos, 0))
         if prop == CV_CAP_PROP_FRAME_WIDTH:
