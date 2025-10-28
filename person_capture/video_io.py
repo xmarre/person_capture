@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import subprocess, json, os
+import subprocess, json, os, sys, math
 from dataclasses import dataclass
 from typing import Optional
 
 import av
 import numpy as np
 import logging
+import imageio_ffmpeg as iioff
 
 try:
     import cv2  # type: ignore
@@ -23,16 +24,33 @@ except Exception:
     CV_CAP_PROP_FRAME_HEIGHT = 4
 
 
+def _ffprobe_path() -> Optional[str]:
+    try:
+        return iioff.get_ffprobe_exe()
+    except Exception:
+        return None
+
+
+def _ffmpeg_path() -> Optional[str]:
+    try:
+        return iioff.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
 def _ffprobe_json(path: str) -> dict:
+    probe = _ffprobe_path()
+    if not probe:
+        return {}
     p = subprocess.run(
         [
-            "ffprobe",
+            probe,
             "-v",
             "error",
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=color_space,color_transfer,color_primaries,color_range,avg_frame_rate,nb_frames,duration,time_base",
+            "stream=color_space,color_transfer,color_primaries,color_range,avg_frame_rate,nb_frames,duration,time_base,width,height",
             "-of",
             "json",
             path,
@@ -68,14 +86,37 @@ def _probe_pixfmt_av(path: str) -> tuple[Optional[str], Optional[int], Optional[
 
 def _detect_hdr(path: str) -> tuple[bool, str]:
     t, p = _probe_colors(path)
-    if t in ("smpte2084", "arib-std-b67"):
-        return True, f"ffprobe transfer={t}"
-    if p == "bt2020":
-        return True, "ffprobe primaries=bt2020"
     pixfmt, w, h = _probe_pixfmt_av(path)
-    if pixfmt and ("p10" in pixfmt or "p12" in pixfmt or "yuv420p16" in pixfmt):
-        return True, f"heuristic pix_fmt={pixfmt} {w}x{h}"
-    return False, "no HDR color tags and no 10/12/16-bit pix_fmt"
+    is_10bit = bool(
+        pixfmt
+        and any(
+            k in pixfmt
+            for k in (
+                "p10",
+                "p12",
+                "p14",
+                "p16",
+                "yuv420p10",
+                "yuv420p12",
+                "yuv420p16",
+            )
+        )
+    )
+    if t in ("smpte2084", "arib-std-b67"):
+        return True, f"transfer={t}"
+    if is_10bit and p == "bt2020":
+        return True, f"primaries=bt2020 & {pixfmt}"
+    if is_10bit:
+        return True, f">=10-bit {pixfmt}"
+    return False, "no HDR transfer and no >=10-bit pix_fmt"
+
+
+def hdr_detect_reason(path: str) -> str:
+    try:
+        _, reason = _detect_hdr(path)
+        return reason
+    except Exception as exc:
+        return f"error: {exc}"
 
 
 def _probe_range(path: str) -> str:
@@ -87,14 +128,8 @@ def _probe_range(path: str) -> str:
 
 
 def is_hdr_stream(path: str) -> bool:
-    meta = _ffprobe_json(path)
-    try:
-        s = (meta.get("streams") or [])[0]
-    except Exception:
-        return False
-    t = str(s.get("color_transfer") or "").lower()
-    p_ = str(s.get("color_primaries") or "").lower()
-    return (t in ("smpte2084", "arib-std-b67")) or (p_ == "bt2020")
+    ok, _ = _detect_hdr(path)
+    return ok
 
 
 def _fps_from_stream(vs) -> float:
@@ -366,7 +401,10 @@ def open_video_with_tonemap(path: str):
         try:
             return AvLibplaceboReader(path)
         except Exception as e:
-            log.error("HDR forced but libplacebo path failed: %s", e, exc_info=True)
+            log.warning("PyAV/libplacebo unavailable, falling back to bundled ffmpeg pipe: %s", e)
+            fmpeg = _ffmpeg_path()
+            if fmpeg:
+                return FfmpegPipeReader(path, fmpeg)
             return None
     # Robust detect
     is_hdr, reason = _detect_hdr(path)
@@ -375,8 +413,170 @@ def open_video_with_tonemap(path: str):
         try:
             return AvLibplaceboReader(path)
         except Exception as e:
-            log.error("HDR path init failed (falling back to SDR). Error: %s", e, exc_info=True)
+            log.warning("PyAV/libplacebo unavailable, falling back to bundled ffmpeg pipe: %s", e)
+            fmpeg = _ffmpeg_path()
+            if fmpeg:
+                return FfmpegPipeReader(path, fmpeg)
             return None
     else:
         log.info("HDR detect: %s → using OpenCV SDR path", reason)
         return None
+
+
+# ---------- Minimal external ffmpeg pipe using imageio-ffmpeg binary ----------
+class FfmpegPipeReader:
+    """HDR→SDR using bundled ffmpeg. Streams bgr24. OpenCV-like API."""
+
+    def __init__(self, path: str, ffmpeg_exe: str):
+        self._log = logging.getLogger(__name__)
+        self._path = path
+        self._ffmpeg = ffmpeg_exe
+        meta = _ffprobe_json(path)
+        s = (meta.get("streams") or [{}])[0]
+        self._w = int(s.get("width") or 0)
+        self._h = int(s.get("height") or 0)
+        self._fps = _safe_fps(s.get("avg_frame_rate") or "0/1")
+        self._nb = int(s.get("nb_frames") or 0)
+        if self._nb <= 0:
+            try:
+                dur = float(s.get("duration") or 0.0)
+                if dur > 0 and self._fps > 0:
+                    self._nb = int(dur * self._fps + 0.5)
+            except Exception:
+                pass
+        self._frame_bytes = self._w * self._h * 3
+        self._pos = -1
+        self._proc = None
+        self._arr: Optional[np.ndarray] = None
+        self._use_libplacebo = self._ffmpeg_has("libplacebo")
+        self._range_in = _probe_range(path)
+        self._start(0)
+        self._log.info(
+            "HDR preview path: bundled ffmpeg pipe (%s)",
+            "libplacebo" if self._use_libplacebo else "zscale+tonemap",
+        )
+
+    def _ffmpeg_has(self, flt: str) -> bool:
+        try:
+            out = subprocess.run(
+                [self._ffmpeg, "-hide_banner", "-v", "error", "-filters"],
+                text=True,
+                capture_output=True,
+                check=False,
+            ).stdout or ""
+            return flt in out
+        except Exception:
+            return False
+
+    def _chain(self) -> str:
+        if self._use_libplacebo:
+            return (
+                "libplacebo=tonemapping=auto:target_primaries=bt709:target_trc=bt709:"
+                "dither=yes:deband=yes"
+            )
+        # conservative fallback chain
+        return (
+            "zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc,"
+            "zscale=transfer=linear:npl=1000,format=gbrpf32le,"
+            "tonemap=tonemap=mobius:param=0.5:desat=0.5:peak=200,"
+            "zscale=transfer=bt709:primaries=bt709:matrix=bt709:dither=error_diffusion,"
+            f"zscale=rangein={self._range_in}:range=full,format=bgr24"
+        )
+
+    def _start(self, idx: int):
+        if self._proc:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+        t = 0.0 if self._fps <= 0 else max(0.0, idx / float(self._fps))
+        cmd = [
+            self._ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-ss",
+            f"{t:.6f}",
+            "-i",
+            self._path,
+            "-vf",
+            self._chain(),
+            "-pix_fmt",
+            "bgr24",
+            "-f",
+            "rawvideo",
+            "-",
+        ]
+        flags = 0
+        if os.name == "nt":
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        self._proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+        )
+        self._pos = idx - 1
+        self._arr = None
+
+    # OpenCV-like API
+    def get(self, prop: int) -> float:
+        if prop == CV_CAP_PROP_FPS:
+            return float(self._fps)
+        if prop == CV_CAP_PROP_FRAME_COUNT:
+            return float(self._nb)
+        if prop == CV_CAP_PROP_POS_FRAMES:
+            return float(max(self._pos, 0))
+        if prop == CV_CAP_PROP_FRAME_WIDTH:
+            return float(self._w)
+        if prop == CV_CAP_PROP_FRAME_HEIGHT:
+            return float(self._h)
+        return 0.0
+
+    def set(self, prop: int, value: float) -> bool:
+        if prop == CV_CAP_PROP_POS_FRAMES:
+            self._start(max(0, int(value)))
+            return True
+        return False
+
+    def grab(self) -> bool:
+        if not self._proc or not self._proc.stdout:
+            return False
+        buf = self._proc.stdout.read(self._frame_bytes)
+        if not buf or len(buf) < self._frame_bytes:
+            return False
+        self._arr = np.frombuffer(buf, dtype=np.uint8).reshape(self._h, self._w, 3)
+        self._pos += 1
+        return True
+
+    def retrieve(self):
+        arr, self._arr = self._arr, None
+        return (arr is not None), arr
+
+    def read(self):
+        return (False, None) if not self.grab() else self.retrieve()
+
+    def release(self):
+        try:
+            if self._proc:
+                self._proc.kill()
+        except Exception:
+            pass
+        self._proc = None
+
+    def __del__(self):
+        self.release()
+
+    def isOpened(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+
+def _safe_fps(frac: str) -> float:
+    try:
+        a, b = frac.split("/")
+        a = float(a)
+        b = float(b) if float(b) != 0 else 1.0
+        return a / b
+    except Exception:
+        return 30.0
