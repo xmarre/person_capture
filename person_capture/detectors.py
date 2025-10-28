@@ -59,9 +59,32 @@ class PersonDetector:
             hub = base if base.endswith(".pt") else "yolov8n.pt"
             weights_dir = Path(os.environ.get("ULTRALYTICS_HOME", ".")) / "weights"
             local = weights_dir / hub
-            if local.is_file():
-                return self._YOLO(str(local))
             log = logging.getLogger(__name__)
+
+            def load_or_quarantine(candidate: Path):
+                try:
+                    return self._YOLO(str(candidate))
+                except Exception as exc:  # pragma: no cover - depends on corrupt cache
+                    log.warning("Failed to load YOLO weights at %s (%s)", candidate, exc)
+                    if self.progress:
+                        self.progress(f"YOLO load failed ({exc}). Recovering...")
+                    try:
+                        bad = candidate.with_name(candidate.name + ".bad")
+                        idx = 1
+                        while bad.exists():
+                            bad = candidate.with_name(f"{candidate.name}.bad{idx}")
+                            idx += 1
+                        candidate.replace(bad)
+                        log.info("Quarantined corrupt YOLO weights %s → %s", candidate, bad)
+                    except Exception:
+                        pass
+                    return None
+
+            if local.is_file():
+                model = load_or_quarantine(local)
+                if model is not None:
+                    return model
+
             log.info("YOLO cache miss for %s → seeding %s", hub, local)
             try:
                 weights_dir.mkdir(parents=True, exist_ok=True)
@@ -71,7 +94,9 @@ class PersonDetector:
             if cwd_candidate.is_file():
                 try:
                     cwd_candidate.replace(local)
-                    return self._YOLO(str(local))
+                    model = load_or_quarantine(local)
+                    if model is not None:
+                        return model
                 except Exception:
                     pass
             wd = os.getcwd()
