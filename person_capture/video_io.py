@@ -50,7 +50,7 @@ def _ffprobe_json(path: str) -> dict:
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=color_space,color_transfer,color_primaries,color_range,avg_frame_rate,nb_frames,duration,time_base,width,height",
+            "stream=color_space,color_transfer,color_primaries,color_range,avg_frame_rate,nb_frames,duration,time_base,width,height:format=duration",
             "-of",
             "json",
             path,
@@ -63,6 +63,27 @@ def _ffprobe_json(path: str) -> dict:
         return json.loads(p.stdout or "{}")
     except Exception:
         return {}
+
+
+def _ffprobe_duration(meta: dict) -> float:
+    try:
+        s = (meta.get("streams") or [{}])[0]
+    except Exception:
+        s = {}
+    # prefer stream duration, else container duration
+    for key in ("duration",):
+        v = s.get(key)
+        if v not in (None, "", "N/A"):
+            try:
+                return float(v)
+            except Exception:
+                pass
+    try:
+        fmt = meta.get("format") or {}
+        v = fmt.get("duration")
+        return float(v) if v not in (None, "", "N/A") else 0.0
+    except Exception:
+        return 0.0
 
 
 def _probe_colors(path: str) -> tuple[str, str]:
@@ -106,9 +127,7 @@ def _detect_hdr(path: str) -> tuple[bool, str]:
         return True, f"transfer={t}"
     if is_10bit and p == "bt2020":
         return True, f"primaries=bt2020 & {pixfmt}"
-    if is_10bit:
-        return True, f">=10-bit {pixfmt}"
-    return False, "no HDR transfer and no >=10-bit pix_fmt"
+    return False, "no HDR transfer and not bt2020 10–12–16-bit"
 
 
 def hdr_detect_reason(path: str) -> str:
@@ -228,8 +247,9 @@ class _BaseAvReader:
 
     def _seek_to(self, index: int):
         # Clamp to valid range if total is known
-        if self._total and self._total > 0:
-            index = min(max(0, index), self._total - 1)
+        known_total = getattr(self, "_total", 0) or getattr(self, "_nb", 0)
+        if known_total and known_total > 0:
+            index = min(max(0, index), int(known_total) - 1)
         else:
             index = max(0, index)
         tb = self._vs.time_base
@@ -322,12 +342,12 @@ class AvLibplaceboReader(_BaseAvReader):
             pass
         try:
             if not self._total or self._total <= 0:
-                s = _stream_meta()
-                dur = float(s.get("duration") or 0.0)
+                meta = _ffprobe_json(self._path)
+                dur = _ffprobe_duration(meta)
                 if dur > 0.0 and self._fps and self._fps > 0.0 and math.isfinite(self._fps):
                     n = int(dur * self._fps + 0.5)
-                    self._total = n
                     self._nb = n
+                    self._total = n
         except Exception:
             pass
         self._log.info(
@@ -466,26 +486,37 @@ class FfmpegPipeReader:
         self._fps = _safe_fps(s.get("avg_frame_rate") or "0/1")
         self._nb = int(s.get("nb_frames") or 0)
         if self._nb <= 0:
-            # mkv often omits nb_frames; estimate from duration * fps
-            try:
-                dur = float(s.get("duration") or 0.0)
-                if dur > 0 and self._fps > 0:
-                    self._nb = int(dur * self._fps + 0.5)
-            except Exception:
-                pass
-        self._frame_bytes = self._w * self._h * 3
+            # estimate from container/stream duration × fps
+            meta = meta or {}
+            dur = _ffprobe_duration(meta)
+            if dur > 0 and self._fps > 0:
+                self._nb = int(dur * self._fps + 0.5)
+        # expose both counters; some callers only read _total
+        self._total = self._nb
         self._pos = -1
         self._proc = None
         self._arr: Optional[np.ndarray] = None
-        self._use_libplacebo = self._ffmpeg_has("libplacebo")
+        self._filters = self._list_filters()
+        self._use_libplacebo = ("libplacebo" in self._filters)
+        self._has_zscale = ("zscale" in self._filters)
+        self._has_tonemap = ("tonemap" in self._filters)
+        self._has_scale = ("scale" in self._filters)
+        if not (self._use_libplacebo or (self._has_zscale and self._has_tonemap) or self._has_scale):
+            raise RuntimeError("Bundled ffmpeg lacks libplacebo, zscale+tonemap, and scale")
         self._range_in = _probe_range(path)
+        self._transfer, self._primaries = _probe_colors(path)
+        self._frame_bytes_u8 = self._w * self._h * 3
+        self._frame_bytes_f32 = self._w * self._h * 3 * 4
+        self._pix_fmt = "bgr24"
         self._start(0)
-        self._log.info(
-            "HDR preview path: bundled ffmpeg pipe (%s)",
-            "libplacebo" if self._use_libplacebo else "zscale+tonemap",
+        mode = (
+            "libplacebo"
+            if self._use_libplacebo
+            else ("zscale+tonemap" if (self._has_zscale and self._has_tonemap) else "linear+python-tonemap")
         )
+        self._log.info("HDR preview path: bundled ffmpeg pipe (%s)", mode)
 
-    def _ffmpeg_has(self, flt: str) -> bool:
+    def _list_filters(self) -> set[str]:
         try:
             out = subprocess.run(
                 [self._ffmpeg, "-hide_banner", "-v", "error", "-filters"],
@@ -493,9 +524,19 @@ class FfmpegPipeReader:
                 capture_output=True,
                 check=False,
             ).stdout or ""
-            return flt in out
+            names = []
+            for line in out.splitlines():
+                if not line or line.startswith("-"):
+                    continue
+                flag = line[:4].strip()
+                if not flag or any(c not in "TSC.PAR" and c != "." for c in flag):
+                    continue
+                name = line[4:20].strip()
+                if name and name != "=":
+                    names.append(name)
+            return set(names)
         except Exception:
-            return False
+            return set()
 
     def _chain(self) -> str:
         if self._use_libplacebo:
@@ -503,14 +544,19 @@ class FfmpegPipeReader:
                 "libplacebo=tonemapping=auto:target_primaries=bt709:target_trc=bt709:"
                 "dither=yes:deband=yes"
             )
-        # conservative fallback chain
-        return (
-            "zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc,"
-            "zscale=transfer=linear:npl=1000,format=gbrpf32le,"
-            "tonemap=tonemap=mobius:param=0.5:desat=0.5:peak=200,"
-            "zscale=transfer=bt709:primaries=bt709:matrix=bt709:dither=error_diffusion,"
-            f"zscale=rangein={self._range_in}:range=full,format=bgr24"
-        )
+        if self._has_zscale and self._has_tonemap:
+            # full HDR→SDR tonemap
+            return (
+                "zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc,"
+                "zscale=transfer=linear:npl=1000,format=gbrpf32le,"
+                "tonemap=tonemap=mobius:param=0.5:desat=0.5:peak=200,"
+                "zscale=transfer=bt709:primaries=bt709:matrix=bt709:dither=error_diffusion,"
+                f"zscale=rangein={self._range_in}:range=full,format=bgr24"
+            )
+        # Fallback path: decode to float RGB (planar), expand to full-range, tonemap in Python.
+        range_in = "pc" if self._range_in == "full" else "tv"
+        mat = "bt2020nc" if self._primaries == "bt2020" else "bt709"
+        return f"scale=in_color_matrix={mat}:in_range={range_in}:out_range=pc,format=gbrpf32le"
 
     def _start(self, idx: int):
         if self._proc:
@@ -519,6 +565,7 @@ class FfmpegPipeReader:
             except Exception:
                 pass
         t = 0.0 if self._fps <= 0 else max(0.0, idx / float(self._fps))
+        pix_fmt = "bgr24" if (self._use_libplacebo or (self._has_zscale and self._has_tonemap)) else "gbrpf32le"
         cmd = [
             self._ffmpeg,
             "-hide_banner",
@@ -529,10 +576,14 @@ class FfmpegPipeReader:
             f"{t:.6f}",
             "-i",
             self._path,
+            "-map",
+            "0:v:0",
+            "-vsync",
+            "0",
             "-vf",
             self._chain(),
             "-pix_fmt",
-            "bgr24",
+            pix_fmt,
             "-f",
             "rawvideo",
             "-",
@@ -548,6 +599,7 @@ class FfmpegPipeReader:
         )
         self._pos = idx - 1
         self._arr = None
+        self._pix_fmt = pix_fmt
 
     # OpenCV-like API
     def get(self, prop: int) -> float:
@@ -573,16 +625,40 @@ class FfmpegPipeReader:
     def grab(self) -> bool:
         if not self._proc or not self._proc.stdout:
             return False
-        buf = self._proc.stdout.read(self._frame_bytes)
-        if not buf or len(buf) < self._frame_bytes:
+        if self._pix_fmt == "bgr24":
+            buf = self._proc.stdout.read(self._frame_bytes_u8)
+            if not buf or len(buf) < self._frame_bytes_u8:
+                return False
+            self._arr = np.frombuffer(buf, dtype=np.uint8).reshape(self._h, self._w, 3)
+            self._pos += 1
+            return True
+        # Linear+python-tonemap path: read float32 RGB (planar G,B,R)
+        fbytes = self._frame_bytes_f32
+        buf = self._proc.stdout.read(fbytes)
+        if not buf or len(buf) < fbytes:
             return False
-        self._arr = np.frombuffer(buf, dtype=np.uint8).reshape(self._h, self._w, 3)
+        planar = np.frombuffer(buf, dtype=np.float32)
+        if planar.size != self._w * self._h * 3:
+            return False
+        planar = planar.reshape(3, self._h, self._w)
+        rgb = np.stack((planar[2], planar[0], planar[1]), axis=-1)
+        if getattr(self, "_transfer", "") == "arib-std-b67":
+            rgb_linear = _eotf_hlg(rgb)
+        else:
+            rgb_linear = _eotf_pq(rgb)
+        self._arr = rgb_linear
         self._pos += 1
         return True
 
     def retrieve(self):
         arr, self._arr = self._arr, None
-        return (arr is not None), arr
+        if arr is None:
+            return False, None
+        if self._pix_fmt == "bgr24":
+            return True, arr
+        # Python tonemap on linear RGB → BT.709 BGR8
+        out = _python_tonemap_to_bgr8(arr, peak_nits=1000.0, target_nits=200.0)
+        return True, out
 
     def read(self):
         return (False, None) if not self.grab() else self.retrieve()
@@ -610,3 +686,59 @@ def _safe_fps(frac: str) -> float:
         return a / b
     except Exception:
         return 30.0
+
+
+# ---------- Pure-Python tonemap (Hable) on linear RGB ----------
+def _eotf_pq(v: np.ndarray) -> np.ndarray:
+    """Apply ST2084 (PQ) EOTF. Input/Output normalized 0..1 where 1.0≈10,000 nits."""
+    m1 = 2610.0 / 16384.0
+    m2 = 2523.0 / 32.0
+    c1 = 3424.0 / 4096.0
+    c2 = 2413.0 / 128.0
+    c3 = 2392.0 / 128.0
+    v = np.clip(v, 0.0, 1.0)
+    vp = np.maximum(np.power(v, 1.0 / m2) - c1, 0.0)
+    denom = c2 - c3 * np.power(v, 1.0 / m2)
+    denom = np.where(np.abs(denom) < 1e-6, 1e-6, denom)
+    out = np.power(vp / denom, 1.0 / m1)
+    return np.clip(out, 0.0, 1.0)
+
+
+def _eotf_hlg(v: np.ndarray) -> np.ndarray:
+    """Apply ITU-R BT.2100 HLG EOTF. Input/Output normalized 0..1 where 1.0≈10,000 nits."""
+    a, b, c = 0.17883277, 0.28466892, 0.55991073
+    v = np.clip(v, 0.0, 1.0)
+    return np.where(v <= 0.5, (v * v) / 3.0, (np.exp((v - c) / a) + b) / 12.0)
+
+
+def _oetf_bt709(v: np.ndarray) -> np.ndarray:
+    # Rec.709 OETF
+    thr = 0.018
+    out = np.where(v < thr, 4.5 * v, 1.099 * np.power(np.clip(v, 0.0, None), 0.45) - 0.099)
+    return np.clip(out, 0.0, 1.0)
+
+
+def _hable_filmic(x: np.ndarray, A=0.15, B=0.50, C=0.10, D=0.20, E=0.02, F=0.30, W=11.2) -> np.ndarray:
+    def h(y):
+        return ((y * (A * y + C * B) + D * E) / (y * (A * y + B) + D * F)) - E / F
+
+    white = h(W)
+    return np.clip(h(x) / white, 0.0, 1.0)
+
+
+def _python_tonemap_to_bgr8(
+    rgb_linear: np.ndarray, peak_nits: float = 1000.0, target_nits: float = 200.0
+) -> np.ndarray:
+    # rgb_linear is in 0..1 where 1.0≈10,000 nits.
+    rgb_linear = np.clip(rgb_linear, 0.0, 1.0)
+    L_nits = rgb_linear * 10000.0
+    Y = 0.2627 * L_nits[..., 0] + 0.6780 * L_nits[..., 1] + 0.0593 * L_nits[..., 2]
+    peak = max(peak_nits, 1e-3)
+    Y_t = _hable_filmic(Y / peak) * target_nits
+    denom = np.maximum(Y, 1e-6)
+    s = (Y_t / denom)[..., None]
+    RGB_t = np.clip(L_nits * s, 0.0, target_nits)
+    RGB_norm = np.clip(RGB_t / 100.0, 0.0, 1.0)
+    RGB_709 = _oetf_bt709(RGB_norm)
+    out = (np.clip(RGB_709, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    return out[..., ::-1]
