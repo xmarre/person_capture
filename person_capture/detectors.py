@@ -71,6 +71,7 @@ class PersonDetector:
         else:
             base = m.name.lower()
             hub = base if base.endswith(".pt") else "yolov8n.pt"
+            # Always resolve to a concrete local file path and use that for loading
             from ultralytics import settings as yolo_settings
 
             home = Path(os.environ.get("ULTRALYTICS_HOME", Path.cwd() / ".ultralytics"))
@@ -106,10 +107,18 @@ class PersonDetector:
                     return None
 
             if local.is_file():
-                log.info("YOLO weights hit: %s", local)
+                log.info("YOLO weights (cached): %s", local)
                 model = load_or_quarantine(local)
                 if model is not None:
                     return model
+
+            exists = local.exists()
+            size = (local.stat().st_size if exists else 0)
+            log.info("YOLO cache probe %s exists=%s size=%d", local, exists, size)
+            if exists and size > 0:
+                m2 = load_or_quarantine(local)
+                if m2 is not None:
+                    return m2
 
             log.info("YOLO cache miss for %s → seeding %s", hub, local)
             try:
@@ -128,40 +137,43 @@ class PersonDetector:
                 model = load_or_quarantine(local)
                 if model is not None:
                     return model
-                # As a fallback, try loading directly
-                try:
-                    return self._YOLO(str(cwd_candidate))
-                except Exception:
-                    pass
-
-            # Last resort: try hub (may download). Never fail hard here.
-            wd = os.getcwd()
-            model = None
-            try:
-                os.chdir(str(weights_dir))
-                try:
-                    model = self._YOLO(hub)
-                except Exception as e:
-                    log.warning("YOLO hub fetch failed (%s); trying local fallbacks", e)
-                    model = None
-            finally:
-                os.chdir(wd)
-
-            # If any candidate file now exists, copy into cache and load
-            for cand in (weights_dir / hub, cwd_candidate, Path(hub)):
-                if cand.is_file():
-                    try:
-                        if not local.is_file():
-                            shutil.copy2(cand, local)
-                    except Exception:
-                        pass
-                    m2 = load_or_quarantine(local)
+                # last attempt with the cwd file path (absolute), still not a hub alias
+                if cwd_candidate.is_file():
+                    m2 = load_or_quarantine(cwd_candidate.resolve())
                     if m2 is not None:
                         return m2
 
-            if model is not None:
-                return model
-            raise RuntimeError(f"YOLO weights not found (tried {local}, {cwd_candidate}, hub={hub})")
+            # Last resort: fetch ONCE, then rebind to the cached absolute path.
+            # Using YOLO(hub) only to download; then copy its resolved .pt into our cache.
+            try:
+                tmp_model = self._YOLO(hub)  # may download to Ultralytics’ own path
+                src = Path(getattr(tmp_model, "pt_path", ""))  # Ultralytics resolves this
+                if not src.is_file():
+                    # fallback: if Ultralytics placed the file in CWD
+                    src = Path.cwd() / hub
+                if src.is_file():
+                    try:
+                        weights_dir.mkdir(parents=True, exist_ok=True)
+                        if src.resolve() != local.resolve():
+                            shutil.copy2(src, local)
+                        log.info("Seeded YOLO cache: %s", local)
+                        seeded_model = load_or_quarantine(local)
+                        if seeded_model is not None:
+                            log.info("YOLO loaded from cache: %s", local)
+                            return seeded_model
+                    except Exception as e:
+                        log.warning("Failed to copy YOLO weights into cache (%s)", e)
+                else:
+                    log.warning("Ultralytics did not expose a concrete pt_path for %s", hub)
+            except Exception as e:
+                log.warning("YOLO hub fetch failed (%s); continuing without hub", e)
+
+            # Now load strictly from our cached absolute path (no hub alias involved)
+            if local.exists() and local.stat().st_size > 0:
+                model = load_or_quarantine(local)
+                if model is not None:
+                    return model
+            raise RuntimeError(f"YOLO weights not found (expected at {local})")
         try:
             return self._YOLO(model_arg)
         except Exception as e:
@@ -180,14 +192,7 @@ class PersonDetector:
             # Derive a clean hub model name
             base = Path(model_name).name.lower()
             hub = base if base.endswith('.pt') else 'yolov8n.pt'
-            weights_dir = Path(os.environ.get("ULTRALYTICS_HOME", ".")) / "weights"
-            wd = os.getcwd()
-            try:
-                weights_dir.mkdir(parents=True, exist_ok=True)
-                os.chdir(str(weights_dir))
-                return self._YOLO(hub)
-            finally:
-                os.chdir(wd)
+            return self._load_model(hub)
 
     def detect(self, frame, conf=0.35):
         """Return list of dicts for class=person only."""
