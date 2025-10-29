@@ -156,7 +156,9 @@ class PersonDetector:
                     if m2 is not None:
                         return m2
 
-            # Last resort: fetch ONCE directly into weights_dir, then load from 'local'.
+            # Last resort: fetch ONCE, then rebind to the cached absolute path.
+            # Using YOLO(hub) only to download; then copy its resolved .pt into our cache.
+            tmp_model = None
             try:
                 with self._pushd(weights_dir):
                     # If already here (previous run), adopt it.
@@ -173,7 +175,10 @@ class PersonDetector:
                         except Exception as e:
                             log.warning("Copy into cache failed (%s) — continuing", e)
             except Exception as e:
-                log.warning("YOLO hub fetch into weights_dir failed (%s)", e)
+                log.warning("YOLO hub fetch failed (%s); continuing without hub", e)
+            if tmp_model is not None:
+                log.info("Using YOLO model returned directly from Ultralytics for %s", hub)
+                return tmp_model
 
             # Always finish by loading strictly from the absolute cache path.
             try:
