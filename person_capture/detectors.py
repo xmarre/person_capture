@@ -82,6 +82,9 @@ class PersonDetector:
             pass
 
     def _load_model(self, model_name: str):
+        # Repo root (…/person_capture)
+        _REPO_ROOT = Path(__file__).resolve().parents[1]
+
         m = Path(model_name)
         # If user gave a real file, load it. Otherwise use hub name to honor ULTRALYTICS_HOME.
         if m.is_file():
@@ -110,6 +113,9 @@ class PersonDetector:
             local = weights_dir / hub
             log = logging.getLogger(__name__)
 
+            # 0) Explicit override: PERSON_CAPTURE_YOLO_WEIGHTS points to a .pt file → use that and never fetch.
+            env_override = os.getenv("PERSON_CAPTURE_YOLO_WEIGHTS") or ""
+
             def load_or_quarantine(candidate: Path):
                 try:
                     return self._YOLO(str(candidate))
@@ -128,6 +134,30 @@ class PersonDetector:
                     except Exception:
                         pass
                     return None
+
+            # A) If the override exists, use it immediately (no network ever).
+            if env_override:
+                p = Path(env_override)
+                if p.is_file():
+                    log.info("YOLO weights (override): %s", p)
+                    m2 = load_or_quarantine(p)
+                    if m2 is not None:
+                        return m2
+                    # If override was corrupt, fall through to normal logic.
+
+            # B) If repo has models/<hub>, seed cache from there (no download).
+            repo_models = _REPO_ROOT / "models" / hub
+            if repo_models.is_file():
+                try:
+                    weights_dir.mkdir(parents=True, exist_ok=True)
+                    if not local.is_file():
+                        shutil.copy2(repo_models, local)
+                    log.info("YOLO seed from repo models/: %s", repo_models)
+                    m2 = load_or_quarantine(local)
+                    if m2 is not None:
+                        return m2
+                except Exception as e:
+                    log.warning("Failed seeding from repo models/ (%s) — continuing", e)
 
             if local.is_file():
                 log.info("YOLO weights (cached): %s", local)
@@ -176,7 +206,7 @@ class PersonDetector:
                 except Exception:
                     pass
 
-            # Network allowed: fetch ONCE into weights_dir, then adopt cache.
+            # C) Network path (last resort): fetch ONCE into weights_dir, then adopt cache.
             # Last resort: fetch ONCE, then rebind to the cached absolute path.
             # Using YOLO(hub) only to download; then copy its resolved .pt into our cache.
             tmp_model = None
