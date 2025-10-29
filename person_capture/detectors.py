@@ -116,24 +116,52 @@ class PersonDetector:
                 weights_dir.mkdir(parents=True, exist_ok=True)
             except Exception:
                 pass
+            # Offline-first: prefer an existing file in CWD before any hub attempt
+            cwd_candidate = Path.cwd() / hub
+            if cwd_candidate.is_file():
+                try:
+                    if not local.is_file():
+                        shutil.copy2(cwd_candidate, local)
+                        log.info("Seeded YOLO cache from CWD: %s", cwd_candidate)
+                except Exception as e:
+                    log.warning("Failed to seed from CWD (%s)", e)
+                model = load_or_quarantine(local)
+                if model is not None:
+                    return model
+                # As a fallback, try loading directly
+                try:
+                    return self._YOLO(str(cwd_candidate))
+                except Exception:
+                    pass
+
+            # Last resort: try hub (may download). Never fail hard here.
             wd = os.getcwd()
+            model = None
             try:
                 os.chdir(str(weights_dir))
-                model = self._YOLO(hub)
+                try:
+                    model = self._YOLO(hub)
+                except Exception as e:
+                    log.warning("YOLO hub fetch failed (%s); trying local fallbacks", e)
+                    model = None
             finally:
                 os.chdir(wd)
-            for cand in (weights_dir / hub, Path.cwd() / hub, Path(hub)):
+
+            # If any candidate file now exists, copy into cache and load
+            for cand in (weights_dir / hub, cwd_candidate, Path(hub)):
                 if cand.is_file():
                     try:
                         if not local.is_file():
                             shutil.copy2(cand, local)
-                            log.info("Seeded YOLO cache: %s", local)
-                        else:
-                            log.info("YOLO weights hit: %s", local)
                     except Exception:
                         pass
-                    break
-            return model
+                    m2 = load_or_quarantine(local)
+                    if m2 is not None:
+                        return m2
+
+            if model is not None:
+                return model
+            raise RuntimeError(f"YOLO weights not found (tried {local}, {cwd_candidate}, hub={hub})")
         try:
             return self._YOLO(model_arg)
         except Exception as e:
