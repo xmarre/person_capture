@@ -377,7 +377,8 @@ class FaceEmbedder:
 
         def _trt_opts(device_id: int, prefix: str) -> Dict[str, str]:
             _b = lambda v: "True" if v else "False"
-            cache_root = _P(_e("PERSON_CAPTURE_TRT_CACHE_ROOT", "trt_cache")).resolve()
+            # Always take cache root from env so GUI/env decide one canonical place
+            cache_root = _P(os.getenv("PERSON_CAPTURE_TRT_CACHE_ROOT", "trt_cache")).resolve()
             (cache_root / prefix).mkdir(parents=True, exist_ok=True)
             timing_en = _ef("PERSON_CAPTURE_TRT_TIMING_CACHE_ENABLE", True)
             engine_en = _ef("PERSON_CAPTURE_TRT_ENGINE_CACHE_ENABLE", True)
@@ -968,7 +969,8 @@ class FaceEmbedder:
                     dev_id = -1
             if isinstance(dev_id, int) and dev_id >= 0:
                 trt['device_id'] = str(dev_id)
-            cache_root = _P(getattr(self, "trt_cache_dir", "trt_cache")) / "scrfd"
+            # Use the same env-driven cache root here as well
+            cache_root = _P(os.getenv("PERSON_CAPTURE_TRT_CACHE_ROOT", "trt_cache")).resolve() / "scrfd"
             try:
                 cache_root.mkdir(parents=True, exist_ok=True)
             except Exception:
