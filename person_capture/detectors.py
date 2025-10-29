@@ -156,6 +156,16 @@ class PersonDetector:
                     if m2 is not None:
                         return m2
 
+            # If another process populated the cache while we were probing, adopt it now.
+            if local.is_file():
+                try:
+                    if local.stat().st_size > 0:
+                        m2 = load_or_quarantine(local)
+                        if m2 is not None:
+                            return m2
+                except Exception:
+                    pass
+
             # Last resort: fetch ONCE, then rebind to the cached absolute path.
             # Using YOLO(hub) only to download; then copy its resolved .pt into our cache.
             tmp_model = None
