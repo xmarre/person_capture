@@ -10,6 +10,9 @@ import numpy as np
 import logging
 import imageio_ffmpeg as iioff
 
+# keep FFmpeg chatter down (must be set before cv2 loads the plugin)
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "quiet")
+
 try:
     import cv2  # type: ignore
     # keep OpenCV/FFmpeg chatter down
@@ -31,19 +34,42 @@ except Exception:
 
 
 def _ffprobe_path() -> Optional[str]:
-    # 1) imageio bundle, 2) PATH, 3) local fallbacks
-    for getter in (
-        lambda: iioff.get_ffprobe_exe(),
-        lambda: shutil.which("ffprobe"),
-        lambda: str(Path(__file__).resolve().parent / "ffprobe.exe"),
-        lambda: str(Path.cwd() / "ffprobe.exe"),
+    # 1) explicit environment overrides
+    for envk in ("FFPROBE", "FFPROBE_PATH"):
+        p = os.getenv(envk)
+        if p and os.path.exists(p):
+            return p
+
+    # 2) imageio bundle (if available)
+    try:
+        p = iioff.get_ffprobe_exe()
+        if p and os.path.exists(p):
+            return p
+    except Exception:
+        pass
+
+    # 3) PATH lookup
+    p = shutil.which("ffprobe")
+    if p and os.path.exists(p):
+        return p
+
+    # 4) derive ffprobe next to the bundled ffmpeg binary
+    try:
+        ffm = iioff.get_ffmpeg_exe()
+        if ffm and os.path.exists(ffm):
+            cand = Path(ffm).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe")
+            if cand.exists():
+                return str(cand)
+    except Exception:
+        pass
+
+    # 5) local fallbacks (package dir, cwd)
+    for cand in (
+        Path(__file__).resolve().parent / ("ffprobe.exe" if os.name == "nt" else "ffprobe"),
+        Path.cwd() / ("ffprobe.exe" if os.name == "nt" else "ffprobe"),
     ):
-        try:
-            p = getter()
-            if p and os.path.exists(p):
-                return p
-        except Exception:
-            pass
+        if cand.exists():
+            return str(cand)
     return None
 
 

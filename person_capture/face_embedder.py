@@ -386,8 +386,12 @@ class FaceEmbedder:
             ctxshare = _ef("PERSON_CAPTURE_TRT_CONTEXT_MEMORY_SHARING_ENABLE", True)
             aux_stream = _ei("PERSON_CAPTURE_TRT_AUX_STREAMS", -1)
             build_lvl = _ei("PERSON_CAPTURE_TRT_BUILDER_OPT_LEVEL", 5)
-            tcache_p = (cache_root / prefix / "timing.cache").resolve()
-            tcache = str(tcache_p)
+            tcache_dir = cache_root / prefix / "timing.cache"
+            try:
+                tcache_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            tcache = str(tcache_dir.resolve())
             return {
                 "device_id": str(device_id),
                 "trt_fp16_enable": _b(fp16_en),
@@ -970,6 +974,10 @@ class FaceEmbedder:
             except Exception:
                 pass
             timing_path = cache_root / "timing.cache"
+            try:
+                timing_path.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
             try:
                 cache_root_resolved = str(cache_root.resolve())
             except Exception:
