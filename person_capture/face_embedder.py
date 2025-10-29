@@ -993,6 +993,12 @@ class FaceEmbedder:
                 'trt_profile_opt_shapes': f'{in_name}:1x3x640x640',
                 'trt_profile_max_shapes': f'{in_name}:1x3x{max_hw}x{max_hw}',
             })
+            trt.update({
+                # TRT 8.6+: use builder optimization level instead of heuristics flag
+                'trt_builder_optimization_level': '2',
+            })
+            # Remove deprecated flag if present (prevents warning spam)
+            trt.pop('trt_build_heuristics_enable', None)
             if callable(getattr(self, "progress", None)):
                 self.progress(f"SCRFD TRT dynamic profile active min=320 opt=640 max={max_hw}")
 
@@ -1009,8 +1015,9 @@ class FaceEmbedder:
                 'trt_min_subgraph_size': '1',
             })
         try:
-            so.log_severity_level = 0
-            so.log_verbosity_level = 1
+            # keep ORT quiet unless debugging
+            so.log_severity_level = 2  # WARNING
+            so.log_verbosity_level = 0
         except Exception:
             pass
 
