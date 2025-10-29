@@ -64,7 +64,12 @@ class PersonDetector:
                 resolved = m
             else:
                 base = m.name.lower()
-                hub = base if base.endswith(".pt") else "yolov8n.pt"
+                if base.endswith(".pt"):
+                    hub = base
+                elif base.startswith("yolov"):
+                    hub = base + ".pt"
+                else:
+                    hub = "yolov8n.pt"
                 resolved = Path(os.environ["ULTRALYTICS_HOME"]) / "weights" / Path(hub)
             logging.getLogger(__name__).info("YOLO weights=%s", resolved)
         except Exception:
@@ -83,7 +88,12 @@ class PersonDetector:
             model_arg = str(m)
         else:
             base = m.name.lower()
-            hub = base if base.endswith(".pt") else "yolov8n.pt"
+            if base.endswith(".pt"):
+                hub = base
+            elif base.startswith("yolov"):
+                hub = base + ".pt"
+            else:
+                hub = "yolov8n.pt"
             # Always resolve to a concrete local file path and use that for loading
             from ultralytics import settings as yolo_settings
 
@@ -99,14 +109,6 @@ class PersonDetector:
                 pass
             local = weights_dir / hub
             log = logging.getLogger(__name__)
-
-            # Respect local-only mode by default (no network fetches).
-            local_only = os.getenv("PERSON_CAPTURE_YOLO_LOCAL_ONLY", "1").strip().lower() in (
-                "1",
-                "true",
-                "yes",
-                "on",
-            )
 
             def load_or_quarantine(candidate: Path):
                 try:
@@ -174,16 +176,6 @@ class PersonDetector:
                 except Exception:
                     pass
 
-            # If file is still missing and network is disallowed, fail fast with guidance.
-            if local_only:
-                exists = local.exists()
-                size = local.stat().st_size if exists else 0
-                log.error("YOLO local-only: expected weights at %s (exists=%s size=%d)", local, exists, size)
-                raise RuntimeError(
-                    "YOLO weights not found in local cache and PERSON_CAPTURE_YOLO_LOCAL_ONLY=1.\n"
-                    f"Place '{hub}' at '{local}' (or set PERSON_CAPTURE_YOLO_LOCAL_ONLY=0 to permit a one-time fetch)."
-                )
-
             # Network allowed: fetch ONCE into weights_dir, then adopt cache.
             # Last resort: fetch ONCE, then rebind to the cached absolute path.
             # Using YOLO(hub) only to download; then copy its resolved .pt into our cache.
@@ -238,7 +230,12 @@ class PersonDetector:
                 pass
             # Derive a clean hub model name
             base = Path(model_name).name.lower()
-            hub = base if base.endswith('.pt') else 'yolov8n.pt'
+            if base.endswith('.pt'):
+                hub = base
+            elif base.startswith('yolov'):
+                hub = base + '.pt'
+            else:
+                hub = 'yolov8n.pt'
             return self._load_model(hub)
 
     def detect(self, frame, conf=0.35):
