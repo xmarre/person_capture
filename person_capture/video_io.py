@@ -50,7 +50,7 @@ def _ffprobe_json(path: str) -> dict:
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=color_space,color_transfer,color_primaries,color_range,avg_frame_rate,nb_frames,duration,time_base,width,height:format=duration",
+            "stream=color_space,color_transfer,color_primaries,color_range,avg_frame_rate,nb_frames,duration,time_base,width,height,pix_fmt,bits_per_raw_sample,side_data_list:format=duration",
             "-of",
             "json",
             path,
@@ -106,28 +106,43 @@ def _probe_pixfmt_av(path: str) -> tuple[Optional[str], Optional[int], Optional[
 
 
 def _detect_hdr(path: str) -> tuple[bool, str]:
-    t, p = _probe_colors(path)
-    pixfmt, w, h = _probe_pixfmt_av(path)
-    is_10bit = bool(
-        pixfmt
-        and any(
-            k in pixfmt
-            for k in (
-                "p10",
-                "p12",
-                "p14",
-                "p16",
-                "yuv420p10",
-                "yuv420p12",
-                "yuv420p16",
-            )
+    meta = _ffprobe_json(path)
+    s = (meta.get("streams") or [{}])[0]
+    t = str(s.get("color_transfer") or "").lower()
+    p = str(s.get("color_primaries") or "").lower()
+    csp = str(s.get("color_space") or "").lower()
+    pixfmt = str(s.get("pix_fmt") or "")
+    side = s.get("side_data_list") or []
+    bits = str(s.get("bits_per_raw_sample") or "").strip()
+    is_10bit = any(
+        token in pixfmt
+        for token in (
+            "p10",
+            "p12",
+            "p14",
+            "p16",
+            "yuv420p10",
+            "yuv420p12",
+            "yuv420p16",
         )
     )
+    if not is_10bit:
+        try:
+            is_10bit = int(bits) >= 10
+        except Exception:
+            is_10bit = False
     if t in ("smpte2084", "arib-std-b67"):
         return True, f"transfer={t}"
-    if is_10bit and p == "bt2020":
-        return True, f"primaries=bt2020 & {pixfmt}"
-    return False, "no HDR transfer and not bt2020 10–12–16-bit"
+    for sd in side:
+        try:
+            typ = str(sd.get("side_data_type") or "").lower()
+        except AttributeError:
+            typ = ""
+        if any(keyword in typ for keyword in ("dolby", "dovi", "content light level", "mastering display", "hdr10+")):
+            return True, f"hdr side-data ({typ})"
+    if is_10bit and ("2020" in p or "2020" in csp):
+        return True, f"bt2020 {pixfmt or bits}"
+    return False, "no HDR signal (transfer/metadata/2020 missing)"
 
 
 def hdr_detect_reason(path: str) -> str:

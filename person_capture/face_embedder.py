@@ -521,10 +521,8 @@ class FaceEmbedder:
             _providers.append('CPUExecutionProvider')
             _prov_opts.append({})
             # Optional: richer failure logs when debugging
-            if (
-                os.getenv("PERSON_CAPTURE_TRT_DEBUG", "0") not in ("0", "", "false")
-                and 'TensorrtExecutionProvider' in _providers
-            ):
+            dbg = os.getenv("PERSON_CAPTURE_TRT_DEBUG", "0").lower() not in ("0", "", "false", "no")
+            if dbg and 'TensorrtExecutionProvider' in _providers:
                 _prov_opts[_providers.index('TensorrtExecutionProvider')]["trt_detailed_build_log"] = "True"
                 try:
                     _default_so.log_severity_level = 0
@@ -1006,8 +1004,8 @@ class FaceEmbedder:
         if provs and provs[0] == 'TensorrtExecutionProvider':
             trt = opts[0]
             trt.update({
-                'trt_dump_subgraphs': 'True',
-                'trt_detailed_build_log': 'True',
+                'trt_dump_subgraphs': '0',
+                'trt_detailed_build_log': '0',
                 'trt_min_subgraph_size': '1',
             })
         try:

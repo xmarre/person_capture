@@ -1,5 +1,7 @@
+import hashlib
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # pragma: no cover
@@ -30,6 +32,18 @@ class PersonDetector:
         self.device = 'cuda' if (str(device).startswith('cuda') and _torch.cuda.is_available()) else 'cpu'
         self.progress = progress
         self.model = self._load_model(model_name)
+        # Make ORT/TRT engine options stable (avoid rebuilds due to debug flags)
+        os.environ.setdefault("ORT_TRT_DUMP_SUBGRAPHS", "0")
+        os.environ.setdefault("ORT_TRT_DETAILED_BUILD_LOG", "0")
+        try:
+            pt_path = Path(getattr(self.model, "pt_path", ""))
+            if pt_path.is_file():
+                digest = hashlib.sha1(pt_path.read_bytes()[: 1 << 20]).hexdigest()
+                self._engine_tag = digest[:8]
+            else:
+                self._engine_tag = "default"
+        except Exception:
+            self._engine_tag = "default"
         try:
             # show exactly where weights came from
             m = Path(model_name)
@@ -57,7 +71,18 @@ class PersonDetector:
         else:
             base = m.name.lower()
             hub = base if base.endswith(".pt") else "yolov8n.pt"
-            weights_dir = Path(os.environ.get("ULTRALYTICS_HOME", ".")) / "weights"
+            from ultralytics import settings as yolo_settings
+
+            home = Path(os.environ.get("ULTRALYTICS_HOME", Path.cwd() / ".ultralytics"))
+            weights_dir = home / "weights"
+            yolo_settings.update({
+                "weights_dir": str(weights_dir),
+                "datasets_dir": str(home / "datasets"),
+            })
+            try:
+                yolo_settings.save()
+            except Exception:
+                pass
             local = weights_dir / hub
             log = logging.getLogger(__name__)
 
@@ -81,6 +106,7 @@ class PersonDetector:
                     return None
 
             if local.is_file():
+                log.info("YOLO weights hit: %s", local)
                 model = load_or_quarantine(local)
                 if model is not None:
                     return model
@@ -90,26 +116,23 @@ class PersonDetector:
                 weights_dir.mkdir(parents=True, exist_ok=True)
             except Exception:
                 pass
-            cwd_candidate = Path.cwd() / hub
-            if cwd_candidate.is_file():
-                try:
-                    cwd_candidate.replace(local)
-                    model = load_or_quarantine(local)
-                    if model is not None:
-                        return model
-                except Exception:
-                    pass
             wd = os.getcwd()
             try:
                 os.chdir(str(weights_dir))
                 model = self._YOLO(hub)
             finally:
                 os.chdir(wd)
-            try:
-                if local.is_file():
-                    log.info("YOLO cached at %s", local)
-            except Exception:
-                pass
+            for cand in (weights_dir / hub, Path.cwd() / hub, Path(hub)):
+                if cand.is_file():
+                    try:
+                        if not local.is_file():
+                            shutil.copy2(cand, local)
+                            log.info("Seeded YOLO cache: %s", local)
+                        else:
+                            log.info("YOLO weights hit: %s", local)
+                    except Exception:
+                        pass
+                    break
             return model
         try:
             return self._YOLO(model_arg)
