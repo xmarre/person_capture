@@ -145,6 +145,7 @@ class PersonDetector:
 
             # Last resort: fetch ONCE, then rebind to the cached absolute path.
             # Using YOLO(hub) only to download; then copy its resolved .pt into our cache.
+            tmp_model = None
             try:
                 tmp_model = self._YOLO(hub)  # may download to Ultralytics’ own path
                 src = Path(getattr(tmp_model, "pt_path", ""))  # Ultralytics resolves this
@@ -167,6 +168,9 @@ class PersonDetector:
                     log.warning("Ultralytics did not expose a concrete pt_path for %s", hub)
             except Exception as e:
                 log.warning("YOLO hub fetch failed (%s); continuing without hub", e)
+            if tmp_model is not None:
+                log.info("Using YOLO model returned directly from Ultralytics for %s", hub)
+                return tmp_model
 
             # Now load strictly from our cached absolute path (no hub alias involved)
             if local.exists() and local.stat().st_size > 0:
