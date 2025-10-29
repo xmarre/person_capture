@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+from contextlib import contextmanager
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -19,6 +20,8 @@ class PersonDetector:
             from ultralytics import YOLO as _YOLO
             # Point Ultralytics HOME into repo root to avoid user roaming caches
             _home = Path(os.environ["ULTRALYTICS_HOME"])
+            # also pin settings so Ultralytics never wanders
+            os.environ.setdefault("ULTRALYTICS_SETTINGS", str(_home / "settings.yaml"))
             (_home / "weights").mkdir(parents=True, exist_ok=True)
             (_home / "datasets").mkdir(parents=True, exist_ok=True)
             logging.getLogger(__name__).info("YOLO home=%s", _home)
@@ -27,6 +30,16 @@ class PersonDetector:
                 "Heavy dependencies not installed; install requirements.txt to run detection."
             ) from e
 
+        @contextmanager
+        def _pushd(d: Path):
+            d.mkdir(parents=True, exist_ok=True)
+            wd = os.getcwd()
+            os.chdir(str(d))
+            try:
+                yield
+            finally:
+                os.chdir(wd)
+        self._pushd = _pushd
         self._torch = _torch
         self._YOLO = _YOLO
         self.device = 'cuda' if (str(device).startswith('cuda') and _torch.cuda.is_available()) else 'cpu'
@@ -143,36 +156,36 @@ class PersonDetector:
                     if m2 is not None:
                         return m2
 
-            # Last resort: fetch ONCE, then rebind to the cached absolute path.
-            # Using YOLO(hub) only to download; then copy its resolved .pt into our cache.
+            # Last resort: fetch ONCE directly into weights_dir, then load from 'local'.
             try:
-                tmp_model = self._YOLO(hub)  # may download to Ultralytics’ own path
-                src = Path(getattr(tmp_model, "pt_path", ""))  # Ultralytics resolves this
-                if not src.is_file():
-                    # fallback: if Ultralytics placed the file in CWD
-                    src = Path.cwd() / hub
-                if src.is_file():
-                    try:
-                        weights_dir.mkdir(parents=True, exist_ok=True)
-                        if src.resolve() != local.resolve():
+                with self._pushd(weights_dir):
+                    # If already here (previous run), adopt it.
+                    if Path(hub).is_file():
+                        log.info("YOLO found in weights_dir: %s", Path(hub).resolve())
+                    else:
+                        log.info("YOLO fetching into weights_dir via Ultralytics: %s", hub)
+                        self._YOLO(hub)  # Ultralytics downloads to CWD (=weights_dir)
+                    # Ensure cache path is populated
+                    src = Path(hub)
+                    if src.is_file() and src.resolve() != local.resolve():
+                        try:
                             shutil.copy2(src, local)
-                        log.info("Seeded YOLO cache: %s", local)
-                        seeded_model = load_or_quarantine(local)
-                        if seeded_model is not None:
-                            log.info("YOLO loaded from cache: %s", local)
-                            return seeded_model
-                    except Exception as e:
-                        log.warning("Failed to copy YOLO weights into cache (%s)", e)
-                else:
-                    log.warning("Ultralytics did not expose a concrete pt_path for %s", hub)
+                        except Exception as e:
+                            log.warning("Copy into cache failed (%s) — continuing", e)
             except Exception as e:
-                log.warning("YOLO hub fetch failed (%s); continuing without hub", e)
+                log.warning("YOLO hub fetch into weights_dir failed (%s)", e)
 
-            # Now load strictly from our cached absolute path (no hub alias involved)
+            # Always finish by loading strictly from the absolute cache path.
+            try:
+                exists = local.exists()
+                size = local.stat().st_size if exists else 0
+                log.info("YOLO seed check %s exists=%s size=%d", local, exists, size)
+            except Exception:
+                pass
             if local.exists() and local.stat().st_size > 0:
-                model = load_or_quarantine(local)
-                if model is not None:
-                    return model
+                m2 = load_or_quarantine(local)
+                if m2 is not None:
+                    return m2
             raise RuntimeError(f"YOLO weights not found (expected at {local})")
         try:
             return self._YOLO(model_arg)
