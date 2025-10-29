@@ -100,6 +100,14 @@ class PersonDetector:
             local = weights_dir / hub
             log = logging.getLogger(__name__)
 
+            # Respect local-only mode by default (no network fetches).
+            local_only = os.getenv("PERSON_CAPTURE_YOLO_LOCAL_ONLY", "1").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+
             def load_or_quarantine(candidate: Path):
                 try:
                     return self._YOLO(str(candidate))
@@ -166,6 +174,17 @@ class PersonDetector:
                 except Exception:
                     pass
 
+            # If file is still missing and network is disallowed, fail fast with guidance.
+            if local_only:
+                exists = local.exists()
+                size = local.stat().st_size if exists else 0
+                log.error("YOLO local-only: expected weights at %s (exists=%s size=%d)", local, exists, size)
+                raise RuntimeError(
+                    "YOLO weights not found in local cache and PERSON_CAPTURE_YOLO_LOCAL_ONLY=1.\n"
+                    f"Place '{hub}' at '{local}' (or set PERSON_CAPTURE_YOLO_LOCAL_ONLY=0 to permit a one-time fetch)."
+                )
+
+            # Network allowed: fetch ONCE into weights_dir, then adopt cache.
             # Last resort: fetch ONCE, then rebind to the cached absolute path.
             # Using YOLO(hub) only to download; then copy its resolved .pt into our cache.
             tmp_model = None
