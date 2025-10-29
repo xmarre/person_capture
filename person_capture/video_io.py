@@ -240,13 +240,108 @@ def _probe_pixfmt_av(path: str) -> tuple[Optional[str], Optional[int], Optional[
         return None, None, None
 
 
+def _str_lower_nonempty(x) -> str:
+    s = str(x or "").strip()
+    return s.lower() if s and s.lower() != "unknown" else ""
+
+
+def _looks_bt2020(s: str) -> bool:
+    s = s.lower()
+    return "2020" in s or "bt2020" in s
+
+
+def _is_10bit_pixfmt(pix: str, bprs: int) -> bool:
+    pix_l = (pix or "").lower()
+    return any(t in pix_l for t in ("p10", "yuv420p10", "yuv422p10", "yuv444p10", "p012", "p016")) or (bprs >= 10)
+
+
+def _stream_says_hdr_pyav(stream) -> tuple[bool, str]:
+    """Stream-level HDR hints from PyAV (no ffprobe)."""
+    cc = getattr(stream, "codec_context", stream)
+    trc = _str_lower_nonempty(getattr(cc, "color_trc", None) or getattr(cc, "color_transfer", None))
+    prim = _str_lower_nonempty(getattr(cc, "color_primaries", None))
+    csp = _str_lower_nonempty(getattr(cc, "colorspace", None) or getattr(cc, "color_space", None))
+    pix = _str_lower_nonempty(getattr(stream, "format", None) or getattr(cc, "pix_fmt", None))
+    try:
+        bprs = int(getattr(cc, "bits_per_raw_sample", 0) or 0)
+    except Exception:
+        bprs = 0
+    tag = _str_lower_nonempty(getattr(cc, "codec_tag_string", None) or getattr(cc, "codec_tag", None))
+    meta = {}
+    try:
+        meta = {str(k).lower(): str(v).lower() for k, v in (getattr(stream, "metadata", {}) or {}).items()}
+    except Exception:
+        pass
+    if tag.startswith("dvh") or "dvhe" in tag:
+        return True, f"pyav stream tag={tag}"
+    if any("dolby" in (k + v) or "dvhe" in (k + v) or "dvh1" in (k + v) for k, v in meta.items()):
+        return True, "pyav stream metadata: dolby-vision"
+
+    if trc in ("smpte2084", "arib-std-b67", "hlg", "bt2020-10", "bt2020-12"):
+        return True, f"pyav stream transfer={trc or 'unknown'}"
+
+    if _is_10bit_pixfmt(pix, bprs) and (_looks_bt2020(prim) or _looks_bt2020(csp)):
+        return True, f"pyav stream bt2020 {pix or bprs}"
+
+    assume_10 = os.getenv("PERSON_CAPTURE_HDR_ASSUME_10BIT", "0").lower() in ("1", "true", "yes", "on")
+    name = _str_lower_nonempty(getattr(cc, "name", None) or getattr(stream, "name", None))
+    prof = _str_lower_nonempty(getattr(cc, "profile", None) or getattr(stream, "profile", None))
+    if assume_10 and ("hevc" in name or "h265" in name) and ("main 10" in prof or _is_10bit_pixfmt(pix, bprs)):
+        return True, "pyav stream forced main10"
+
+    return False, "pyav stream: no hdr flags"
+
+
+def _frames_say_hdr_pyav(container, stream_index: int) -> tuple[bool, str]:
+    """
+    Decode a handful of frames and look for frame-level HDR cues:
+      - frame.color_trc = smpte2084/hlg
+      - frame.side_data contains MasteringDisplayMetadata / ContentLightLevel / HDR dynamic metadata
+    """
+    try:
+        vstream = container.streams.video[stream_index]
+    except Exception:
+        return False, "pyav frame: no stream"
+
+    max_probe = 12
+    count = 0
+    for frame in container.decode(vstream):
+        count += 1
+        trc = _str_lower_nonempty(getattr(frame, "color_trc", None))
+        if trc in ("smpte2084", "arib-std-b67", "hlg", "bt2020-10", "bt2020-12"):
+            return True, f"pyav frame transfer={trc}"
+        try:
+            sds = list(getattr(frame, "side_data", []) or [])
+        except Exception:
+            sds = []
+        for sd in sds:
+            t = _str_lower_nonempty(getattr(sd, "type", None) or str(sd))
+            if any(
+                key in t
+                for key in (
+                    "mastering",
+                    "contentlight",
+                    "content_light",
+                    "dynamic",
+                    "hdr",
+                    "dolby",
+                    "dv",
+                )
+            ):
+                return True, f"pyav frame side_data={t or 'hdr'}"
+        if count >= max_probe:
+            break
+    return False, "pyav frame: no hdr cues"
+
+
 def _detect_hdr_pyav(path: str) -> tuple[bool, str]:
     """
     ffprobe-free HDR detection using PyAV only.
     Signals:
       - transfer: smpte2084 (PQ), arib-std-b67/hlg
-      - Dolby Vision hints via codec_tag_string dvh*/dvhe
+      - Dolby Vision hints via codec tags or stream metadata
       - BT.2020 + >=10-bit pixfmt/bprs as fallback
+      - Frame-level HDR side-data / transfer (MasteringDisplayMetadata, ContentLightLevel, etc.)
     """
     try:
         ct = av.open(path)
@@ -256,54 +351,38 @@ def _detect_hdr_pyav(path: str) -> tuple[bool, str]:
         vids = [s for s in ct.streams if getattr(s, "type", None) == "video"] or list(ct.streams.video)
     except Exception:
         vids = list(ct.streams.video) if hasattr(ct.streams, "video") else []
-    if not vids:
+    video_streams = list(vids)
+    if not video_streams:
         ct.close()
         return False, "pyav: no video streams"
 
-    def _get(obj, names, default=""):
-        for n in names:
-            v = getattr(obj, n, None)
-            if v is None:
-                continue
-            # enums/objects -> string
-            s = str(getattr(v, "name", v)).strip().lower()
-            if s and s != "unknown":
-                return s
-        return default
+    for i, s in enumerate(video_streams):
+        ok, why = _stream_says_hdr_pyav(s)
+        if ok:
+            ct.close()
+            return True, f"pyav v:{i} {why}"
 
-    for i, s in enumerate(vids):
-        cc = getattr(s, "codec_context", s)
-        trc = _get(cc, ["color_trc", "color_transfer", "color_transfer_characteristic"])
-        prim = _get(cc, ["color_primaries"])
-        csp = _get(cc, ["colorspace", "color_space"])
-        pix = _get(s, ["format"])
-        if not pix:
-            pix = _get(cc, ["pix_fmt", "format"])
-        # bits per raw sample
+    try:
+        ct.close()
+    except Exception:
+        pass
+
+    for i in range(len(video_streams)):
         try:
-            bprs = int(getattr(cc, "bits_per_raw_sample", 0) or 0)
-        except Exception:
-            bprs = 0
-        # DV tag hint
-        tag = _get(cc, ["codec_tag_string"])
-        if tag.startswith("dvh") or "dvhe" in tag:
-            ct.close()
-            return True, f"pyav v:{i} dolby-vision tag={tag}"
-        # Explicit HDR transfers
-        if trc in ("smpte2084", "arib-std-b67", "hlg", "bt2020-10", "bt2020-12"):
-            ct.close()
-            return True, f"pyav v:{i} transfer={trc}"
-        # 10-bit BT.2020 fallback
-        pix_l = pix.lower()
-        is_10b = any(t in pix_l for t in ("p10", "yuv420p10", "yuv422p10", "yuv444p10")) or (bprs >= 10)
-        if is_10b and ("2020" in prim or "2020" in csp):
-            ct.close()
-            return True, f"pyav v:{i} bt2020 {pix or bprs}"
-        # optional: treat any 10-bit as HDR if env forces it
-        if is_10b and os.getenv("PERSON_CAPTURE_HDR_ASSUME_10BIT", "0").lower() in ("1","true","yes","on"):
-            ct.close()
-            return True, f"pyav v:{i} forced-10bit"
-    ct.close()
+            ct_frame = av.open(path)
+        except Exception as e:
+            ok, why = False, f"pyav frame open failed: {e}"
+        else:
+            try:
+                ok, why = _frames_say_hdr_pyav(ct_frame, i)
+            finally:
+                try:
+                    ct_frame.close()
+                except Exception:
+                    pass
+        if ok:
+            return True, f"pyav v:{i} {why}"
+
     return False, "pyav: no HDR signal"
 
 
