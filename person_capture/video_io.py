@@ -241,8 +241,22 @@ def _probe_pixfmt_av(path: str) -> tuple[Optional[str], Optional[int], Optional[
 
 
 def _str_lower_nonempty(x) -> str:
-    s = str(x or "").strip()
-    return s.lower() if s and s.lower() != "unknown" else ""
+    if x in (None, ""):
+        return ""
+
+    if hasattr(x, "name") and isinstance(getattr(x, "name"), str):
+        s = x.name
+    else:
+        s = str(x)
+        if "." in s:
+            s = s.rsplit(".", 1)[-1]
+
+    s = s.strip()
+    if not s:
+        return ""
+
+    s = s.lower()
+    return s if s != "unknown" else ""
 
 
 def _looks_bt2020(s: str) -> bool:
