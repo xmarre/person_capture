@@ -3,6 +3,8 @@ from __future__ import annotations
 import subprocess, json, os, sys, math, functools
 from dataclasses import dataclass
 from typing import Optional
+import shutil
+from pathlib import Path
 
 import av
 import numpy as np
@@ -11,6 +13,11 @@ import imageio_ffmpeg as iioff
 
 try:
     import cv2  # type: ignore
+    # keep OpenCV/FFmpeg chatter down
+    try:
+        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+    except Exception:
+        pass
     CV_CAP_PROP_POS_FRAMES = int(cv2.CAP_PROP_POS_FRAMES)
     CV_CAP_PROP_FPS = int(cv2.CAP_PROP_FPS)
     CV_CAP_PROP_FRAME_COUNT = int(cv2.CAP_PROP_FRAME_COUNT)
@@ -25,10 +32,20 @@ except Exception:
 
 
 def _ffprobe_path() -> Optional[str]:
-    try:
-        return iioff.get_ffprobe_exe()
-    except Exception:
-        return None
+    # 1) imageio bundle, 2) PATH, 3) local fallbacks
+    for getter in (
+        lambda: iioff.get_ffprobe_exe(),
+        lambda: shutil.which("ffprobe"),
+        lambda: str(Path(__file__).resolve().parent / "ffprobe.exe"),
+        lambda: str(Path.cwd() / "ffprobe.exe"),
+    ):
+        try:
+            p = getter()
+            if p and os.path.exists(p):
+                return p
+        except Exception:
+            pass
+    return None
 
 
 def _ffmpeg_path() -> Optional[str]:
@@ -52,27 +69,33 @@ def _ffprobe_json_cached(key: tuple[str, int, int]) -> dict:
     probe = _ffprobe_path()
     if not probe:
         return {}
-    p = subprocess.run(
-        [
-            probe,
-            "-v",
-            "error",
-            "-select_streams",
-            "v",
-            "-show_entries",
-            "stream=index,codec_name,codec_tag_string,profile,color_space,matrix_coefficients,color_transfer,color_primaries,color_range,avg_frame_rate,nb_frames,duration,time_base,width,height,pix_fmt,bits_per_raw_sample,side_data_list:format=duration",
-            "-of",
-            "json",
-            path,
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    try:
-        return json.loads(p.stdout or "{}")
-    except Exception:
-        return {}
+    base = [
+        probe,
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=index,codec_name,codec_tag_string,profile,color_space,matrix_coefficients,color_transfer,color_primaries,color_range,avg_frame_rate,nb_frames,duration,time_base,width,height,pix_fmt,bits_per_raw_sample,side_data_list:format=duration",
+        "-of",
+        "json",
+        "-analyzeduration",
+        "200M",
+        "-probesize",
+        "200M",
+        path,
+    ]
+    # Try with v:0, then v, then all streams (no selector)
+    for sel in (["-select_streams", "v:0"], ["-select_streams", "v"], []):
+        args = base[:]
+        if sel:
+            args[3:3] = sel
+        p = subprocess.run(args, text=True, capture_output=True, check=False)
+        try:
+            meta = json.loads(p.stdout or "{}")
+            if meta.get("streams"):
+                return meta
+        except Exception:
+            pass
+    return {}
 
 
 def _ffprobe_json(path: str) -> dict:
