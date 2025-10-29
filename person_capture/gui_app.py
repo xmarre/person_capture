@@ -2294,14 +2294,26 @@ class Processor(QtCore.QObject):
             logger.info("Repo root=%s", _REPO_ROOT)
             logger.info("TRT cache root=%s", trt_cache_root)
             logger.info("ULTRALYTICS_HOME=%s", os.environ.get("ULTRALYTICS_HOME"))
-            _env_set("PERSON_CAPTURE_TRT_FP16", "1" if getattr(self.cfg, "trt_fp16_enable", True) else "0")
-            _env_set("PERSON_CAPTURE_TRT_TIMING_CACHE_ENABLE", "1" if getattr(self.cfg, "trt_timing_cache_enable", True) else "0")
-            _env_set("PERSON_CAPTURE_TRT_ENGINE_CACHE_ENABLE", "1" if getattr(self.cfg, "trt_engine_cache_enable", True) else "0")
+            _env_set(
+                "PERSON_CAPTURE_TRT_FP16",
+                "True" if getattr(self.cfg, "trt_fp16_enable", True) else "False",
+            )
+            _env_set(
+                "PERSON_CAPTURE_TRT_TIMING_CACHE_ENABLE",
+                "True" if getattr(self.cfg, "trt_timing_cache_enable", True) else "False",
+            )
+            _env_set(
+                "PERSON_CAPTURE_TRT_ENGINE_CACHE_ENABLE",
+                "True" if getattr(self.cfg, "trt_engine_cache_enable", True) else "False",
+            )
             _env_set("PERSON_CAPTURE_TRT_BUILDER_OPT_LEVEL", int(getattr(self.cfg, "trt_builder_optimization_level", 5)))
-            _env_set("PERSON_CAPTURE_TRT_CUDA_GRAPH_ENABLE", "1" if getattr(self.cfg, "trt_cuda_graph_enable", True) else "0")
+            _env_set(
+                "PERSON_CAPTURE_TRT_CUDA_GRAPH_ENABLE",
+                "True" if getattr(self.cfg, "trt_cuda_graph_enable", True) else "False",
+            )
             _env_set(
                 "PERSON_CAPTURE_TRT_CONTEXT_MEMORY_SHARING_ENABLE",
-                "1" if getattr(self.cfg, "trt_context_memory_sharing_enable", True) else "0",
+                "True" if getattr(self.cfg, "trt_context_memory_sharing_enable", True) else "False",
             )
             _env_set("PERSON_CAPTURE_TRT_AUX_STREAMS", int(getattr(self.cfg, "trt_auxiliary_streams", -1)))
             _env_set("PERSON_CAPTURE_CUDA_USE_TF32", "1" if getattr(self.cfg, "cuda_use_tf32", True) else "0")

@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import subprocess, json, os, sys, math, functools
+import subprocess, json, os, sys, math, functools, shutil
 from dataclasses import dataclass
 from typing import Optional
-import shutil
 from pathlib import Path
 
 import av
@@ -48,6 +47,23 @@ def _ffprobe_path() -> Optional[str]:
     return None
 
 
+def _ffprobe_version(path: Optional[str] = None) -> str:
+    p = path or _ffprobe_path()
+    if not p:
+        return "missing"
+    try:
+        out = subprocess.run(
+            [p, "-v", "error", "-hide_banner", "-version"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        line = (out.stdout or out.stderr or "").splitlines()[0:1]
+        return line[0] if line else "unknown"
+    except Exception:
+        return "unknown"
+
+
 def _ffmpeg_path() -> Optional[str]:
     try:
         return iioff.get_ffmpeg_exe()
@@ -81,13 +97,10 @@ def _ffprobe_json_cached(key: tuple[str, int, int]) -> dict:
         "200M",
         "-probesize",
         "200M",
-        path,
     ]
     # Try with v:0, then v, then all streams (no selector)
     for sel in (["-select_streams", "v:0"], ["-select_streams", "v"], []):
-        args = base[:]
-        if sel:
-            args[3:3] = sel
+        args = base + sel + [path]
         p = subprocess.run(args, text=True, capture_output=True, check=False)
         try:
             meta = json.loads(p.stdout or "{}")
@@ -121,6 +134,10 @@ def _ffprobe_first_frame_side_data_cached(key: tuple[str, int, int]) -> list[dic
             "-show_frames",  # ensure per-frame metadata (side_data_list) is emitted
             "-show_entries",
             "frame=stream_index,side_data_list,color_transfer,color_primaries,color_space",
+            "-analyzeduration",
+            "200M",
+            "-probesize",
+            "200M",
             "-of",
             "json",
             path,
@@ -147,6 +164,10 @@ def _ffprobe_first_frame_side_data_cached(key: tuple[str, int, int]) -> list[dic
                 else:
                     enriched = {"_stream_index": idx, "value": item}
                 side.append(enriched)
+        # also honor frame-level HDR signals even when side_data_list is absent
+        ct = str(frame.get("color_transfer") or "").lower()
+        if ct in ("smpte2084", "arib-std-b67", "hlg", "bt2020-10", "bt2020-12"):
+            side.append({"_stream_index": idx, "side_data_type": f"frame color_transfer {ct}"})
     return side
 
 
@@ -195,11 +216,16 @@ def _probe_pixfmt_av(path: str) -> tuple[Optional[str], Optional[int], Optional[
 
 
 def _detect_hdr(path: str) -> tuple[bool, str]:
+    probe = _ffprobe_path()
+    log = logging.getLogger(__name__)
+    log.info("HDR: ffprobe=%s (%s)", probe or "None", _ffprobe_version(probe))
+    if not probe:
+        return False, "ffprobe missing"
     meta = _ffprobe_json(path)
     streams = list(meta.get("streams") or [])
     if not streams:
-        return False, "no streams"
-    side_frames_all = _ffprobe_first_frame_side_data(path)
+        return False, "no streams (ffprobe saw none)"
+    side_frames_all = _ffprobe_first_frame_side_data_cached(_probe_cache_key(path))
     if not isinstance(side_frames_all, list):
         side_frames_all = []
     # check each video stream; early return on first HDR hit
@@ -212,6 +238,9 @@ def _detect_hdr(path: str) -> tuple[bool, str]:
         csp = str(s.get("color_space") or "").lower()
         mc = str(s.get("matrix_coefficients") or "").lower()
         pixfmt = str(s.get("pix_fmt") or "")
+        tag = str(s.get("codec_tag_string") or "").lower()
+        if tag.startswith("dvh") or "dvhe" in tag:
+            return True, f"v:{stream_idx} dolby-vision tag={tag}"
         side_stream = s.get("side_data_list") or []
         if not isinstance(side_stream, list):
             side_stream = [side_stream]

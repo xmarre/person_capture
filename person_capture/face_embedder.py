@@ -399,7 +399,6 @@ class FaceEmbedder:
                 "trt_engine_cache_path": str((cache_root / prefix).resolve()) if engine_en else "",
                 "trt_engine_cache_prefix": prefix if engine_en else "",
                 "trt_builder_optimization_level": str(max(0, min(5, build_lvl))),
-                "trt_build_heuristics_enable": _b(True),
                 "trt_cuda_graph_enable": _b(cg_en),
                 "trt_context_memory_sharing_enable": _b(ctxshare),
                 "trt_auxiliary_streams": str(aux_stream),
@@ -548,9 +547,9 @@ class FaceEmbedder:
                     _prov_opts[trt_i].setdefault("trt_profile_min_shapes", f"{_in_name}:{fixed}")
                     _prov_opts[trt_i].setdefault("trt_profile_opt_shapes", f"{_in_name}:{fixed}")
                     _prov_opts[trt_i].setdefault("trt_profile_max_shapes", f"{_in_name}:{fixed}")
-                    _prov_opts[trt_i].setdefault("trt_force_sequential_engine_build", "1")
+                    _prov_opts[trt_i].setdefault("trt_force_sequential_engine_build", "True")
                     _prov_opts[trt_i].setdefault("trt_engine_cache_prefix", "scrfd")
-                    _prov_opts[trt_i].setdefault("trt_engine_cache_enable", "1")
+                    _prov_opts[trt_i].setdefault("trt_engine_cache_enable", "True")
             except Exception:
                 pass
             # keep ORT CPU threads low; TRT runs on GPU
@@ -1010,8 +1009,8 @@ class FaceEmbedder:
         if provs and provs[0] == 'TensorrtExecutionProvider':
             trt = opts[0]
             trt.update({
-                'trt_dump_subgraphs': '0',
-                'trt_detailed_build_log': '0',
+                'trt_dump_subgraphs': 'False',
+                'trt_detailed_build_log': 'False',
                 'trt_min_subgraph_size': '1',
             })
         try:
