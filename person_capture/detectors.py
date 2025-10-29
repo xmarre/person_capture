@@ -46,8 +46,8 @@ class PersonDetector:
         self.progress = progress
         self.model = self._load_model(model_name)
         # Make ORT/TRT engine options stable (avoid rebuilds due to debug flags)
-        os.environ.setdefault("ORT_TRT_DUMP_SUBGRAPHS", "0")
-        os.environ.setdefault("ORT_TRT_DETAILED_BUILD_LOG", "0")
+        os.environ.setdefault("ORT_TRT_DUMP_SUBGRAPHS", "False")
+        os.environ.setdefault("ORT_TRT_DETAILED_BUILD_LOG", "False")
         try:
             pt_path = Path(getattr(self.model, "pt_path", ""))
             if pt_path.is_file():
