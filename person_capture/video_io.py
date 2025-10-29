@@ -58,9 +58,9 @@ def _ffprobe_json_cached(key: tuple[str, int, int]) -> dict:
             "-v",
             "error",
             "-select_streams",
-            "v:0",
+            "v",
             "-show_entries",
-            "stream=codec_name,codec_tag_string,profile,color_space,matrix_coefficients,color_transfer,color_primaries,color_range,avg_frame_rate,nb_frames,duration,time_base,width,height,pix_fmt,bits_per_raw_sample,side_data_list:format=duration",
+            "stream=index,codec_name,codec_tag_string,profile,color_space,matrix_coefficients,color_transfer,color_primaries,color_range,avg_frame_rate,nb_frames,duration,time_base,width,height,pix_fmt,bits_per_raw_sample,side_data_list:format=duration",
             "-of",
             "json",
             path,
@@ -94,9 +94,10 @@ def _ffprobe_first_frame_side_data_cached(key: tuple[str, int, int]) -> list[dic
             "-read_intervals",
             "0%+3",  # probe fewer frames; enough for DV/HDR10+ metadata
             "-select_streams",
-            "v:0",
+            "v",
+            "-show_frames",  # ensure per-frame metadata (side_data_list) is emitted
             "-show_entries",
-            "frame=side_data_list",
+            "frame=stream_index,side_data_list,color_transfer,color_primaries,color_space",
             "-of",
             "json",
             path,
@@ -111,9 +112,18 @@ def _ffprobe_first_frame_side_data_cached(key: tuple[str, int, int]) -> list[dic
         frames = []
     side: list[dict] = []
     for frame in frames:
-        sdl = frame.get("side_data_list") if isinstance(frame, dict) else None
+        if not isinstance(frame, dict):
+            continue
+        idx = frame.get("stream_index")
+        sdl = frame.get("side_data_list")
         if isinstance(sdl, list):
-            side.extend(sdl)
+            for item in sdl:
+                if isinstance(item, dict):
+                    enriched = dict(item)
+                    enriched["_stream_index"] = idx
+                else:
+                    enriched = {"_stream_index": idx, "value": item}
+                side.append(enriched)
     return side
 
 
@@ -163,62 +173,78 @@ def _probe_pixfmt_av(path: str) -> tuple[Optional[str], Optional[int], Optional[
 
 def _detect_hdr(path: str) -> tuple[bool, str]:
     meta = _ffprobe_json(path)
-    s = (meta.get("streams") or [{}])[0]
-    t = str(s.get("color_transfer") or "").lower()
-    p = str(s.get("color_primaries") or "").lower()
-    csp = str(s.get("color_space") or "").lower()
-    mc = str(s.get("matrix_coefficients") or "").lower()
-    pixfmt = str(s.get("pix_fmt") or "")
-    side_stream = s.get("side_data_list") or []
-    if not isinstance(side_stream, list):
-        side_stream = [side_stream]
-    bits = str(s.get("bits_per_raw_sample") or "").strip()
-    is_10bit = any(
-        token in pixfmt
-        for token in (
-            "p10",
-            "p12",
-            "p14",
-            "p16",
-            "yuv420p10",
-            "yuv420p12",
-            "yuv420p16",
-        )
-    )
-    if not is_10bit:
-        try:
-            is_10bit = int(bits) >= 10
-        except Exception:
-            is_10bit = False
-    # explicit HDR transfers (PQ / HLG / BT.2020 HDR curves)
-    if t in ("smpte2084", "arib-std-b67", "hlg", "bt2020-10", "bt2020-12"):
-        return True, f"transfer={t}"
-    # only now probe early frames (DV/HDR10+ sometimes live there)
-    side_frames = _ffprobe_first_frame_side_data(path)
-    if not isinstance(side_frames, list):
-        side_frames = []
-    side_all = side_stream + side_frames
-    for sd in side_all:
-        try:
-            typ = str(sd.get("side_data_type") or "").lower()
-        except AttributeError:
-            typ = ""
-        if any(
-            keyword in typ
-            for keyword in (
-                "dolby vision",
-                "dovi",
-                "dovi configuration record",
-                "hdr10+",
-                "mastering display metadata",
-                "content light level",
-                "cta 861-3",
+    streams = list(meta.get("streams") or [])
+    if not streams:
+        return False, "no streams"
+    side_frames_all = _ffprobe_first_frame_side_data(path)
+    if not isinstance(side_frames_all, list):
+        side_frames_all = []
+    # check each video stream; early return on first HDR hit
+    for idx, s in enumerate(streams):
+        stream_idx = s.get("index")
+        if stream_idx is None:
+            stream_idx = idx
+        t = str(s.get("color_transfer") or "").lower()
+        p = str(s.get("color_primaries") or "").lower()
+        csp = str(s.get("color_space") or "").lower()
+        mc = str(s.get("matrix_coefficients") or "").lower()
+        pixfmt = str(s.get("pix_fmt") or "")
+        side_stream = s.get("side_data_list") or []
+        if not isinstance(side_stream, list):
+            side_stream = [side_stream]
+        bits = str(s.get("bits_per_raw_sample") or "").strip()
+        is_10bit = any(
+            token in pixfmt
+            for token in (
+                "p10",
+                "p12",
+                "p14",
+                "p16",
+                "yuv420p10",
+                "yuv420p12",
+                "yuv420p16",
             )
-        ):
-            return True, f"hdr side-data ({typ})"
-    if is_10bit and ("2020" in p or "2020" in csp or "2020" in mc):
-        return True, f"bt2020 {pixfmt or bits}"
-    return False, "no HDR signal (transfer/metadata/2020 missing)"
+        )
+        if not is_10bit:
+            try:
+                is_10bit = int(bits) >= 10
+            except Exception:
+                is_10bit = False
+        if t in ("smpte2084", "arib-std-b67", "hlg", "bt2020-10", "bt2020-12"):
+            return True, f"v:{stream_idx} transfer={t}"
+        side_frames = [
+            sd
+            for sd in side_frames_all
+            if (
+                isinstance(sd, dict)
+                and (
+                    sd.get("_stream_index") == stream_idx
+                    or sd.get("_stream_index") is None
+                )
+            )
+        ]
+        side_all = side_stream + side_frames
+        for sd in side_all:
+            try:
+                typ = str(sd.get("side_data_type") or "").lower()
+            except AttributeError:
+                typ = ""
+            if any(
+                keyword in typ
+                for keyword in (
+                    "dolby vision",
+                    "dovi",
+                    "dovi configuration record",
+                    "hdr10+",
+                    "mastering display metadata",
+                    "content light level",
+                    "cta 861-3",
+                )
+            ):
+                return True, f"v:{stream_idx} hdr side-data ({typ})"
+        if is_10bit and ("2020" in p or "2020" in csp or "2020" in mc):
+            return True, f"v:{stream_idx} bt2020 {pixfmt or bits}"
+    return False, "no HDR signal across video streams"
 
 
 def hdr_detect_reason(path: str) -> str:
