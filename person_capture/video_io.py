@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import subprocess, json, os, sys, math, functools, shutil
+import subprocess, json, os, sys, math, functools
 from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
@@ -34,42 +34,41 @@ except Exception:
 
 
 def _ffprobe_path() -> Optional[str]:
-    # 1) explicit environment overrides
-    for envk in ("FFPROBE", "FFPROBE_PATH"):
-        p = os.getenv(envk)
-        if p and os.path.exists(p):
-            return p
-
-    # 2) imageio bundle (if available)
+    """
+    Strict policy: use only the `imageio-ffmpeg` bundled ffprobe (never PATH).
+    If imageio-ffmpeg does not expose a probe path, try to locate a sibling
+    ffprobe next to the bundled ffmpeg binary. Otherwise return None.
+    """
+    log = logging.getLogger(__name__)
+    # 1) Ask imageio-ffmpeg directly
     try:
         p = iioff.get_ffprobe_exe()
         if p and os.path.exists(p):
             return p
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("imageio-ffmpeg.get_ffprobe_exe() failed: %s", e)
 
-    # 3) PATH lookup
-    p = shutil.which("ffprobe")
-    if p and os.path.exists(p):
-        return p
-
-    # 4) derive ffprobe next to the bundled ffmpeg binary
+    # 2) Derive sibling from the bundled ffmpeg directory (still within bundle)
     try:
         ffm = iioff.get_ffmpeg_exe()
         if ffm and os.path.exists(ffm):
-            cand = Path(ffm).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe")
-            if cand.exists():
-                return str(cand)
-    except Exception:
-        pass
-
-    # 5) local fallbacks (package dir, cwd)
-    for cand in (
-        Path(__file__).resolve().parent / ("ffprobe.exe" if os.name == "nt" else "ffprobe"),
-        Path.cwd() / ("ffprobe.exe" if os.name == "nt" else "ffprobe"),
-    ):
-        if cand.exists():
-            return str(cand)
+            d = Path(ffm).parent
+            # common exact name
+            exact = d / ("ffprobe.exe" if os.name == "nt" else "ffprobe")
+            if exact.is_file():
+                return str(exact)
+            # any ffprobe* in the same folder (imageio cache sometimes uses versioned names)
+            for cand in d.glob("ffprobe*"):
+                if cand.is_file():
+                    return str(cand)
+            try:
+                # Helpful debug: what’s actually in that dir?
+                listing = [p.name for p in d.iterdir()]
+                log.info("imageio ffmpeg dir had no ffprobe: %s (contents=%s)", d, listing)
+            except Exception:
+                log.info("imageio ffmpeg dir had no ffprobe: %s", d)
+    except Exception as e:
+        log.warning("imageio-ffmpeg ffprobe sibling scan failed: %s", e)
     return None
 
 
@@ -311,6 +310,13 @@ def _detect_hdr_pyav(path: str) -> tuple[bool, str]:
 def _detect_hdr(path: str) -> tuple[bool, str]:
     probe = _ffprobe_path()
     log = logging.getLogger(__name__)
+    # Extra diagnostics so we can see what imageio-ffmpeg is doing on this machine
+    try:
+        iio_ver = getattr(iioff, "__version__", "unknown")
+        ffm = iioff.get_ffmpeg_exe()
+    except Exception:
+        iio_ver, ffm = "unknown", None
+    log.info("HDR: imageio-ffmpeg=%s ffmpeg=%s", iio_ver, ffm or "None")
     log.info("HDR: ffprobe=%s (%s)", probe or "None", _ffprobe_version(probe))
     if not probe:
         # No ffprobe allowed/available → pure PyAV path
