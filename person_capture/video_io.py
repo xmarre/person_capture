@@ -947,6 +947,17 @@ def open_video_with_tonemap(path: str):
             return None
     # Robust detect
     is_hdr, reason = _detect_hdr(path)
+    # Respect explicit GUI/backend override only for HDR content: skip PyAV when forcing zscale/scale.
+    pref = (os.getenv("PC_FORCE_TONEMAP", "") or "").strip().lower()
+    if is_hdr and pref in ("zscale", "scale"):
+        log.info(
+            "HDR detect: %s → forcing external ffmpeg pipe (%s)",
+            reason or "unknown", pref
+        )
+        fmpeg = _ffmpeg_path()
+        if fmpeg:
+            return FfmpegPipeReader(path, fmpeg)
+        return None
     if is_hdr:
         log.info("HDR detect: %s → enabling tone-map path", reason)
         try:
@@ -1041,12 +1052,28 @@ class FfmpegPipeReader:
         self._frame_bytes_u8 = self._w * self._h * 3
         self._frame_bytes_f32 = self._w * self._h * 3 * 4
         self._pix_fmt = "bgr24"
+        # Tunables (env overrides). Defaults align with MPC VR feel.
+        self._sdr_nits = float(os.getenv("PC_SDR_NITS", "125"))       # 80–200 typical
+        self._tm_desat = float(os.getenv("PC_TM_DESAT", "0.25"))      # 0=keep chroma, 1=desaturate more
+        self._tm_param = float(os.getenv("PC_TM_PARAM", "0.40"))      # Mobius curve softness
+        self._force_mode = (os.getenv("PC_FORCE_TONEMAP", "") or "").strip().lower()
+        if not self._force_mode:
+            if os.getenv("PC_FORCE_ZSCALE", ""):
+                self._force_mode = "zscale"
+            elif os.getenv("PC_FORCE_SCALE", ""):
+                self._force_mode = "scale"
         # Track the currently active filter mode so we can fall back if needed.
         self._mode = (
             "libplacebo"
             if self._use_libplacebo
             else ("zscale" if (self._has_zscale and self._has_tonemap) else "scale")
         )
+        if self._force_mode == "libplacebo" and self._use_libplacebo:
+            self._mode = "libplacebo"
+        elif self._force_mode == "zscale" and (self._has_zscale and self._has_tonemap):
+            self._mode = "zscale"
+        elif self._force_mode == "scale" and self._has_scale:
+            self._mode = "scale"
         # Stage-specific fallback flags so we can attempt zscale, then scale.
         self._tried_zscale = False
         self._tried_scale = False
@@ -1124,11 +1151,11 @@ class FfmpegPipeReader:
                 "dither=yes:deband=yes"
             )
         if self._mode in ("libplacebo", "zscale") and (self._has_zscale and self._has_tonemap):
-            # full HDR→SDR tonemap
+            # Full HDR→SDR tonemap tuned for SDR target brightness and optional desaturation.
             return (
                 "zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc,"
                 "zscale=transfer=linear:npl=1000,format=gbrpf32le,"
-                "tonemap=tonemap=mobius:param=0.5:desat=0.5:peak=200,"
+                f"tonemap=tonemap=mobius:param={self._tm_param}:desat={self._tm_desat}:peak={self._sdr_nits},"
                 "zscale=transfer=bt709:primaries=bt709:matrix=bt709:dither=error_diffusion,"
                 f"zscale=rangein={self._range_in}:range=full,format=bgr24"
             )
@@ -1181,6 +1208,7 @@ class FfmpegPipeReader:
         self._pix_fmt = pix_fmt
 
     def _stop(self):
+        # Idempotent; callers may invoke multiple times during fallback.
         try:
             if self._proc:
                 self._proc.kill()
@@ -1221,6 +1249,8 @@ class FfmpegPipeReader:
         if self._pix_fmt == "bgr24":
             buf = self._proc.stdout.read(self._frame_bytes_u8)
             if not buf or len(buf) < self._frame_bytes_u8:
+                if self.try_fallback_chain():
+                    return self.grab()
                 return False
             self._arr = np.frombuffer(buf, dtype=np.uint8).reshape(self._h, self._w, 3)
             self._pos += 1
@@ -1257,9 +1287,7 @@ class FfmpegPipeReader:
         # If the process died prematurely (e.g., libplacebo failed to init),
         # attempt a one-time filter-chain fallback before giving up.
         if self._proc is not None and self._proc.poll() is not None:
-            if self.try_fallback_chain():
-                pass
-            else:
+            if not self.try_fallback_chain():
                 return False, None
 
         if not self.grab():

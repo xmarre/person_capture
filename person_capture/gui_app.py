@@ -268,6 +268,11 @@ class SessionConfig:
     lock_reid_thresh: float = 0.30
     score_margin: float = 0.03
     iou_gate: float = 0.05
+    # --- HDR tonemap tuning ---
+    sdr_nits: float = 125.0          # target SDR display brightness
+    tm_desat: float = 0.25           # 0..1 chroma desaturation in highlights
+    tm_param: float = 0.40           # Mobius shoulder softness
+    hdr_tonemap_pref: str = "auto"   # auto | libplacebo | zscale | scale
     reid_backbone: str = "ViT-L-14"
     reid_pretrained: str = "laion2b_s32b_b82k"
     clip_face_backbone: str = "ViT-L-14"
@@ -2516,6 +2521,18 @@ class Processor(QtCore.QObject):
 
             # Video
             hdr_active = False
+            # Apply HDR tonemap env overrides from cfg (GUI always supplies defaults)
+            try:
+                os.environ["PC_SDR_NITS"] = str(float(getattr(cfg, "sdr_nits", 125.0)))
+                os.environ["PC_TM_DESAT"] = str(float(getattr(cfg, "tm_desat", 0.25)))
+                os.environ["PC_TM_PARAM"] = str(float(getattr(cfg, "tm_param", 0.40)))
+                for key in ("PC_FORCE_ZSCALE", "PC_FORCE_SCALE", "PC_FORCE_TONEMAP"):
+                    os.environ.pop(key, None)
+                pref = str(getattr(cfg, "hdr_tonemap_pref", "auto") or "auto").lower()
+                if pref in {"libplacebo", "zscale", "scale"}:
+                    os.environ["PC_FORCE_TONEMAP"] = pref
+            except Exception:
+                pass
             try:
                 s = QtCore.QSettings(APP_ORG, APP_NAME)
                 ffdir = s.value(_SETTINGS_KEY_FFMPEG_DIR, "", type=str) or ""
@@ -4975,6 +4992,35 @@ class MainWindow(QtWidgets.QMainWindow):
         grid = QtWidgets.QGridLayout(param_group)
 
         self.ratio_edit = QtWidgets.QLineEdit("2:3")
+        self.sdr_nits_spin = QtWidgets.QDoubleSpinBox()
+        self.sdr_nits_spin.setRange(50.0, 400.0)
+        self.sdr_nits_spin.setDecimals(0)
+        self.sdr_nits_spin.setSingleStep(5.0)
+        self.sdr_nits_spin.setValue(float(self.cfg.sdr_nits))
+        self.sdr_nits_spin.setToolTip("float: sdr_nits (target SDR brightness in nits)")
+        self.sdr_nits_spin.valueChanged.connect(self._on_ui_change)
+        self.tm_desat_spin = QtWidgets.QDoubleSpinBox()
+        self.tm_desat_spin.setRange(0.0, 1.0)
+        self.tm_desat_spin.setDecimals(2)
+        self.tm_desat_spin.setSingleStep(0.05)
+        self.tm_desat_spin.setValue(float(self.cfg.tm_desat))
+        self.tm_desat_spin.setToolTip("float: tm_desat (0..1 chroma desaturation)")
+        self.tm_desat_spin.valueChanged.connect(self._on_ui_change)
+        self.tm_param_spin = QtWidgets.QDoubleSpinBox()
+        self.tm_param_spin.setRange(0.0, 1.0)
+        self.tm_param_spin.setDecimals(2)
+        self.tm_param_spin.setSingleStep(0.05)
+        self.tm_param_spin.setValue(float(self.cfg.tm_param))
+        self.tm_param_spin.setToolTip("float: tm_param (Mobius shoulder softness)")
+        self.tm_param_spin.valueChanged.connect(self._on_ui_change)
+        self.tonemap_pref_combo = QtWidgets.QComboBox()
+        self.tonemap_pref_combo.addItem("Auto", "auto")
+        self.tonemap_pref_combo.addItem("Force libplacebo", "libplacebo")
+        self.tonemap_pref_combo.addItem("Force zscale+tonemap", "zscale")
+        self.tonemap_pref_combo.addItem("Force scale only", "scale")
+        pref_idx = self.tonemap_pref_combo.findData(self.cfg.hdr_tonemap_pref)
+        self.tonemap_pref_combo.setCurrentIndex(pref_idx if pref_idx >= 0 else 0)
+        self.tonemap_pref_combo.currentIndexChanged.connect(self._on_ui_change)
         self.stride_spin = QtWidgets.QSpinBox(); self.stride_spin.setRange(1, 1000); self.stride_spin.setValue(2)
         self.det_conf_spin = QtWidgets.QDoubleSpinBox(); self.det_conf_spin.setDecimals(3); self.det_conf_spin.setRange(0.0, 1.0); self.det_conf_spin.setSingleStep(0.01); self.det_conf_spin.setValue(0.35)
         self.face_thr_spin = QtWidgets.QDoubleSpinBox(); self.face_thr_spin.setDecimals(3); self.face_thr_spin.setRange(0.0, 2.0); self.face_thr_spin.setSingleStep(0.01); self.face_thr_spin.setValue(0.45)
@@ -5391,6 +5437,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         labels = [
             ("Aspect ratio W:H", self.ratio_edit),
+            ("SDR tonemap target (nits)", self.sdr_nits_spin),
+            ("Tonemap desat", self.tm_desat_spin),
+            ("Tonemap Mobius param", self.tm_param_spin),
+            ("Tonemap backend", self.tonemap_pref_combo),
             ("Frame stride", self.stride_spin),
             ("YOLO min conf", self.det_conf_spin),
             ("Face max dist", self.face_thr_spin),
@@ -6520,6 +6570,10 @@ class MainWindow(QtWidgets.QMainWindow):
             ref=ref_join,
             out_dir=self.out_edit.text().strip() or "output",
             ratio=self.ratio_edit.text().strip() or "2:3",
+            sdr_nits=float(self.sdr_nits_spin.value()),
+            tm_desat=float(self.tm_desat_spin.value()),
+            tm_param=float(self.tm_param_spin.value()),
+            hdr_tonemap_pref=self.tonemap_pref_combo.currentData() or "auto",
             seek_fast=bool(self.seek_fast_check.isChecked()) if hasattr(self, "seek_fast_check") else bool(getattr(self.cfg, "seek_fast", True)),
             seek_max_grabs=max(0, int(self.seek_max_grabs_spin.value())) if hasattr(self, "seek_max_grabs_spin") else max(0, int(getattr(self.cfg, "seek_max_grabs", 12))),
             frame_stride=int(self.stride_spin.value()),
@@ -6670,6 +6724,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_ref_paths(paths)
         self.out_edit.setText(cfg.out_dir)
         self.ratio_edit.setText(cfg.ratio)
+        try:
+            self.sdr_nits_spin.setValue(float(getattr(cfg, "sdr_nits", 125.0)))
+        except Exception:
+            self.sdr_nits_spin.setValue(125.0)
+        try:
+            self.tm_desat_spin.setValue(float(getattr(cfg, "tm_desat", 0.25)))
+        except Exception:
+            self.tm_desat_spin.setValue(0.25)
+        try:
+            self.tm_param_spin.setValue(float(getattr(cfg, "tm_param", 0.40)))
+        except Exception:
+            self.tm_param_spin.setValue(0.40)
+        pref = str(getattr(cfg, "hdr_tonemap_pref", "auto") or "auto")
+        idx = self.tonemap_pref_combo.findData(pref)
+        if idx >= 0:
+            self.tonemap_pref_combo.setCurrentIndex(idx)
+        else:
+            self.tonemap_pref_combo.setCurrentIndex(0)
         self.stride_spin.setValue(cfg.frame_stride)
         self.det_conf_spin.setValue(cfg.min_det_conf)
         self.face_thr_spin.setValue(cfg.face_thresh)
@@ -7199,6 +7271,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_ref_paths(paths)
         self.out_edit.setText(s.value("out_dir", "output"))
         self.ratio_edit.setText(s.value("ratio", "2:3"))
+        try:
+            self.sdr_nits_spin.setValue(float(s.value("sdr_nits", self.cfg.sdr_nits)))
+        except Exception:
+            self.sdr_nits_spin.setValue(float(self.cfg.sdr_nits))
+        try:
+            self.tm_desat_spin.setValue(float(s.value("tm_desat", self.cfg.tm_desat)))
+        except Exception:
+            self.tm_desat_spin.setValue(float(self.cfg.tm_desat))
+        try:
+            self.tm_param_spin.setValue(float(s.value("tm_param", self.cfg.tm_param)))
+        except Exception:
+            self.tm_param_spin.setValue(float(self.cfg.tm_param))
+        pref = str(s.value("hdr_tonemap_pref", self.cfg.hdr_tonemap_pref))
+        idx = self.tonemap_pref_combo.findData(pref)
+        if idx >= 0:
+            self.tonemap_pref_combo.setCurrentIndex(idx)
+        else:
+            self.tonemap_pref_combo.setCurrentIndex(0)
         self.cfg.seek_fast = s.value("seek_fast", True, type=bool)
         try:
             self.cfg.seek_max_grabs = int(s.value("seek_max_grabs", 12))
@@ -7499,6 +7589,13 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg_dict["ref"] = "; ".join(self._get_ref_paths())
         for k, v in cfg_dict.items():
             s.setValue(k, v)
+        try:
+            s.setValue("sdr_nits", float(self.sdr_nits_spin.value()))
+            s.setValue("tm_desat", float(self.tm_desat_spin.value()))
+            s.setValue("tm_param", float(self.tm_param_spin.value()))
+            s.setValue("hdr_tonemap_pref", self.tonemap_pref_combo.currentData())
+        except Exception:
+            pass
         if hasattr(self, "_ffmpeg_edit"):
             try:
                 s.setValue(_SETTINGS_KEY_FFMPEG_DIR, self._ffmpeg_edit.text().strip())
