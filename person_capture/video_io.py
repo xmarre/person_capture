@@ -2,7 +2,7 @@
 from __future__ import annotations
 import subprocess, json, os, sys, math, functools
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 from pathlib import Path
 
 import av
@@ -398,6 +398,82 @@ def _detect_hdr_pyav(path: str) -> tuple[bool, str]:
             return True, f"pyav v:{i} {why}"
 
     return False, "pyav: no HDR signal"
+
+# -------------------- Robust fps/total probing (no ffprobe needed) --------------------
+def _probe_fps_total_cv2(path: str) -> Tuple[Optional[float], Optional[int]]:
+    try:
+        cap = cv2.VideoCapture(path)
+        f = cap.get(CV_CAP_PROP_FPS)
+        n = cap.get(CV_CAP_PROP_FRAME_COUNT)
+        cap.release()
+        fps = float(f) if f and f > 1e-3 else None
+        total = int(n) if n and n > 0 else None
+        return fps, total
+    except Exception:
+        return None, None
+
+
+def _probe_fps_total_pyav(path: str) -> Tuple[Optional[float], Optional[int]]:
+    try:
+        ct = av.open(path)
+    except Exception:
+        return None, None
+    try:
+        vs = ct.streams.video[0]
+    except Exception:
+        try:
+            ct.close()
+        except Exception:
+            pass
+        return None, None
+
+    # fps
+    fps = None
+    try:
+        r = getattr(vs, "average_rate", None) or getattr(vs, "base_rate", None)
+        if r:
+            fps = float(r)
+    except Exception:
+        pass
+
+    # total frames
+    total = None
+    try:
+        if getattr(vs, "frames", 0):
+            total = int(vs.frames)
+    except Exception:
+        pass
+    if total is None or total <= 0:
+        dur_s = 0.0
+        try:
+            if getattr(vs, "duration", None) and getattr(vs, "time_base", None):
+                dur_s = float(vs.duration * vs.time_base)
+            elif getattr(ct, "duration", None) and getattr(ct, "time_base", None):
+                dur_s = float(ct.duration * ct.time_base)
+        except Exception:
+            dur_s = 0.0
+        if dur_s > 0 and fps and fps > 0:
+            total = int(dur_s * fps + 0.5)
+    try:
+        ct.close()
+    except Exception:
+        pass
+    return fps, total
+
+
+def probe_fps_total(path: str, fps_hint: Optional[float] = None) -> Tuple[float, int]:
+    """Return ``(fps, total_frames)`` without requiring ffprobe."""
+
+    fps, total = _probe_fps_total_cv2(path)
+    if (fps is None or fps <= 0) or (total is None or total <= 0):
+        f2, t2 = _probe_fps_total_pyav(path)
+        fps = fps if (fps and fps > 0) else f2
+        total = total if (total and total > 0) else t2
+    if fps is None or fps <= 0:
+        fps = float(fps_hint or 30.0)
+    if total is None:
+        total = 0
+    return fps, int(total)
 
 
 def _detect_hdr(path: str) -> tuple[bool, str]:

@@ -2539,6 +2539,27 @@ class Processor(QtCore.QObject):
                 pass
             fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+            # If ffprobe is missing, OpenCV may report total=0 and/or fps=0 → fix BEFORE keyframes/setup.
+            try:
+                if (not total_frames or total_frames <= 0) or (not fps or fps <= 1e-3 or fps != fps):
+                    try:
+                        from .video_io import probe_fps_total as _pc_probe_fps_total  # type: ignore
+                    except Exception:
+                        from video_io import probe_fps_total as _pc_probe_fps_total  # type: ignore
+                    fps_fixed, total_fixed = _pc_probe_fps_total(cfg.video, fps_hint=fps)
+                    if (total_fixed and total_fixed > 0) or (fps_fixed and fps_fixed > 1e-3):
+                        if fps_fixed and fps_fixed > 1e-3:
+                            fps = float(fps_fixed)
+                        if total_fixed and total_fixed > 0:
+                            total_frames = int(total_fixed)
+                        self.status.emit(
+                            f"Recovered fps/total via PyAV/OpenCV → fps={fps:.3f} total={total_frames}"
+                        )
+            except Exception:
+                pass
+
+            # Persist corrected values (some UI/paths use these attrs later)
             self._fps = fps
             self._total_frames = total_frames
             keep_spans = []
@@ -2553,6 +2574,7 @@ class Processor(QtCore.QObject):
                 self.keyframes.emit(list(self._keyframes))
             except Exception:
                 pass
+            # Now that fps/total are final, set up the UI/processor with correct values
             self.setup.emit(total_frames, fps)
             try:
                 self.status.emit(
