@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import subprocess, json, os, sys, math, functools
+import subprocess, json, os, sys, math, functools, shutil
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from pathlib import Path
 
 import av
+try:
+    import cv2  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    cv2 = None  # type: ignore
 import numpy as np
 import logging
 import imageio_ffmpeg as iioff
@@ -14,7 +18,6 @@ import imageio_ffmpeg as iioff
 os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "quiet")
 
 try:
-    import cv2  # type: ignore
     # keep OpenCV/FFmpeg chatter down
     try:
         cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
@@ -35,11 +38,14 @@ except Exception:
 
 def _ffprobe_path() -> Optional[str]:
     """
-    Strict policy: use only the `imageio-ffmpeg` bundled ffprobe (never PATH).
-    If imageio-ffmpeg does not expose a probe path, try to locate a sibling
-    ffprobe next to the bundled ffmpeg binary. Otherwise return None.
+    Locate ffprobe. Order: explicit env → imageio bundle → PATH.
     """
     log = logging.getLogger(__name__)
+    # 0) Explicit env override
+    for env in ("PERSON_CAPTURE_FFPROBE", "FFPROBE", "FFPROBE_BIN"):
+        p = os.environ.get(env)
+        if p and os.path.exists(p):
+            return p
     # 1) Ask imageio-ffmpeg directly
     try:
         p = iioff.get_ffprobe_exe()
@@ -69,7 +75,9 @@ def _ffprobe_path() -> Optional[str]:
                 log.info("imageio ffmpeg dir had no ffprobe: %s", d)
     except Exception as e:
         log.warning("imageio-ffmpeg ffprobe sibling scan failed: %s", e)
-    return None
+    # 3) PATH fallback
+    which = shutil.which("ffprobe.exe" if os.name == "nt" else "ffprobe")
+    return which
 
 
 def _ffprobe_version(path: Optional[str] = None) -> str:
@@ -90,6 +98,34 @@ def _ffprobe_version(path: Optional[str] = None) -> str:
 
 
 def _ffmpeg_path() -> Optional[str]:
+    """
+    Prefer an ffmpeg with HDR-capable filters. Order: explicit env → PATH with filters → imageio bundle.
+    """
+
+    def _has_filters(bin_path: str, names: tuple[str, ...]) -> bool:
+        try:
+            out = subprocess.run(
+                [bin_path, "-hide_banner", "-v", "error", "-filters"],
+                text=True,
+                capture_output=True,
+                check=False,
+            ).stdout or ""
+            present = {line.split()[1] for line in out.splitlines() if line and not line.startswith("-")}
+            return all(n in present for n in names)
+        except Exception:
+            return False
+
+    # 0) Explicit env override
+    for env in ("PERSON_CAPTURE_FFMPEG", "FFMPEG", "FFMPEG_BIN"):
+        p = os.environ.get(env)
+        if p and os.path.exists(p):
+            return p
+    # 1) PATH candidates with filters
+    cand = shutil.which("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+    if cand:
+        if _has_filters(cand, ("libplacebo",)) or _has_filters(cand, ("zscale", "tonemap")):
+            return cand
+    # 2) imageio bundle
     try:
         return iioff.get_ffmpeg_exe()
     except Exception:
@@ -233,6 +269,18 @@ def _probe_pixfmt_av(path: str) -> tuple[Optional[str], Optional[int], Optional[
         ct = av.open(path)
         vs = ct.streams.video[0]
         fmt = getattr(vs.format, "name", None)
+        w, h = vs.width, vs.height
+        ct.close()
+        return fmt, w, h
+    except Exception:
+        return None, None, None
+
+
+def _probe_pixfmt_wh_pyav(path: str) -> tuple[Optional[str], Optional[int], Optional[int]]:
+    try:
+        ct = av.open(path)
+        vs = ct.streams.video[0]
+        fmt = getattr(vs.format, "name", None) or getattr(getattr(vs, "codec_context", None), "pix_fmt", None)
         w, h = vs.width, vs.height
         ct.close()
         return fmt, w, h
@@ -928,12 +976,46 @@ class FfmpegPipeReader:
         self._h = int(s.get("height") or 0)
         self._fps = _safe_fps(s.get("avg_frame_rate") or "0/1")
         self._nb = int(s.get("nb_frames") or 0)
+        # If ffprobe is missing, recover dimensions and fps via PyAV/OpenCV.
+        if (self._w <= 0) or (self._h <= 0) or (self._fps <= 0) or (self._nb <= 0):
+            _fmt, w_pyav, h_pyav = _probe_pixfmt_wh_pyav(path)
+            if w_pyav and h_pyav:
+                if self._w <= 0:
+                    self._w = int(w_pyav)
+                if self._h <= 0:
+                    self._h = int(h_pyav)
+            f_pyav, n_pyav = _probe_fps_total_pyav(path)
+            if f_pyav and f_pyav > 0 and self._fps <= 0:
+                self._fps = float(f_pyav)
+            if n_pyav and n_pyav > 0 and self._nb <= 0:
+                self._nb = int(n_pyav)
+        if ((self._w <= 0) or (self._h <= 0) or (self._fps <= 0) or (self._nb <= 0)) and cv2 is not None:
+            try:
+                cap = cv2.VideoCapture(path)
+                try:
+                    if self._w <= 0:
+                        self._w = int(cap.get(CV_CAP_PROP_FRAME_WIDTH) or 0)
+                    if self._h <= 0:
+                        self._h = int(cap.get(CV_CAP_PROP_FRAME_HEIGHT) or 0)
+                    if self._fps <= 0:
+                        self._fps = float(cap.get(CV_CAP_PROP_FPS) or 0.0)
+                    if self._nb <= 0:
+                        total = cap.get(CV_CAP_PROP_FRAME_COUNT) or 0
+                        if total:
+                            self._nb = int(total)
+                finally:
+                    cap.release()
+            except Exception:
+                pass
         if self._nb <= 0:
             # estimate from container/stream duration × fps
             meta = meta or {}
             dur = _ffprobe_duration(meta)
             if dur > 0 and self._fps > 0:
                 self._nb = int(dur * self._fps + 0.5)
+        # Abort early if we still lack geometry
+        if self._w <= 0 or self._h <= 0:
+            raise RuntimeError("HDR pipe init failed: unknown frame size; supply ffprobe or use PATH ffmpeg")
         # expose both counters; some callers only read _total
         self._total = self._nb
         self._pos = -1
@@ -946,6 +1028,14 @@ class FfmpegPipeReader:
         self._has_scale = ("scale" in self._filters)
         if not (self._use_libplacebo or (self._has_zscale and self._has_tonemap) or self._has_scale):
             raise RuntimeError("Bundled ffmpeg lacks libplacebo, zscale+tonemap, and scale")
+        # Helpful logging for debugging external ffmpeg selection
+        self._log.info("HDR ffmpeg binary: %s", self._ffmpeg)
+        self._log.info(
+            "HDR filters: libplacebo=%s zscale=%s tonemap=%s",
+            self._use_libplacebo,
+            self._has_zscale,
+            self._has_tonemap,
+        )
         self._range_in = _probe_range(path)
         self._transfer, self._primaries = _probe_colors(path)
         self._frame_bytes_u8 = self._w * self._h * 3

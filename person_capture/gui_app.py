@@ -153,6 +153,11 @@ def _imp():
     hdr_detect_reason,
     UpdateManager,
 ) = _imp()
+
+try:
+    from .utils import set_ffmpeg_env, resolve_ffmpeg_bins, ffmpeg_has_hdr_filters  # type: ignore
+except Exception:  # pragma: no cover - fallback for flat layout
+    from utils import set_ffmpeg_env, resolve_ffmpeg_bins, ffmpeg_has_hdr_filters  # type: ignore
 # Optional Curate tab
 try:
     from .gui_curate_tab import CurateTab  # type: ignore
@@ -228,6 +233,8 @@ class CollapsibleSection(QtWidgets.QWidget):
 
 APP_ORG = "PersonCapture"
 APP_NAME = "PersonCapture GUI"
+
+_SETTINGS_KEY_FFMPEG_DIR = "paths/ffmpeg_dir"
 
 # ---------------------- Data & Settings ----------------------
 
@@ -2509,6 +2516,13 @@ class Processor(QtCore.QObject):
 
             # Video
             hdr_active = False
+            try:
+                s = QtCore.QSettings(APP_ORG, APP_NAME)
+                ffdir = s.value(_SETTINGS_KEY_FFMPEG_DIR, "", type=str) or ""
+                if ffdir:
+                    set_ffmpeg_env(ffdir)
+            except Exception:
+                pass
             try:
                 # Prefer HDR->SDR via libplacebo if HDR; else OpenCV path.
                 try:
@@ -4849,6 +4863,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.cfg = SessionConfig()
         self._updating_refs = False
+        self._initial_ffmpeg_dir: str = ""
+        try:
+            s = QtCore.QSettings(APP_ORG, APP_NAME)
+            self._initial_ffmpeg_dir = s.value(_SETTINGS_KEY_FFMPEG_DIR, "", type=str) or ""
+            if self._initial_ffmpeg_dir:
+                set_ffmpeg_env(self._initial_ffmpeg_dir)
+        except Exception:
+            self._initial_ffmpeg_dir = ""
         self._build_ui()
         self._load_qsettings()
         self.statusbar = self.statusBar()
@@ -4929,6 +4951,10 @@ class MainWindow(QtWidgets.QMainWindow):
         file_layout.addWidget(QtWidgets.QLabel("Output directory"), 3, 0)
         file_layout.addWidget(self.out_edit, 3, 1)
         file_layout.addWidget(out_btn, 3, 2)
+
+        ffmpeg_row = self._make_ffmpeg_row()
+        file_layout.addWidget(QtWidgets.QLabel("FFmpeg folder"), 4, 0)
+        file_layout.addWidget(ffmpeg_row, 4, 1, 1, 2)
 
         # Params
         param_group = QtWidgets.QGroupBox("Parameters")
@@ -5691,6 +5717,84 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
 
         self._update_buttons(state="idle")
+
+    def _make_ffmpeg_row(self) -> QtWidgets.QWidget:
+        row_widget = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(row_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._ffmpeg_edit = QtWidgets.QLineEdit()
+        self._ffmpeg_edit.setPlaceholderText("e.g. D:\\ffmpeg or /usr/local/ffmpeg/bin")
+        initial = getattr(self, "_initial_ffmpeg_dir", "")
+        if initial:
+            self._ffmpeg_edit.setText(initial)
+        else:
+            try:
+                s = QtCore.QSettings(APP_ORG, APP_NAME)
+                self._ffmpeg_edit.setText(s.value(_SETTINGS_KEY_FFMPEG_DIR, "", type=str) or "")
+            except Exception:
+                pass
+        browse_btn = QtWidgets.QPushButton("Browse…")
+        browse_btn.setAutoDefault(False)
+        browse_btn.clicked.connect(self._browse_ffmpeg_dir)
+        apply_btn = QtWidgets.QPushButton("Apply")
+        apply_btn.setAutoDefault(False)
+        apply_btn.clicked.connect(self._apply_ffmpeg_dir_from_field)
+        layout.addWidget(self._ffmpeg_edit, 1)
+        layout.addWidget(browse_btn)
+        layout.addWidget(apply_btn)
+        return row_widget
+
+    @QtCore.Slot()
+    def _browse_ffmpeg_dir(self):
+        start = ""
+        try:
+            start = self._ffmpeg_edit.text().strip()
+        except Exception:
+            start = ""
+        if not start:
+            start = os.getcwd()
+        directory = QtWidgets.QFileDialog.getExistingDirectory(self, "Select FFmpeg folder", start)
+        if directory:
+            self._ffmpeg_edit.setText(directory)
+
+    @QtCore.Slot()
+    def _apply_ffmpeg_dir_from_field(self):
+        path = ""
+        try:
+            path = self._ffmpeg_edit.text().strip()
+        except Exception:
+            path = ""
+        if not path:
+            QtWidgets.QMessageBox.warning(self, "FFmpeg", "Please select a folder.")
+            return
+        try:
+            s = QtCore.QSettings(APP_ORG, APP_NAME)
+            s.setValue(_SETTINGS_KEY_FFMPEG_DIR, path)
+            s.sync()
+        except Exception:
+            pass
+        try:
+            set_ffmpeg_env(path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "FFmpeg", f"Failed to apply environment:\n{exc}")
+            return
+        self._initial_ffmpeg_dir = path
+        ffmpeg_path, ffprobe_path = resolve_ffmpeg_bins(path)
+        flags = (
+            ffmpeg_has_hdr_filters(ffmpeg_path)
+            if ffmpeg_path
+            else {"libplacebo": False, "zscale": False, "tonemap": False}
+        )
+        message = [
+            f"FFmpeg: {ffmpeg_path or 'not found'}",
+            f"ffprobe: {ffprobe_path or 'not found'}",
+            "Filters → libplacebo={libplacebo} zscale={zscale} tonemap={tonemap}".format(**flags),
+        ]
+        if self._worker is not None:
+            message.append(
+                "Note: if processing is currently running, the new FFmpeg will be used next time you open a video."
+            )
+        QtWidgets.QMessageBox.information(self, "FFmpeg configured", "\n".join(message))
 
     @property
     def processor(self) -> Processor:
@@ -7069,6 +7173,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _load_qsettings(self):
         s = QtCore.QSettings(APP_ORG, APP_NAME)
+        try:
+            if hasattr(self, "_ffmpeg_edit"):
+                stored = s.value(_SETTINGS_KEY_FFMPEG_DIR, getattr(self, "_initial_ffmpeg_dir", ""), type=str)
+                self._ffmpeg_edit.setText(stored or "")
+        except Exception:
+            pass
         self.video_edit.setText(s.value("video", ""))
         refs = s.value("ref", "", type=str)
         paths = self._filter_images([part.strip() for part in refs.split(';') if part.strip()])
@@ -7375,6 +7485,11 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg_dict["ref"] = "; ".join(self._get_ref_paths())
         for k, v in cfg_dict.items():
             s.setValue(k, v)
+        if hasattr(self, "_ffmpeg_edit"):
+            try:
+                s.setValue(_SETTINGS_KEY_FFMPEG_DIR, self._ffmpeg_edit.text().strip())
+            except Exception:
+                pass
         if hasattr(self, 'spin_prescan_fd_add'):
             s.setValue("prescan_fd_add", float(self.spin_prescan_fd_add.value()))
         if hasattr(self, 'spin_prescan_exit_cooldown'):
