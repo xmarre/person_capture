@@ -1060,6 +1060,17 @@ class FfmpegPipeReader:
         )
         self._range_in = _probe_range(path)
         self._transfer, self._primaries = _probe_colors(path)
+        # If decoder-level downscale is active, adjust output dims to match the filter graph.
+        try:
+            _maxw = int(os.getenv("PC_DECODE_MAX_W", "0"))
+        except Exception:
+            _maxw = 0
+        if _maxw > 0 and self._w > _maxw:
+            ratio = float(_maxw) / float(self._w)
+            new_w = int(_maxw)
+            new_h = int(round(self._h * ratio / 2.0) * 2)  # keep even height
+            self._w = max(2, new_w)
+            self._h = max(2, new_h)
         self._frame_bytes_u8 = self._w * self._h * 3
         self._frame_bytes_f32 = self._w * self._h * 3 * 4
         self._pix_fmt = "bgr24"
