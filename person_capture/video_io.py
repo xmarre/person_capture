@@ -1047,7 +1047,9 @@ class FfmpegPipeReader:
             if self._use_libplacebo
             else ("zscale" if (self._has_zscale and self._has_tonemap) else "scale")
         )
-        self._fallback_tried = False
+        # Stage-specific fallback flags so we can attempt zscale, then scale.
+        self._tried_zscale = False
+        self._tried_scale = False
         self._start(0)
         mode = (
             "libplacebo"
@@ -1078,28 +1080,41 @@ class FfmpegPipeReader:
         except Exception:
             return set()
 
-    # --- Fallback helper used if libplacebo produces no frames (e.g., Vulkan init issues) ---
+    # --- Fallback helper used if a chain produces no frames (e.g., Vulkan init issues) ---
     def try_fallback_chain(self) -> bool:
         """
-        Restart the pipe with a safer chain if libplacebo produced no frames.
-        Returns True if a fallback was attempted.
+        Attempt staged fallback:
+        libplacebo → zscale+tonemap → linear scale.
+        Returns True if we switched chains; False if no further fallback exists.
         """
-        if self._fallback_tried:
+        # From libplacebo → zscale (once), then → scale (once)
+        if self._mode == "libplacebo":
+            if (self._has_zscale and self._has_tonemap) and not self._tried_zscale:
+                self._log.warning("HDR: libplacebo yielded no frames; falling back to zscale+tonemap.")
+                self._stop()
+                self._mode = "zscale"
+                self._tried_zscale = True
+                self._start(max(self._pos + 1, 0))
+                return True
+            if self._has_scale and not self._tried_scale:
+                self._log.warning("HDR: libplacebo yielded no frames; falling back to linear scale.")
+                self._stop()
+                self._mode = "scale"
+                self._tried_scale = True
+                self._start(max(self._pos + 1, 0))
+                return True
             return False
-        self._fallback_tried = True
-        # Prefer zscale+tonemap if available, else plain scale
-        if self._mode == "libplacebo" and (self._has_zscale and self._has_tonemap):
-            self._log.warning("HDR: libplacebo yielded no frames; falling back to zscale+tonemap.")
-            self._stop()
-            self._mode = "zscale"
-            self._start(max(self._pos + 1, 0))
-            return True
-        if self._mode in ("libplacebo", "zscale") and self._has_scale:
-            self._log.warning("HDR: tone-map filters unavailable/failed; falling back to linear scale.")
-            self._stop()
-            self._mode = "scale"
-            self._start(max(self._pos + 1, 0))
-            return True
+        # From zscale → scale (once)
+        if self._mode == "zscale":
+            if self._has_scale and not self._tried_scale:
+                self._log.warning("HDR: zscale+tonemap yielded no frames; falling back to linear scale.")
+                self._stop()
+                self._mode = "scale"
+                self._tried_scale = True
+                self._start(max(self._pos + 1, 0))
+                return True
+            return False
+        # Already on scale: no more fallbacks
         return False
 
     def _chain(self) -> str:
