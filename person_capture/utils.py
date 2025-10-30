@@ -1,8 +1,102 @@
 import os
-from typing import Iterable
+import subprocess
+from pathlib import Path
+from typing import Dict, Iterable, Optional, Tuple
 
 import cv2
 import numpy as np
+
+
+def _exe_name(base: str) -> str:
+    return f"{base}.exe" if os.name == "nt" else base
+
+
+def resolve_ffmpeg_bins(ffmpeg_dir: str | os.PathLike) -> Tuple[Optional[str], Optional[str]]:
+    """Given a folder, return absolute paths to (ffmpeg, ffprobe) if found.
+
+    Accepts either the root directory or its ``bin`` subfolder.
+    """
+
+    if not ffmpeg_dir:
+        return None, None
+    try:
+        d = Path(ffmpeg_dir).expanduser()
+    except Exception:
+        return None, None
+    try:
+        d = d.resolve()
+    except Exception:
+        # Resolving can fail on some network paths; fall back to raw path
+        pass
+    cand_dirs = [d, d / "bin"]
+    ffmpeg: Optional[str] = None
+    ffprobe: Optional[str] = None
+    for root in cand_dirs:
+        p = root / _exe_name("ffmpeg")
+        q = root / _exe_name("ffprobe")
+        if ffmpeg is None and p.is_file():
+            ffmpeg = str(p)
+        if ffprobe is None and q.is_file():
+            ffprobe = str(q)
+        if ffmpeg and ffprobe:
+            break
+    return ffmpeg, ffprobe
+
+
+def ffmpeg_has_hdr_filters(ffmpeg_path: str) -> Dict[str, bool]:
+    """Probe filter availability for HDR tone mapping helpers."""
+
+    try:
+        cp = subprocess.run(
+            [ffmpeg_path, "-hide_banner", "-v", "error", "-filters"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        out = cp.stdout or ""
+    except Exception:
+        return {"libplacebo": False, "zscale": False, "tonemap": False}
+    names = {
+        line.split()[1]
+        for line in out.splitlines()
+        if line and not line.startswith("-") and len(line.split()) >= 2
+    }
+    return {
+        "libplacebo": "libplacebo" in names,
+        "zscale": "zscale" in names,
+        "tonemap": "tonemap" in names,
+    }
+
+
+def set_ffmpeg_env(ffmpeg_dir: str | os.PathLike) -> Dict[str, str]:
+    """Resolve binaries and set env vars used by video I/O helpers."""
+
+    ffmpeg, ffprobe = resolve_ffmpeg_bins(ffmpeg_dir)
+    applied: Dict[str, str] = {}
+    if ffmpeg:
+        os.environ["PERSON_CAPTURE_FFMPEG"] = ffmpeg
+        applied["PERSON_CAPTURE_FFMPEG"] = ffmpeg
+        if not os.environ.get("FFMPEG"):
+            os.environ["FFMPEG"] = ffmpeg
+            applied["FFMPEG"] = ffmpeg
+    if ffprobe:
+        os.environ["PERSON_CAPTURE_FFPROBE"] = ffprobe
+        applied["PERSON_CAPTURE_FFPROBE"] = ffprobe
+        if not os.environ.get("FFPROBE"):
+            os.environ["FFPROBE"] = ffprobe
+            applied["FFPROBE"] = ffprobe
+    # Clear ffprobe JSON cache so new binaries take effect immediately
+    try:
+        try:
+            from . import video_io as _vio  # type: ignore
+        except Exception:
+            import video_io as _vio  # type: ignore
+        cache = getattr(_vio, "_ffprobe_json_cached", None)
+        if cache is not None and hasattr(cache, "cache_clear"):
+            cache.cache_clear()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return applied
 
 def parse_ratio(s: str):
     w, h = s.split(':')
