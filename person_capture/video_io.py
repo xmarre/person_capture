@@ -883,10 +883,21 @@ class AvLibplaceboReader(_BaseAvReader):
                     "libplacebo",
                     "tonemapping=auto:gamut_mode=perceptual:target_trc=bt709:target_primaries=bt709:deband=yes:dither=yes",
                 )
+                f_down = None
+                try:
+                    maxw = int(os.getenv("PC_DECODE_MAX_W", "0"))
+                except Exception:
+                    maxw = 0
+                if maxw > 0:
+                    f_down = g.add("scale", f"w=min(iw\\,{maxw}):h=-2")
                 f2 = g.add("format", "bgr24")
                 sink = g.add("buffersink")
                 src.link_to(f1)
-                f1.link_to(f2)
+                if f_down is not None:
+                    f1.link_to(f_down)
+                    f_down.link_to(f2)
+                else:
+                    f1.link_to(f2)
                 f2.link_to(sink)
             else:
                 src_tr = "arib-std-b67" if self._transfer == "arib-std-b67" else "smpte2084"
@@ -1145,24 +1156,39 @@ class FfmpegPipeReader:
         return False
 
     def _chain(self) -> str:
+        try:
+            maxw = int(os.getenv("PC_DECODE_MAX_W", "0"))
+        except Exception:
+            maxw = 0
         if self._mode == "libplacebo" and self._use_libplacebo:
-            return (
+            s = (
                 "libplacebo=tonemapping=auto:target_primaries=bt709:target_trc=bt709:"
                 "dither=yes:deband=yes"
             )
+            if maxw > 0:
+                s += f":w=min(iw\\,{maxw}):h=-2"
+            return s
         if self._mode in ("libplacebo", "zscale") and (self._has_zscale and self._has_tonemap):
             # Full HDR→SDR tonemap tuned for SDR target brightness and optional desaturation.
-            return (
+            s = (
                 "zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc,"
                 "zscale=transfer=linear:npl=1000,format=gbrpf32le,"
                 f"tonemap=tonemap=mobius:param={self._tm_param}:desat={self._tm_desat}:peak={self._sdr_nits},"
                 "zscale=transfer=bt709:primaries=bt709:matrix=bt709:dither=error_diffusion,"
-                f"zscale=rangein={self._range_in}:range=full,format=bgr24"
+                f"zscale=rangein={self._range_in}:range=full"
             )
+            if maxw > 0:
+                s += f",scale=w=min(iw\\,{maxw}):h=-2"
+            s += ",format=bgr24"
+            return s
         # Fallback path: decode to float RGB (planar), expand to full-range, tonemap in Python.
         range_in = "pc" if self._range_in == "full" else "tv"
         mat = "bt2020nc" if self._primaries == "bt2020" else "bt709"
-        return f"scale=in_color_matrix={mat}:in_range={range_in}:out_range=pc,format=gbrpf32le"
+        s = f"scale=in_color_matrix={mat}:in_range={range_in}:out_range=pc"
+        if maxw > 0:
+            s += f",scale=w=min(iw\\,{maxw}):h=-2"
+        s += ",format=gbrpf32le"
+        return s
 
     def _start(self, idx: int):
         if self._proc:
