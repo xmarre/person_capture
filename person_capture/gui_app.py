@@ -372,6 +372,8 @@ class SessionConfig:
     prescan_enable: bool = True
     prescan_stride: int = 24               # sample every N frames
     prescan_max_width: int = 416           # downscale for prescan
+    # Decoder-level prescan downscale (open a separate low-res reader only for prescan).
+    prescan_decode_max_w: int = 384
     prescan_face_conf: float = 0.5         # face detector confidence during prescan
     prescan_fd_enter: float = 0.45         # ArcFace dist to ENTER (looser)
     prescan_fd_add: float = 0.22           # ArcFace dist to add to bank (tighter)
@@ -555,8 +557,6 @@ class Processor(QtCore.QObject):
                 return i
             if f < s:
                 return i
-        return len(spans)
-
     def _prescan(self, cap, fps, total_frames, face: "FaceEmbedder", ref_feat, cfg):
         """
         Fast pass to find keep-spans. Now:
@@ -565,551 +565,534 @@ class Processor(QtCore.QObject):
         Returns: (spans, updated_ref_feat)
         """
         import numpy as _np
-        # seed bank
-        if ref_feat is None:
-            ref_bank_list = []
-        else:
-            arr = _np.asarray(ref_feat, dtype=_np.float32)
-            if arr.ndim == 1:
-                arr = arr.reshape(1, -1)
-            norms = _np.linalg.norm(arr, axis=1, keepdims=True)
-            arr = arr / _np.maximum(norms, 1e-6)
-            ref_bank_list = [row.copy() for row in arr]
-        initial_bank_len = len(ref_bank_list)
-        ref_feat_local = _np.vstack(ref_bank_list).astype(_np.float32) if ref_bank_list else None
-        added_vecs = 0
-        stride = max(1, int(cfg.prescan_stride))
-        pad = int(round(cfg.prescan_pad_sec * fps))
-        min_len = int(round(cfg.prescan_min_segment_sec * fps))
-        pos0 = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
-        Wmax = int(getattr(cfg, "prescan_max_width", 0))
-        enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
-        fd_add = float(getattr(cfg, "prescan_fd_add", enter))
-        old_face_conf = getattr(face, "conf", 0.5)
-        face.conf = float(cfg.prescan_face_conf)
-        old_rot_adapt = getattr(face, "rot_adaptive", True)
+        cap_main = cap
+        cap_override = None
+        cap_ps = cap
+        _restore_env: dict[str, str] = {}
         try:
-            # freeze legacy rotation gating; rely on pre-scan throttle
+            ps_maxw = int(getattr(cfg, "prescan_decode_max_w", 0))
+        except Exception:
+            ps_maxw = 0
+        if ps_maxw > 0:
             try:
-                face.configure_rotation_strategy(adaptive=False)
+                _restore_env["PC_DECODE_MAX_W"] = os.environ.get("PC_DECODE_MAX_W", "")
+                _restore_env["PC_FORCE_TONEMAP"] = os.environ.get("PC_FORCE_TONEMAP", "")
+                os.environ["PC_DECODE_MAX_W"] = str(ps_maxw)
+                os.environ.setdefault("PC_FORCE_TONEMAP", "scale")
+                try:
+                    from .video_io import FfmpegPipeReader as _Pipe, _ffmpeg_path as _ffp
+                except Exception:
+                    from video_io import FfmpegPipeReader as _Pipe, _ffmpeg_path as _ffp  # type: ignore
+                _fmpeg = _ffp()
+                if _fmpeg:
+                    cap_override = _Pipe(cfg.video, _fmpeg)
+                    cap_ps = cap_override
             except Exception:
-                pass
+                cap_override = None
+        cap = cap_ps
+        pos0 = int(cap_main.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+
+        def _run():
+            nonlocal cap
+            # seed bank
+            if ref_feat is None:
+                ref_bank_list = []
+            else:
+                arr = _np.asarray(ref_feat, dtype=_np.float32)
+                if arr.ndim == 1:
+                    arr = arr.reshape(1, -1)
+                norms = _np.linalg.norm(arr, axis=1, keepdims=True)
+                arr = arr / _np.maximum(norms, 1e-6)
+                ref_bank_list = [row.copy() for row in arr]
+            initial_bank_len = len(ref_bank_list)
+            ref_feat_local = _np.vstack(ref_bank_list).astype(_np.float32) if ref_bank_list else None
+            added_vecs = 0
+            stride = max(1, int(cfg.prescan_stride))
+            pad = int(round(cfg.prescan_pad_sec * fps))
+            min_len = int(round(cfg.prescan_min_segment_sec * fps))
+            Wmax = int(getattr(cfg, "prescan_max_width", 0))
+            enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
+            fd_add = float(getattr(cfg, "prescan_fd_add", enter))
+            old_face_conf = getattr(face, "conf", 0.5)
+            face.conf = float(cfg.prescan_face_conf)
+            old_rot_adapt = getattr(face, "rot_adaptive", True)
             try:
-                face.set_prescan_fast(True, mode="rr")
-                face.set_prescan_hint(escalate=False)
-                face._probe_conf = float(getattr(cfg, "prescan_probe_conf", 0.03))
-                face._prescan_period = int(getattr(cfg, "prescan_rot_probe_period", 3))
-                face._prescan_probe_imgsz = int(getattr(cfg, "prescan_probe_imgsz", 512))
-                face._high_90  = int(getattr(cfg, "prescan_heavy_90", 1536))
-                face._high_180 = int(getattr(cfg, "prescan_heavy_180", 1280))
-            except Exception:
-                pass
-            add_cooldown_samples = int(
-                getattr(
-                    cfg,
-                    "prescan_add_cooldown_samples",
-                    getattr(cfg, "prescan_add_cooldown_frames", 5),
+                # freeze legacy rotation gating; rely on pre-scan throttle
+                try:
+                    face.configure_rotation_strategy(adaptive=False)
+                except Exception:
+                    pass
+                try:
+                    face.set_prescan_fast(True, mode="rr")
+                    face.set_prescan_hint(escalate=False)
+                    face._probe_conf = float(getattr(cfg, "prescan_probe_conf", 0.03))
+                    face._prescan_period = int(getattr(cfg, "prescan_rot_probe_period", 3))
+                    face._prescan_probe_imgsz = int(getattr(cfg, "prescan_probe_imgsz", 512))
+                    face._high_90  = int(getattr(cfg, "prescan_heavy_90", 1536))
+                    face._high_180 = int(getattr(cfg, "prescan_heavy_180", 1280))
+                except Exception:
+                    pass
+                add_cooldown_samples = int(
+                    getattr(
+                        cfg,
+                        "prescan_add_cooldown_samples",
+                        getattr(cfg, "prescan_add_cooldown_frames", 5),
+                    )
                 )
-            )
-            last_add_sample = -10**9
-            spans = []
-            active = False
-            start = 0
-            neg_run = 0
-            total_samples = max(1, (total_frames + stride - 1) // stride)
-            progress_step = max(1, total_samples // 50)
-            next_progress_sample = 0
-            preview_step = max(stride, int(getattr(cfg, "preview_every", 3)))
-            last_preview_idx = -preview_step
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            processed_samples = 0
-            fd9_streak = 0
-            fd9_skip_samples = 0
-            fd9_probe_samples = 0
-            fd9_gate_period = 1
-            i = 0
-            # fast pass
-            while i < total_frames:
-                # drain + coalesce controls
-                last_seek: Optional[int] = None
-                step_accum: int = 0
-                pending_speed: Optional[float] = None
-                pending_cfg: dict = {}
-                try:
-                    while True:
-                        cmd, arg = self._cmd_q.get_nowait()
-                        if cmd == "pause":
-                            self._paused = True
-                        elif cmd == "play":
-                            self._paused = False
-                        elif cmd == "seek":
-                            try:
-                                last_seek = int(arg)
-                            except Exception:
-                                pass
-                        elif cmd == "step":
-                            try:
-                                step_accum += int(arg) if arg is not None else 1
-                            except Exception:
-                                step_accum += 1
-                        elif cmd == "speed":
-                            try:
-                                pending_speed = float(arg)
-                            except Exception:
-                                pass
-                        elif cmd == "cfg":
-                            # allow live edits to prescan_* fields if sent
-                            try:
-                                ch = dict(arg or {})
-                                for k, v in ch.items():
-                                    if k.startswith("prescan_"):
-                                        setattr(cfg, k, v)
-                                stride = max(1, int(cfg.prescan_stride))
-                                enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
-                                fd_add = float(getattr(cfg, "prescan_fd_add", enter))
-                                Wmax = int(cfg.prescan_max_width)
-                                face.conf = float(cfg.prescan_face_conf)
-                                add_cooldown_samples = int(
-                                    getattr(
-                                        cfg,
-                                        "prescan_add_cooldown_samples",
-                                        getattr(cfg, "prescan_add_cooldown_frames", 5),
-                                    )
-                                )
-                            except Exception:
-                                pass
-                except queue.Empty:
-                    pass
-
-                if pending_speed is not None:
-                    self._speed = max(0.1, min(4.0, float(pending_speed)))
-                if last_seek is not None or step_accum:
-                    tgt = int(last_seek) if last_seek is not None else int(i + step_accum)
-                    tgt = max(0, min(total_frames - 1, tgt))
-                    new_pos = self._seek_to(
-                        cap,
-                        i,
-                        tgt,
-                        fast=bool(getattr(cfg, "seek_fast", True)),
-                        max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
-                    )
-                    # ensure forward progress even if seek advanced < stride
-                    i_floor = (new_pos // stride) * stride
-                    if i_floor <= i:
-                        i = i + stride
-                    else:
-                        i = i_floor
-                    processed_samples = i // stride
-                    active = False
-                    neg_run = 0
-                    fd9_streak = 0
-                    fd9_skip_samples = 0
-                    fd9_probe_samples = 0
-                    fd9_gate_period = 1
+                last_add_sample = -10**9
+                spans = []
+                active = False
+                start = 0
+                neg_run = 0
+                total_samples = max(1, (total_frames + stride - 1) // stride)
+                progress_step = max(1, total_samples // 50)
+                next_progress_sample = 0
+                preview_step = max(stride, int(getattr(cfg, "preview_every", 3)))
+                last_preview_idx = -preview_step
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                processed_samples = 0
+                fd9_streak = 0
+                fd9_skip_samples = 0
+                fd9_probe_samples = 0
+                fd9_gate_period = 1
+                i = 0
+                # fast pass
+                while i < total_frames:
+                    # drain + coalesce controls
+                    last_seek: Optional[int] = None
+                    step_accum: int = 0
+                    pending_speed: Optional[float] = None
+                    pending_cfg: dict = {}
                     try:
-                        self.progress.emit(i)
-                    except Exception:
+                        while True:
+                            cmd, arg = self._cmd_q.get_nowait()
+                            if cmd == "pause":
+                                self._paused = True
+                            elif cmd == "play":
+                                self._paused = False
+                            elif cmd == "seek":
+                                try:
+                                    last_seek = int(arg)
+                                except Exception:
+                                    pass
+                            elif cmd == "step":
+                                try:
+                                    step_accum += int(arg) if arg is not None else 1
+                                except Exception:
+                                    step_accum += 1
+                            elif cmd == "speed":
+                                try:
+                                    pending_speed = float(arg)
+                                except Exception:
+                                    pass
+                            elif cmd == "cfg":
+                                # allow live edits to prescan_* fields if sent
+                                try:
+                                    ch = dict(arg or {})
+                                    for k, v in ch.items():
+                                        if k.startswith("prescan_"):
+                                            setattr(cfg, k, v)
+                                    stride = max(1, int(cfg.prescan_stride))
+                                    enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
+                                    fd_add = float(getattr(cfg, "prescan_fd_add", enter))
+                                    Wmax = int(cfg.prescan_max_width)
+                                    face.conf = float(cfg.prescan_face_conf)
+                                    add_cooldown_samples = int(
+                                        getattr(
+                                            cfg,
+                                            "prescan_add_cooldown_samples",
+                                            getattr(cfg, "prescan_add_cooldown_frames", 5),
+                                        )
+                                    )
+                                except Exception:
+                                    pass
+                    except queue.Empty:
                         pass
 
-                if self._abort:
-                    break
-                if self._paused:
-                    time.sleep(0.02)
-                    continue
-                if i % stride != 0:
-                    next_i = ((i // stride) + 1) * stride
-                    if next_i >= total_frames:
-                        break
-                    old_i = i
-                    i2 = self._seek_to(
-                        cap,
-                        i,
-                        next_i,
-                        fast=bool(getattr(cfg, "seek_fast", True)),
-                        max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
-                    )
-                    # if capped seek didn't reach next_i, still advance one stride to avoid stalls
-                    i = i2 if i2 > old_i else old_i + stride
-                    continue
-                # Preempt before IO to honor newly queued seeks/steps
-                try:
-                    while True:
-                        cmd, arg = self._cmd_q.get_nowait()
-                        if cmd == "seek":
-                            try:
-                                last_seek = int(arg)
-                            except Exception:
-                                pass
-                        elif cmd == "step":
-                            try:
-                                step_accum += int(arg) if arg is not None else 1
-                            except Exception:
-                                step_accum += 1
-                        elif cmd == "speed":
-                            try:
-                                pending_speed = float(arg)
-                            except Exception:
-                                pass
-                        elif cmd == "cfg":
-                            try:
-                                ch = dict(arg or {})
-                                for k, v in ch.items():
-                                    if k.startswith("prescan_"):
-                                        setattr(cfg, k, v)
-                                stride = max(1, int(cfg.prescan_stride))
-                                enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
-                                fd_add = float(getattr(cfg, "prescan_fd_add", enter))
-                                Wmax = int(cfg.prescan_max_width)
-                                face.conf = float(cfg.prescan_face_conf)
-                                add_cooldown_samples = int(
-                                    getattr(
-                                        cfg,
-                                        "prescan_add_cooldown_samples",
-                                        getattr(cfg, "prescan_add_cooldown_frames", 5),
-                                    )
-                                )
-                            except Exception:
-                                pass
-                        elif cmd == "pause":
-                            self._paused = True
-                        elif cmd == "play":
-                            self._paused = False
-                except queue.Empty:
-                    pass
-
-                if pending_speed is not None:
-                    self._speed = max(0.1, min(4.0, float(pending_speed)))
-                    pending_speed = None
-                if last_seek is not None or step_accum:
-                    tgt = int(last_seek) if last_seek is not None else int(i + step_accum)
-                    tgt = max(0, min(total_frames - 1, tgt))
-                    new_pos = self._seek_to(
-                        cap,
-                        i,
-                        tgt,
-                        fast=bool(getattr(cfg, "seek_fast", True)),
-                        max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
-                    )
-                    i_floor = (new_pos // stride) * stride
-                    if i_floor <= i:
-                        i = i + stride
-                    else:
-                        i = i_floor
-                    processed_samples = i // stride
-                    active = False
-                    neg_run = 0
-                    fd9_streak = 0
-                    fd9_skip_samples = 0
-                    fd9_probe_samples = 0
-                    fd9_gate_period = 1
-                    try:
-                        self.progress.emit(i)
-                    except Exception:
-                        pass
-                    continue
-                if not cap.grab():
-                    break
-                ok, frame = cap.retrieve()
-                if not ok or frame is None:
-                    i += 1
-                    continue
-                idx = i
-                sample_idx = processed_samples
-                processed_samples += 1
-                h, w = frame.shape[:2]
-                # widen angles while active; keep probe-throttled when idle
-                try:
-                    face._prescan_rr_mode = "full" if active else "rr"
-                    face.set_prescan_hint(escalate=active)
-                except Exception:
-                    pass
-                best = 9.0  # defensive default
-                # ---- fd9 skip-gate ----
-                skip_extract = False
-                fd9_gate_active = False
-                try:
-                    if (not active) and bool(getattr(cfg, "prescan_fd9_skip", True)):
-                        grace = max(0, int(getattr(cfg, "prescan_fd9_grace", 1)))
-                        period = max(1, int(getattr(cfg, "prescan_fd9_probe_period", 3)))
-                        if fd9_streak >= grace:
-                            fd9_gate_active = True
-                            fd9_gate_period = period
-                            if (fd9_streak % period) != 0:
-                                skip_extract = True
-                except Exception:
-                    pass
-
-                if fd9_gate_active:
-                    if skip_extract:
-                        fd9_skip_samples += 1
-                    else:
-                        fd9_probe_samples += 1
-                else:
-                    fd9_skip_samples = 0
-                    fd9_probe_samples = 0
-
-                if not skip_extract:
-                    # defer resize until we actually extract
-                    if w > Wmax:
-                        nh = int(round(h * (Wmax / float(w))))
-                        frame = cv2.resize(frame, (Wmax, nh), interpolation=cv2.INTER_AREA)
-                    try:
-                        faces = face.extract(frame)
-                    except Exception:
-                        faces = ()
-                    for f in faces:
-                        feat = f.get("feat")
-                        if feat is None:
-                            continue
-                        # current best vs live bank
-                        fd = self._fd_min(feat, ref_feat_local)
-                        best = min(best, fd)
-                        if (
-                            fd <= fd_add
-                            and (sample_idx - last_add_sample) >= add_cooldown_samples
-                            and f.get("quality", 1e9) >= cfg.face_quality_min
-                        ):
-                            try:
-                                quality_val = float(f.get("quality", 0.0))
-                            except Exception:
-                                quality_val = 0.0
-                            ref_feat_local, action, idx_info = self._stream_ref_bank_update(
-                                ref_bank_list,
-                                ref_feat_local,
-                                feat,
-                                quality_val,
-                                cfg,
-                            )
-                            if action in {"added", "replaced"}:
-                                last_add_sample = sample_idx
-                                if action == "added":
-                                    added_vecs += 1
-                                    self._status(
-                                        f"Pre-scan ref bank +1 (size={len(ref_bank_list)}) fd={fd:.3f}",
-                                        key="prescan_bank",
-                                        interval=2.0,
-                                    )
-                                elif action == "replaced":
-                                    self._status(
-                                        f"Pre-scan replaced #{idx_info} with better ref (score↑)",
-                                        key="prescan_bank",
-                                        interval=2.0,
-                                    )
-                else:
-                    best = 9.0
-                    self._status(
-                        "Pre-scan: fd9-skip gate active",
-                        key="prescan_skip",
-                        interval=5.0,
-                    )
-                    self._status(
-                        f"Pre-scan fd9 cadence skip={fd9_skip_samples} probe={fd9_probe_samples} period={fd9_gate_period}",
-                        key="prescan_skip_cadence",
-                        interval=5.0,
-                    )
-
-                if fd9_gate_active and not skip_extract:
-                    self._status(
-                        f"Pre-scan fd9 cadence probe skip={fd9_skip_samples} probe={fd9_probe_samples} period={fd9_gate_period}",
-                        key="prescan_skip_probe",
-                        interval=5.0,
-                    )
-
-                if best >= 8.99:
-                    fd9_streak += 1
-                else:
-                    fd9_streak = 0
-                if sample_idx >= next_progress_sample:
-                    pct = min(100.0, (idx + stride) / max(1.0, float(total_frames)) * 100.0)
-                    self._status(
-                        f"Pre-scan {pct:.1f}% ({idx}/{total_frames})",
-                        key="prescan_progress",
-                        interval=0.25,
-                    )
-                    try:
-                        self.progress.emit(int(min(idx, max(total_frames - 1, 0))))
-                    except Exception:
-                        pass
-                    next_progress_sample = sample_idx + progress_step
-                emit_preview = False
-                if idx - last_preview_idx >= preview_step:
-                    emit_preview = True
-                    last_preview_idx = idx
-                if best <= enter:
-                    if not active:
-                        active = True
+                    if pending_speed is not None:
+                        self._speed = max(0.1, min(4.0, float(pending_speed)))
+                    if last_seek is not None or step_accum:
+                        tgt = int(last_seek) if last_seek is not None else int(i + step_accum)
+                        tgt = max(0, min(total_frames - 1, tgt))
+                        new_pos = self._seek_to(
+                            cap,
+                            i,
+                            tgt,
+                            fast=bool(getattr(cfg, "seek_fast", True)),
+                            max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
+                        )
+                        # ensure forward progress even if seek advanced < stride
+                        i_floor = (new_pos // stride) * stride
+                        if i_floor <= i:
+                            i = i + stride
+                        else:
+                            i = i_floor
+                        processed_samples = i // stride
+                        active = False
+                        neg_run = 0
                         fd9_streak = 0
                         fd9_skip_samples = 0
                         fd9_probe_samples = 0
                         fd9_gate_period = 1
-                        start = idx
-                    neg_run = 0
-                    emit_preview = True
-                else:
-                    if active:
-                        neg_run += 1
-                        # configurable exit cooldown instead of fixed 0.5s
-                        exit_cool = int(
-                            round(
-                                max(0.0, float(getattr(cfg, "prescan_exit_cooldown_sec", 0.5)))
-                                * fps
-                            )
+                        try:
+                            self.progress.emit(i)
+                        except Exception:
+                            pass
+
+                    if self._abort:
+                        break
+                    if self._paused:
+                        time.sleep(0.02)
+                        continue
+                    if i % stride != 0:
+                        next_i = ((i // stride) + 1) * stride
+                        if next_i >= total_frames:
+                            break
+                        old_i = i
+                        i2 = self._seek_to(
+                            cap,
+                            i,
+                            next_i,
+                            fast=bool(getattr(cfg, "seek_fast", True)),
+                            max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
                         )
-                        if neg_run * stride >= exit_cool or best >= exit_:
-                            end = idx
-                            # pad, clamp, merge
-                            s = max(0, start - pad)
-                            e = min(total_frames - 1, end + pad)
-                            if e - s + 1 >= min_len:
-                                if spans and s <= spans[-1][1] + 1:
-                                    spans[-1] = (spans[-1][0], max(spans[-1][1], e))
-                                else:
-                                    spans.append((s, e))
-                            active = False
-                            neg_run = 0
+                        # if capped seek didn't reach next_i, still advance one stride to avoid stalls
+                        i = i2 if i2 > old_i else old_i + stride
+                        continue
+                    # Preempt before IO to honor newly queued seeks/steps
+                    try:
+                        while True:
+                            cmd, arg = self._cmd_q.get_nowait()
+                            if cmd == "seek":
+                                try:
+                                    last_seek = int(arg)
+                                except Exception:
+                                    pass
+                            elif cmd == "step":
+                                try:
+                                    step_accum += int(arg) if arg is not None else 1
+                                except Exception:
+                                    step_accum += 1
+                            elif cmd == "speed":
+                                try:
+                                    pending_speed = float(arg)
+                                except Exception:
+                                    pass
+                            elif cmd == "cfg":
+                                try:
+                                    ch = dict(arg or {})
+                                    for k, v in ch.items():
+                                        if k.startswith("prescan_"):
+                                            setattr(cfg, k, v)
+                                    stride = max(1, int(cfg.prescan_stride))
+                                    enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
+                                    fd_add = float(getattr(cfg, "prescan_fd_add", enter))
+                                    Wmax = int(cfg.prescan_max_width)
+                                    face.conf = float(cfg.prescan_face_conf)
+                                    add_cooldown_samples = int(
+                                        getattr(
+                                            cfg,
+                                            "prescan_add_cooldown_samples",
+                                            getattr(cfg, "prescan_add_cooldown_frames", 5),
+                                        )
+                                    )
+                                except Exception:
+                                    pass
+                            elif cmd == "pause":
+                                self._paused = True
+                            elif cmd == "play":
+                                self._paused = False
+                    except queue.Empty:
+                        pass
+
+                    if pending_speed is not None:
+                        self._speed = max(0.1, min(4.0, float(pending_speed)))
+                        pending_speed = None
+                    if last_seek is not None or step_accum:
+                        tgt = int(last_seek) if last_seek is not None else int(i + step_accum)
+                        tgt = max(0, min(total_frames - 1, tgt))
+                        new_pos = self._seek_to(
+                            cap,
+                            i,
+                            tgt,
+                            fast=bool(getattr(cfg, "seek_fast", True)),
+                            max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
+                        )
+                        i_floor = (new_pos // stride) * stride
+                        if i_floor <= i:
+                            i = i + stride
+                        else:
+                            i = i_floor
+                        processed_samples = i // stride
+                        active = False
+                        neg_run = 0
+                        fd9_streak = 0
+                        fd9_skip_samples = 0
+                        fd9_probe_samples = 0
+                        fd9_gate_period = 1
+                        try:
+                            self.progress.emit(i)
+                        except Exception:
+                            pass
+                        continue
+                    if not cap.grab():
+                        break
+                    ok, frame = cap.retrieve()
+                    if not ok or frame is None:
+                        i += 1
+                        continue
+                    idx = i
+                    sample_idx = processed_samples
+                    processed_samples += 1
+                    h, w = frame.shape[:2]
+                    # widen angles while active; keep probe-throttled when idle
+                    try:
+                        face._prescan_rr_mode = "full" if active else "rr"
+                        face.set_prescan_hint(escalate=active)
+                    except Exception:
+                        pass
+                    best = 9.0  # defensive default
+                    # ---- fd9 skip-gate ----
+                    skip_extract = False
+                    fd9_gate_active = False
+                    try:
+                        if (not active) and bool(getattr(cfg, "prescan_fd9_skip", True)):
+                            grace = max(0, int(getattr(cfg, "prescan_fd9_grace", 1)))
+                            period = max(1, int(getattr(cfg, "prescan_fd9_probe_period", 3)))
+                            if fd9_streak >= grace:
+                                fd9_gate_active = True
+                                fd9_gate_period = period
+                                if (fd9_streak % period) != 0:
+                                    skip_extract = True
+                    except Exception:
+                        pass
+
+                    if fd9_gate_active:
+                        if skip_extract:
+                            fd9_skip_samples += 1
+                        else:
+                            fd9_probe_samples += 1
+                    else:
+                        fd9_skip_samples = 0
+                        fd9_probe_samples = 0
+
+                    if not skip_extract:
+                        # defer resize until we actually extract
+                        if w > Wmax:
+                            nh = int(round(h * (Wmax / float(w))))
+                            frame = cv2.resize(frame, (Wmax, nh), interpolation=cv2.INTER_AREA)
+                        try:
+                            faces = face.extract(frame)
+                        except Exception:
+                            faces = ()
+                        for f in faces:
+                            feat = f.get("feat")
+                            if feat is None:
+                                continue
+                            # current best vs live bank
+                            fd = self._fd_min(feat, ref_feat_local)
+                            best = min(best, fd)
+                            if (
+                                fd <= fd_add
+                                and (sample_idx - last_add_sample) >= add_cooldown_samples
+                                and f.get("quality", 1e9) >= cfg.face_quality_min
+                            ):
+                                try:
+                                    quality_val = float(f.get("quality", 0.0))
+                                except Exception:
+                                    quality_val = 0.0
+                                ref_feat_local, action, idx_info = self._stream_ref_bank_update(
+                                    ref_bank_list,
+                                    ref_feat_local,
+                                    feat,
+                                    quality_val,
+                                    cfg,
+                                )
+                                if action in {"added", "replaced"}:
+                                    last_add_sample = sample_idx
+                                    if action == "added":
+                                        added_vecs += 1
+                                        self._status(
+                                            f"Pre-scan ref bank +1 (size={len(ref_bank_list)}) fd={fd:.3f}",
+                                            key="prescan_bank",
+                                            interval=2.0,
+                                        )
+                                    elif action == "replaced":
+                                        self._status(
+                                            f"Pre-scan replaced #{idx_info} with better ref (score↑)",
+                                            key="prescan_bank",
+                                            interval=2.0,
+                                        )
+                    else:
+                        best = 9.0
+                        self._status(
+                            "Pre-scan: fd9-skip gate active",
+                            key="prescan_skip",
+                            interval=5.0,
+                        )
+                        self._status(
+                            f"Pre-scan fd9 cadence skip={fd9_skip_samples} probe={fd9_probe_samples} period={fd9_gate_period}",
+                            key="prescan_skip_cadence",
+                            interval=5.0,
+                        )
+
+                    if fd9_gate_active and not skip_extract:
+                        self._status(
+                            f"Pre-scan fd9 cadence probe skip={fd9_skip_samples} probe={fd9_probe_samples} period={fd9_gate_period}",
+                            key="prescan_skip_probe",
+                            interval=5.0,
+                        )
+
+                    if best >= 8.99:
+                        fd9_streak += 1
+                    else:
+                        fd9_streak = 0
+                    if sample_idx >= next_progress_sample:
+                        pct = min(100.0, (idx + stride) / max(1.0, float(total_frames)) * 100.0)
+                        self._status(
+                            f"Pre-scan {pct:.1f}% ({idx}/{total_frames})",
+                            key="prescan_progress",
+                            interval=0.25,
+                        )
+                        try:
+                            self.progress.emit(int(min(idx, max(total_frames - 1, 0))))
+                        except Exception:
+                            pass
+                        next_progress_sample = sample_idx + progress_step
+                    emit_preview = False
+                    if idx - last_preview_idx >= preview_step:
+                        emit_preview = True
+                        last_preview_idx = idx
+                    if best <= enter:
+                        if not active:
+                            active = True
                             fd9_streak = 0
                             fd9_skip_samples = 0
                             fd9_probe_samples = 0
                             fd9_gate_period = 1
-                if emit_preview:
-                    try:
-                        vis = frame.copy()
-                        color = (0, 200, 0) if best <= enter else (0, 0, 200)
-                        cv2.putText(
-                            vis,
-                            f"Pre-scan fd={best:.2f} f={idx}",
-                            (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.75,
-                            color,
-                            2,
-                            cv2.LINE_AA,
+                            start = idx
+                        neg_run = 0
+                        emit_preview = True
+                    else:
+                        if active:
+                            neg_run += 1
+                            # configurable exit cooldown instead of fixed 0.5s
+                            exit_cool = int(
+                                round(
+                                    max(0.0, float(getattr(cfg, "prescan_exit_cooldown_sec", 0.5)))
+                                    * fps
+                                )
+                            )
+                            if neg_run * stride >= exit_cool or best >= exit_:
+                                end = idx
+                                # pad, clamp, merge
+                                s = max(0, start - pad)
+                                e = min(total_frames - 1, end + pad)
+                                if e - s + 1 >= min_len:
+                                    if spans and s <= spans[-1][1] + 1:
+                                        spans[-1] = (spans[-1][0], max(spans[-1][1], e))
+                                    else:
+                                        spans.append((s, e))
+                                active = False
+                                neg_run = 0
+                                fd9_streak = 0
+                                fd9_skip_samples = 0
+                                fd9_probe_samples = 0
+                                fd9_gate_period = 1
+                    if emit_preview:
+                        try:
+                            vis = frame.copy()
+                            color = (0, 200, 0) if best <= enter else (0, 0, 200)
+                            cv2.putText(
+                                vis,
+                                f"Pre-scan fd={best:.2f} f={idx}",
+                                (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.75,
+                                color,
+                                2,
+                                cv2.LINE_AA,
+                            )
+                            self._emit_preview_bgr(vis)
+                        except Exception:
+                            pass
+                    i += 1
+                if active:
+                    s = max(0, start - pad)
+                    e = total_frames - 1
+                    if e - s + 1 >= min_len:
+                        if spans and s <= spans[-1][1] + 1:
+                            spans[-1] = (spans[-1][0], max(spans[-1][1], e))
+                        else:
+                            spans.append((s, e))
+                # bridge tiny gaps
+                if spans and getattr(cfg, "prescan_bridge_gap_sec", 0) > 0:
+                    bridged = []
+                    gap = int(round(cfg.prescan_bridge_gap_sec * fps))
+                    cs, ce = spans[0]
+                    for s, e in spans[1:]:
+                        if s - ce <= gap:
+                            ce = max(ce, e)
+                        else:
+                            bridged.append((cs, ce))
+                            cs, ce = s, e
+                    bridged.append((cs, ce))
+                    spans = bridged
+
+                # --- boundary refinement: tighten edges to cut dead time, but bounded ---
+                def _refine_edges(sp_list):
+                    if not sp_list:
+                        return sp_list
+                    import time
+                    # smaller stride and stronger probe around edges
+                    stride_ref = max(
+                        1,
+                        min(
+                            int(max(1, cfg.prescan_stride) // 4),
+                            int(getattr(cfg, "prescan_refine_stride_min", 3)),
+                        ),
+                    )
+                    win = int(
+                        round(
+                            max(0.0, float(getattr(cfg, "prescan_boundary_refine_sec", 0.75)))
+                            * fps
                         )
-                        self._emit_preview_bgr(vis)
+                    )
+                    pad_frames = int(round(max(0.0, float(cfg.prescan_pad_sec)) * fps))
+                    search = max(pad_frames, win)
+                    refined = []
+                    budget_s = float(getattr(cfg, "prescan_refine_budget_sec", 0.0))
+                    t0 = time.perf_counter()
+
+                    def over_budget():
+                        return budget_s > 1e-3 and (time.perf_counter() - t0) > budget_s
+
+                    # temporarily crank prescan hints
+                    rr_old = getattr(face, "_prescan_rr_mode", "rr")
+                    try:
+                        face._prescan_rr_mode = "full"
                     except Exception:
                         pass
-                i += 1
-            if active:
-                s = max(0, start - pad)
-                e = total_frames - 1
-                if e - s + 1 >= min_len:
-                    if spans and s <= spans[-1][1] + 1:
-                        spans[-1] = (spans[-1][0], max(spans[-1][1], e))
-                    else:
-                        spans.append((s, e))
-            # bridge tiny gaps
-            if spans and getattr(cfg, "prescan_bridge_gap_sec", 0) > 0:
-                bridged = []
-                gap = int(round(cfg.prescan_bridge_gap_sec * fps))
-                cs, ce = spans[0]
-                for s, e in spans[1:]:
-                    if s - ce <= gap:
-                        ce = max(ce, e)
-                    else:
-                        bridged.append((cs, ce))
-                        cs, ce = s, e
-                bridged.append((cs, ce))
-                spans = bridged
-
-            # --- boundary refinement: tighten edges to cut dead time, but bounded ---
-            def _refine_edges(sp_list):
-                if not sp_list:
-                    return sp_list
-                import time
-                # smaller stride and stronger probe around edges
-                stride_ref = max(
-                    1,
-                    min(
-                        int(max(1, cfg.prescan_stride) // 4),
-                        int(getattr(cfg, "prescan_refine_stride_min", 3)),
-                    ),
-                )
-                win = int(
-                    round(
-                        max(0.0, float(getattr(cfg, "prescan_boundary_refine_sec", 0.75)))
-                        * fps
-                    )
-                )
-                pad_frames = int(round(max(0.0, float(cfg.prescan_pad_sec)) * fps))
-                search = max(pad_frames, win)
-                refined = []
-                budget_s = float(getattr(cfg, "prescan_refine_budget_sec", 0.0))
-                t0 = time.perf_counter()
-
-                def over_budget():
-                    return budget_s > 1e-3 and (time.perf_counter() - t0) > budget_s
-
-                # temporarily crank prescan hints
-                rr_old = getattr(face, "_prescan_rr_mode", "rr")
-                try:
-                    face._prescan_rr_mode = "full"
-                except Exception:
-                    pass
-                try:
-                    face.set_prescan_hint(escalate=True)
-                except Exception:
-                    pass
-                timeout = False
-                for idx, (s, e) in enumerate(sp_list):
-                    ls = s
-                    le = e
-                    skip_right = bool(getattr(cfg, "prescan_skip_trailing_refine", True)) and (
-                        e >= total_frames - 1
-                    )
-                    # LEFT edge: scan forward from s to s+search
-                    left_stop = min(e, s + search)
-                    j = s
-                    best_left = None
-                    while j <= left_stop:
-                        if over_budget():
-                            timeout = True
-                            break
-                        # keyframe-aware seek for responsiveness
-                        self._seek_to(
-                            cap,
-                            j,
-                            j,
-                            fast=bool(getattr(cfg, "seek_fast", True)),
-                            max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
+                    try:
+                        face.set_prescan_hint(escalate=True)
+                    except Exception:
+                        pass
+                    timeout = False
+                    for idx, (s, e) in enumerate(sp_list):
+                        ls = s
+                        le = e
+                        skip_right = bool(getattr(cfg, "prescan_skip_trailing_refine", True)) and (
+                            e >= total_frames - 1
                         )
-                        ret, frame = cap.read()
-                        if not ret or frame is None:
-                            j += stride_ref
-                            continue
-                        h, w = frame.shape[:2]
-                        if Wmax > 0 and w > Wmax:
-                            scale = float(Wmax) / float(w)
-                            frame = cv2.resize(
-                                frame,
-                                (int(round(w * scale)), int(round(h * scale))),
-                                interpolation=cv2.INTER_AREA,
-                            )
-                        faces = face.extract(frame)
-                        if faces:
-                            bank = ref_feat_local if ref_feat_local is not None else ref_feat
-                            for f in faces:
-                                feat = f.get("feat")
-                                if feat is not None and self._fd_min(feat, bank) <= enter:
-                                    best_left = j
-                                    break
-                        if best_left is not None:
-                            break
-                        j += stride_ref
-                    if timeout:
-                        refined.append((ls, le))
-                        refined.extend(sp_list[idx + 1 :])
-                        break
-                    if best_left is not None and bool(getattr(cfg, "prescan_trim_pad", True)):
-                        ls = max(s, best_left)
-                    # RIGHT edge: scan backward region [e-search, e] to last good
-                    last_good = None
-                    if not skip_right:
-                        right_start = max(ls, e - search)
-                        j = right_start
-                        while j <= e:
+                        # LEFT edge: scan forward from s to s+search
+                        left_stop = min(e, s + search)
+                        j = s
+                        best_left = None
+                        while j <= left_stop:
                             if over_budget():
                                 timeout = True
                                 break
+                            # keyframe-aware seek for responsiveness
                             self._seek_to(
                                 cap,
                                 j,
@@ -1135,89 +1118,148 @@ class Processor(QtCore.QObject):
                                 for f in faces:
                                     feat = f.get("feat")
                                     if feat is not None and self._fd_min(feat, bank) <= enter:
-                                        last_good = j
+                                        best_left = j
+                                        break
+                            if best_left is not None:
+                                break
                             j += stride_ref
                         if timeout:
                             refined.append((ls, le))
                             refined.extend(sp_list[idx + 1 :])
                             break
-                    if last_good is not None and bool(getattr(cfg, "prescan_trim_pad", True)):
-                        le = min(e, last_good)
-                    # keep only if span remains big enough
-                    if le >= ls and (le - ls + 1) >= min_len:
-                        refined.append((ls, le))
-                # restore hints
+                        if best_left is not None and bool(getattr(cfg, "prescan_trim_pad", True)):
+                            ls = max(s, best_left)
+                        # RIGHT edge: scan backward region [e-search, e] to last good
+                        last_good = None
+                        if not skip_right:
+                            right_start = max(ls, e - search)
+                            j = right_start
+                            while j <= e:
+                                if over_budget():
+                                    timeout = True
+                                    break
+                                self._seek_to(
+                                    cap,
+                                    j,
+                                    j,
+                                    fast=bool(getattr(cfg, "seek_fast", True)),
+                                    max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
+                                )
+                                ret, frame = cap.read()
+                                if not ret or frame is None:
+                                    j += stride_ref
+                                    continue
+                                h, w = frame.shape[:2]
+                                if Wmax > 0 and w > Wmax:
+                                    scale = float(Wmax) / float(w)
+                                    frame = cv2.resize(
+                                        frame,
+                                        (int(round(w * scale)), int(round(h * scale))),
+                                        interpolation=cv2.INTER_AREA,
+                                    )
+                                faces = face.extract(frame)
+                                if faces:
+                                    bank = ref_feat_local if ref_feat_local is not None else ref_feat
+                                    for f in faces:
+                                        feat = f.get("feat")
+                                        if feat is not None and self._fd_min(feat, bank) <= enter:
+                                            last_good = j
+                                j += stride_ref
+                            if timeout:
+                                refined.append((ls, le))
+                                refined.extend(sp_list[idx + 1 :])
+                                break
+                        if last_good is not None and bool(getattr(cfg, "prescan_trim_pad", True)):
+                            le = min(e, last_good)
+                        # keep only if span remains big enough
+                        if le >= ls and (le - ls + 1) >= min_len:
+                            refined.append((ls, le))
+                    # restore hints
+                    try:
+                        face.set_prescan_hint(escalate=False)
+                    except Exception:
+                        pass
+                    try:
+                        face._prescan_rr_mode = rr_old
+                    except Exception:
+                        pass
+                    return refined
+
+                spans = _refine_edges(spans)
+                if spans and getattr(cfg, "prescan_bridge_gap_sec", 0) > 0:
+                    # bridge tiny gaps (repeat post-refine)
+                    bridged = []
+                    gap = int(round(cfg.prescan_bridge_gap_sec * fps))
+                    cs, ce = spans[0]
+                    for s, e in spans[1:]:
+                        if s - ce <= gap:
+                            ce = max(ce, e)
+                        else:
+                            bridged.append((cs, ce))
+                            cs, ce = s, e
+                    bridged.append((cs, ce))
+                    spans = bridged
                 try:
+                    fps_f = float(fps)
+                except Exception:
+                    fps_f = 0.0
+                if fps_f <= 0:
+                    fps_f = 1.0
+                total_sec = sum((e - s + 1) / fps_f for s, e in spans)
+                self._status(
+                    f"Pre-scan refined spans={len(spans)} • total_keep≈{total_sec:.1f}s",
+                    key="prescan_refine",
+                    interval=1.0,
+                )
+            finally:
+                try:
+                    face.configure_rotation_strategy(adaptive=bool(old_rot_adapt))
+                except Exception:
+                    pass
+                try:
+                    face.set_prescan_fast(False)
                     face.set_prescan_hint(escalate=False)
                 except Exception:
                     pass
+                face.conf = old_face_conf
+            cap_main.set(cv2.CAP_PROP_POS_FRAMES, pos0)
+            try:
+                # Restore progress to the position we were at before pre-scan so the UI
+                # doesn't jump to EOF and queue a seek there.
+                self.progress.emit(max(0, pos0))
+            except Exception:
+                pass
+            # Final prescan progress: do not claim 100% coverage if we bailed early.
+            try:
+                samples = int(i)
+            except Exception:
+                samples = 0
+            msg = (
+                f"Pre-scan done • samples≈{samples} • segments={len(spans)}"
+                if samples > 0
+                else f"Pre-scan done • segments={len(spans)}"
+            )
+            self._status(msg, key="prescan_progress", interval=0.1)
+            self._status(
+                f"Pre-scan ref bank added {added_vecs} vector(s); size={len(ref_bank_list)} (start={initial_bank_len})",
+                key="prescan_bank_summary",
+                interval=0.5,
+            )
+            return spans, (ref_feat_local if ref_feat_local is not None else ref_feat)
+
+        try:
+            return _run()
+        finally:
+            if cap_override is not None:
                 try:
-                    face._prescan_rr_mode = rr_old
+                    cap_override.release()
                 except Exception:
                     pass
-                return refined
-
-            spans = _refine_edges(spans)
-            if spans and getattr(cfg, "prescan_bridge_gap_sec", 0) > 0:
-                # bridge tiny gaps (repeat post-refine)
-                bridged = []
-                gap = int(round(cfg.prescan_bridge_gap_sec * fps))
-                cs, ce = spans[0]
-                for s, e in spans[1:]:
-                    if s - ce <= gap:
-                        ce = max(ce, e)
-                    else:
-                        bridged.append((cs, ce))
-                        cs, ce = s, e
-                bridged.append((cs, ce))
-                spans = bridged
-            try:
-                fps_f = float(fps)
-            except Exception:
-                fps_f = 0.0
-            if fps_f <= 0:
-                fps_f = 1.0
-            total_sec = sum((e - s + 1) / fps_f for s, e in spans)
-            self._status(
-                f"Pre-scan refined spans={len(spans)} • total_keep≈{total_sec:.1f}s",
-                key="prescan_refine",
-                interval=1.0,
-            )
-        finally:
-            try:
-                face.configure_rotation_strategy(adaptive=bool(old_rot_adapt))
-            except Exception:
-                pass
-            try:
-                face.set_prescan_fast(False)
-                face.set_prescan_hint(escalate=False)
-            except Exception:
-                pass
-            face.conf = old_face_conf
-        cap.set(cv2.CAP_PROP_POS_FRAMES, pos0)
-        try:
-            # Restore progress to the position we were at before pre-scan so the UI
-            # doesn't jump to EOF and queue a seek there.
-            self.progress.emit(max(0, pos0))
-        except Exception:
-            pass
-        # Final prescan progress: do not claim 100% coverage if we bailed early.
-        try:
-            samples = int(i)
-        except Exception:
-            samples = 0
-        msg = (
-            f"Pre-scan done • samples≈{samples} • segments={len(spans)}"
-            if samples > 0
-            else f"Pre-scan done • segments={len(spans)}"
-        )
-        self._status(msg, key="prescan_progress", interval=0.1)
-        self._status(
-            f"Pre-scan ref bank added {added_vecs} vector(s); size={len(ref_bank_list)} (start={initial_bank_len})",
-            key="prescan_bank_summary",
-            interval=0.5,
-        )
-        return spans, (ref_feat_local if ref_feat_local is not None else ref_feat)
+            for k, v in _restore_env.items():
+                if v:
+                    os.environ[k] = v
+                elif k in os.environ:
+                    del os.environ[k]
 
     @staticmethod
     def _clip_to_frame(x1: float, y1: float, x2: float, y2: float, frame_w: int, frame_h: int) -> Tuple[int, int, int, int]:
@@ -5082,6 +5124,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_prescan_max_width.setValue(int(self.cfg.prescan_max_width))
         self.spin_prescan_max_width.setToolTip("int: prescan_max_width")
         self.spin_prescan_max_width.valueChanged.connect(self._on_ui_change)
+        self.spin_prescan_decode_max_w = QtWidgets.QSpinBox()
+        self.spin_prescan_decode_max_w.setRange(0, 8192)
+        self.spin_prescan_decode_max_w.setValue(int(getattr(self.cfg, "prescan_decode_max_w", 384)))
+        self.spin_prescan_decode_max_w.setToolTip("int: prescan_decode_max_w (decoder downscale; 0=disable)")
+        self.spin_prescan_decode_max_w.valueChanged.connect(self._on_ui_change)
         self.spin_prescan_face_conf = QtWidgets.QDoubleSpinBox()
         self.spin_prescan_face_conf.setDecimals(3)
         self.spin_prescan_face_conf.setRange(0.0, 1.0)
@@ -5463,6 +5510,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Pre-scan stride (frames)", self.spin_prescan_stride),
             ("Pre-scan bank add dist ≤", self.spin_prescan_fd_add),
             ("Pre-scan max width (px)", self.spin_prescan_max_width),
+            ("Pre-scan decode max width (px)", self.spin_prescan_decode_max_w),
             ("Pre-scan face det conf", self.spin_prescan_face_conf),
             ("Pre-scan ENTER dist ≤", self.spin_prescan_fd_enter),
             ("Pre-scan EXIT dist ≥", self.spin_prescan_fd_exit),
@@ -6457,6 +6505,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "prescan_enable",
             "prescan_stride",
             "prescan_max_width",
+            "prescan_decode_max_w",
             "prescan_face_conf",
             "prescan_fd_enter",
             "prescan_fd_add",
@@ -6589,6 +6638,7 @@ class MainWindow(QtWidgets.QMainWindow):
             prescan_stride=int(self.spin_prescan_stride.value()) if hasattr(self, "spin_prescan_stride") else 16,
             prescan_fd_add=float(self.spin_prescan_fd_add.value()) if hasattr(self, "spin_prescan_fd_add") else 0.22,
             prescan_max_width=int(self.spin_prescan_max_width.value()) if hasattr(self, "spin_prescan_max_width") else 416,
+            prescan_decode_max_w=int(self.spin_prescan_decode_max_w.value()) if hasattr(self, "spin_prescan_decode_max_w") else int(getattr(self.cfg, "prescan_decode_max_w", 384)),
             prescan_face_conf=float(self.spin_prescan_face_conf.value()) if hasattr(self, "spin_prescan_face_conf") else 0.5,
             prescan_fd_enter=float(self.spin_prescan_fd_enter.value()) if hasattr(self, "spin_prescan_fd_enter") else 0.45,
             prescan_fd_exit=float(self.spin_prescan_fd_exit.value()) if hasattr(self, "spin_prescan_fd_exit") else 0.52,
@@ -6719,6 +6769,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.preview_every = int(getattr(cfg, "preview_every", 3))
         except Exception:
             self.cfg.preview_every = 3
+        try:
+            self.cfg.prescan_decode_max_w = int(getattr(cfg, "prescan_decode_max_w", 384))
+        except Exception:
+            self.cfg.prescan_decode_max_w = 384
         self.video_edit.setText(cfg.video)
         paths = [part.strip() for part in (cfg.ref or "").split(';') if part.strip()]
         self._set_ref_paths(paths)
@@ -6782,6 +6836,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spin_prescan_fd_add.setValue(float(cfg.prescan_fd_add))
         if hasattr(self, 'spin_prescan_max_width'):
             self.spin_prescan_max_width.setValue(int(cfg.prescan_max_width))
+        if hasattr(self, 'spin_prescan_decode_max_w'):
+            self.spin_prescan_decode_max_w.setValue(int(getattr(cfg, 'prescan_decode_max_w', 384)))
         if hasattr(self, 'spin_prescan_face_conf'):
             self.spin_prescan_face_conf.setValue(float(cfg.prescan_face_conf))
         if hasattr(self, 'spin_prescan_fd_enter'):
@@ -7348,6 +7404,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spin_prescan_fd_add.setValue(float(s.value("prescan_fd_add", self.cfg.prescan_fd_add)))
         if hasattr(self, 'spin_prescan_max_width'):
             self.spin_prescan_max_width.setValue(int(s.value("prescan_max_width", self.cfg.prescan_max_width)))
+        if hasattr(self, 'spin_prescan_decode_max_w'):
+            self.spin_prescan_decode_max_w.setValue(int(s.value("prescan_decode_max_w", getattr(self.cfg, "prescan_decode_max_w", 384))))
         if hasattr(self, 'spin_prescan_face_conf'):
             self.spin_prescan_face_conf.setValue(float(s.value("prescan_face_conf", self.cfg.prescan_face_conf)))
         if hasattr(self, 'spin_prescan_fd_enter'):
