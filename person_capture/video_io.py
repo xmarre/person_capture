@@ -1041,11 +1041,18 @@ class FfmpegPipeReader:
         self._frame_bytes_u8 = self._w * self._h * 3
         self._frame_bytes_f32 = self._w * self._h * 3 * 4
         self._pix_fmt = "bgr24"
+        # Track the currently active filter mode so we can fall back if needed.
+        self._mode = (
+            "libplacebo"
+            if self._use_libplacebo
+            else ("zscale" if (self._has_zscale and self._has_tonemap) else "scale")
+        )
+        self._fallback_tried = False
         self._start(0)
         mode = (
             "libplacebo"
-            if self._use_libplacebo
-            else ("zscale+tonemap" if (self._has_zscale and self._has_tonemap) else "linear+python-tonemap")
+            if self._mode == "libplacebo"
+            else ("zscale+tonemap" if self._mode == "zscale" else "linear+python-tonemap")
         )
         self._log.info("HDR preview path: bundled ffmpeg pipe (%s)", mode)
 
@@ -1071,13 +1078,37 @@ class FfmpegPipeReader:
         except Exception:
             return set()
 
+    # --- Fallback helper used if libplacebo produces no frames (e.g., Vulkan init issues) ---
+    def try_fallback_chain(self) -> bool:
+        """
+        Restart the pipe with a safer chain if libplacebo produced no frames.
+        Returns True if a fallback was attempted.
+        """
+        if self._fallback_tried:
+            return False
+        self._fallback_tried = True
+        # Prefer zscale+tonemap if available, else plain scale
+        if self._mode == "libplacebo" and (self._has_zscale and self._has_tonemap):
+            self._log.warning("HDR: libplacebo yielded no frames; falling back to zscale+tonemap.")
+            self._stop()
+            self._mode = "zscale"
+            self._start(max(self._pos + 1, 0))
+            return True
+        if self._mode in ("libplacebo", "zscale") and self._has_scale:
+            self._log.warning("HDR: tone-map filters unavailable/failed; falling back to linear scale.")
+            self._stop()
+            self._mode = "scale"
+            self._start(max(self._pos + 1, 0))
+            return True
+        return False
+
     def _chain(self) -> str:
-        if self._use_libplacebo:
+        if self._mode == "libplacebo" and self._use_libplacebo:
             return (
                 "libplacebo=tonemapping=auto:target_primaries=bt709:target_trc=bt709:"
                 "dither=yes:deband=yes"
             )
-        if self._has_zscale and self._has_tonemap:
+        if self._mode in ("libplacebo", "zscale") and (self._has_zscale and self._has_tonemap):
             # full HDR→SDR tonemap
             return (
                 "zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc,"
@@ -1098,7 +1129,7 @@ class FfmpegPipeReader:
             except Exception:
                 pass
         t = 0.0 if self._fps <= 0 else max(0.0, idx / float(self._fps))
-        pix_fmt = "bgr24" if (self._use_libplacebo or (self._has_zscale and self._has_tonemap)) else "gbrpf32le"
+        pix_fmt = "bgr24" if self._mode in ("libplacebo", "zscale") else "gbrpf32le"
         cmd = [
             self._ffmpeg,
             "-hide_banner",
@@ -1133,6 +1164,20 @@ class FfmpegPipeReader:
         self._pos = idx - 1
         self._arr = None
         self._pix_fmt = pix_fmt
+
+    def _stop(self):
+        try:
+            if self._proc:
+                self._proc.kill()
+        except Exception:
+            pass
+        try:
+            if self._proc and self._proc.stdout:
+                self._proc.stdout.close()
+        except Exception:
+            pass
+        self._proc = None
+        self._arr = None
 
     # OpenCV-like API
     def get(self, prop: int) -> float:
@@ -1194,15 +1239,26 @@ class FfmpegPipeReader:
         return True, out
 
     def read(self):
-        return (False, None) if not self.grab() else self.retrieve()
+        # If the process died prematurely (e.g., libplacebo failed to init),
+        # attempt a one-time filter-chain fallback before giving up.
+        if self._proc is not None and self._proc.poll() is not None:
+            if self.try_fallback_chain():
+                pass
+            else:
+                return False, None
+
+        if not self.grab():
+            # grab() failed (end-of-stream or short read). If we haven't tried fallback yet,
+            # switch to a safer chain once.
+            if self.try_fallback_chain():
+                if not self.grab():
+                    return False, None
+            else:
+                return False, None
+        return self.retrieve()
 
     def release(self):
-        try:
-            if self._proc:
-                self._proc.kill()
-        except Exception:
-            pass
-        self._proc = None
+        self._stop()
 
     def __del__(self):
         self.release()

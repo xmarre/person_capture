@@ -2594,7 +2594,21 @@ class Processor(QtCore.QObject):
             fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-            if not _probe_reader(cap, float(fps or 24.0)):
+            ok = _probe_reader(cap, float(fps or 24.0))
+            if (not ok) and hasattr(cap, "try_fallback_chain"):
+                try:
+                    # If HDR pipe failed on libplacebo (e.g., Vulkan), ask it to fall back to zscale+tonemap.
+                    if cap.try_fallback_chain():
+                        self._status(
+                            "HDR: libplacebo produced no frames; retrying with zscale+tonemap.",
+                            key="hdr_probe_fail",
+                            interval=60.0,
+                        )
+                        ok = _probe_reader(cap, float(fps or 24.0))
+                except Exception:
+                    ok = False
+
+            if not ok:
                 msg = (
                     "HDR reader delivered no frames; falling back to OpenCV reader"
                     if hdr_active
