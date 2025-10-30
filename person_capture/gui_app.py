@@ -1189,11 +1189,17 @@ class Processor(QtCore.QObject):
             self.progress.emit(max(0, pos0))
         except Exception:
             pass
-        self._status(
-            f"Pre-scan 100% ({total_frames}/{total_frames}) • segments={len(spans)}",
-            key="prescan_progress",
-            interval=0.1,
+        # Final prescan progress: do not claim 100% coverage if we bailed early.
+        try:
+            samples = int(i)
+        except Exception:
+            samples = 0
+        msg = (
+            f"Pre-scan done • samples≈{samples} • segments={len(spans)}"
+            if samples > 0
+            else f"Pre-scan done • segments={len(spans)}"
         )
+        self._status(msg, key="prescan_progress", interval=0.1)
         self._status(
             f"Pre-scan ref bank added {added_vecs} vector(s); size={len(ref_bank_list)} (start={initial_bank_len})",
             key="prescan_bank_summary",
@@ -2502,6 +2508,7 @@ class Processor(QtCore.QObject):
             face_only_pipeline = (base_match_mode == "face_only")
 
             # Video
+            hdr_active = False
             try:
                 # Prefer HDR->SDR via libplacebo if HDR; else OpenCV path.
                 try:
@@ -2516,10 +2523,12 @@ class Processor(QtCore.QObject):
                 if tonemap_cap is not None:
                     logger.info("Video open: HDR tone-map reader selected")
                     self._status(f"HDR: active ({hdr_reason})")
+                    hdr_active = True
                     cap = tonemap_cap
                 else:
                     logger.info("Video open: OpenCV/FFmpeg reader selected")
                     self._status(f"HDR: inactive ({hdr_reason})")
+                    hdr_active = False
                     os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
                     cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
                     try:
@@ -2537,8 +2546,71 @@ class Processor(QtCore.QObject):
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
             except Exception:
                 pass
+
+            # --- Sanity probe: ensure the selected reader actually delivers frames.
+            # If HDR tone-map reader stalls, fall back to OpenCV/FFmpeg so the preview and pre-scan advance.
+            def _probe_reader(c, fps_hint: float) -> bool:
+                try:
+                    tries = max(8, min(32, int(round(fps_hint or 24.0))))
+                except Exception:
+                    tries = 12
+                ok_any = False
+                # some wrappers may not expose get/set; fall back to 0
+                get = getattr(c, "get", None)
+                set_ = getattr(c, "set", None)
+                pos0 = int(get(cv2.CAP_PROP_POS_FRAMES) or 0) if callable(get) else 0
+                for _ in range(tries):
+                    ok, fr = c.read()
+                    if ok and fr is not None and fr.size:
+                        ok_any = True
+                        # show first frame immediately so UI proves the pipeline is alive
+                        try:
+                            self._emit_preview_bgr(fr)
+                        except Exception:
+                            pass
+                        break
+                # rewind for normal processing
+                if callable(set_):
+                    try:
+                        set_(cv2.CAP_PROP_POS_FRAMES, pos0)
+                    except Exception:
+                        pass
+                return ok_any
+
             fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+            if not _probe_reader(cap, float(fps or 24.0)):
+                msg = (
+                    "HDR reader delivered no frames; falling back to OpenCV reader"
+                    if hdr_active
+                    else "Selected reader delivered no frames; reopening with OpenCV/FFmpeg"
+                )
+                self._status(msg, key="hdr_probe_fail", interval=60.0)
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
+                cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
+                try:
+                    cap.set(cv2.CAP_PROP_HW_ACCELERATION, 1)
+                except Exception:
+                    pass
+                if not cap.isOpened():
+                    cap.release()
+                    cap = cv2.VideoCapture(cfg.video)
+                if not cap.isOpened():
+                    raise RuntimeError(f"Cannot open video after HDR fallback: {cfg.video}")
+                try:
+                    logger.warning("HDR reader produced no frames; reopened with OpenCV/FFmpeg")
+                    self._status("HDR: inactive (fallback)", key="hdr_state", interval=60.0)
+                    hdr_active = False
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+                    fps = float(cap.get(cv2.CAP_PROP_FPS) or fps or 30.0)
+                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or total_frames or 0)
+                except Exception:
+                    pass
 
             # If ffprobe is missing, OpenCV may report total=0 and/or fps=0 → fix BEFORE keyframes/setup.
             try:
