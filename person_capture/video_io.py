@@ -1051,6 +1051,7 @@ class FfmpegPipeReader:
         self._has_zscale = ("zscale" in self._filters)
         self._has_tonemap = ("tonemap" in self._filters)
         self._has_scale = ("scale" in self._filters)
+        self._has_scale_vulkan = ("scale_vulkan" in self._filters)
         if not (self._use_libplacebo or (self._has_zscale and self._has_tonemap) or self._has_scale):
             raise RuntimeError("Bundled ffmpeg lacks libplacebo, zscale+tonemap, and scale")
         # Helpful logging for debugging external ffmpeg selection
@@ -1070,16 +1071,34 @@ class FfmpegPipeReader:
             self._lp_opts = self._probe_libplacebo_opts()
         # If decoder-level downscale is active, adjust output dims to match the filter graph.
         try:
-            _maxw = int(os.getenv("PC_DECODE_MAX_W", "0"))
+            _maxw_req = int(os.getenv("PC_DECODE_MAX_W", "0"))
         except Exception:
-            _maxw = 0
+            _maxw_req = 0
+        _hdr = (self._transfer or "").lower() in ("smpte2084", "arib-std-b67")
+        try:
+            _minw_hdr = int(os.getenv("PC_TONEMAP_MIN_W", "960"))
+        except Exception:
+            _minw_hdr = 960
+        _maxw = _maxw_req
+        if _hdr and _maxw_req > 0 and _maxw_req < _minw_hdr:
+            _maxw = _minw_hdr
+            self._log.info("HDR clamp: PC_DECODE_MAX_W=%s raised to PC_TONEMAP_MIN_W=%s", _maxw_req, _minw_hdr)
+        # Persist the effective cap so the filter chain doesn't re-read env and diverge.
+        # This makes prescan/preview and processing use the exact same width policy.
+        self._maxw = int(_maxw)
+        # Helpful visibility into what we'll actually use
+        self._log.info(
+            "Downscale cap: req=%s • hdr=%s • used=%s • scale_vulkan=%s",
+            _maxw_req,
+            _hdr,
+            _maxw,
+            self._has_scale_vulkan,
+        )
         if _maxw > 0 and self._w > _maxw:
             ratio = float(_maxw) / float(self._w)
-            new_w = int(_maxw)
+            self._w = int(_maxw)
             scaled_h = int(math.floor(self._h * ratio))
-            new_h = max(2, scaled_h & ~1)  # match ffmpeg scale h=-2 rounding
-            self._w = max(2, new_w)
-            self._h = max(2, new_h)
+            self._h = max(2, scaled_h & ~1)  # even height
         self._frame_bytes_u8 = self._w * self._h * 3
         self._frame_bytes_f32 = self._w * self._h * 3 * 4
         self._pix_fmt = "bgr24"
@@ -1203,7 +1222,7 @@ class FfmpegPipeReader:
         except Exception:
             return {}
         # Make a quick lookup table of option names present in help output
-        found = {}
+        found: dict[str, bool] = {}
         for name in (
             "tonemapping",
             "gamut_mode",
@@ -1220,17 +1239,11 @@ class FfmpegPipeReader:
         return found
 
     def _chain(self) -> str:
-        try:
-            maxw = int(os.getenv("PC_DECODE_MAX_W", "0"))
-        except Exception:
-            maxw = 0
+        maxw = int(getattr(self, "_maxw", 0))
         if self._mode == "libplacebo" and self._use_libplacebo:
             if self._has_vulkan:
-                # Normalize HDR signaling + bit-depth BEFORE uploading.
-                # For HDR10/HLG sources: set BT.2020 + correct transfer, convert to p010le,
-                # then hwupload → libplacebo (GPU) → hwdownload.
+                # Normalize HDR signaling + bit-depth BEFORE uploading (some builds balk on odd formats).
                 tr = (self._transfer or "").lower()
-                # build libplacebo option string based on availability
                 lp_opts = ["tonemapping=auto"]
                 if self._lp_opts.get("gamut_mode"):
                     lp_opts.append("gamut_mode=clip")
@@ -1243,25 +1256,39 @@ class FfmpegPipeReader:
                 if self._lp_opts.get("deband"):
                     lp_opts.append("deband=yes")
                 lp = "libplacebo=" + ":".join(lp_opts)
-                if tr in ("smpte2084", "arib-std-b67"):  # HDR10 / HLG
-                    s = (
-                        f"zscale=primaries=bt2020:transfer={tr}:matrix=bt2020nc,"
-                        "format=p010le,hwupload=extra_hw_frames=8,"
-                        f"{lp},hwdownload,format=p010le"
+                filters: list[str] = []
+                if tr in ("smpte2084", "arib-std-b67"):
+                    filters.extend(
+                        [
+                            f"zscale=primaries=bt2020:transfer={tr}:matrix=bt2020nc",
+                            "format=p010le",
+                            "hwupload=extra_hw_frames=8",
+                        ]
                     )
                 else:
-                    # SDR: use 8-bit surfaces; libplacebo still runs on GPU
-                    s = f"format=nv12,hwupload=extra_hw_frames=8,{lp},hwdownload,format=nv12"
-                # If the build lacks target_* options, convert to BT.709 on CPU after download.
+                    filters.extend(["format=nv12", "hwupload=extra_hw_frames=8"])
+                filters.append(lp)
+                scaled_gpu = False
+                if maxw > 0 and self._has_scale_vulkan:
+                    filters.append(f"scale_vulkan=w=min(iw\\,{maxw}):h=-2")
+                    scaled_gpu = True
+                filters.append("hwdownload")
+                # If we still need downscale on CPU, do it BEFORE final format convert
+                if maxw > 0 and not scaled_gpu:
+                    filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                 if not (self._lp_opts.get("target_primaries") and self._lp_opts.get("target_trc")):
-                    s += (
-                        ",format=gbrpf32le,"
-                        "zscale=transfer=bt709:primaries=bt709:matrix=bt709:"
-                        "rangein=pc:range=pc:dither=error_diffusion,"
-                        "format=bgr24"
-                    )
+                    filters.extend([
+                        "format=gbrpf32le",
+                        "zscale=transfer=bt709:primaries=bt709:matrix=bt709:rangein=pc:range=pc:dither=error_diffusion",
+                        "format=bgr24",
+                        "setsar=1",
+                    ])
                 else:
-                    s += ",format=bgr24"
+                    filters.extend([
+                        "format=bgr24",
+                        "setsar=1",
+                    ])
+                return ",".join(filters)
             else:
                 # No Vulkan: try CPU libplacebo once; fallback code will switch to zscale if it yields no frames.
                 lp_opts = ["tonemapping=auto"]
@@ -1275,19 +1302,19 @@ class FfmpegPipeReader:
                     lp_opts.append("dither=auto")
                 if self._lp_opts.get("deband"):
                     lp_opts.append("deband=yes")
-                s = "libplacebo=" + ":".join(lp_opts)
+                parts = ["libplacebo=" + ":".join(lp_opts)]
+                if maxw > 0:
+                    parts.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                 if not (self._lp_opts.get("target_primaries") and self._lp_opts.get("target_trc")):
-                    s += (
-                        ",format=gbrpf32le,"
-                        "zscale=transfer=bt709:primaries=bt709:matrix=bt709:"
-                        "rangein=pc:range=pc:dither=error_diffusion,"
-                        "format=bgr24"
-                    )
+                    parts.extend([
+                        "format=gbrpf32le",
+                        "zscale=transfer=bt709:primaries=bt709:matrix=bt709:rangein=pc:range=pc:dither=error_diffusion",
+                        "format=bgr24",
+                        "setsar=1",
+                    ])
                 else:
-                    s += ",format=bgr24"
-            if maxw > 0:
-                s += f",scale=w=min(iw\\,{maxw}):h=-2"
-            return s
+                    parts.extend(["format=bgr24", "setsar=1"])
+                return ",".join(parts)
         if self._mode in ("libplacebo", "zscale") and (self._has_zscale and self._has_tonemap):
             # Full HDR→SDR tonemap tuned for SDR target brightness and optional desaturation.
             s = (
@@ -1299,7 +1326,7 @@ class FfmpegPipeReader:
             )
             if maxw > 0:
                 s += f",scale=w=min(iw\\,{maxw}):h=-2"
-            s += ",format=bgr24"
+            s += ",format=bgr24,setsar=1"
             return s
         # Fallback path: decode to float RGB (planar), expand to full-range, tonemap in Python.
         range_in = "pc" if (self._range_in or "").lower() in ("pc", "full") else "tv"
@@ -1307,7 +1334,7 @@ class FfmpegPipeReader:
         s = f"scale=in_color_matrix={mat}:in_range={range_in}:out_range=pc"
         if maxw > 0:
             s += f",scale=w=min(iw\\,{maxw}):h=-2"
-        s += ",format=gbrpf32le"
+        s += ",format=gbrpf32le,setsar=1"
         return s
 
     def _start(self, idx: int):
