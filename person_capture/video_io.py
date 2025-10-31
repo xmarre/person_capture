@@ -1068,7 +1068,8 @@ class FfmpegPipeReader:
         if _maxw > 0 and self._w > _maxw:
             ratio = float(_maxw) / float(self._w)
             new_w = int(_maxw)
-            new_h = int(round(self._h * ratio / 2.0) * 2)  # keep even height
+            scaled_h = int(math.floor(self._h * ratio))
+            new_h = max(2, scaled_h & ~1)  # match ffmpeg scale h=-2 rounding
             self._w = max(2, new_w)
             self._h = max(2, new_h)
         self._frame_bytes_u8 = self._w * self._h * 3
@@ -1172,12 +1173,14 @@ class FfmpegPipeReader:
         except Exception:
             maxw = 0
         if self._mode == "libplacebo" and self._use_libplacebo:
+            # Conservative args; scale as a separate filter; force packed BGR.
             s = (
                 "libplacebo=tonemapping=auto:target_primaries=bt709:target_trc=bt709:"
                 "dither=yes:deband=yes"
             )
             if maxw > 0:
-                s += f":w=min(iw\\,{maxw}):h=-2"
+                s += f",scale=w=min(iw\\,{maxw}):h=-2"
+            s += ",format=bgr24"
             return s
         if self._mode in ("libplacebo", "zscale") and (self._has_zscale and self._has_tonemap):
             # Full HDR→SDR tonemap tuned for SDR target brightness and optional desaturation.
