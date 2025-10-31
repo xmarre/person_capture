@@ -1060,6 +1060,8 @@ class FfmpegPipeReader:
         )
         self._range_in = _probe_range(path)
         self._transfer, self._primaries = _probe_colors(path)
+        # Probe Vulkan availability for libplacebo
+        self._has_vulkan = self._probe_vulkan()
         # If decoder-level downscale is active, adjust output dims to match the filter graph.
         try:
             _maxw = int(os.getenv("PC_DECODE_MAX_W", "0"))
@@ -1173,14 +1175,21 @@ class FfmpegPipeReader:
         except Exception:
             maxw = 0
         if self._mode == "libplacebo" and self._use_libplacebo:
-            # Conservative args; scale as a separate filter; force packed BGR.
-            s = (
-                "libplacebo=tonemapping=auto:target_primaries=bt709:target_trc=bt709:"
-                "dither=yes:deband=yes"
-            )
+            if self._has_vulkan:
+                # GPU path: upload → libplacebo → download → BGR
+                s = (
+                    "hwupload=extra_hw_frames=8,"
+                    "libplacebo=tonemapping=auto:target_primaries=bt709:target_trc=bt709:"
+                    "dither=yes:deband=yes,hwdownload,format=bgr24"
+                )
+            else:
+                # No Vulkan: try CPU libplacebo once; fallback code will switch to zscale if it yields no frames.
+                s = (
+                    "libplacebo=tonemapping=auto:target_primaries=bt709:target_trc=bt709:"
+                    "dither=yes:deband=yes,format=bgr24"
+                )
             if maxw > 0:
                 s += f",scale=w=min(iw\\,{maxw}):h=-2"
-            s += ",format=bgr24"
             return s
         if self._mode in ("libplacebo", "zscale") and (self._has_zscale and self._has_tonemap):
             # Full HDR→SDR tonemap tuned for SDR target brightness and optional desaturation.
@@ -1211,13 +1220,16 @@ class FfmpegPipeReader:
             except Exception:
                 pass
         t = 0.0 if self._fps <= 0 else max(0.0, idx / float(self._fps))
+        # If libplacebo was selected but there is no Vulkan, use zscale+tonemap immediately.
+        if self._mode == "libplacebo" and self._use_libplacebo and not self._has_vulkan:
+            self._log.warning("libplacebo: Vulkan not available; switching to zscale+tonemap.")
+            self._mode = "zscale"
         pix_fmt = "bgr24" if self._mode in ("libplacebo", "zscale") else "gbrpf32le"
-        cmd = [
-            self._ffmpeg,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
+        cmd = [self._ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin"]
+        # Ensure a Vulkan device exists for libplacebo
+        if self._mode == "libplacebo" and self._use_libplacebo and self._has_vulkan:
+            cmd += ["-init_hw_device", "vulkan=pl", "-filter_hw_device", "pl"]
+        cmd += [
             "-ss",
             f"{t:.6f}",
             "-i",
@@ -1228,24 +1240,55 @@ class FfmpegPipeReader:
             "0",
             "-vf",
             self._chain(),
-            "-pix_fmt",
-            pix_fmt,
             "-f",
             "rawvideo",
-            "-",
+            "-pix_fmt",
+            pix_fmt,
+            "pipe:1",
         ]
         flags = 0
         if os.name == "nt":
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        self._log.info(
+            "Pipe mode=%s vulkan=%s • out=%dx%d • fmt=%s • t=%.3fs",
+            self._mode,
+            ("on" if (self._mode == "libplacebo" and self._has_vulkan) else "off"),
+            self._w,
+            self._h,
+            pix_fmt,
+            t,
+        )
         self._proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,  # avoid PIPE back-pressure stalling the graph
             creationflags=flags,
         )
         self._pos = idx - 1
         self._arr = None
         self._pix_fmt = pix_fmt
+
+    def _probe_vulkan(self) -> bool:
+        """Return True if this ffmpeg can init a Vulkan device for filters."""
+        try:
+            r = subprocess.run(
+                [
+                    self._ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-init_hw_device",
+                    "vulkan=pl",
+                    "-filters",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=3.0,
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
 
     def _stop(self):
         # Idempotent; callers may invoke multiple times during fallback.
