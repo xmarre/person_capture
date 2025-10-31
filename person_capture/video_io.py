@@ -1233,13 +1233,13 @@ class FfmpegPipeReader:
                 # build libplacebo option string based on availability
                 lp_opts = ["tonemapping=auto"]
                 if self._lp_opts.get("gamut_mode"):
-                    lp_opts.append("gamut_mode=perceptual")
+                    lp_opts.append("gamut_mode=clip")
                 if self._lp_opts.get("target_primaries"):
                     lp_opts.append("target_primaries=bt709")
                 if self._lp_opts.get("target_trc"):
                     lp_opts.append("target_trc=bt709")
                 if self._lp_opts.get("dither"):
-                    lp_opts.append("dither=yes")
+                    lp_opts.append("dither=auto")
                 if self._lp_opts.get("deband"):
                     lp_opts.append("deband=yes")
                 lp = "libplacebo=" + ":".join(lp_opts)
@@ -1247,32 +1247,42 @@ class FfmpegPipeReader:
                     s = (
                         f"zscale=primaries=bt2020:transfer={tr}:matrix=bt2020nc,"
                         "format=p010le,hwupload=extra_hw_frames=8,"
-                        f"{lp},hwdownload"
+                        f"{lp},hwdownload,format=p010le"
                     )
                 else:
                     # SDR: use 8-bit surfaces; libplacebo still runs on GPU
-                    s = f"format=nv12,hwupload=extra_hw_frames=8,{lp},hwdownload"
+                    s = f"format=nv12,hwupload=extra_hw_frames=8,{lp},hwdownload,format=nv12"
                 # If the build lacks target_* options, convert to BT.709 on CPU after download.
                 if not (self._lp_opts.get("target_primaries") and self._lp_opts.get("target_trc")):
-                    s += ",format=gbrpf32le,zscale=transfer=bt709:primaries=bt709:matrix=bt709:dither=error_diffusion,format=bgr24"
+                    s += (
+                        ",format=gbrpf32le,"
+                        "zscale=transfer=bt709:primaries=bt709:matrix=bt709:"
+                        "rangein=pc:range=pc:dither=error_diffusion,"
+                        "format=bgr24"
+                    )
                 else:
                     s += ",format=bgr24"
             else:
                 # No Vulkan: try CPU libplacebo once; fallback code will switch to zscale if it yields no frames.
                 lp_opts = ["tonemapping=auto"]
                 if self._lp_opts.get("gamut_mode"):
-                    lp_opts.append("gamut_mode=perceptual")
+                    lp_opts.append("gamut_mode=clip")
                 if self._lp_opts.get("target_primaries"):
                     lp_opts.append("target_primaries=bt709")
                 if self._lp_opts.get("target_trc"):
                     lp_opts.append("target_trc=bt709")
                 if self._lp_opts.get("dither"):
-                    lp_opts.append("dither=yes")
+                    lp_opts.append("dither=auto")
                 if self._lp_opts.get("deband"):
                     lp_opts.append("deband=yes")
                 s = "libplacebo=" + ":".join(lp_opts)
                 if not (self._lp_opts.get("target_primaries") and self._lp_opts.get("target_trc")):
-                    s += ",format=gbrpf32le,zscale=transfer=bt709:primaries=bt709:matrix=bt709:dither=error_diffusion,format=bgr24"
+                    s += (
+                        ",format=gbrpf32le,"
+                        "zscale=transfer=bt709:primaries=bt709:matrix=bt709:"
+                        "rangein=pc:range=pc:dither=error_diffusion,"
+                        "format=bgr24"
+                    )
                 else:
                     s += ",format=bgr24"
             if maxw > 0:
