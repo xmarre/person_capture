@@ -1273,21 +1273,23 @@ class FfmpegPipeReader:
                     filters.append(f"scale_vulkan=w=min(iw\\,{maxw}):h=-2")
                     scaled_gpu = True
                 filters.append("hwdownload")
-                # If we still need downscale on CPU, do it BEFORE final format convert
-                if maxw > 0 and not scaled_gpu:
-                    filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
+
+                # Build post-download color pipeline first (to land in bgr24),
+                # then (optionally) apply CPU scale so odd widths keep working.
+                post = []
                 if not (self._lp_opts.get("target_primaries") and self._lp_opts.get("target_trc")):
-                    filters.extend([
+                    post.extend([
                         "format=gbrpf32le",
                         "zscale=transfer=bt709:primaries=bt709:matrix=bt709:rangein=pc:range=pc:dither=error_diffusion",
                         "format=bgr24",
-                        "setsar=1",
                     ])
                 else:
-                    filters.extend([
-                        "format=bgr24",
-                        "setsar=1",
-                    ])
+                    post.append("format=bgr24")
+                if maxw > 0 and not scaled_gpu:
+                    post.append(f"scale=w=min(iw\\,{maxw}):h=-2")
+                post.append("setsar=1")
+
+                filters.extend(post)
                 return ",".join(filters)
             else:
                 # No Vulkan: try CPU libplacebo once; fallback code will switch to zscale if it yields no frames.
@@ -1302,19 +1304,21 @@ class FfmpegPipeReader:
                     lp_opts.append("dither=auto")
                 if self._lp_opts.get("deband"):
                     lp_opts.append("deband=yes")
+                # Keep any CPU downscale after we’ve converted to bgr24.
                 parts = ["libplacebo=" + ":".join(lp_opts)]
-                if maxw > 0:
-                    parts.append(f"scale=w=min(iw\\,{maxw}):h=-2")
+                post = []
                 if not (self._lp_opts.get("target_primaries") and self._lp_opts.get("target_trc")):
-                    parts.extend([
+                    post.extend([
                         "format=gbrpf32le",
                         "zscale=transfer=bt709:primaries=bt709:matrix=bt709:rangein=pc:range=pc:dither=error_diffusion",
                         "format=bgr24",
-                        "setsar=1",
                     ])
                 else:
-                    parts.extend(["format=bgr24", "setsar=1"])
-                return ",".join(parts)
+                    post.append("format=bgr24")
+                if maxw > 0:
+                    post.append(f"scale=w=min(iw\\,{maxw}):h=-2")
+                post.append("setsar=1")
+                return ",".join(parts + post)
         if self._mode in ("libplacebo", "zscale") and (self._has_zscale and self._has_tonemap):
             # Full HDR→SDR tonemap tuned for SDR target brightness and optional desaturation.
             s = (
