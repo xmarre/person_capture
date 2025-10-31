@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import subprocess, json, os, sys, math, functools, shutil, threading
+import subprocess, json, os, sys, math, functools, shutil, threading, re
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from pathlib import Path
@@ -1045,6 +1045,7 @@ class FfmpegPipeReader:
         self._arr: Optional[np.ndarray] = None
         self._stderr_thread = None
         self._stderr_tail: list[str] = []
+        self._lp_opts: dict[str, bool] = {}
         self._filters = self._list_filters()
         self._use_libplacebo = ("libplacebo" in self._filters)
         self._has_zscale = ("zscale" in self._filters)
@@ -1064,6 +1065,9 @@ class FfmpegPipeReader:
         self._transfer, self._primaries = _probe_colors(path)
         # Probe Vulkan availability for libplacebo
         self._has_vulkan = self._probe_vulkan()
+        # Probe which libplacebo options exist on this ffmpeg build
+        if self._use_libplacebo:
+            self._lp_opts = self._probe_libplacebo_opts()
         # If decoder-level downscale is active, adjust output dims to match the filter graph.
         try:
             _maxw = int(os.getenv("PC_DECODE_MAX_W", "0"))
@@ -1181,6 +1185,40 @@ class FfmpegPipeReader:
         # Already on scale: no more fallbacks
         return False
 
+    def _probe_libplacebo_opts(self) -> dict[str, bool]:
+        """
+        Ask ffmpeg which options the libplacebo filter supports.
+        Some Windows builds lack target_primaries/target_trc/gamut_mode.
+        """
+        out = ""
+        try:
+            r = subprocess.run(
+                [self._ffmpeg, "-hide_banner", "-h", "filter=libplacebo"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=3.0,
+            )
+            out = r.stdout or ""
+        except Exception:
+            return {}
+        # Make a quick lookup table of option names present in help output
+        found = {}
+        for name in (
+            "tonemapping",
+            "gamut_mode",
+            "target_primaries",
+            "target_trc",
+            "dither",
+            "deband",
+        ):
+            # match whole words like "  target_primaries  " in the help text
+            found[name] = bool(re.search(rf"(^|\s){re.escape(name)}(\s|=)", out))
+        # Always assume tonemapping is there; older builds still have it
+        if not found.get("tonemapping"):
+            found["tonemapping"] = True
+        return found
+
     def _chain(self) -> str:
         try:
             maxw = int(os.getenv("PC_DECODE_MAX_W", "0"))
@@ -1188,35 +1226,55 @@ class FfmpegPipeReader:
             maxw = 0
         if self._mode == "libplacebo" and self._use_libplacebo:
             if self._has_vulkan:
-                # Normalize HDR signaling + bit-depth BEFORE uploading. Many Windows builds
-                # refuse to upload odd formats directly. For HDR10/HLG sources: set BT.2020/PQ/HLG,
-                # convert to 10-bit (p010le), then hwupload → libplacebo → hwdownload.
+                # Normalize HDR signaling + bit-depth BEFORE uploading.
+                # For HDR10/HLG sources: set BT.2020 + correct transfer, convert to p010le,
+                # then hwupload → libplacebo (GPU) → hwdownload.
                 tr = (self._transfer or "").lower()
+                # build libplacebo option string based on availability
+                lp_opts = ["tonemapping=auto"]
+                if self._lp_opts.get("gamut_mode"):
+                    lp_opts.append("gamut_mode=perceptual")
+                if self._lp_opts.get("target_primaries"):
+                    lp_opts.append("target_primaries=bt709")
+                if self._lp_opts.get("target_trc"):
+                    lp_opts.append("target_trc=bt709")
+                if self._lp_opts.get("dither"):
+                    lp_opts.append("dither=yes")
+                if self._lp_opts.get("deband"):
+                    lp_opts.append("deband=yes")
+                lp = "libplacebo=" + ":".join(lp_opts)
                 if tr in ("smpte2084", "arib-std-b67"):  # HDR10 / HLG
-                    # Ensure correct primaries/matrix/transfer and 10-bit surfaces on GPU
                     s = (
                         f"zscale=primaries=bt2020:transfer={tr}:matrix=bt2020nc,"
-                        "format=p010le,"
-                        "hwupload=extra_hw_frames=8,"
-                        "libplacebo=tonemapping=auto:gamut_mode=perceptual:target_primaries=bt709:target_trc=bt709:"
-                        "dither=yes:deband=yes,"
-                        "hwdownload,format=bgr24"
+                        "format=p010le,hwupload=extra_hw_frames=8,"
+                        f"{lp},hwdownload"
                     )
                 else:
-                    # SDR: use 8-bit surfaces; libplacebo still runs on GPU.
-                    s = (
-                        "format=nv12,"
-                        "hwupload=extra_hw_frames=8,"
-                        "libplacebo=tonemapping=auto:gamut_mode=perceptual:target_primaries=bt709:target_trc=bt709:"
-                        "dither=yes:deband=yes,"
-                        "hwdownload,format=bgr24"
-                    )
+                    # SDR: use 8-bit surfaces; libplacebo still runs on GPU
+                    s = f"format=nv12,hwupload=extra_hw_frames=8,{lp},hwdownload"
+                # If the build lacks target_* options, convert to BT.709 on CPU after download.
+                if not (self._lp_opts.get("target_primaries") and self._lp_opts.get("target_trc")):
+                    s += ",format=gbrpf32le,zscale=transfer=bt709:primaries=bt709:matrix=bt709:dither=error_diffusion,format=bgr24"
+                else:
+                    s += ",format=bgr24"
             else:
                 # No Vulkan: try CPU libplacebo once; fallback code will switch to zscale if it yields no frames.
-                s = (
-                    "libplacebo=tonemapping=auto:gamut_mode=perceptual:target_primaries=bt709:target_trc=bt709:"
-                    "dither=yes:deband=yes,format=bgr24"
-                )
+                lp_opts = ["tonemapping=auto"]
+                if self._lp_opts.get("gamut_mode"):
+                    lp_opts.append("gamut_mode=perceptual")
+                if self._lp_opts.get("target_primaries"):
+                    lp_opts.append("target_primaries=bt709")
+                if self._lp_opts.get("target_trc"):
+                    lp_opts.append("target_trc=bt709")
+                if self._lp_opts.get("dither"):
+                    lp_opts.append("dither=yes")
+                if self._lp_opts.get("deband"):
+                    lp_opts.append("deband=yes")
+                s = "libplacebo=" + ":".join(lp_opts)
+                if not (self._lp_opts.get("target_primaries") and self._lp_opts.get("target_trc")):
+                    s += ",format=gbrpf32le,zscale=transfer=bt709:primaries=bt709:matrix=bt709:dither=error_diffusion,format=bgr24"
+                else:
+                    s += ",format=bgr24"
             if maxw > 0:
                 s += f",scale=w=min(iw\\,{maxw}):h=-2"
             return s
@@ -1227,14 +1285,14 @@ class FfmpegPipeReader:
                 "zscale=transfer=linear:npl=1000,format=gbrpf32le,"
                 f"tonemap=tonemap=mobius:param={self._tm_param}:desat={self._tm_desat}:peak={self._sdr_nits},"
                 "zscale=transfer=bt709:primaries=bt709:matrix=bt709:dither=error_diffusion,"
-                f"zscale=rangein={self._range_in}:range=full"
+                f"zscale=rangein={'pc' if (self._range_in or '').lower() in ('pc','full') else 'tv'}:range=pc"
             )
             if maxw > 0:
                 s += f",scale=w=min(iw\\,{maxw}):h=-2"
             s += ",format=bgr24"
             return s
         # Fallback path: decode to float RGB (planar), expand to full-range, tonemap in Python.
-        range_in = "pc" if self._range_in == "full" else "tv"
+        range_in = "pc" if (self._range_in or "").lower() in ("pc", "full") else "tv"
         mat = "bt2020nc" if self._primaries == "bt2020" else "bt709"
         s = f"scale=in_color_matrix={mat}:in_range={range_in}:out_range=pc"
         if maxw > 0:
@@ -1287,7 +1345,7 @@ class FfmpegPipeReader:
         self._proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,  # drain to avoid PIPE back-pressure and capture errors
+            stderr=subprocess.PIPE,  # drain & capture errors for fallback logging
             creationflags=flags,
         )
         self._stderr_tail = []
