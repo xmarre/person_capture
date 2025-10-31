@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import subprocess, json, os, sys, math, functools, shutil
+import subprocess, json, os, sys, math, functools, shutil, threading
 from dataclasses import dataclass
 from typing import Optional, Tuple
 from pathlib import Path
@@ -1043,6 +1043,8 @@ class FfmpegPipeReader:
         self._pos = -1
         self._proc = None
         self._arr: Optional[np.ndarray] = None
+        self._stderr_thread = None
+        self._stderr_tail: list[str] = []
         self._filters = self._list_filters()
         self._use_libplacebo = ("libplacebo" in self._filters)
         self._has_zscale = ("zscale" in self._filters)
@@ -1141,7 +1143,16 @@ class FfmpegPipeReader:
         """
         # From libplacebo → zscale (once), then → scale (once)
         if self._mode == "libplacebo":
+            def _log_tail() -> None:
+                tail = getattr(self, "_stderr_tail", [])[-5:]
+                if tail:
+                    self._log.warning(
+                        "HDR: libplacebo yielded no frames; stderr tail: %s",
+                        " | ".join(tail),
+                    )
+
             if (self._has_zscale and self._has_tonemap) and not self._tried_zscale:
+                _log_tail()
                 self._log.warning("HDR: libplacebo yielded no frames; falling back to zscale+tonemap.")
                 self._stop()
                 self._mode = "zscale"
@@ -1149,6 +1160,7 @@ class FfmpegPipeReader:
                 self._start(max(self._pos + 1, 0))
                 return True
             if self._has_scale and not self._tried_scale:
+                _log_tail()
                 self._log.warning("HDR: libplacebo yielded no frames; falling back to linear scale.")
                 self._stop()
                 self._mode = "scale"
@@ -1176,16 +1188,33 @@ class FfmpegPipeReader:
             maxw = 0
         if self._mode == "libplacebo" and self._use_libplacebo:
             if self._has_vulkan:
-                # GPU path: upload → libplacebo → download → BGR
-                s = (
-                    "hwupload=extra_hw_frames=8,"
-                    "libplacebo=tonemapping=auto:target_primaries=bt709:target_trc=bt709:"
-                    "dither=yes:deband=yes,hwdownload,format=bgr24"
-                )
+                # Normalize HDR signaling + bit-depth BEFORE uploading. Many Windows builds
+                # refuse to upload odd formats directly. For HDR10/HLG sources: set BT.2020/PQ/HLG,
+                # convert to 10-bit (p010le), then hwupload → libplacebo → hwdownload.
+                tr = (self._transfer or "").lower()
+                if tr in ("smpte2084", "arib-std-b67"):  # HDR10 / HLG
+                    # Ensure correct primaries/matrix/transfer and 10-bit surfaces on GPU
+                    s = (
+                        f"zscale=primaries=bt2020:transfer={tr}:matrix=bt2020nc,"
+                        "format=p010le,"
+                        "hwupload=extra_hw_frames=8,"
+                        "libplacebo=tonemapping=auto:gamut_mode=perceptual:target_primaries=bt709:target_trc=bt709:"
+                        "dither=yes:deband=yes,"
+                        "hwdownload,format=bgr24"
+                    )
+                else:
+                    # SDR: use 8-bit surfaces; libplacebo still runs on GPU.
+                    s = (
+                        "format=nv12,"
+                        "hwupload=extra_hw_frames=8,"
+                        "libplacebo=tonemapping=auto:gamut_mode=perceptual:target_primaries=bt709:target_trc=bt709:"
+                        "dither=yes:deband=yes,"
+                        "hwdownload,format=bgr24"
+                    )
             else:
                 # No Vulkan: try CPU libplacebo once; fallback code will switch to zscale if it yields no frames.
                 s = (
-                    "libplacebo=tonemapping=auto:target_primaries=bt709:target_trc=bt709:"
+                    "libplacebo=tonemapping=auto:gamut_mode=perceptual:target_primaries=bt709:target_trc=bt709:"
                     "dither=yes:deband=yes,format=bgr24"
                 )
             if maxw > 0:
@@ -1215,10 +1244,7 @@ class FfmpegPipeReader:
 
     def _start(self, idx: int):
         if self._proc:
-            try:
-                self._proc.kill()
-            except Exception:
-                pass
+            self._stop()
         t = 0.0 if self._fps <= 0 else max(0.0, idx / float(self._fps))
         # If libplacebo was selected but there is no Vulkan, use zscale+tonemap immediately.
         if self._mode == "libplacebo" and self._use_libplacebo and not self._has_vulkan:
@@ -1261,9 +1287,28 @@ class FfmpegPipeReader:
         self._proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,  # avoid PIPE back-pressure stalling the graph
+            stderr=subprocess.PIPE,  # drain to avoid PIPE back-pressure and capture errors
             creationflags=flags,
         )
+        self._stderr_tail = []
+
+        def _drain() -> None:
+            try:
+                if not self._proc or not self._proc.stderr:
+                    return
+                for line in iter(self._proc.stderr.readline, b""):
+                    if not line:
+                        break
+                    ln = line.decode("utf-8", "ignore").strip()
+                    if ln:
+                        self._stderr_tail.append(ln)
+                        if len(self._stderr_tail) > 50:
+                            self._stderr_tail.pop(0)
+            except Exception:
+                pass
+
+        self._stderr_thread = threading.Thread(target=_drain, daemon=True)
+        self._stderr_thread.start()
         self._pos = idx - 1
         self._arr = None
         self._pix_fmt = pix_fmt
@@ -1302,6 +1347,18 @@ class FfmpegPipeReader:
                 self._proc.stdout.close()
         except Exception:
             pass
+        try:
+            if self._proc and self._proc.stderr:
+                self._proc.stderr.close()
+        except Exception:
+            pass
+        try:
+            t = getattr(self, "_stderr_thread", None)
+            if t and t.is_alive():
+                t.join(timeout=0.1)
+        except Exception:
+            pass
+        self._stderr_thread = None
         self._proc = None
         self._arr = None
 
