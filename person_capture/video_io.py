@@ -1057,18 +1057,24 @@ class FfmpegPipeReader:
         # Helpful logging for debugging external ffmpeg selection
         self._log.info("HDR ffmpeg binary: %s", self._ffmpeg)
         self._log.info(
-            "HDR filters: libplacebo=%s zscale=%s tonemap=%s",
+            "HDR filters: libplacebo=%s zscale=%s tonemap=%s scale_vulkan=%s",
             self._use_libplacebo,
             self._has_zscale,
             self._has_tonemap,
+            self._has_scale_vulkan,
         )
         self._range_in = _probe_range(path)
         self._transfer, self._primaries = _probe_colors(path)
         # Probe Vulkan availability for libplacebo
+        self._range_in_tag = "pc" if (self._range_in or "").lower() in ("pc", "full") else "tv"
         self._has_vulkan = self._probe_vulkan()
         # Probe which libplacebo options exist on this ffmpeg build
         if self._use_libplacebo:
             self._lp_opts = self._probe_libplacebo_opts()
+            self._log.debug(
+                "libplacebo opts enabled: %s",
+                [k for k, v in self._lp_opts.items() if v],
+            )
         # If decoder-level downscale is active, adjust output dims to match the filter graph.
         try:
             _maxw_req = int(os.getenv("PC_DECODE_MAX_W", "0"))
@@ -1257,20 +1263,25 @@ class FfmpegPipeReader:
                     lp_opts.append("deband=yes")
                 lp = "libplacebo=" + ":".join(lp_opts)
                 filters: list[str] = []
+                # Always expand to full-range before upload so libplacebo/Vulkan gets PC range.
+                # Do this with zscale first to avoid range-mismatch EINVAL from libplacebo.
                 if tr in ("smpte2084", "arib-std-b67"):
-                    filters.extend(
-                        [
-                            f"zscale=primaries=bt2020:transfer={tr}:matrix=bt2020nc",
-                            "format=p010le",
-                            "hwupload=extra_hw_frames=8",
-                        ]
+                    filters.append(
+                        f"zscale=primaries=bt2020:transfer={tr}:matrix=bt2020nc:rangein={self._range_in_tag}:range=pc"
                     )
+                    filters.extend(["format=p010le", "hwupload=extra_hw_frames=8"])
                 else:
+                    if self._range_in_tag != "pc":
+                        filters.append("zscale=rangein=tv:range=pc")
                     filters.extend(["format=nv12", "hwupload=extra_hw_frames=8"])
                 filters.append(lp)
                 scaled_gpu = False
                 if maxw > 0 and self._has_scale_vulkan:
-                    filters.append(f"scale_vulkan=w=min(iw\\,{maxw}):h=-2")
+                    # NV12/p010 Vulkan scalers require even widths; clamp odd caps here.
+                    gpuw = maxw & ~1
+                    if gpuw <= 0:
+                        gpuw = 2
+                    filters.append(f"scale_vulkan=w=min(iw\\,{gpuw}):h=-2")
                     scaled_gpu = True
                 filters.append("hwdownload")
 
@@ -1305,7 +1316,11 @@ class FfmpegPipeReader:
                 if self._lp_opts.get("deband"):
                     lp_opts.append("deband=yes")
                 # Keep any CPU downscale after we’ve converted to bgr24.
-                parts = ["libplacebo=" + ":".join(lp_opts)]
+                parts: list[str] = []
+                # If SDR limited, expand to PC before running CPU libplacebo to keep behavior consistent.
+                if self._range_in_tag != "pc":
+                    parts.append("zscale=rangein=tv:range=pc")
+                parts.append("libplacebo=" + ":".join(lp_opts))
                 post = []
                 if not (self._lp_opts.get("target_primaries") and self._lp_opts.get("target_trc")):
                     post.extend([
@@ -1350,7 +1365,9 @@ class FfmpegPipeReader:
             self._log.warning("libplacebo: Vulkan not available; switching to zscale+tonemap.")
             self._mode = "zscale"
         pix_fmt = "bgr24" if self._mode in ("libplacebo", "zscale") else "gbrpf32le"
-        cmd = [self._ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin"]
+        # Turn up logging while attempting libplacebo so stderr_tail shows the true cause.
+        ll = "warning" if self._mode == "libplacebo" else "error"
+        cmd = [self._ffmpeg, "-hide_banner", "-loglevel", ll, "-nostdin"]
         # Ensure a Vulkan device exists for libplacebo
         if self._mode == "libplacebo" and self._use_libplacebo and self._has_vulkan:
             cmd += ["-init_hw_device", "vulkan=pl", "-filter_hw_device", "pl"]
