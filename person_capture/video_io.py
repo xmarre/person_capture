@@ -1065,8 +1065,9 @@ class FfmpegPipeReader:
         )
         self._range_in = _probe_range(path)
         self._transfer, self._primaries = _probe_colors(path)
-        # Probe Vulkan availability for libplacebo
+        # Cache a normalized tag for range decisions in filters
         self._range_in_tag = "pc" if (self._range_in or "").lower() in ("pc", "full") else "tv"
+        # Probe Vulkan availability for libplacebo
         self._has_vulkan = self._probe_vulkan()
         # Probe which libplacebo options exist on this ffmpeg build
         if self._use_libplacebo:
@@ -1109,6 +1110,7 @@ class FfmpegPipeReader:
         self._frame_bytes_f32 = self._w * self._h * 3 * 4
         self._pix_fmt = "bgr24"
         # Tunables (env overrides). Defaults align with MPC VR feel.
+        self._tm_algo = (os.getenv("PC_TM_ALGO", "bt2390") or "bt2390").lower()
         self._sdr_nits = float(os.getenv("PC_SDR_NITS", "125"))       # 80–200 typical
         self._tm_desat = float(os.getenv("PC_TM_DESAT", "0.25"))      # 0=keep chroma, 1=desaturate more
         self._tm_param = float(os.getenv("PC_TM_PARAM", "0.40"))      # Mobius curve softness
@@ -1231,10 +1233,16 @@ class FfmpegPipeReader:
         found: dict[str, bool] = {}
         for name in (
             "tonemapping",
-            "gamut_mode",
+            # modern names
+            "colorspace",
+            "color_primaries",
+            "color_trc",
+            "range",
+            "dithering",          # modern
+            # legacy names still seen in some builds
             "target_primaries",
             "target_trc",
-            "dither",
+            "dither",             # legacy
             "deband",
         ):
             # match whole words like "  target_primaries  " in the help text
@@ -1250,17 +1258,38 @@ class FfmpegPipeReader:
             if self._has_vulkan:
                 # Normalize HDR signaling + bit-depth BEFORE uploading (some builds balk on odd formats).
                 tr = (self._transfer or "").lower()
-                lp_opts = ["tonemapping=auto"]
-                if self._lp_opts.get("gamut_mode"):
-                    lp_opts.append("gamut_mode=clip")
+                # Can libplacebo itself output BT.709 with full-range? (modern OR legacy controls)
+                has_lp_bt709 = (
+                    (self._lp_opts.get("target_primaries") and self._lp_opts.get("target_trc"))
+                    or (
+                        self._lp_opts.get("colorspace")
+                        and self._lp_opts.get("color_primaries")
+                        and self._lp_opts.get("color_trc")
+                        and self._lp_opts.get("range")
+                    )
+                )
+                # Conservative libplacebo args (widely supported across builds)
+                # libplacebo expects "bt.2390" (with a dot)
+                _tm = "bt.2390" if self._tm_algo in ("bt2390", "bt_2390", "bt.2390") else self._tm_algo
+                lp_opts = [f"tonemapping={_tm}"]
+                # Prefer forcing output bt709 directly in libplacebo if those keys exist
                 if self._lp_opts.get("target_primaries"):
                     lp_opts.append("target_primaries=bt709")
                 if self._lp_opts.get("target_trc"):
                     lp_opts.append("target_trc=bt709")
-                if self._lp_opts.get("dither"):
-                    lp_opts.append("dither=auto")
-                if self._lp_opts.get("deband"):
-                    lp_opts.append("deband=yes")
+                # Modern names preferred; use them if present
+                if self._lp_opts.get("colorspace"):
+                    lp_opts.append("colorspace=bt709")
+                if self._lp_opts.get("color_primaries"):
+                    lp_opts.append("color_primaries=bt709")
+                if self._lp_opts.get("color_trc"):
+                    lp_opts.append("color_trc=bt709")
+                if self._lp_opts.get("range"):
+                    lp_opts.append("range=pc")
+                if self._lp_opts.get("dithering"):
+                    lp_opts.append("dithering=white")
+                elif self._lp_opts.get("dither"):
+                    lp_opts.append("dither=yes")
                 lp = "libplacebo=" + ":".join(lp_opts)
                 filters: list[str] = []
                 # Always expand to full-range before upload so libplacebo/Vulkan gets PC range.
@@ -1288,7 +1317,7 @@ class FfmpegPipeReader:
                 # Build post-download color pipeline first (to land in bgr24),
                 # then (optionally) apply CPU scale so odd widths keep working.
                 post = []
-                if not (self._lp_opts.get("target_primaries") and self._lp_opts.get("target_trc")):
+                if not has_lp_bt709:
                     post.extend([
                         "format=gbrpf32le",
                         "zscale=transfer=bt709:primaries=bt709:matrix=bt709:rangein=pc:range=pc:dither=error_diffusion",
@@ -1304,17 +1333,35 @@ class FfmpegPipeReader:
                 return ",".join(filters)
             else:
                 # No Vulkan: try CPU libplacebo once; fallback code will switch to zscale if it yields no frames.
-                lp_opts = ["tonemapping=auto"]
-                if self._lp_opts.get("gamut_mode"):
-                    lp_opts.append("gamut_mode=clip")
+                # libplacebo expects "bt.2390" (with a dot)
+                _tm = "bt.2390" if self._tm_algo in ("bt2390", "bt_2390", "bt.2390") else self._tm_algo
+                lp_opts = [f"tonemapping={_tm}"]
                 if self._lp_opts.get("target_primaries"):
                     lp_opts.append("target_primaries=bt709")
                 if self._lp_opts.get("target_trc"):
                     lp_opts.append("target_trc=bt709")
-                if self._lp_opts.get("dither"):
-                    lp_opts.append("dither=auto")
-                if self._lp_opts.get("deband"):
-                    lp_opts.append("deband=yes")
+                # Can libplacebo itself output BT.709 with full-range? (modern OR legacy controls)
+                has_lp_bt709 = (
+                    (self._lp_opts.get("target_primaries") and self._lp_opts.get("target_trc"))
+                    or (
+                        self._lp_opts.get("colorspace")
+                        and self._lp_opts.get("color_primaries")
+                        and self._lp_opts.get("color_trc")
+                        and self._lp_opts.get("range")
+                    )
+                )
+                if self._lp_opts.get("colorspace"):
+                    lp_opts.append("colorspace=bt709")
+                if self._lp_opts.get("color_primaries"):
+                    lp_opts.append("color_primaries=bt709")
+                if self._lp_opts.get("color_trc"):
+                    lp_opts.append("color_trc=bt709")
+                if self._lp_opts.get("range"):
+                    lp_opts.append("range=pc")
+                if self._lp_opts.get("dithering"):
+                    lp_opts.append("dithering=white")
+                elif self._lp_opts.get("dither"):
+                    lp_opts.append("dither=yes")
                 # Keep any CPU downscale after we’ve converted to bgr24.
                 parts: list[str] = []
                 # If SDR limited, expand to PC before running CPU libplacebo to keep behavior consistent.
@@ -1322,7 +1369,7 @@ class FfmpegPipeReader:
                     parts.append("zscale=rangein=tv:range=pc")
                 parts.append("libplacebo=" + ":".join(lp_opts))
                 post = []
-                if not (self._lp_opts.get("target_primaries") and self._lp_opts.get("target_trc")):
+                if not has_lp_bt709:
                     post.extend([
                         "format=gbrpf32le",
                         "zscale=transfer=bt709:primaries=bt709:matrix=bt709:rangein=pc:range=pc:dither=error_diffusion",
@@ -1366,7 +1413,7 @@ class FfmpegPipeReader:
             self._mode = "zscale"
         pix_fmt = "bgr24" if self._mode in ("libplacebo", "zscale") else "gbrpf32le"
         # Turn up logging while attempting libplacebo so stderr_tail shows the true cause.
-        ll = "warning" if self._mode == "libplacebo" else "error"
+        ll = "info" if self._mode == "libplacebo" else "error"
         cmd = [self._ffmpeg, "-hide_banner", "-loglevel", ll, "-nostdin"]
         # Ensure a Vulkan device exists for libplacebo
         if self._mode == "libplacebo" and self._use_libplacebo and self._has_vulkan:
@@ -1418,7 +1465,7 @@ class FfmpegPipeReader:
                     ln = line.decode("utf-8", "ignore").strip()
                     if ln:
                         self._stderr_tail.append(ln)
-                        if len(self._stderr_tail) > 50:
+                        if len(self._stderr_tail) > 200:
                             self._stderr_tail.pop(0)
             except Exception:
                 pass
