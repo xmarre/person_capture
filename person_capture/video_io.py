@@ -1110,6 +1110,9 @@ class FfmpegPipeReader:
         self._frame_bytes_f32 = self._w * self._h * 3 * 4
         self._pix_fmt = "bgr24"
         # Tunables (env overrides). Defaults align with MPC VR feel.
+        # Strict LP mode = no CPU/zscale fallback. We'll try one minimal LP chain retry, then error.
+        self._strict_lp = bool(int(os.getenv("PC_STRICT_LIBPLACEBO", "1")))
+        self._lp_minimal = False
         self._tm_algo = (os.getenv("PC_TM_ALGO", "bt2390") or "bt2390").lower()
         self._sdr_nits = float(os.getenv("PC_SDR_NITS", "125"))       # 80–200 typical
         self._tm_desat = float(os.getenv("PC_TM_DESAT", "0.25"))      # 0=keep chroma, 1=desaturate more
@@ -1121,18 +1124,25 @@ class FfmpegPipeReader:
             elif os.getenv("PC_FORCE_SCALE", ""):
                 self._force_mode = "scale"
         # Track the currently active filter mode so we can fall back if needed.
-        self._mode = (
-            "libplacebo"
-            if self._use_libplacebo
-            else ("zscale" if (self._has_zscale and self._has_tonemap) else "scale")
-        )
-        if self._force_mode == "libplacebo" and self._use_libplacebo:
+        if self._strict_lp:
+            if not self._use_libplacebo:
+                raise RuntimeError(
+                    "Strict libplacebo mode is enabled but ffmpeg/libplacebo is unavailable"
+                )
             self._mode = "libplacebo"
-        elif self._force_mode == "zscale" and (self._has_zscale and self._has_tonemap):
-            self._mode = "zscale"
-        elif self._force_mode == "scale" and self._has_scale:
-            self._mode = "scale"
-        # Stage-specific fallback flags so we can attempt zscale, then scale.
+        else:
+            self._mode = (
+                "libplacebo"
+                if self._use_libplacebo
+                else ("zscale" if (self._has_zscale and self._has_tonemap) else "scale")
+            )
+            if self._force_mode == "libplacebo" and self._use_libplacebo:
+                self._mode = "libplacebo"
+            elif self._force_mode == "zscale" and (self._has_zscale and self._has_tonemap):
+                self._mode = "zscale"
+            elif self._force_mode == "scale" and self._has_scale:
+                self._mode = "scale"
+        # Stage-specific fallback flags so we can attempt zscale, then scale (non-strict mode).
         self._tried_zscale = False
         self._tried_scale = False
         self._start(0)
@@ -1168,22 +1178,30 @@ class FfmpegPipeReader:
     # --- Fallback helper used if a chain produces no frames (e.g., Vulkan init issues) ---
     def try_fallback_chain(self) -> bool:
         """
-        Attempt staged fallback:
-        libplacebo → zscale+tonemap → linear scale.
+        Attempt staged fallback.
+        In strict LP mode we retry once with a minimal libplacebo chain, then raise.
+        Non-strict mode continues to fall back to zscale and linear scale.
         Returns True if we switched chains; False if no further fallback exists.
         """
-        # From libplacebo → zscale (once), then → scale (once)
         if self._mode == "libplacebo":
-            def _log_tail() -> None:
+            def _log_tail(prefix: str) -> None:
                 tail = getattr(self, "_stderr_tail", [])[-5:]
                 if tail:
-                    self._log.warning(
-                        "HDR: libplacebo yielded no frames; stderr tail: %s",
-                        " | ".join(tail),
-                    )
+                    self._log.warning("%s stderr tail: %s", prefix, " | ".join(tail))
 
+            if self._use_libplacebo and not getattr(self, "_lp_minimal", False):
+                _log_tail("libplacebo emitted no frames;")
+                self._log.warning("libplacebo produced no frames; retrying with MINIMAL LP chain.")
+                self._lp_minimal = True
+                self._start(max(self._pos + 1, 0))
+                return True
+            if self._strict_lp:
+                err = " | ".join(getattr(self, "_stderr_tail", [])[-15:]) or "n/a"
+                raise RuntimeError(
+                    f"libplacebo(Vulkan) produced no frames even with minimal chain. stderr tail: {err}"
+                )
             if (self._has_zscale and self._has_tonemap) and not self._tried_zscale:
-                _log_tail()
+                _log_tail("HDR: libplacebo yielded no frames;")
                 self._log.warning("HDR: libplacebo yielded no frames; falling back to zscale+tonemap.")
                 self._stop()
                 self._mode = "zscale"
@@ -1191,7 +1209,7 @@ class FfmpegPipeReader:
                 self._start(max(self._pos + 1, 0))
                 return True
             if self._has_scale and not self._tried_scale:
-                _log_tail()
+                _log_tail("HDR: libplacebo yielded no frames;")
                 self._log.warning("HDR: libplacebo yielded no frames; falling back to linear scale.")
                 self._stop()
                 self._mode = "scale"
@@ -1199,7 +1217,6 @@ class FfmpegPipeReader:
                 self._start(max(self._pos + 1, 0))
                 return True
             return False
-        # From zscale → scale (once)
         if self._mode == "zscale":
             if self._has_scale and not self._tried_scale:
                 self._log.warning("HDR: zscale+tonemap yielded no frames; falling back to linear scale.")
@@ -1209,7 +1226,6 @@ class FfmpegPipeReader:
                 self._start(max(self._pos + 1, 0))
                 return True
             return False
-        # Already on scale: no more fallbacks
         return False
 
     def _probe_libplacebo_opts(self) -> dict[str, bool]:
@@ -1256,131 +1272,87 @@ class FfmpegPipeReader:
         maxw = int(getattr(self, "_maxw", 0))
         if self._mode == "libplacebo" and self._use_libplacebo:
             if self._has_vulkan:
-                # Normalize HDR signaling + bit-depth BEFORE uploading (some builds balk on odd formats).
                 tr = (self._transfer or "").lower()
-                # Can libplacebo itself output BT.709 with full-range? (modern OR legacy controls)
-                has_lp_bt709 = (
-                    (self._lp_opts.get("target_primaries") and self._lp_opts.get("target_trc"))
-                    or (
-                        self._lp_opts.get("colorspace")
-                        and self._lp_opts.get("color_primaries")
-                        and self._lp_opts.get("color_trc")
-                        and self._lp_opts.get("range")
-                    )
-                )
-                # Conservative libplacebo args (widely supported across builds)
-                # libplacebo expects "bt.2390" (with a dot)
+                surf = "p010le" if tr in ("smpte2084", "arib-std-b67") else "nv12"
                 _tm = "bt.2390" if self._tm_algo in ("bt2390", "bt_2390", "bt.2390") else self._tm_algo
-                lp_opts = [f"tonemapping={_tm}"]
-                # Prefer forcing output bt709 directly in libplacebo if those keys exist
-                if self._lp_opts.get("target_primaries"):
-                    lp_opts.append("target_primaries=bt709")
-                if self._lp_opts.get("target_trc"):
-                    lp_opts.append("target_trc=bt709")
-                # Modern names preferred; use them if present
+                if getattr(self, "_lp_minimal", False):
+                    filters = [
+                        f"format={surf}",
+                        "hwupload=extra_hw_frames=8",
+                        f"libplacebo=tonemapping={_tm}",
+                        "hwdownload",
+                        "format=bgr24",
+                    ]
+                    if maxw > 0:
+                        filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
+                    filters.append("setsar=1")
+                    return ",".join(filters)
+                lp_args = [f"tonemapping={_tm}"]
                 if self._lp_opts.get("colorspace"):
-                    lp_opts.append("colorspace=bt709")
+                    lp_args.append("colorspace=bt709")
                 if self._lp_opts.get("color_primaries"):
-                    lp_opts.append("color_primaries=bt709")
+                    lp_args.append("color_primaries=bt709")
                 if self._lp_opts.get("color_trc"):
-                    lp_opts.append("color_trc=bt709")
+                    lp_args.append("color_trc=bt709")
                 if self._lp_opts.get("range"):
-                    lp_opts.append("range=pc")
+                    lp_args.append("range=pc")
+                if (not self._lp_opts.get("colorspace")) and self._lp_opts.get("target_primaries"):
+                    lp_args.append("target_primaries=bt709")
+                if (not self._lp_opts.get("color_trc")) and self._lp_opts.get("target_trc"):
+                    lp_args.append("target_trc=bt709")
                 if self._lp_opts.get("dithering"):
-                    lp_opts.append("dithering=white")
+                    lp_args.append("dithering=white")
                 elif self._lp_opts.get("dither"):
-                    lp_opts.append("dither=yes")
-                lp = "libplacebo=" + ":".join(lp_opts)
-                filters: list[str] = []
-                # Always expand to full-range before upload so libplacebo/Vulkan gets PC range.
-                # Do this with zscale first to avoid range-mismatch EINVAL from libplacebo.
-                if tr in ("smpte2084", "arib-std-b67"):
-                    filters.append(
-                        f"zscale=primaries=bt2020:transfer={tr}:matrix=bt2020nc:rangein={self._range_in_tag}:range=pc"
-                    )
-                    filters.extend(["format=p010le", "hwupload=extra_hw_frames=8"])
-                else:
-                    if self._range_in_tag != "pc":
-                        filters.append("zscale=rangein=tv:range=pc")
-                    filters.extend(["format=nv12", "hwupload=extra_hw_frames=8"])
-                filters.append(lp)
+                    lp_args.append("dither=yes")
+                filters = [f"format={surf}", "hwupload=extra_hw_frames=8", "libplacebo=" + ":".join(lp_args)]
                 scaled_gpu = False
                 if maxw > 0 and self._has_scale_vulkan:
-                    # NV12/p010 Vulkan scalers require even widths; clamp odd caps here.
-                    gpuw = maxw & ~1
-                    if gpuw <= 0:
-                        gpuw = 2
+                    gpuw = max(maxw & ~1, 2)
                     filters.append(f"scale_vulkan=w=min(iw\\,{gpuw}):h=-2")
                     scaled_gpu = True
-                filters.append("hwdownload")
-
-                # Build post-download color pipeline first (to land in bgr24),
-                # then (optionally) apply CPU scale so odd widths keep working.
-                post = []
-                if not has_lp_bt709:
-                    post.extend([
-                        "format=gbrpf32le",
-                        "zscale=transfer=bt709:primaries=bt709:matrix=bt709:rangein=pc:range=pc:dither=error_diffusion",
-                        "format=bgr24",
-                    ])
-                else:
-                    post.append("format=bgr24")
+                filters.extend(["hwdownload", "format=bgr24"])
                 if maxw > 0 and not scaled_gpu:
-                    post.append(f"scale=w=min(iw\\,{maxw}):h=-2")
-                post.append("setsar=1")
-
-                filters.extend(post)
+                    filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
+                filters.append("setsar=1")
                 return ",".join(filters)
-            else:
-                # No Vulkan: try CPU libplacebo once; fallback code will switch to zscale if it yields no frames.
-                # libplacebo expects "bt.2390" (with a dot)
-                _tm = "bt.2390" if self._tm_algo in ("bt2390", "bt_2390", "bt.2390") else self._tm_algo
-                lp_opts = [f"tonemapping={_tm}"]
-                if self._lp_opts.get("target_primaries"):
-                    lp_opts.append("target_primaries=bt709")
-                if self._lp_opts.get("target_trc"):
-                    lp_opts.append("target_trc=bt709")
-                # Can libplacebo itself output BT.709 with full-range? (modern OR legacy controls)
-                has_lp_bt709 = (
-                    (self._lp_opts.get("target_primaries") and self._lp_opts.get("target_trc"))
-                    or (
-                        self._lp_opts.get("colorspace")
-                        and self._lp_opts.get("color_primaries")
-                        and self._lp_opts.get("color_trc")
-                        and self._lp_opts.get("range")
-                    )
+            if self._strict_lp:
+                raise RuntimeError(
+                    "Strict libplacebo mode is enabled but Vulkan/libplacebo is unavailable in ffmpeg."
                 )
-                if self._lp_opts.get("colorspace"):
-                    lp_opts.append("colorspace=bt709")
-                if self._lp_opts.get("color_primaries"):
-                    lp_opts.append("color_primaries=bt709")
-                if self._lp_opts.get("color_trc"):
-                    lp_opts.append("color_trc=bt709")
-                if self._lp_opts.get("range"):
-                    lp_opts.append("range=pc")
-                if self._lp_opts.get("dithering"):
-                    lp_opts.append("dithering=white")
-                elif self._lp_opts.get("dither"):
-                    lp_opts.append("dither=yes")
-                # Keep any CPU downscale after we’ve converted to bgr24.
-                parts: list[str] = []
-                # If SDR limited, expand to PC before running CPU libplacebo to keep behavior consistent.
-                if self._range_in_tag != "pc":
-                    parts.append("zscale=rangein=tv:range=pc")
-                parts.append("libplacebo=" + ":".join(lp_opts))
-                post = []
-                if not has_lp_bt709:
-                    post.extend([
-                        "format=gbrpf32le",
-                        "zscale=transfer=bt709:primaries=bt709:matrix=bt709:rangein=pc:range=pc:dither=error_diffusion",
-                        "format=bgr24",
-                    ])
-                else:
-                    post.append("format=bgr24")
+            _tm = "bt.2390" if self._tm_algo in ("bt2390", "bt_2390", "bt.2390") else self._tm_algo
+            if getattr(self, "_lp_minimal", False):
+                parts = [f"libplacebo=tonemapping={_tm}", "format=bgr24"]
                 if maxw > 0:
-                    post.append(f"scale=w=min(iw\\,{maxw}):h=-2")
-                post.append("setsar=1")
-                return ",".join(parts + post)
+                    parts.append(f"scale=w=min(iw\\,{maxw}):h=-2")
+                parts.append("setsar=1")
+                return ",".join(parts)
+            lp_opts = [f"tonemapping={_tm}"]
+            if self._lp_opts.get("colorspace"):
+                lp_opts.append("colorspace=bt709")
+            if self._lp_opts.get("color_primaries"):
+                lp_opts.append("color_primaries=bt709")
+            if self._lp_opts.get("color_trc"):
+                lp_opts.append("color_trc=bt709")
+            if self._lp_opts.get("range"):
+                lp_opts.append("range=pc")
+            if self._lp_opts.get("dithering"):
+                lp_opts.append("dithering=white")
+            parts: list[str] = []
+            if self._range_in_tag != "pc":
+                parts.append("zscale=rangein=tv:range=pc")
+            parts.append("libplacebo=" + ":".join(lp_opts))
+            if self._lp_opts.get("colorspace") and self._lp_opts.get("color_trc") and self._lp_opts.get("range"):
+                post = ["format=bgr24"]
+            else:
+                post = [
+                    "format=gbrpf32le",
+                    "zscale=transfer=bt709:primaries=bt709:matrix=bt709:rangein=pc:range=pc:dither=error_diffusion",
+                    "format=bgr24",
+                ]
+            if maxw > 0:
+                post.append(f"scale=w=min(iw\\,{maxw}):h=-2")
+            post.append("setsar=1")
+            return ",".join(parts + post)
         if self._mode in ("libplacebo", "zscale") and (self._has_zscale and self._has_tonemap):
             # Full HDR→SDR tonemap tuned for SDR target brightness and optional desaturation.
             s = (
@@ -1407,20 +1379,38 @@ class FfmpegPipeReader:
         if self._proc:
             self._stop()
         t = 0.0 if self._fps <= 0 else max(0.0, idx / float(self._fps))
-        # If libplacebo was selected but there is no Vulkan, use zscale+tonemap immediately.
+        # If libplacebo was selected but there is no Vulkan, handle according to strict mode.
         if self._mode == "libplacebo" and self._use_libplacebo and not self._has_vulkan:
+            if self._strict_lp:
+                raise RuntimeError("Strict libplacebo mode requires Vulkan-capable ffmpeg build.")
             self._log.warning("libplacebo: Vulkan not available; switching to zscale+tonemap.")
             self._mode = "zscale"
         pix_fmt = "bgr24" if self._mode in ("libplacebo", "zscale") else "gbrpf32le"
         # Turn up logging while attempting libplacebo so stderr_tail shows the true cause.
         ll = "info" if self._mode == "libplacebo" else "error"
-        cmd = [self._ffmpeg, "-hide_banner", "-loglevel", ll, "-nostdin"]
+        cmd = [
+            self._ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            ll,
+            "-nostdin",
+            # Make weird HEVC/DOVI intros and broken containers more robust:
+            "-fflags",
+            "+genpts",
+            "-analyzeduration",
+            "200M",
+            "-probesize",
+            "200M",
+            "-err_detect",
+            "ignore_err",
+        ]
         # Ensure a Vulkan device exists for libplacebo
         if self._mode == "libplacebo" and self._use_libplacebo and self._has_vulkan:
             cmd += ["-init_hw_device", "vulkan=pl", "-filter_hw_device", "pl"]
+        # Only include -ss for t>0. Some HEVC streams + libplacebo + "-ss 0" never emit a frame.
+        if t > 1e-6:
+            cmd += ["-ss", f"{t:.6f}"]
         cmd += [
-            "-ss",
-            f"{t:.6f}",
             "-i",
             self._path,
             "-map",
@@ -1439,13 +1429,13 @@ class FfmpegPipeReader:
         if os.name == "nt":
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self._log.info(
-            "Pipe mode=%s vulkan=%s • out=%dx%d • fmt=%s • t=%.3fs",
+            "Pipe mode=%s vulkan=%s • out=%dx%d • fmt=%s • t=%s",
             self._mode,
             ("on" if (self._mode == "libplacebo" and self._has_vulkan) else "off"),
             self._w,
             self._h,
             pix_fmt,
-            t,
+            (f"{t:.3f}s" if t > 1e-6 else "start"),
         )
         self._proc = subprocess.Popen(
             cmd,
