@@ -998,6 +998,11 @@ class FfmpegPipeReader:
         self._h = int(s.get("height") or 0)
         self._fps = _safe_fps(s.get("avg_frame_rate") or "0/1")
         self._nb = int(s.get("nb_frames") or 0)
+        self._src_pixfmt = _str_lower_nonempty(s.get("pix_fmt"))
+        try:
+            self._bits_per_raw_sample = int(s.get("bits_per_raw_sample") or 0)
+        except Exception:
+            self._bits_per_raw_sample = 0
         # If ffprobe is missing, recover dimensions and fps via PyAV/OpenCV.
         if (self._w <= 0) or (self._h <= 0) or (self._fps <= 0) or (self._nb <= 0):
             _fmt, w_pyav, h_pyav = _probe_pixfmt_wh_pyav(path)
@@ -1006,6 +1011,8 @@ class FfmpegPipeReader:
                     self._w = int(w_pyav)
                 if self._h <= 0:
                     self._h = int(h_pyav)
+            if _fmt:
+                self._src_pixfmt = _str_lower_nonempty(_fmt)
             f_pyav, n_pyav = _probe_fps_total_pyav(path)
             if f_pyav and f_pyav > 0 and self._fps <= 0:
                 self._fps = float(f_pyav)
@@ -1272,8 +1279,8 @@ class FfmpegPipeReader:
         maxw = int(getattr(self, "_maxw", 0))
         if self._mode == "libplacebo" and self._use_libplacebo:
             if self._has_vulkan:
-                tr = (self._transfer or "").lower()
-                surf = "p010le" if tr in ("smpte2084", "arib-std-b67") else "nv12"
+                src10 = _is_10bit_pixfmt(getattr(self, "_src_pixfmt", ""), getattr(self, "_bits_per_raw_sample", 0))
+                surf = "yuv420p10le" if src10 else "nv12"
                 _tm = "bt.2390" if self._tm_algo in ("bt2390", "bt_2390", "bt.2390") else self._tm_algo
                 if getattr(self, "_lp_minimal", False):
                     filters = [
@@ -1295,13 +1302,13 @@ class FfmpegPipeReader:
                 if self._lp_opts.get("color_trc"):
                     lp_args.append("color_trc=bt709")
                 if self._lp_opts.get("range"):
-                    lp_args.append("range=pc")
+                    lp_args.append("range=full")
                 if (not self._lp_opts.get("colorspace")) and self._lp_opts.get("target_primaries"):
                     lp_args.append("target_primaries=bt709")
                 if (not self._lp_opts.get("color_trc")) and self._lp_opts.get("target_trc"):
                     lp_args.append("target_trc=bt709")
                 if self._lp_opts.get("dithering"):
-                    lp_args.append("dithering=white")
+                    lp_args.append("dithering=ordered")
                 elif self._lp_opts.get("dither"):
                     lp_args.append("dither=yes")
                 filters = [f"format={surf}", "hwupload=extra_hw_frames=8", "libplacebo=" + ":".join(lp_args)]
@@ -1334,9 +1341,9 @@ class FfmpegPipeReader:
             if self._lp_opts.get("color_trc"):
                 lp_opts.append("color_trc=bt709")
             if self._lp_opts.get("range"):
-                lp_opts.append("range=pc")
+                lp_opts.append("range=full")
             if self._lp_opts.get("dithering"):
-                lp_opts.append("dithering=white")
+                lp_opts.append("dithering=ordered")
             parts: list[str] = []
             if self._range_in_tag != "pc":
                 parts.append("zscale=rangein=tv:range=pc")
@@ -1410,6 +1417,9 @@ class FfmpegPipeReader:
         # Only include -ss for t>0. Some HEVC streams + libplacebo + "-ss 0" never emit a frame.
         if t > 1e-6:
             cmd += ["-ss", f"{t:.6f}"]
+        vf = self._chain()
+        if self._mode == "libplacebo" and self._use_libplacebo:
+            self._log.debug("LP vf: %s", vf)
         cmd += [
             "-i",
             self._path,
@@ -1418,7 +1428,7 @@ class FfmpegPipeReader:
             "-vsync",
             "0",
             "-vf",
-            self._chain(),
+            vf,
             "-f",
             "rawvideo",
             "-pix_fmt",
