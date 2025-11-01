@@ -1120,18 +1120,37 @@ class FfmpegPipeReader:
                 self._force_mode = "zscale"
             elif os.getenv("PC_FORCE_SCALE", ""):
                 self._force_mode = "scale"
-        # Track the currently active filter mode so we can fall back if needed.
-        self._mode = (
-            "libplacebo"
-            if self._use_libplacebo
-            else ("zscale" if (self._has_zscale and self._has_tonemap) else "scale")
-        )
-        if self._force_mode == "libplacebo" and self._use_libplacebo:
-            self._mode = "libplacebo"
+        # Choose a preferred mode (honor explicit PC_FORCE_* first), then apply strict LP semantics.
+        if self._force_mode == "libplacebo":
+            preferred = "libplacebo"
         elif self._force_mode == "zscale" and (self._has_zscale and self._has_tonemap):
-            self._mode = "zscale"
+            preferred = "zscale"
         elif self._force_mode == "scale" and self._has_scale:
+            preferred = "scale"
+        else:
+            preferred = (
+                "libplacebo"
+                if self._use_libplacebo
+                else ("zscale" if (self._has_zscale and self._has_tonemap) else "scale")
+            )
+
+        # In strict mode, only enforce when LP is the chosen path; otherwise permit non-LP paths.
+        if self._strict_lp and preferred == "libplacebo" and not self._use_libplacebo:
+            raise RuntimeError(
+                "Strict libplacebo mode is enabled but ffmpeg/libplacebo is unavailable"
+            )
+        if preferred == "libplacebo" and self._use_libplacebo:
+            self._mode = "libplacebo"
+        elif preferred == "zscale" and (self._has_zscale and self._has_tonemap):
+            self._mode = "zscale"
+        elif preferred == "scale" and self._has_scale:
             self._mode = "scale"
+        else:
+            self._mode = (
+                "libplacebo"
+                if self._use_libplacebo
+                else ("zscale" if (self._has_zscale and self._has_tonemap) else "scale")
+            )
         # Stage-specific fallback flags so we can attempt zscale, then scale.
         self._tried_zscale = False
         self._tried_scale = False
