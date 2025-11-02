@@ -1475,9 +1475,6 @@ class FfmpegPipeReader:
             "-hide_banner",
             "-loglevel", ll,
             "-nostdin",
-            # Preserve timestamps and avoid accidental drop on seek
-            "-fps_mode", "passthrough",
-            "-vsync", "0",
             # Make weird HEVC/DOVI intros and broken containers more robust:
             "-fflags",
             "+genpts",
@@ -1501,6 +1498,8 @@ class FfmpegPipeReader:
             "-i",
             self._path,
             "-map", "0:v:0",
+            # Output-side timing: replacement for deprecated -vsync 0
+            "-fps_mode", "passthrough",
             "-vf",
             vf,
             "-f",
