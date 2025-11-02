@@ -1007,6 +1007,10 @@ class FfmpegPipeReader:
         self._lp_tm_alt = False        # toggle bt2390 ↔ bt.2390 if needed
         self._lp_surf_alt = False      # toggle yuv420p10le/nv12 ↔ p010le/yuv420p if needed
         self._last_cmdline = None
+        # Tonemap algo fallback chain: bt.2390 → mobius → hable → clip
+        # Start at index 0, but allow env override while debugging.
+        self._tm_algos = ["bt.2390", "mobius", "hable", "clip"]
+        self._tm_ai = int(os.getenv("PC_LP_TM_INDEX", "0"))
         # If ffprobe is missing, recover dimensions and fps via PyAV/OpenCV.
         if (self._w <= 0) or (self._h <= 0) or (self._fps <= 0) or (self._nb <= 0):
             _fmt, w_pyav, h_pyav = _probe_pixfmt_wh_pyav(path)
@@ -1190,7 +1194,7 @@ class FfmpegPipeReader:
     def try_fallback_chain(self) -> bool:
         """
         Attempt staged fallback.
-        In strict LP mode we retry once with a minimal libplacebo chain, then raise.
+        In strict LP mode stay on libplacebo: vary algo alias, surface, then minimal, then alternative algos.
         Non-strict mode continues to fall back to zscale and linear scale.
         Returns True if we switched chains; False if no further fallback exists.
         """
@@ -1202,7 +1206,13 @@ class FfmpegPipeReader:
 
             if self._use_libplacebo:
                 if self._has_vulkan:
-                    if not self._lp_tm_alt:
+                    base_algo = (self._tm_algo or "").strip().lower()
+                    if not base_algo:
+                        try:
+                            base_algo = (self._tm_algos[self._tm_ai] or "").lower()
+                        except Exception:
+                            base_algo = ""
+                    if base_algo in {"bt2390", "bt_2390", "bt.2390"} and not self._lp_tm_alt:
                         _log_tail("libplacebo emitted no frames;")
                         self._lp_tm_alt = True
                         self._log.warning(
@@ -1215,6 +1225,23 @@ class FfmpegPipeReader:
                         self._lp_surf_alt = True
                         self._log.warning(
                             "libplacebo produced no frames; retrying with alternate upload surface."
+                        )
+                        self._start(max(self._pos + 1, 0))
+                        return True
+                    if not getattr(self, "_lp_minimal", False):
+                        _log_tail("libplacebo emitted no frames;")
+                        self._log.warning("libplacebo produced no frames; retrying with MINIMAL LP chain.")
+                        self._lp_minimal = True
+                        self._start(max(self._pos + 1, 0))
+                        return True
+                    if self._tm_ai + 1 < len(self._tm_algos):
+                        self._tm_ai += 1
+                        self._lp_minimal = False
+                        self._lp_tm_alt = False
+                        self._lp_surf_alt = False
+                        self._log.warning(
+                            "libplacebo produced no frames; retrying with different tonemap algo: %s",
+                            self._tm_algos[self._tm_ai],
                         )
                         self._start(max(self._pos + 1, 0))
                         return True
@@ -1298,13 +1325,21 @@ class FfmpegPipeReader:
         return found
 
     def _tm_value(self) -> str:
-        """Return the preferred tonemapping keyword for libplacebo."""
-        if self._tm_algo not in {"bt2390", "bt_2390", "bt.2390"}:
-            return self._tm_algo
-        # Prefer alias 'bt2390'. Some builds reject 'bt.2390'.
-        if self._lp_tm_alt:
+        """
+        Return the tonemapping keyword for libplacebo.
+        If user set a custom algorithm, use it. Otherwise pick from fallback list.
+        """
+        algo = (self._tm_algo or "").strip().lower()
+        if algo and algo not in {"bt2390", "bt_2390", "bt.2390"}:
+            return algo
+        # alias handling for 2390
+        if algo in {"bt2390", "bt_2390", "bt.2390"}:
+            return "bt.2390" if self._lp_tm_alt else "bt2390"
+        # no explicit algo → pick from list
+        try:
+            return self._tm_algos[self._tm_ai]
+        except Exception:
             return "bt.2390"
-        return "bt2390"
 
     def _choose_surf(self) -> str:
         """Pick upload surface for hwupload→Vulkan."""
@@ -1324,7 +1359,7 @@ class FfmpegPipeReader:
                 if getattr(self, "_lp_minimal", False):
                     filters = [
                         f"format={surf}",
-                        "hwupload=extra_hw_frames=8",
+                        "hwupload=derive_device=1:extra_hw_frames=8",
                         # minimal: only tonemap in LP
                         f"libplacebo=tonemapping={_tm}",
                         "hwdownload",
@@ -1351,7 +1386,7 @@ class FfmpegPipeReader:
                     lp_args.append("dithering=ordered")
                 elif self._lp_opts.get("dither"):
                     lp_args.append("dither=yes")
-                filters = [f"format={surf}", "hwupload=extra_hw_frames=8", "libplacebo=" + ":".join(lp_args)]
+                filters = [f"format={surf}", "hwupload=derive_device=1:extra_hw_frames=8", "libplacebo=" + ":".join(lp_args)]
                 scaled_gpu = False
                 if maxw > 0 and self._has_scale_vulkan:
                     gpuw = max(maxw & ~1, 2)
@@ -1438,9 +1473,11 @@ class FfmpegPipeReader:
         cmd = [
             self._ffmpeg,
             "-hide_banner",
-            "-loglevel",
-            ll,
+            "-loglevel", ll,
             "-nostdin",
+            # Preserve timestamps and avoid accidental drop on seek
+            "-fps_mode", "passthrough",
+            "-vsync", "0",
             # Make weird HEVC/DOVI intros and broken containers more robust:
             "-fflags",
             "+genpts",
@@ -1463,10 +1500,7 @@ class FfmpegPipeReader:
         cmd += [
             "-i",
             self._path,
-            "-map",
-            "0:v:0",
-            "-vsync",
-            "0",
+            "-map", "0:v:0",
             "-vf",
             vf,
             "-f",
