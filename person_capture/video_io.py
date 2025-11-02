@@ -1013,6 +1013,14 @@ class FfmpegPipeReader:
         self._tm_ai = int(os.getenv("PC_LP_TM_INDEX", "0"))
         # Tonemap selection: 'auto' enables fallback rotation via _tm_ai
         self._tm_algo = (os.getenv("PC_TM_ALGO", "auto") or "auto")
+        # Vulkan device pinning (e.g. "0"); if unset, ffmpeg picks default enumerated device.
+        self._vk_device = (os.getenv("PC_LP_VK_DEVICE") or "").strip()
+        # When a filter hardware device is provided, deriving a new device inside hwupload can
+        # cause a second context with different permissions/ICD → allocations fail on Windows.
+        # Default off; enable explicitly for experiments.
+        self._hwupload_derive = (
+            os.getenv("PC_LP_HWUPLOAD_DERIVE", "0").lower() not in ("0", "false", "no")
+        )
         # GPU queue / memory controls
         self._extra_hw_frames = max(1, int(os.getenv("PC_LP_EXTRA_FRAMES", "6")))
         # staged memory relief (0=none, 1=reduce frames, 2=cap 2560, 3=cap 1920, 4=cap 1280)
@@ -1196,6 +1204,34 @@ class FfmpegPipeReader:
         except Exception:
             return set()
 
+    def _supports_fps_mode(self) -> bool:
+        """Return True if this ffmpeg understands -fps_mode (output option)."""
+        cached = getattr(self, "_fps_mode_cap", None)
+        if cached is not None:
+            return bool(cached)
+        result = False
+        try:
+            out = subprocess.run(
+                [self._ffmpeg, "-h"],
+                text=True,
+                capture_output=True,
+                check=False,
+            ).stdout or ""
+            if "fps_mode" in out:
+                result = True
+            else:
+                out = subprocess.run(
+                    [self._ffmpeg, "-h", "full"],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                ).stdout or ""
+                result = "fps_mode" in out
+        except Exception:
+            result = False
+        setattr(self, "_fps_mode_cap", result)
+        return result
+
     # --- Fallback helper used if a chain produces no frames (e.g., Vulkan init issues) ---
     def try_fallback_chain(self) -> bool:
         """
@@ -1213,6 +1249,22 @@ class FfmpegPipeReader:
             # Vulkan/libplacebo memory starvation signals from ffmpeg/libplacebo
             mem_fault = _stderr_contains("cannot allocate memory") or _stderr_contains("out of memory")
             if mem_fault and self._use_libplacebo and self._has_vulkan:
+                # First: if user enabled derive_device, turn it off and retry on the same context.
+                if getattr(self, "_hwupload_derive", False):
+                    self._hwupload_derive = False
+                    self._log.warning(
+                        "LP(Vulkan): memory/perm fault • disabling hwupload derive_device and retrying."
+                    )
+                    self._start(max(self._pos + 1, 0))
+                    return True
+                # Second: if no explicit device set, try the first enumerated device (:0) once.
+                if not getattr(self, "_vk_device", "").strip():
+                    self._vk_device = "0"
+                    self._log.warning(
+                        "LP(Vulkan): memory/perm fault • pinning Vulkan device index :0 and retrying."
+                    )
+                    self._start(max(self._pos + 1, 0))
+                    return True
                 # Stage 1: shrink GPU queue
                 if self._mem_relief_stage < 1 and self._extra_hw_frames > 2:
                     self._mem_relief_stage = 1
@@ -1410,6 +1462,13 @@ class FfmpegPipeReader:
         # Alternate choice seen to fix some Windows/Vulkan builds
         return "p010le" if src10 else "yuv420p"
 
+    def _vk_init_args(self) -> list[str]:
+        """Build -init_hw_device/-filter_hw_device args (optionally with explicit device index)."""
+        if self._vk_device:
+            return ["-init_hw_device", f"vulkan=pl:{self._vk_device}", "-filter_hw_device", "pl"]
+        # default device selection
+        return ["-init_hw_device", "vulkan=pl", "-filter_hw_device", "pl"]
+
     def _chain(self) -> str:
         maxw = int(getattr(self, "_maxw", 0))
         if self._mode == "libplacebo" and self._use_libplacebo:
@@ -1419,7 +1478,11 @@ class FfmpegPipeReader:
                 if getattr(self, "_lp_minimal", False):
                     filters = [
                         f"format={surf}",
-                        f"hwupload=derive_device=1:extra_hw_frames={self._extra_hw_frames}",
+                        (
+                            f"hwupload=derive_device=1:extra_hw_frames={self._extra_hw_frames}"
+                            if self._hwupload_derive
+                            else f"hwupload=extra_hw_frames={self._extra_hw_frames}"
+                        ),
                         # minimal: only tonemap in LP
                         f"libplacebo=tonemapping={_tm}",
                         "hwdownload",
@@ -1446,7 +1509,15 @@ class FfmpegPipeReader:
                     lp_args.append("dithering=ordered")
                 elif self._lp_opts.get("dither"):
                     lp_args.append("dither=yes")
-                filters = [f"format={surf}", f"hwupload=derive_device=1:extra_hw_frames={self._extra_hw_frames}", "libplacebo=" + ":".join(lp_args)]
+                filters = [
+                    f"format={surf}",
+                    (
+                        f"hwupload=derive_device=1:extra_hw_frames={self._extra_hw_frames}"
+                        if self._hwupload_derive
+                        else f"hwupload=extra_hw_frames={self._extra_hw_frames}"
+                    ),
+                    "libplacebo=" + ":".join(lp_args),
+                ]
                 scaled_gpu = False
                 if maxw > 0 and self._has_scale_vulkan:
                     gpuw = max(maxw & ~1, 2)
@@ -1547,7 +1618,10 @@ class FfmpegPipeReader:
         ]
         # Required for hwupload/scale_vulkan to bind to a Vulkan context.
         if self._mode == "libplacebo" and self._use_libplacebo and self._has_vulkan:
-            cmd += ["-init_hw_device", "vulkan=pl", "-filter_hw_device", "pl"]
+            vk_args = self._vk_init_args()
+            cmd += vk_args
+            if self._vk_device:
+                self._log.info("libplacebo: using Vulkan device index :%s", self._vk_device)
         # Only include -ss for t>0. Some HEVC streams + libplacebo + "-ss 0" never emit a frame.
         if t > 1e-6:
             cmd += ["-ss", f"{t:.6f}"]
@@ -1563,7 +1637,16 @@ class FfmpegPipeReader:
             "-map", "-0:d",         # drop data streams
             "-vf",
             vf,
-            "-fps_mode", "passthrough",  # output option (replaces deprecated -vsync)
+        ]
+        try:
+            fps_passthrough = self._supports_fps_mode()
+        except Exception:
+            fps_passthrough = False
+        if fps_passthrough:
+            cmd += ["-fps_mode", "passthrough"]
+        else:
+            cmd += ["-vsync", "0"]
+        cmd += [
             "-f",
             "rawvideo",
             "-pix_fmt",
