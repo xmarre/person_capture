@@ -1325,21 +1325,21 @@ class FfmpegPipeReader:
         return found
 
     def _tm_value(self) -> str:
-        """
-        Return the tonemapping keyword for libplacebo.
-        If user set a custom algorithm, use it. Otherwise pick from fallback list.
-        """
-        algo = (self._tm_algo or "").strip().lower()
-        if algo and algo not in {"bt2390", "bt_2390", "bt.2390"}:
-            return algo
-        # alias handling for 2390
-        if algo in {"bt2390", "bt_2390", "bt.2390"}:
-            return "bt.2390" if self._lp_tm_alt else "bt2390"
-        # no explicit algo → pick from list
+        """Return the libplacebo tonemapping keyword."""
+        # 1) Fallback list advanced → honor that choice regardless of user preference
         try:
-            return self._tm_algos[self._tm_ai]
+            if getattr(self, "_tm_ai", 0) > 0:
+                cand = self._tm_algos[self._tm_ai]
+                if cand in {"bt2390", "bt.2390"}:
+                    return "bt.2390" if self._lp_tm_alt else "bt2390"
+                return cand
         except Exception:
-            return "bt.2390"
+            pass
+        # 2) Either no fallback yet or lookup failed → respect user/default algorithm
+        algo = (getattr(self, "_tm_algo", "") or "").strip().lower()
+        if not algo or algo in {"bt2390", "bt_2390", "bt.2390"}:
+            return "bt.2390" if self._lp_tm_alt else "bt2390"
+        return algo
 
     def _choose_surf(self) -> str:
         """Pick upload surface for hwupload→Vulkan."""
