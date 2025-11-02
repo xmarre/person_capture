@@ -1011,6 +1011,12 @@ class FfmpegPipeReader:
         # Start at index 0, but allow env override while debugging.
         self._tm_algos = ["bt.2390", "mobius", "hable", "clip"]
         self._tm_ai = int(os.getenv("PC_LP_TM_INDEX", "0"))
+        # Tonemap selection: 'auto' enables fallback rotation via _tm_ai
+        self._tm_algo = (os.getenv("PC_TM_ALGO", "auto") or "auto")
+        # GPU queue / memory controls
+        self._extra_hw_frames = max(1, int(os.getenv("PC_LP_EXTRA_FRAMES", "6")))
+        # staged memory relief (0=none, 1=reduce frames, 2=cap 2560, 3=cap 1920, 4=cap 1280)
+        self._mem_relief_stage = 0
         # If ffprobe is missing, recover dimensions and fps via PyAV/OpenCV.
         if (self._w <= 0) or (self._h <= 0) or (self._fps <= 0) or (self._nb <= 0):
             _fmt, w_pyav, h_pyav = _probe_pixfmt_wh_pyav(path)
@@ -1198,6 +1204,45 @@ class FfmpegPipeReader:
         Non-strict mode continues to fall back to zscale and linear scale.
         Returns True if we switched chains; False if no further fallback exists.
         """
+        # Inspect stderr for OOM-type failures first and relieve memory while staying on LP/Vulkan.
+        def _stderr_contains(s: str) -> bool:
+            tail = " | ".join(getattr(self, "_stderr_tail", [])[-50:]).lower()
+            return s.lower() in tail
+
+        if self._mode == "libplacebo":
+            # Vulkan/libplacebo memory starvation signals from ffmpeg/libplacebo
+            mem_fault = _stderr_contains("cannot allocate memory") or _stderr_contains("out of memory")
+            if mem_fault and self._use_libplacebo and self._has_vulkan:
+                # Stage 1: shrink GPU queue
+                if self._mem_relief_stage < 1 and self._extra_hw_frames > 2:
+                    self._mem_relief_stage = 1
+                    old = self._extra_hw_frames
+                    self._extra_hw_frames = 2
+                    self._log.warning("LP(Vulkan): memory relief • extra_hw_frames %s→%s", old, self._extra_hw_frames)
+                    self._start(max(self._pos + 1, 0))
+                    return True
+                # Stage 2: cap width to 2560 on GPU
+                if self._mem_relief_stage < 2 and (getattr(self, "_maxw", 0) == 0 or getattr(self, "_maxw", 0) > 2560):
+                    self._mem_relief_stage = 2
+                    self._maxw = 2560
+                    self._log.warning("LP(Vulkan): memory relief • apply GPU downscale cap to w=2560")
+                    self._start(max(self._pos + 1, 0))
+                    return True
+                # Stage 3: cap width to 1920
+                if self._mem_relief_stage < 3 and getattr(self, "_maxw", 0) > 1920:
+                    self._mem_relief_stage = 3
+                    self._maxw = 1920
+                    self._log.warning("LP(Vulkan): memory relief • apply GPU downscale cap to w=1920")
+                    self._start(max(self._pos + 1, 0))
+                    return True
+                # Stage 4: cap width to 1280
+                if self._mem_relief_stage < 4 and getattr(self, "_maxw", 0) > 1280:
+                    self._mem_relief_stage = 4
+                    self._maxw = 1280
+                    self._log.warning("LP(Vulkan): memory relief • apply GPU downscale cap to w=1280")
+                    self._start(max(self._pos + 1, 0))
+                    return True
+
         if self._mode == "libplacebo":
             def _log_tail(prefix: str) -> None:
                 tail = getattr(self, "_stderr_tail", [])[-5:]
@@ -1325,20 +1370,35 @@ class FfmpegPipeReader:
         return found
 
     def _tm_value(self) -> str:
-        """Return the libplacebo tonemapping keyword."""
-        # 1) Fallback list advanced → honor that choice regardless of user preference
-        try:
-            if getattr(self, "_tm_ai", 0) > 0:
-                cand = self._tm_algos[self._tm_ai]
-                if cand in {"bt2390", "bt.2390"}:
-                    return "bt.2390" if self._lp_tm_alt else "bt2390"
-                return cand
-        except Exception:
-            pass
-        # 2) Either no fallback yet or lookup failed → respect user/default algorithm
+        """
+        Resolve the libplacebo tonemapping algorithm.
+        - 'auto' (default): use fallback list driven by _tm_ai.
+        - explicit algo: honor it (except alias handling for 2390).
+        - if explicit is 2390 and we've advanced _tm_ai, switch to the indexed fallback.
+        """
         algo = (getattr(self, "_tm_algo", "") or "").strip().lower()
-        if not algo or algo in {"bt2390", "bt_2390", "bt.2390"}:
+        # auto → use the staged list
+        if algo in ("", "auto"):
+            try:
+                cand = self._tm_algos[self._tm_ai]
+            except Exception:
+                cand = "bt.2390"
+            if cand in {"bt2390", "bt.2390"}:
+                return "bt.2390" if self._lp_tm_alt else "bt2390"
+            return cand
+        # explicit 2390 → allow alias & staged fallback when _tm_ai advanced
+        if algo in {"bt2390", "bt_2390", "bt.2390"}:
+            if self._tm_ai > 0:
+                try:
+                    cand = self._tm_algos[self._tm_ai]
+                except Exception:
+                    cand = None
+                else:
+                    if cand in {"bt2390", "bt.2390"}:
+                        return "bt.2390" if self._lp_tm_alt else "bt2390"
+                    return cand
             return "bt.2390" if self._lp_tm_alt else "bt2390"
+        # any other explicit algo
         return algo
 
     def _choose_surf(self) -> str:
@@ -1359,7 +1419,7 @@ class FfmpegPipeReader:
                 if getattr(self, "_lp_minimal", False):
                     filters = [
                         f"format={surf}",
-                        "hwupload=derive_device=1:extra_hw_frames=8",
+                        f"hwupload=derive_device=1:extra_hw_frames={self._extra_hw_frames}",
                         # minimal: only tonemap in LP
                         f"libplacebo=tonemapping={_tm}",
                         "hwdownload",
@@ -1386,7 +1446,7 @@ class FfmpegPipeReader:
                     lp_args.append("dithering=ordered")
                 elif self._lp_opts.get("dither"):
                     lp_args.append("dither=yes")
-                filters = [f"format={surf}", "hwupload=derive_device=1:extra_hw_frames=8", "libplacebo=" + ":".join(lp_args)]
+                filters = [f"format={surf}", f"hwupload=derive_device=1:extra_hw_frames={self._extra_hw_frames}", "libplacebo=" + ":".join(lp_args)]
                 scaled_gpu = False
                 if maxw > 0 and self._has_scale_vulkan:
                     gpuw = max(maxw & ~1, 2)
@@ -1497,11 +1557,13 @@ class FfmpegPipeReader:
         cmd += [
             "-i",
             self._path,
-            "-map", "0:v:0",
-            # Output-side timing: replacement for deprecated -vsync 0
-            "-fps_mode", "passthrough",
+            "-map", "0:v:0",        # select only video
+            "-map", "-0:a",         # drop audio streams
+            "-map", "-0:s",         # drop subtitle streams (PGS can be huge)
+            "-map", "-0:d",         # drop data streams
             "-vf",
             vf,
+            "-fps_mode", "passthrough",  # output option (replaces deprecated -vsync)
             "-f",
             "rawvideo",
             "-pix_fmt",
