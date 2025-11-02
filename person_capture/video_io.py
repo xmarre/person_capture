@@ -1003,6 +1003,10 @@ class FfmpegPipeReader:
             self._bits_per_raw_sample = int(s.get("bits_per_raw_sample") or 0)
         except Exception:
             self._bits_per_raw_sample = 0
+        # Hints for robust LP(Vulkan) init and logging
+        self._lp_tm_alt = False        # toggle bt2390 ↔ bt.2390 if needed
+        self._lp_surf_alt = False      # toggle yuv420p10le/nv12 ↔ p010le/yuv420p if needed
+        self._last_cmdline = None
         # If ffprobe is missing, recover dimensions and fps via PyAV/OpenCV.
         if (self._w <= 0) or (self._h <= 0) or (self._fps <= 0) or (self._nb <= 0):
             _fmt, w_pyav, h_pyav = _probe_pixfmt_wh_pyav(path)
@@ -1075,7 +1079,7 @@ class FfmpegPipeReader:
         # Cache a normalized tag for range decisions in filters
         self._range_in_tag = "pc" if (self._range_in or "").lower() in ("pc", "full") else "tv"
         # Probe Vulkan availability for libplacebo
-        self._has_vulkan = self._probe_vulkan()
+        self._has_vulkan = self._use_libplacebo and self._has_scale_vulkan and self._probe_vulkan()
         # Probe which libplacebo options exist on this ffmpeg build
         if self._use_libplacebo:
             self._lp_opts = self._probe_libplacebo_opts()
@@ -1196,12 +1200,30 @@ class FfmpegPipeReader:
                 if tail:
                     self._log.warning("%s stderr tail: %s", prefix, " | ".join(tail))
 
-            if self._use_libplacebo and not getattr(self, "_lp_minimal", False):
-                _log_tail("libplacebo emitted no frames;")
-                self._log.warning("libplacebo produced no frames; retrying with MINIMAL LP chain.")
-                self._lp_minimal = True
-                self._start(max(self._pos + 1, 0))
-                return True
+            if self._use_libplacebo:
+                if self._has_vulkan:
+                    if not self._lp_tm_alt:
+                        _log_tail("libplacebo emitted no frames;")
+                        self._lp_tm_alt = True
+                        self._log.warning(
+                            "libplacebo produced no frames; retrying with alternate tonemap alias."
+                        )
+                        self._start(max(self._pos + 1, 0))
+                        return True
+                    if not self._lp_surf_alt:
+                        _log_tail("libplacebo emitted no frames;")
+                        self._lp_surf_alt = True
+                        self._log.warning(
+                            "libplacebo produced no frames; retrying with alternate upload surface."
+                        )
+                        self._start(max(self._pos + 1, 0))
+                        return True
+                if not getattr(self, "_lp_minimal", False):
+                    _log_tail("libplacebo emitted no frames;")
+                    self._log.warning("libplacebo produced no frames; retrying with MINIMAL LP chain.")
+                    self._lp_minimal = True
+                    self._start(max(self._pos + 1, 0))
+                    return True
             if self._strict_lp:
                 err = " | ".join(getattr(self, "_stderr_tail", [])[-15:]) or "n/a"
                 raise RuntimeError(
@@ -1275,17 +1297,35 @@ class FfmpegPipeReader:
             found["tonemapping"] = True
         return found
 
+    def _tm_value(self) -> str:
+        """Return the preferred tonemapping keyword for libplacebo."""
+        if self._tm_algo not in {"bt2390", "bt_2390", "bt.2390"}:
+            return self._tm_algo
+        # Prefer alias 'bt2390'. Some builds reject 'bt.2390'.
+        if self._lp_tm_alt:
+            return "bt.2390"
+        return "bt2390"
+
+    def _choose_surf(self) -> str:
+        """Pick upload surface for hwupload→Vulkan."""
+        src10 = _is_10bit_pixfmt(getattr(self, "_src_pixfmt", ""), getattr(self, "_bits_per_raw_sample", 0))
+        if not self._lp_surf_alt:
+            # primary choice
+            return "yuv420p10le" if src10 else "nv12"
+        # Alternate choice seen to fix some Windows/Vulkan builds
+        return "p010le" if src10 else "yuv420p"
+
     def _chain(self) -> str:
         maxw = int(getattr(self, "_maxw", 0))
         if self._mode == "libplacebo" and self._use_libplacebo:
             if self._has_vulkan:
-                src10 = _is_10bit_pixfmt(getattr(self, "_src_pixfmt", ""), getattr(self, "_bits_per_raw_sample", 0))
-                surf = "yuv420p10le" if src10 else "nv12"
-                _tm = "bt.2390" if self._tm_algo in ("bt2390", "bt_2390", "bt.2390") else self._tm_algo
+                surf = self._choose_surf()
+                _tm = self._tm_value()
                 if getattr(self, "_lp_minimal", False):
                     filters = [
                         f"format={surf}",
                         "hwupload=extra_hw_frames=8",
+                        # minimal: only tonemap in LP
                         f"libplacebo=tonemapping={_tm}",
                         "hwdownload",
                         "format=bgr24",
@@ -1326,14 +1366,14 @@ class FfmpegPipeReader:
                 raise RuntimeError(
                     "Strict libplacebo mode is enabled but Vulkan/libplacebo is unavailable in ffmpeg."
                 )
-            _tm = "bt.2390" if self._tm_algo in ("bt2390", "bt_2390", "bt.2390") else self._tm_algo
+            _tm = self._tm_value()
             if getattr(self, "_lp_minimal", False):
                 parts = [f"libplacebo=tonemapping={_tm}", "format=bgr24"]
                 if maxw > 0:
                     parts.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                 parts.append("setsar=1")
                 return ",".join(parts)
-            lp_opts = [f"tonemapping={_tm}"]
+            lp_opts = [f"tonemapping={self._tm_value()}"]
             if self._lp_opts.get("colorspace"):
                 lp_opts.append("colorspace=bt709")
             if self._lp_opts.get("color_primaries"):
@@ -1411,7 +1451,7 @@ class FfmpegPipeReader:
             "-err_detect",
             "ignore_err",
         ]
-        # Ensure a Vulkan device exists for libplacebo
+        # Required for hwupload/scale_vulkan to bind to a Vulkan context.
         if self._mode == "libplacebo" and self._use_libplacebo and self._has_vulkan:
             cmd += ["-init_hw_device", "vulkan=pl", "-filter_hw_device", "pl"]
         # Only include -ss for t>0. Some HEVC streams + libplacebo + "-ss 0" never emit a frame.
@@ -1447,6 +1487,13 @@ class FfmpegPipeReader:
             pix_fmt,
             (f"{t:.3f}s" if t > 1e-6 else "start"),
         )
+        try:
+            import shlex
+
+            self._last_cmdline = " ".join(shlex.quote(part) for part in cmd)
+            self._log.debug("LP cmd: %s", self._last_cmdline)
+        except Exception:
+            self._last_cmdline = None
         self._proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
