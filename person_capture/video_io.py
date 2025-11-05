@@ -1049,7 +1049,9 @@ class FfmpegPipeReader:
         # staged memory relief (0=none, 1=reduce frames, 2=cap 2560, 3=cap 1920, 4=cap 1280)
         self._mem_relief_stage = 0
         self._fallback_hops = 0
-        self._fallback_hops_max = int(os.getenv("PC_LP_MAX_HOPS", "12"))
+        self._fallback_hops_max = int(
+            os.getenv("PC_LP_MAX_HOPS", str(self._calc_fallback_budget()))
+        )
         # If ffprobe is missing, recover dimensions and fps via PyAV/OpenCV.
         if (self._w <= 0) or (self._h <= 0) or (self._fps <= 0) or (self._nb <= 0):
             _fmt, w_pyav, h_pyav = _probe_pixfmt_wh_pyav(path)
@@ -1155,13 +1157,9 @@ class FfmpegPipeReader:
             _maxw,
             self._has_scale_vulkan,
         )
-        if _maxw > 0 and self._w > _maxw:
-            ratio = float(_maxw) / float(self._w)
-            self._w = int(_maxw)
-            scaled_h = int(math.floor(self._h * ratio))
-            self._h = max(2, scaled_h & ~1)  # even height
         self._frame_bytes_u8 = self._w * self._h * 3
         self._frame_bytes_f32 = self._w * self._h * 3 * 4
+        self._apply_cap_dims()
         self._pix_fmt = "bgr24"
         # Tunables (env overrides). Defaults align with MPC VR feel.
         # Strict LP mode = no CPU/zscale fallback. We'll try one minimal LP chain retry, then error.
@@ -1204,6 +1202,26 @@ class FfmpegPipeReader:
             else ("zscale+tonemap" if self._mode == "zscale" else "linear+python-tonemap")
         )
         self._log.info("HDR preview path: bundled ffmpeg pipe (%s)", mode)
+
+    def _calc_fallback_budget(self) -> int:
+        n = len(getattr(self, "_vk_probe_modes", []))         # Vulkan probe modes
+        n += 4                                                # mem-relief stages (frames, 2560, 1920, 1280)
+        n += 1                                                # CPU diagnostic probe
+        n += 1                                                # 2390 alias flip
+        n += 1                                                # surface alt
+        n += 1                                                # minimal LP chain
+        n += max(0, len(getattr(self, "_tm_algos", [])) - 1)  # algo rotations
+        n += 2                                                # zscale + scale fallbacks
+        return n + 4                                          # headroom
+
+    def _apply_cap_dims(self) -> None:
+        maxw = int(getattr(self, "_maxw", 0))
+        if maxw > 0 and self._w > maxw:
+            ratio = float(maxw) / float(self._w or 1)
+            self._w = int(maxw)
+            self._h = max(2, int(math.floor(self._h * ratio)) & ~1)
+            self._frame_bytes_u8 = self._w * self._h * 3
+            self._frame_bytes_f32 = self._w * self._h * 3 * 4
 
     def _list_filters(self) -> set[str]:
         try:
@@ -1316,6 +1334,7 @@ class FfmpegPipeReader:
                     self._mem_relief_stage = 2
                     self._maxw = 2560
                     self._log.warning("LP(Vulkan): memory relief • apply GPU downscale cap to w=2560")
+                    self._apply_cap_dims()
                     _restart(max(self._pos + 1, 0))
                     return True
                 # Stage 3: cap width to 1920
@@ -1323,6 +1342,7 @@ class FfmpegPipeReader:
                     self._mem_relief_stage = 3
                     self._maxw = 1920
                     self._log.warning("LP(Vulkan): memory relief • apply GPU downscale cap to w=1920")
+                    self._apply_cap_dims()
                     _restart(max(self._pos + 1, 0))
                     return True
                 # Stage 4: cap width to 1280
@@ -1330,6 +1350,7 @@ class FfmpegPipeReader:
                     self._mem_relief_stage = 4
                     self._maxw = 1280
                     self._log.warning("LP(Vulkan): memory relief • apply GPU downscale cap to w=1280")
+                    self._apply_cap_dims()
                     _restart(max(self._pos + 1, 0))
                     return True
 
@@ -1408,6 +1429,7 @@ class FfmpegPipeReader:
                 self._log.warning("HDR: libplacebo yielded no frames; falling back to zscale+tonemap.")
                 self._stop()
                 self._mode = "zscale"
+                self._fallback_hops = 0
                 self._tried_zscale = True
                 _restart(max(self._pos + 1, 0))
                 return True
@@ -1416,6 +1438,7 @@ class FfmpegPipeReader:
                 self._log.warning("HDR: libplacebo yielded no frames; falling back to linear scale.")
                 self._stop()
                 self._mode = "scale"
+                self._fallback_hops = 0
                 self._tried_scale = True
                 _restart(max(self._pos + 1, 0))
                 return True
@@ -1425,6 +1448,7 @@ class FfmpegPipeReader:
                 self._log.warning("HDR: zscale+tonemap yielded no frames; falling back to linear scale.")
                 self._stop()
                 self._mode = "scale"
+                self._fallback_hops = 0
                 self._tried_scale = True
                 _restart(max(self._pos + 1, 0))
                 return True
