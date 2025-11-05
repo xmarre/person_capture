@@ -1013,6 +1013,17 @@ class FfmpegPipeReader:
         self._tm_ai = int(os.getenv("PC_LP_TM_INDEX", "0"))
         # Tonemap selection: 'auto' enables fallback rotation via _tm_ai
         self._tm_algo = (os.getenv("PC_TM_ALGO", "auto") or "auto")
+
+        # --- quoting helper for libplacebo string enums (bt.2390/mobius/hable/clip) ---
+        # Some ffmpeg builds require quotes, otherwise "bt2390" is parsed as an expression → EINVAL.
+        def _q(s: str) -> str:
+            # Always quote tonemapping enums for libplacebo; some builds try to eval unquoted tokens.
+            s = (s or "").strip()
+            if not s or s[0] in "'\"":
+                return s
+            return "'" + s.replace("'", r"\'") + "'"
+
+        self._q = _q
         # Vulkan device pinning (e.g. "0"); if unset, ffmpeg picks default enumerated device.
         self._vk_device = (os.getenv("PC_LP_VK_DEVICE") or "").strip()
         # When a filter hardware device is provided, deriving a new device inside hwupload can
@@ -1236,6 +1247,8 @@ class FfmpegPipeReader:
     def try_fallback_chain(self) -> bool:
         """
         Attempt staged fallback.
+        Also try a one-shot diagnostic: force CPU libplacebo (no Vulkan) once to
+        distinguish Vulkan/ICD issues from general libplacebo failures.
         In strict LP mode stay on libplacebo: vary algo alias, surface, then minimal, then alternative algos.
         Non-strict mode continues to fall back to zscale and linear scale.
         Returns True if we switched chains; False if no further fallback exists.
@@ -1303,6 +1316,13 @@ class FfmpegPipeReader:
 
             if self._use_libplacebo:
                 if self._has_vulkan:
+                    if _stderr_contains("Error reinitializing filters") or _stderr_contains("return code -22"):
+                        if not getattr(self, "_force_cpu_lp_once", False):
+                            self._force_cpu_lp_once = True
+                            self._log.warning("libplacebo: forcing CPU path once to diagnose Vulkan issues.")
+                            self._has_vulkan = False
+                            self._start(max(self._pos + 1, 0))
+                            return True
                     base_algo = (self._tm_algo or "").strip().lower()
                     if not base_algo:
                         try:
@@ -1456,10 +1476,14 @@ class FfmpegPipeReader:
     def _choose_surf(self) -> str:
         """Pick upload surface for hwupload→Vulkan."""
         src10 = _is_10bit_pixfmt(getattr(self, "_src_pixfmt", ""), getattr(self, "_bits_per_raw_sample", 0))
+        # Prefer p010le for 10-bit uploads on Vulkan; many Windows builds expect this when hwuploading.
+        if self._has_vulkan:
+            if not self._lp_surf_alt:
+                return "p010le" if src10 else "nv12"
+            return "yuv420p10le" if src10 else "yuv420p"
+        # CPU path swaps back to the legacy ordering.
         if not self._lp_surf_alt:
-            # primary choice
             return "yuv420p10le" if src10 else "nv12"
-        # Alternate choice seen to fix some Windows/Vulkan builds
         return "p010le" if src10 else "yuv420p"
 
     def _vk_init_args(self) -> list[str]:
@@ -1474,7 +1498,7 @@ class FfmpegPipeReader:
         if self._mode == "libplacebo" and self._use_libplacebo:
             if self._has_vulkan:
                 surf = self._choose_surf()
-                _tm = self._tm_value()
+                _tm = self._q(self._tm_value())
                 if getattr(self, "_lp_minimal", False):
                     filters = [
                         f"format={surf}",
@@ -1528,18 +1552,26 @@ class FfmpegPipeReader:
                     filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                 filters.append("setsar=1")
                 return ",".join(filters)
+            else:
+                # CPU libplacebo path: avoid hwupload/scale_vulkan and just tonemap+download.
+                _tm = self._q(self._tm_value())
+                parts = [f"libplacebo=tonemapping={_tm}", "format=bgr24"]
+                if maxw > 0:
+                    parts.append(f"scale=w=min(iw\\,{maxw}):h=-2")
+                parts.append("setsar=1")
+                return ",".join(parts)
             if self._strict_lp:
                 raise RuntimeError(
                     "Strict libplacebo mode is enabled but Vulkan/libplacebo is unavailable in ffmpeg."
                 )
             _tm = self._tm_value()
             if getattr(self, "_lp_minimal", False):
-                parts = [f"libplacebo=tonemapping={_tm}", "format=bgr24"]
+                parts = [f"libplacebo=tonemapping={self._q(_tm)}", "format=bgr24"]
                 if maxw > 0:
                     parts.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                 parts.append("setsar=1")
                 return ",".join(parts)
-            lp_opts = [f"tonemapping={self._tm_value()}"]
+            lp_opts = [f"tonemapping={self._q(self._tm_value())}"]
             if self._lp_opts.get("colorspace"):
                 lp_opts.append("colorspace=bt709")
             if self._lp_opts.get("color_primaries"):
@@ -1615,6 +1647,8 @@ class FfmpegPipeReader:
             "200M",
             "-err_detect",
             "ignore_err",
+            "-filter_threads",
+            "1",
         ]
         # Required for hwupload/scale_vulkan to bind to a Vulkan context.
         if self._mode == "libplacebo" and self._use_libplacebo and self._has_vulkan:
@@ -1635,6 +1669,8 @@ class FfmpegPipeReader:
             "-map", "-0:a",         # drop audio streams
             "-map", "-0:s",         # drop subtitle streams (PGS can be huge)
             "-map", "-0:d",         # drop data streams
+            "-map_metadata", "-1",
+            "-map_chapters", "-1",
             "-vf",
             vf,
         ]
