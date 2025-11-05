@@ -1317,7 +1317,12 @@ class FfmpegPipeReader:
             if self._use_libplacebo:
                 if self._has_vulkan:
                     if _stderr_contains("Error reinitializing filters") or _stderr_contains("return code -22"):
-                        if not getattr(self, "_force_cpu_lp_once", False):
+                        if self._strict_lp:
+                            self._log.warning(
+                                "libplacebo: strict mode active → skipping CPU diagnostic probe. "
+                                "Set PC_LP_STRICT=0 to allow a one-shot CPU libplacebo test."
+                            )
+                        elif not getattr(self, "_force_cpu_lp_once", False):
                             self._force_cpu_lp_once = True
                             self._log.warning("libplacebo: forcing CPU path once to diagnose Vulkan issues.")
                             self._has_vulkan = False
@@ -1552,14 +1557,6 @@ class FfmpegPipeReader:
                     filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                 filters.append("setsar=1")
                 return ",".join(filters)
-            else:
-                # CPU libplacebo path: avoid hwupload/scale_vulkan and just tonemap+download.
-                _tm = self._q(self._tm_value())
-                parts = [f"libplacebo=tonemapping={_tm}", "format=bgr24"]
-                if maxw > 0:
-                    parts.append(f"scale=w=min(iw\\,{maxw}):h=-2")
-                parts.append("setsar=1")
-                return ",".join(parts)
             if self._strict_lp:
                 raise RuntimeError(
                     "Strict libplacebo mode is enabled but Vulkan/libplacebo is unavailable in ffmpeg."
@@ -1627,7 +1624,10 @@ class FfmpegPipeReader:
         # If libplacebo was selected but there is no Vulkan, handle according to strict mode.
         if self._mode == "libplacebo" and self._use_libplacebo and not self._has_vulkan:
             if self._strict_lp:
-                raise RuntimeError("Strict libplacebo mode requires Vulkan-capable ffmpeg build.")
+                raise RuntimeError(
+                    "Strict libplacebo mode requires Vulkan-capable ffmpeg build. "
+                    "Either provide an ffmpeg with libplacebo+Vulkan, or set PC_LP_STRICT=0 to allow CPU libplacebo."
+                )
             # Keep libplacebo active so CPU-only builds can still tonemap; just note the missing Vulkan path.
             self._log.warning("libplacebo: Vulkan not available; using CPU libplacebo chain.")
         pix_fmt = "bgr24" if self._mode in ("libplacebo", "zscale") else "gbrpf32le"
