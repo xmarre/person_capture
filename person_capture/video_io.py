@@ -1013,6 +1013,8 @@ class FfmpegPipeReader:
         self._tm_ai = int(os.getenv("PC_LP_TM_INDEX", "0"))
         # Tonemap selection: 'auto' enables fallback rotation via _tm_ai
         self._tm_algo = (os.getenv("PC_TM_ALGO", "auto") or "auto")
+        # Strict LP: stay on libplacebo+Vulkan only (no CPU diag / no zscale fallback switching).
+        self._strict_lp = os.getenv("PC_LP_STRICT", "1").lower() not in ("0", "false", "no")
 
         # --- quoting helper for libplacebo string enums (bt.2390/mobius/hable/clip) ---
         # Some ffmpeg builds require quotes, otherwise "bt2390" is parsed as an expression → EINVAL.
@@ -1032,6 +1034,16 @@ class FfmpegPipeReader:
         self._hwupload_derive = (
             os.getenv("PC_LP_HWUPLOAD_DERIVE", "0").lower() not in ("0", "false", "no")
         )
+        # Vulkan probing modes (derive/bind/device) to auto-work around ICD quirks.
+        self._vk_probe_modes = [
+            {"derive": True,  "bind": True,  "dev": ""},   # default
+            {"derive": False, "bind": True,  "dev": ""},   # no derive
+            {"derive": False, "bind": True,  "dev": "0"},  # pin :0
+            {"derive": True,  "bind": True,  "dev": "0"},  # derive + :0
+            {"derive": True,  "bind": False, "dev": "0"}, # no filter_hw_device, rely on derive_device
+        ]
+        self._vk_probe_i = 0
+        self._vk_bind = True
         # GPU queue / memory controls
         self._extra_hw_frames = max(1, int(os.getenv("PC_LP_EXTRA_FRAMES", "6")))
         # staged memory relief (0=none, 1=reduce frames, 2=cap 2560, 3=cap 1920, 4=cap 1280)
@@ -1151,9 +1163,7 @@ class FfmpegPipeReader:
         self._pix_fmt = "bgr24"
         # Tunables (env overrides). Defaults align with MPC VR feel.
         # Strict LP mode = no CPU/zscale fallback. We'll try one minimal LP chain retry, then error.
-        self._strict_lp = bool(int(os.getenv("PC_STRICT_LIBPLACEBO", "1")))
         self._lp_minimal = False
-        self._tm_algo = (os.getenv("PC_TM_ALGO", "bt2390") or "bt2390").lower()
         self._sdr_nits = float(os.getenv("PC_SDR_NITS", "125"))       # 80–200 typical
         self._tm_desat = float(os.getenv("PC_TM_DESAT", "0.25"))      # 0=keep chroma, 1=desaturate more
         self._tm_param = float(os.getenv("PC_TM_PARAM", "0.40"))      # Mobius curve softness
@@ -1247,7 +1257,7 @@ class FfmpegPipeReader:
     def try_fallback_chain(self) -> bool:
         """
         Attempt staged fallback.
-        Also try a one-shot diagnostic: force CPU libplacebo (no Vulkan) once to
+        In non-strict mode, also try a one-shot diagnostic (CPU libplacebo) to
         distinguish Vulkan/ICD issues from general libplacebo failures.
         In strict LP mode stay on libplacebo: vary algo alias, surface, then minimal, then alternative algos.
         Non-strict mode continues to fall back to zscale and linear scale.
@@ -1259,22 +1269,27 @@ class FfmpegPipeReader:
             return s.lower() in tail
 
         if self._mode == "libplacebo":
-            # Vulkan/libplacebo memory starvation signals from ffmpeg/libplacebo
+            # Classify common faults
             mem_fault = _stderr_contains("cannot allocate memory") or _stderr_contains("out of memory")
-            if mem_fault and self._use_libplacebo and self._has_vulkan:
-                # First: if user enabled derive_device, turn it off and retry on the same context.
-                if getattr(self, "_hwupload_derive", False):
-                    self._hwupload_derive = False
+            arg_fault = (
+                _stderr_contains("error reinitializing filters")
+                or _stderr_contains("return code -22")
+                or _stderr_contains("invalid argument")
+            )
+            if (mem_fault or arg_fault) and self._use_libplacebo and self._has_vulkan:
+                # First: advance Vulkan probe mode (derive/bind/device) before scaling caps.
+                modes = getattr(self, "_vk_probe_modes", [])
+                i = getattr(self, "_vk_probe_i", 0)
+                if i < len(modes):
+                    m = modes[i]
+                    self._vk_probe_i = i + 1
+                    self._hwupload_derive = bool(m["derive"])
+                    self._vk_bind = bool(m["bind"])
+                    if (not getattr(self, "_vk_device", "")) and m["dev"]:
+                        self._vk_device = m["dev"]
                     self._log.warning(
-                        "LP(Vulkan): memory/perm fault • disabling hwupload derive_device and retrying."
-                    )
-                    self._start(max(self._pos + 1, 0))
-                    return True
-                # Second: if no explicit device set, try the first enumerated device (:0) once.
-                if not getattr(self, "_vk_device", "").strip():
-                    self._vk_device = "0"
-                    self._log.warning(
-                        "LP(Vulkan): memory/perm fault • pinning Vulkan device index :0 and retrying."
+                        "LP(Vulkan): fault → trying mode derive=%s bind=%s dev=%s",
+                        m["derive"], m["bind"], m["dev"] or "<auto>",
                     )
                     self._start(max(self._pos + 1, 0))
                     return True
@@ -1492,11 +1507,14 @@ class FfmpegPipeReader:
         return "p010le" if src10 else "yuv420p"
 
     def _vk_init_args(self) -> list[str]:
-        """Build -init_hw_device/-filter_hw_device args (optionally with explicit device index)."""
-        if self._vk_device:
-            return ["-init_hw_device", f"vulkan=pl:{self._vk_device}", "-filter_hw_device", "pl"]
-        # default device selection
-        return ["-init_hw_device", "vulkan=pl", "-filter_hw_device", "pl"]
+        """Build -init_hw_device [and maybe -filter_hw_device] for current probe mode."""
+        dev = getattr(self, "_vk_device", "") or ""
+        tag = "pl"
+        init = f"vulkan={tag}" + (f":{dev}" if dev else "")
+        args = ["-init_hw_device", init]
+        if getattr(self, "_vk_bind", True):
+            args += ["-filter_hw_device", tag]
+        return args
 
     def _chain(self) -> str:
         maxw = int(getattr(self, "_maxw", 0))
@@ -1515,25 +1533,17 @@ class FfmpegPipeReader:
                         # minimal: only tonemap in LP
                         f"libplacebo=tonemapping={_tm}",
                         "hwdownload",
+                        # post-download color/range fix mirrors CPU path for correctness
+                        "format=gbrpf32le",
+                        "zscale=transfer=bt709:primaries=bt709:matrix=bt709:rangein=pc:range=pc:dither=error_diffusion",
                         "format=bgr24",
                     ]
                     if maxw > 0:
                         filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                     filters.append("setsar=1")
                     return ",".join(filters)
+                # Vulkan path: keep LP args minimal to avoid EINVAL across builds.
                 lp_args = [f"tonemapping={_tm}"]
-                if self._lp_opts.get("colorspace"):
-                    lp_args.append("colorspace=bt709")
-                if self._lp_opts.get("color_primaries"):
-                    lp_args.append("color_primaries=bt709")
-                if self._lp_opts.get("color_trc"):
-                    lp_args.append("color_trc=bt709")
-                if self._lp_opts.get("range"):
-                    lp_args.append("range=full")
-                if (not self._lp_opts.get("colorspace")) and self._lp_opts.get("target_primaries"):
-                    lp_args.append("target_primaries=bt709")
-                if (not self._lp_opts.get("color_trc")) and self._lp_opts.get("target_trc"):
-                    lp_args.append("target_trc=bt709")
                 if self._lp_opts.get("dithering"):
                     lp_args.append("dithering=ordered")
                 elif self._lp_opts.get("dither"):
@@ -1552,7 +1562,13 @@ class FfmpegPipeReader:
                     gpuw = max(maxw & ~1, 2)
                     filters.append(f"scale_vulkan=w=min(iw\\,{gpuw}):h=-2")
                     scaled_gpu = True
-                filters.extend(["hwdownload", "format=bgr24"])
+                # download then do 709/range fix CPU-side for uniform results
+                filters.extend([
+                    "hwdownload",
+                    "format=gbrpf32le",
+                    "zscale=transfer=bt709:primaries=bt709:matrix=bt709:rangein=pc:range=pc:dither=error_diffusion",
+                    "format=bgr24",
+                ])
                 if maxw > 0 and not scaled_gpu:
                     filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                 filters.append("setsar=1")
@@ -1563,7 +1579,12 @@ class FfmpegPipeReader:
                 )
             _tm = self._tm_value()
             if getattr(self, "_lp_minimal", False):
-                parts = [f"libplacebo=tonemapping={self._q(_tm)}", "format=bgr24"]
+                parts = [
+                    f"libplacebo=tonemapping={self._q(_tm)}",
+                    "format=gbrpf32le",
+                    "zscale=transfer=bt709:primaries=bt709:matrix=bt709:rangein=pc:range=pc:dither=error_diffusion",
+                    "format=bgr24",
+                ]
                 if maxw > 0:
                     parts.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                 parts.append("setsar=1")
@@ -1625,8 +1646,7 @@ class FfmpegPipeReader:
         if self._mode == "libplacebo" and self._use_libplacebo and not self._has_vulkan:
             if self._strict_lp:
                 raise RuntimeError(
-                    "Strict libplacebo mode requires Vulkan-capable ffmpeg build. "
-                    "Either provide an ffmpeg with libplacebo+Vulkan, or set PC_LP_STRICT=0 to allow CPU libplacebo."
+                    "Strict libplacebo mode requires Vulkan-capable ffmpeg build."
                 )
             # Keep libplacebo active so CPU-only builds can still tonemap; just note the missing Vulkan path.
             self._log.warning("libplacebo: Vulkan not available; using CPU libplacebo chain.")
