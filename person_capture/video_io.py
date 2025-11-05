@@ -1048,6 +1048,8 @@ class FfmpegPipeReader:
         self._extra_hw_frames = max(1, int(os.getenv("PC_LP_EXTRA_FRAMES", "6")))
         # staged memory relief (0=none, 1=reduce frames, 2=cap 2560, 3=cap 1920, 4=cap 1280)
         self._mem_relief_stage = 0
+        self._fallback_hops = 0
+        self._fallback_hops_max = int(os.getenv("PC_LP_MAX_HOPS", "12"))
         # If ffprobe is missing, recover dimensions and fps via PyAV/OpenCV.
         if (self._w <= 0) or (self._h <= 0) or (self._fps <= 0) or (self._nb <= 0):
             _fmt, w_pyav, h_pyav = _probe_pixfmt_wh_pyav(path)
@@ -1263,6 +1265,14 @@ class FfmpegPipeReader:
         Non-strict mode continues to fall back to zscale and linear scale.
         Returns True if we switched chains; False if no further fallback exists.
         """
+        if self._fallback_hops >= getattr(self, "_fallback_hops_max", 12):
+            self._log.error("LP fallback exhausted after %s hops.", self._fallback_hops)
+            return False
+
+        def _restart(idx: int) -> None:
+            self._fallback_hops += 1
+            self._start(idx)
+
         # Inspect stderr for OOM-type failures first and relieve memory while staying on LP/Vulkan.
         def _stderr_contains(s: str) -> bool:
             tail = " | ".join(getattr(self, "_stderr_tail", [])[-50:]).lower()
@@ -1291,7 +1301,7 @@ class FfmpegPipeReader:
                         "LP(Vulkan): fault → trying mode derive=%s bind=%s dev=%s",
                         m["derive"], m["bind"], m["dev"] or "<auto>",
                     )
-                    self._start(max(self._pos + 1, 0))
+                    _restart(max(self._pos + 1, 0))
                     return True
                 # Stage 1: shrink GPU queue
                 if self._mem_relief_stage < 1 and self._extra_hw_frames > 2:
@@ -1299,28 +1309,28 @@ class FfmpegPipeReader:
                     old = self._extra_hw_frames
                     self._extra_hw_frames = 2
                     self._log.warning("LP(Vulkan): memory relief • extra_hw_frames %s→%s", old, self._extra_hw_frames)
-                    self._start(max(self._pos + 1, 0))
+                    _restart(max(self._pos + 1, 0))
                     return True
                 # Stage 2: cap width to 2560 on GPU
                 if self._mem_relief_stage < 2 and (getattr(self, "_maxw", 0) == 0 or getattr(self, "_maxw", 0) > 2560):
                     self._mem_relief_stage = 2
                     self._maxw = 2560
                     self._log.warning("LP(Vulkan): memory relief • apply GPU downscale cap to w=2560")
-                    self._start(max(self._pos + 1, 0))
+                    _restart(max(self._pos + 1, 0))
                     return True
                 # Stage 3: cap width to 1920
                 if self._mem_relief_stage < 3 and getattr(self, "_maxw", 0) > 1920:
                     self._mem_relief_stage = 3
                     self._maxw = 1920
                     self._log.warning("LP(Vulkan): memory relief • apply GPU downscale cap to w=1920")
-                    self._start(max(self._pos + 1, 0))
+                    _restart(max(self._pos + 1, 0))
                     return True
                 # Stage 4: cap width to 1280
                 if self._mem_relief_stage < 4 and getattr(self, "_maxw", 0) > 1280:
                     self._mem_relief_stage = 4
                     self._maxw = 1280
                     self._log.warning("LP(Vulkan): memory relief • apply GPU downscale cap to w=1280")
-                    self._start(max(self._pos + 1, 0))
+                    _restart(max(self._pos + 1, 0))
                     return True
 
         if self._mode == "libplacebo":
@@ -1341,7 +1351,7 @@ class FfmpegPipeReader:
                             self._force_cpu_lp_once = True
                             self._log.warning("libplacebo: forcing CPU path once to diagnose Vulkan issues.")
                             self._has_vulkan = False
-                            self._start(max(self._pos + 1, 0))
+                            _restart(max(self._pos + 1, 0))
                             return True
                     base_algo = (self._tm_algo or "").strip().lower()
                     if not base_algo:
@@ -1355,7 +1365,7 @@ class FfmpegPipeReader:
                         self._log.warning(
                             "libplacebo produced no frames; retrying with alternate tonemap alias."
                         )
-                        self._start(max(self._pos + 1, 0))
+                        _restart(max(self._pos + 1, 0))
                         return True
                     if not self._lp_surf_alt:
                         _log_tail("libplacebo emitted no frames;")
@@ -1363,13 +1373,13 @@ class FfmpegPipeReader:
                         self._log.warning(
                             "libplacebo produced no frames; retrying with alternate upload surface."
                         )
-                        self._start(max(self._pos + 1, 0))
+                        _restart(max(self._pos + 1, 0))
                         return True
                     if not getattr(self, "_lp_minimal", False):
                         _log_tail("libplacebo emitted no frames;")
                         self._log.warning("libplacebo produced no frames; retrying with MINIMAL LP chain.")
                         self._lp_minimal = True
-                        self._start(max(self._pos + 1, 0))
+                        _restart(max(self._pos + 1, 0))
                         return True
                     if self._tm_ai + 1 < len(self._tm_algos):
                         self._tm_ai += 1
@@ -1380,13 +1390,13 @@ class FfmpegPipeReader:
                             "libplacebo produced no frames; retrying with different tonemap algo: %s",
                             self._tm_algos[self._tm_ai],
                         )
-                        self._start(max(self._pos + 1, 0))
+                        _restart(max(self._pos + 1, 0))
                         return True
                 if not getattr(self, "_lp_minimal", False):
                     _log_tail("libplacebo emitted no frames;")
                     self._log.warning("libplacebo produced no frames; retrying with MINIMAL LP chain.")
                     self._lp_minimal = True
-                    self._start(max(self._pos + 1, 0))
+                    _restart(max(self._pos + 1, 0))
                     return True
             if self._strict_lp:
                 err = " | ".join(getattr(self, "_stderr_tail", [])[-15:]) or "n/a"
@@ -1399,7 +1409,7 @@ class FfmpegPipeReader:
                 self._stop()
                 self._mode = "zscale"
                 self._tried_zscale = True
-                self._start(max(self._pos + 1, 0))
+                _restart(max(self._pos + 1, 0))
                 return True
             if self._has_scale and not self._tried_scale:
                 _log_tail("HDR: libplacebo yielded no frames;")
@@ -1407,7 +1417,7 @@ class FfmpegPipeReader:
                 self._stop()
                 self._mode = "scale"
                 self._tried_scale = True
-                self._start(max(self._pos + 1, 0))
+                _restart(max(self._pos + 1, 0))
                 return True
             return False
         if self._mode == "zscale":
@@ -1416,7 +1426,7 @@ class FfmpegPipeReader:
                 self._stop()
                 self._mode = "scale"
                 self._tried_scale = True
-                self._start(max(self._pos + 1, 0))
+                _restart(max(self._pos + 1, 0))
                 return True
             return False
         return False
@@ -1475,8 +1485,8 @@ class FfmpegPipeReader:
                 cand = self._tm_algos[self._tm_ai]
             except Exception:
                 cand = "bt.2390"
-            if cand in {"bt2390", "bt.2390"}:
-                return "bt.2390" if self._lp_tm_alt else "bt2390"
+            if cand in {"bt2390", "bt_2390", "bt.2390"}:
+                return "bt.2390" if not self._lp_tm_alt else "bt2390"
             return cand
         # explicit 2390 → allow alias & staged fallback when _tm_ai advanced
         if algo in {"bt2390", "bt_2390", "bt.2390"}:
@@ -1486,10 +1496,10 @@ class FfmpegPipeReader:
                 except Exception:
                     cand = None
                 else:
-                    if cand in {"bt2390", "bt.2390"}:
-                        return "bt.2390" if self._lp_tm_alt else "bt2390"
+                    if cand in {"bt2390", "bt_2390", "bt.2390"}:
+                        return "bt.2390" if not self._lp_tm_alt else "bt2390"
                     return cand
-            return "bt.2390" if self._lp_tm_alt else "bt2390"
+            return "bt.2390" if not self._lp_tm_alt else "bt2390"
         # any other explicit algo
         return algo
 
@@ -1523,6 +1533,7 @@ class FfmpegPipeReader:
                 surf = self._choose_surf()
                 _tm = self._q(self._tm_value())
                 if getattr(self, "_lp_minimal", False):
+                    # minimal = tonemap only, then download to bgr24
                     filters = [
                         f"format={surf}",
                         (
@@ -1530,12 +1541,8 @@ class FfmpegPipeReader:
                             if self._hwupload_derive
                             else f"hwupload=extra_hw_frames={self._extra_hw_frames}"
                         ),
-                        # minimal: only tonemap in LP
                         f"libplacebo=tonemapping={_tm}",
                         "hwdownload",
-                        # post-download color/range fix mirrors CPU path for correctness
-                        "format=gbrpf32le",
-                        "zscale=transfer=bt709:primaries=bt709:matrix=bt709:rangein=pc:range=pc:dither=error_diffusion",
                         "format=bgr24",
                     ]
                     if maxw > 0:
@@ -1579,12 +1586,8 @@ class FfmpegPipeReader:
                 )
             _tm = self._tm_value()
             if getattr(self, "_lp_minimal", False):
-                parts = [
-                    f"libplacebo=tonemapping={self._q(_tm)}",
-                    "format=gbrpf32le",
-                    "zscale=transfer=bt709:primaries=bt709:matrix=bt709:rangein=pc:range=pc:dither=error_diffusion",
-                    "format=bgr24",
-                ]
+                # minimal = tonemap only, then emit bgr24
+                parts = [f"libplacebo=tonemapping={self._q(_tm)}", "format=bgr24"]
                 if maxw > 0:
                     parts.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                 parts.append("setsar=1")
