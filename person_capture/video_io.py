@@ -1013,8 +1013,8 @@ class FfmpegPipeReader:
         self._tm_ai = int(os.getenv("PC_LP_TM_INDEX", "0"))
         # Tonemap selection: 'auto' enables fallback rotation via _tm_ai
         self._tm_algo = (os.getenv("PC_TM_ALGO", "auto") or "auto")
-        # Strict LP: stay on libplacebo+Vulkan only (no CPU diag / no zscale fallback switching).
-        self._strict_lp = os.getenv("PC_LP_STRICT", "1").lower() not in ("0", "false", "no")
+        # Strict LP (opt-in): stay on libplacebo+Vulkan only (no CPU diag / no zscale fallback switching).
+        self._strict_lp = os.getenv("PC_LP_STRICT", "0").lower() not in ("0", "false", "no")
 
         # --- quoting helper for libplacebo string enums (bt.2390/mobius/hable/clip) ---
         # Some ffmpeg builds require quotes, otherwise "bt2390" is parsed as an expression → EINVAL.
@@ -1046,7 +1046,7 @@ class FfmpegPipeReader:
         self._vk_bind = True
         # GPU queue / memory controls
         self._extra_hw_frames = max(1, int(os.getenv("PC_LP_EXTRA_FRAMES", "6")))
-        # staged memory relief (0=none, 1=reduce frames, 2=cap 2560, 3=cap 1920, 4=cap 1280)
+        # staged memory relief (0=none, 1=queue=1, 2=queue=2, 3=cap 2560, 4=cap 1920, 5=cap 1280)
         self._mem_relief_stage = 0
         self._fallback_hops = 0
         self._fallback_hops_max = int(
@@ -1205,7 +1205,7 @@ class FfmpegPipeReader:
 
     def _calc_fallback_budget(self) -> int:
         n = len(getattr(self, "_vk_probe_modes", []))         # Vulkan probe modes
-        n += 4                                                # mem-relief stages (frames, 2560, 1920, 1280)
+        n += 5                                                # mem-relief stages (q=1, q=2, 2560, 1920, 1280)
         n += 1                                                # CPU diagnostic probe
         n += 1                                                # 2390 alias flip
         n += 1                                                # surface alt
@@ -1321,33 +1321,41 @@ class FfmpegPipeReader:
                     )
                     _restart(max(self._pos + 1, 0))
                     return True
-                # Stage 1: shrink GPU queue
-                if self._mem_relief_stage < 1 and self._extra_hw_frames > 2:
+                # Stage 0: shrink GPU queue to 1
+                if self._mem_relief_stage < 1 and self._extra_hw_frames > 1:
                     self._mem_relief_stage = 1
+                    old = self._extra_hw_frames
+                    self._extra_hw_frames = 1
+                    self._log.warning("LP(Vulkan): memory relief • extra_hw_frames %s→%s", old, self._extra_hw_frames)
+                    _restart(max(self._pos + 1, 0))
+                    return True
+                # Stage 1: shrink GPU queue to 2
+                if self._mem_relief_stage < 2 and self._extra_hw_frames > 2:
+                    self._mem_relief_stage = 2
                     old = self._extra_hw_frames
                     self._extra_hw_frames = 2
                     self._log.warning("LP(Vulkan): memory relief • extra_hw_frames %s→%s", old, self._extra_hw_frames)
                     _restart(max(self._pos + 1, 0))
                     return True
                 # Stage 2: cap width to 2560 on GPU
-                if self._mem_relief_stage < 2 and (getattr(self, "_maxw", 0) == 0 or getattr(self, "_maxw", 0) > 2560):
-                    self._mem_relief_stage = 2
+                if self._mem_relief_stage < 3 and (getattr(self, "_maxw", 0) == 0 or getattr(self, "_maxw", 0) > 2560):
+                    self._mem_relief_stage = 3
                     self._maxw = 2560
                     self._log.warning("LP(Vulkan): memory relief • apply GPU downscale cap to w=2560")
                     self._apply_cap_dims()
                     _restart(max(self._pos + 1, 0))
                     return True
                 # Stage 3: cap width to 1920
-                if self._mem_relief_stage < 3 and getattr(self, "_maxw", 0) > 1920:
-                    self._mem_relief_stage = 3
+                if self._mem_relief_stage < 4 and getattr(self, "_maxw", 0) > 1920:
+                    self._mem_relief_stage = 4
                     self._maxw = 1920
                     self._log.warning("LP(Vulkan): memory relief • apply GPU downscale cap to w=1920")
                     self._apply_cap_dims()
                     _restart(max(self._pos + 1, 0))
                     return True
                 # Stage 4: cap width to 1280
-                if self._mem_relief_stage < 4 and getattr(self, "_maxw", 0) > 1280:
-                    self._mem_relief_stage = 4
+                if self._mem_relief_stage < 5 and getattr(self, "_maxw", 0) > 1280:
+                    self._mem_relief_stage = 5
                     self._maxw = 1280
                     self._log.warning("LP(Vulkan): memory relief • apply GPU downscale cap to w=1280")
                     self._apply_cap_dims()
@@ -1685,6 +1693,7 @@ class FfmpegPipeReader:
             "-hide_banner",
             "-loglevel", ll,
             "-nostdin",
+            "-ignore_unknown",
             # Make weird HEVC/DOVI intros and broken containers more robust:
             "-fflags",
             "+genpts",
@@ -1694,6 +1703,8 @@ class FfmpegPipeReader:
             "200M",
             "-err_detect",
             "ignore_err",
+            "-threads",
+            "1",
             "-filter_threads",
             "1",
         ]
@@ -1710,16 +1721,12 @@ class FfmpegPipeReader:
         if self._mode == "libplacebo" and self._use_libplacebo:
             self._log.debug("LP vf: %s", vf)
         cmd += [
-            "-i",
-            self._path,
-            "-map", "0:v:0",        # select only video
-            "-map", "-0:a",         # drop audio streams
-            "-map", "-0:s",         # drop subtitle streams (PGS can be huge)
-            "-map", "-0:d",         # drop data streams
+            "-i", self._path,
+            "-map", "0:v:0",     # select only video
+            "-an", "-sn", "-dn", # drop audio/subs/data
             "-map_metadata", "-1",
             "-map_chapters", "-1",
-            "-vf",
-            vf,
+            "-vf", vf,
         ]
         try:
             fps_passthrough = self._supports_fps_mode()
