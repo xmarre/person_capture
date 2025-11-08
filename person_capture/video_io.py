@@ -1013,8 +1013,8 @@ class FfmpegPipeReader:
         self._tm_ai = int(os.getenv("PC_LP_TM_INDEX", "0"))
         # Tonemap selection: 'auto' enables fallback rotation via _tm_ai
         self._tm_algo = (os.getenv("PC_TM_ALGO", "auto") or "auto")
-        # Strict LP (opt-in): stay on libplacebo+Vulkan only (no CPU diag / no zscale fallback switching).
-        self._strict_lp = os.getenv("PC_LP_STRICT", "0").lower() not in ("0", "false", "no")
+        # Strict LP (default on): LP+Vulkan only — no CPU diag, no zscale/scale fallbacks.
+        self._strict_lp = os.getenv("PC_LP_STRICT", "1").lower() not in ("0", "false", "no")
 
         # --- quoting helper for libplacebo string enums (bt.2390/mobius/hable/clip) ---
         # Some ffmpeg builds require quotes, otherwise "bt2390" is parsed as an expression → EINVAL.
@@ -1205,7 +1205,7 @@ class FfmpegPipeReader:
 
     def _calc_fallback_budget(self) -> int:
         n = len(getattr(self, "_vk_probe_modes", []))         # Vulkan probe modes
-        n += 5                                                # mem-relief stages (q=1, q=2, 2560, 1920, 1280)
+        n += 5                                                # mem-relief stages (queue=1, queue=2, 2560, 1920, 1280)
         n += 1                                                # CPU diagnostic probe
         n += 1                                                # 2390 alias flip
         n += 1                                                # surface alt
@@ -1362,6 +1362,40 @@ class FfmpegPipeReader:
                     _restart(max(self._pos + 1, 0))
                     return True
 
+                # If this is a memory-type fault and we've exhausted GPU-side mitigations,
+                # skip tonemap algo rotations and go straight to CPU diag (once) or zscale.
+                if mem_fault:
+                    if not self._lp_surf_alt:
+                        self._lp_surf_alt = True
+                        self._log.warning("libplacebo: mem fault → trying alternate upload surface.")
+                        _restart(max(self._pos + 1, 0))
+                        return True
+                    if not getattr(self, "_lp_minimal", False):
+                        self._lp_minimal = True
+                        self._log.warning("libplacebo: mem fault → trying MINIMAL LP chain.")
+                        _restart(max(self._pos + 1, 0))
+                        return True
+                    if self._strict_lp:
+                        err = " | ".join(getattr(self, "_stderr_tail", [])[-15:]) or "n/a"
+                        raise RuntimeError(
+                            f"libplacebo(Vulkan) produced no frames; strict mode forbids CPU fallback. tail: {err}"
+                        )
+                    if not getattr(self, "_force_cpu_lp_once", False):
+                        self._force_cpu_lp_once = True
+                        self._log.warning("libplacebo: mem fault persists → forcing one CPU LP diagnostic.")
+                        self._has_vulkan = False
+                        _restart(max(self._pos + 1, 0))
+                        return True
+                    if (self._has_zscale and self._has_tonemap) and not self._tried_zscale:
+                        self._log.warning("HDR: LP mem fault persists → falling back to zscale+tonemap.")
+                        self._stop()
+                        self._mode = "zscale"
+                        self._fallback_hops = 0
+                        self._tried_zscale = True
+                        _restart(max(self._pos + 1, 0))
+                        return True
+                    return False
+
         if self._mode == "libplacebo":
             def _log_tail(prefix: str) -> None:
                 tail = getattr(self, "_stderr_tail", [])[-5:]
@@ -1430,7 +1464,7 @@ class FfmpegPipeReader:
             if self._strict_lp:
                 err = " | ".join(getattr(self, "_stderr_tail", [])[-15:]) or "n/a"
                 raise RuntimeError(
-                    f"libplacebo(Vulkan) produced no frames even with minimal chain. stderr tail: {err}"
+                    f"libplacebo(Vulkan) produced no frames; strict mode forbids CPU fallback. tail: {err}"
                 )
             if (self._has_zscale and self._has_tonemap) and not self._tried_zscale:
                 _log_tail("HDR: libplacebo yielded no frames;")
@@ -1565,7 +1599,7 @@ class FfmpegPipeReader:
                 surf = self._choose_surf()
                 _tm = self._q(self._tm_value())
                 if getattr(self, "_lp_minimal", False):
-                    # minimal = tonemap only, then download to bgr24
+                    # minimal = tonemap only, then download to compact RGB
                     filters = [
                         f"format={surf}",
                         (
@@ -1575,18 +1609,27 @@ class FfmpegPipeReader:
                         ),
                         f"libplacebo=tonemapping={_tm}",
                         "hwdownload",
-                        "format=bgr24",
+                        "format=bgr0",   # RGBA8: cheap and robust out of hwdownload
+                        "format=bgr24",  # final for OpenCV
                     ]
                     if maxw > 0:
                         filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                     filters.append("setsar=1")
                     return ",".join(filters)
-                # Vulkan path: keep LP args minimal to avoid EINVAL across builds.
+                # Vulkan path: do all colorspace/range in libplacebo to avoid huge CPU float buffers.
                 lp_args = [f"tonemapping={_tm}"]
                 if self._lp_opts.get("dithering"):
                     lp_args.append("dithering=ordered")
                 elif self._lp_opts.get("dither"):
                     lp_args.append("dither=yes")
+                if self._lp_opts.get("target_primaries"):
+                    lp_args.append("target_primaries=bt709")
+                if self._lp_opts.get("target_trc"):
+                    lp_args.append("target_trc=bt709")
+                if self._lp_opts.get("range"):
+                    lp_args.append("range=full")
+                if self._lp_opts.get("gamut_mode"):
+                    lp_args.append("gamut_mode=clip")
                 filters = [
                     f"format={surf}",
                     (
@@ -1601,13 +1644,8 @@ class FfmpegPipeReader:
                     gpuw = max(maxw & ~1, 2)
                     filters.append(f"scale_vulkan=w=min(iw\\,{gpuw}):h=-2")
                     scaled_gpu = True
-                # download then do 709/range fix CPU-side for uniform results
-                filters.extend([
-                    "hwdownload",
-                    "format=gbrpf32le",
-                    "zscale=transfer=bt709:primaries=bt709:matrix=bt709:rangein=pc:range=pc:dither=error_diffusion",
-                    "format=bgr24",
-                ])
+                # download already-tonemapped and 709/full-range RGB to compact format
+                filters.extend(["hwdownload", "format=bgr24"])
                 if maxw > 0 and not scaled_gpu:
                     filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                 filters.append("setsar=1")
@@ -1693,6 +1731,7 @@ class FfmpegPipeReader:
             "-hide_banner",
             "-loglevel", ll,
             "-nostdin",
+            "-max_alloc", "0",
             "-ignore_unknown",
             # Make weird HEVC/DOVI intros and broken containers more robust:
             "-fflags",
@@ -1720,14 +1759,10 @@ class FfmpegPipeReader:
         vf = self._chain()
         if self._mode == "libplacebo" and self._use_libplacebo:
             self._log.debug("LP vf: %s", vf)
-        cmd += [
-            "-i", self._path,
-            "-map", "0:v:0",     # select only video
-            "-an", "-sn", "-dn", # drop audio/subs/data
-            "-map_metadata", "-1",
-            "-map_chapters", "-1",
-            "-vf", vf,
-        ]
+        cmd += ["-i", self._path]
+        # keep only the primary video; drop audio/subs/data/attachments
+        cmd += ["-map", "0:v:0", "-an", "-sn", "-dn", "-map", "-0:t"]
+        cmd += ["-map_metadata", "-1", "-map_chapters", "-1", "-vf", vf]
         try:
             fps_passthrough = self._supports_fps_mode()
         except Exception:
