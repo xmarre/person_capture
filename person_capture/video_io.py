@@ -1041,9 +1041,12 @@ class FfmpegPipeReader:
             {"derive": False, "bind": True,  "dev": "0"},  # pin :0
             {"derive": True,  "bind": True,  "dev": "0"},  # derive + :0
             {"derive": True,  "bind": False, "dev": "0"}, # no filter_hw_device, rely on derive_device
+            {"derive": False, "bind": False, "dev": "", "noinit": True},  # FULL BYPASS: libplacebo owns device
+            {"derive": True,  "bind": False, "dev": "", "noinit": True},  # BYPASS init_hw_device → derive-only
         ]
         self._vk_probe_i = 0
         self._vk_bind = True
+        self._vk_noinit = False
         # GPU queue / memory controls
         self._extra_hw_frames = max(1, int(os.getenv("PC_LP_EXTRA_FRAMES", "6")))
         # staged memory relief (0=none, 1=queue=1, 2=queue=2, 3=cap 2560, 4=cap 1920, 5=cap 1280)
@@ -1206,7 +1209,7 @@ class FfmpegPipeReader:
     def _calc_fallback_budget(self) -> int:
         n = len(getattr(self, "_vk_probe_modes", []))         # Vulkan probe modes
         n += 5                                                # mem-relief stages (queue=1, queue=2, 2560, 1920, 1280)
-        n += 1                                                # CPU diagnostic probe
+        n += 1                                                # CPU diagnostic probe (disabled in strict mode)
         n += 1                                                # 2390 alias flip
         n += 1                                                # surface alt
         n += 1                                                # minimal LP chain
@@ -1222,6 +1225,35 @@ class FfmpegPipeReader:
             self._h = max(2, int(math.floor(self._h * ratio)) & ~1)
             self._frame_bytes_u8 = self._w * self._h * 3
             self._frame_bytes_f32 = self._w * self._h * 3 * 4
+
+    # ---- libplacebo capability helpers ----
+    def _lp_supports_any(self, *names: str) -> str | None:
+        """Return the first supported option name from names, or None."""
+        opts = getattr(self, "_lp_opts", None) or {}
+        for n in names:
+            if opts.get(n):
+                return n
+        return None
+
+    def _lp_add_colorspace_args(self, lp_args: list[str]) -> None:
+        """
+        Append BT.709 + full-range args using whichever libplacebo option names
+        this ffmpeg build supports (modern vs legacy).
+        """
+        # Single modern umbrella first if present
+        if self._lp_supports_any("colorspace"):
+            lp_args.append("colorspace=bt709")
+        else:
+            p = self._lp_supports_any("target_primaries", "color_primaries")
+            t = self._lp_supports_any("target_trc", "color_trc")
+            if p:
+                lp_args.append(f"{p}=bt709")
+            if t:
+                lp_args.append(f"{t}=bt709")
+        if self._lp_supports_any("range"):
+            lp_args.append("range=full")
+        if self._lp_supports_any("gamut_mode"):
+            lp_args.append("gamut_mode=clip")
 
     def _list_filters(self) -> set[str]:
         try:
@@ -1298,7 +1330,13 @@ class FfmpegPipeReader:
 
         if self._mode == "libplacebo":
             # Classify common faults
-            mem_fault = _stderr_contains("cannot allocate memory") or _stderr_contains("out of memory")
+            mem_fault = any(_stderr_contains(k) for k in (
+                "cannot allocate memory",
+                "out of memory",
+                "not enough memory resources",
+                "std::bad_alloc",
+                "Device creation failed: -12",        # VK_ERROR_FRAGMENTED_POOL
+            ))
             arg_fault = (
                 _stderr_contains("error reinitializing filters")
                 or _stderr_contains("return code -22")
@@ -1313,11 +1351,12 @@ class FfmpegPipeReader:
                     self._vk_probe_i = i + 1
                     self._hwupload_derive = bool(m["derive"])
                     self._vk_bind = bool(m["bind"])
+                    self._vk_noinit = bool(m.get("noinit", False))
                     if (not getattr(self, "_vk_device", "")) and m["dev"]:
                         self._vk_device = m["dev"]
                     self._log.warning(
-                        "LP(Vulkan): fault → trying mode derive=%s bind=%s dev=%s",
-                        m["derive"], m["bind"], m["dev"] or "<auto>",
+                        "LP(Vulkan): fault → trying mode derive=%s bind=%s noinit=%s dev=%s",
+                        m["derive"], m["bind"], m.get("noinit", False), m["dev"] or "<auto>",
                     )
                     _restart(max(self._pos + 1, 0))
                     return True
@@ -1584,9 +1623,15 @@ class FfmpegPipeReader:
 
     def _vk_init_args(self) -> list[str]:
         """Build -init_hw_device [and maybe -filter_hw_device] for current probe mode."""
+        if getattr(self, "_vk_noinit", False):
+            self._log.info("libplacebo: Vulkan no-init mode • filter owns device init/bind")
+            return []
         dev = getattr(self, "_vk_device", "") or ""
         tag = "pl"
         init = f"vulkan={tag}" + (f":{dev}" if dev else "")
+        # Optional: reduce driver allocations
+        if (os.getenv("PC_VK_DISABLE_RBA", "0").lower() not in ("0", "false", "no")):
+            init += ":disable_robust_buffer_access=1"
         args = ["-init_hw_device", init]
         if getattr(self, "_vk_bind", True):
             args += ["-filter_hw_device", tag]
@@ -1595,11 +1640,15 @@ class FfmpegPipeReader:
     def _chain(self) -> str:
         maxw = int(getattr(self, "_maxw", 0))
         if self._mode == "libplacebo" and self._use_libplacebo:
+            # ensure libplacebo capabilities are available when building args
+            self._lp_opts = getattr(self, "_lp_opts", None) or self._probe_libplacebo_opts()
             if self._has_vulkan:
                 surf = self._choose_surf()
                 _tm = self._q(self._tm_value())
                 if getattr(self, "_lp_minimal", False):
-                    # minimal = tonemap only, then download to compact RGB
+                    # minimal = tonemap + colorspace/range on-GPU, then download to compact RGB
+                    lp_args = [f"tonemapping={_tm}"]
+                    self._lp_add_colorspace_args(lp_args)
                     filters = [
                         f"format={surf}",
                         (
@@ -1607,7 +1656,7 @@ class FfmpegPipeReader:
                             if self._hwupload_derive
                             else f"hwupload=extra_hw_frames={self._extra_hw_frames}"
                         ),
-                        f"libplacebo=tonemapping={_tm}",
+                        "libplacebo=" + ":".join(lp_args),
                         "hwdownload",
                         "format=bgr0",   # RGBA8: cheap and robust out of hwdownload
                         "format=bgr24",  # final for OpenCV
@@ -1622,14 +1671,8 @@ class FfmpegPipeReader:
                     lp_args.append("dithering=ordered")
                 elif self._lp_opts.get("dither"):
                     lp_args.append("dither=yes")
-                if self._lp_opts.get("target_primaries"):
-                    lp_args.append("target_primaries=bt709")
-                if self._lp_opts.get("target_trc"):
-                    lp_args.append("target_trc=bt709")
-                if self._lp_opts.get("range"):
-                    lp_args.append("range=full")
-                if self._lp_opts.get("gamut_mode"):
-                    lp_args.append("gamut_mode=clip")
+                # Add BT.709/full-range using whatever names this build supports.
+                self._lp_add_colorspace_args(lp_args)
                 filters = [
                     f"format={surf}",
                     (
@@ -1656,21 +1699,16 @@ class FfmpegPipeReader:
                 )
             _tm = self._tm_value()
             if getattr(self, "_lp_minimal", False):
-                # minimal = tonemap only, then emit bgr24
-                parts = [f"libplacebo=tonemapping={self._q(_tm)}", "format=bgr24"]
+                # minimal = tonemap + colorspace/range on CPU, then emit bgr24
+                lp_args = [f"tonemapping={self._q(_tm)}"]
+                self._lp_add_colorspace_args(lp_args)
+                parts = ["libplacebo=" + ":".join(lp_args), "format=bgr24"]
                 if maxw > 0:
                     parts.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                 parts.append("setsar=1")
                 return ",".join(parts)
             lp_opts = [f"tonemapping={self._q(self._tm_value())}"]
-            if self._lp_opts.get("colorspace"):
-                lp_opts.append("colorspace=bt709")
-            if self._lp_opts.get("color_primaries"):
-                lp_opts.append("color_primaries=bt709")
-            if self._lp_opts.get("color_trc"):
-                lp_opts.append("color_trc=bt709")
-            if self._lp_opts.get("range"):
-                lp_opts.append("range=full")
+            self._lp_add_colorspace_args(lp_opts)
             if self._lp_opts.get("dithering"):
                 lp_opts.append("dithering=ordered")
             parts: list[str] = []
