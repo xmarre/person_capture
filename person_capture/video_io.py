@@ -1905,7 +1905,7 @@ class FfmpegPipeReader:
         vf = self._chain()
         if self._mode == "libplacebo" and self._use_libplacebo:
             self._log.debug("LP vf: %s", vf)
-        cmd += ["-safe", "0", "-i", self._ff_input_path()]
+        cmd += ["-i", self._ff_input_path()]
         # keep only the primary video; drop audio/subs/data/attachments
         cmd += ["-map", "0:v:0", "-an", "-sn", "-dn", "-map", "-0:t"]
         cmd += ["-map_metadata", "-1", "-map_chapters", "-1", "-vf", vf]
