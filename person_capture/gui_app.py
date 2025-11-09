@@ -2613,7 +2613,15 @@ class Processor(QtCore.QObject):
                         cap = cv2.VideoCapture(cfg.video)
             except Exception:
                 cap = cv2.VideoCapture(cfg.video)
-            if not cap.isOpened():
+            # Treat LP/Vulkan HDR pipe as opened; it needs a warm-up grab before frames appear.
+            _is_hdr_pipe = False
+            try:
+                from person_capture.video_io import FfmpegPipeReader as _HDRPipe
+
+                _is_hdr_pipe = isinstance(cap, _HDRPipe)
+            except Exception:
+                pass
+            if (not _is_hdr_pipe) and (not cap.isOpened()):
                 raise RuntimeError(f"Cannot open video: {cfg.video}")
             try:
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
@@ -2628,6 +2636,8 @@ class Processor(QtCore.QObject):
                 except Exception:
                     tries = 12
                 ok_any = False
+                warmup_ms = int(os.getenv("PC_HDR_PIPE_WARMUP_MS", "2500"))
+                warmup_deadline = time.time() + (warmup_ms / 1000.0)
                 # some wrappers may not expose get/set; fall back to 0
                 get = getattr(c, "get", None)
                 set_ = getattr(c, "set", None)
@@ -2635,28 +2645,24 @@ class Processor(QtCore.QObject):
                 for _ in range(tries):
                     ok, fr = c.read()
                     if not ok:
-                        # UHD HDR pipelines via ffmpeg/libplacebo may report !ok until frames arrive.
-                        try:
-                            from person_capture.video_io import FfmpegPipeReader  # local import to avoid cycles
-
-                            is_hdr_pipe = isinstance(c, FfmpegPipeReader)
-                        except Exception:
-                            is_hdr_pipe = False
-                        if is_hdr_pipe:
-                            grab = getattr(c, "grab", None)
-                            retrieve = getattr(c, "retrieve", None)
-                            if callable(grab) and callable(retrieve):
-                                deadline = time.time() + 2.0
-                                while time.time() < deadline and not ok:
-                                    try:
-                                        if grab():
-                                            ok, fr = retrieve()
-                                            if ok:
-                                                break
-                                    except Exception:
+                        # FFmpeg/libplacebo may need a few grabs before first retrieve.
+                        grab = getattr(c, "grab", None)
+                        retrieve = getattr(c, "retrieve", None)
+                        while (
+                            time.time() < warmup_deadline
+                            and callable(grab)
+                            and callable(retrieve)
+                            and not ok
+                        ):
+                            try:
+                                if grab():
+                                    ok, fr = retrieve()
+                                    if ok:
                                         break
-                                    time.sleep(0.05)
-                    if ok and fr is not None and fr.size:
+                            except Exception:
+                                break
+                            time.sleep(0.05)
+                    if ok and fr is not None and getattr(fr, "size", 0):
                         ok_any = True
                         # show first frame immediately so UI proves the pipeline is alive
                         try:
@@ -2676,23 +2682,20 @@ class Processor(QtCore.QObject):
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
             ok = _probe_reader(cap, float(fps or 24.0))
+            # No CPU/zscale fallbacks when strict LP is active.
             strict = bool(getattr(cap, "_strict_lp", False))
-            if (not ok) and strict:
-                raise RuntimeError(
-                    "Strict libplacebo reader emitted no frames; aborting open."
-                )
             if (not ok) and hasattr(cap, "try_fallback_chain") and not strict:
                 try:
                     # If HDR pipe failed on libplacebo (e.g., Vulkan), ask it to fall back to zscale+tonemap.
                     if cap.try_fallback_chain():
                         self._status(
-                            "HDR: libplacebo produced no frames; retrying with zscale+tonemap.",
-                            key="hdr_probe_fail",
-                            interval=60.0,
+                            "HDR: libplacebo emitted no frames; retrying with alternate filter chain…"
                         )
                         ok = _probe_reader(cap, float(fps or 24.0))
                 except Exception:
-                    ok = False
+                    pass
+            if (not ok) and strict:
+                raise RuntimeError("libplacebo(Vulkan) produced no frames in strict mode")
 
             if not ok:
                 msg = (
