@@ -2634,6 +2634,28 @@ class Processor(QtCore.QObject):
                 pos0 = int(get(cv2.CAP_PROP_POS_FRAMES) or 0) if callable(get) else 0
                 for _ in range(tries):
                     ok, fr = c.read()
+                    if not ok:
+                        # UHD HDR pipelines via ffmpeg/libplacebo may report !ok until frames arrive.
+                        try:
+                            from person_capture.video_io import FfmpegPipeReader  # local import to avoid cycles
+
+                            is_hdr_pipe = isinstance(c, FfmpegPipeReader)
+                        except Exception:
+                            is_hdr_pipe = False
+                        if is_hdr_pipe:
+                            grab = getattr(c, "grab", None)
+                            retrieve = getattr(c, "retrieve", None)
+                            if callable(grab) and callable(retrieve):
+                                deadline = time.time() + 2.0
+                                while time.time() < deadline and not ok:
+                                    try:
+                                        if grab():
+                                            ok, fr = retrieve()
+                                            if ok:
+                                                break
+                                    except Exception:
+                                        break
+                                    time.sleep(0.05)
                     if ok and fr is not None and fr.size:
                         ok_any = True
                         # show first frame immediately so UI proves the pipeline is alive
@@ -2654,7 +2676,12 @@ class Processor(QtCore.QObject):
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
             ok = _probe_reader(cap, float(fps or 24.0))
-            if (not ok) and hasattr(cap, "try_fallback_chain"):
+            strict = bool(getattr(cap, "_strict_lp", False))
+            if (not ok) and strict:
+                raise RuntimeError(
+                    "Strict libplacebo reader emitted no frames; aborting open."
+                )
+            if (not ok) and hasattr(cap, "try_fallback_chain") and not strict:
                 try:
                     # If HDR pipe failed on libplacebo (e.g., Vulkan), ask it to fall back to zscale+tonemap.
                     if cap.try_fallback_chain():
