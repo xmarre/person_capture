@@ -988,11 +988,35 @@ def open_video_with_tonemap(path: str):
 class FfmpegPipeReader:
     """HDR→SDR using bundled ffmpeg. Streams bgr24. OpenCV-like API."""
 
+    # --- Windows long-path helper ---
+    @staticmethod
+    def _win_longpath(p: str) -> str:
+        if os.name != "nt":
+            return p
+        # Normalize and add \\?\ or \\?\UNC\ for network paths
+        try:
+            ap = os.path.abspath(p)
+        except Exception:
+            ap = p
+        if ap.startswith("\\\\?\\"):
+            return ap
+        if ap.startswith("\\\\"):
+            return "\\\\?\\UNC" + ap[1:]
+        return "\\\\?\\" + ap
+
     def __init__(self, path: str, ffmpeg_exe: str):
         self._log = logging.getLogger(__name__)
         self._path = path
         self._ffmpeg = ffmpeg_exe
-        meta = _ffprobe_json(path)
+        # Use long-path for ffprobe too, or the probe can fail independently of ffmpeg open.
+        try:
+            if os.name == "nt" and os.getenv("PC_WIN_LONGPATH", "1").lower() not in ("0", "false", "no"):
+                _probe_path = self._win_longpath(path)
+            else:
+                _probe_path = path
+        except Exception:
+            _probe_path = path
+        meta = _ffprobe_json(_probe_path)
         s = (meta.get("streams") or [{}])[0]
         self._w = int(s.get("width") or 0)
         self._h = int(s.get("height") or 0)
@@ -1015,6 +1039,20 @@ class FfmpegPipeReader:
         self._tm_algo = (os.getenv("PC_TM_ALGO", "auto") or "auto")
         # Strict LP (default on): LP+Vulkan only — no CPU diag, no zscale/scale fallbacks.
         self._strict_lp = os.getenv("PC_LP_STRICT", "1").lower() not in ("0", "false", "no")
+        # Input/demux probe budgets
+        try:
+            self._probe_m = max(1, int(os.getenv("PC_FF_PROBE_M", "48")))
+        except Exception:
+            self._probe_m = 48
+        try:
+            self._analyze_m = max(1, int(os.getenv("PC_FF_ANALYZE_M", "48")))
+        except Exception:
+            self._analyze_m = 48
+        try:
+            self._max_probe_pkts = max(64, int(os.getenv("PC_FF_MAX_PROBE_PKTS", "1024")))
+        except Exception:
+            self._max_probe_pkts = 1024
+        self._reduced_probe = False
         # Identify as HDR pipe and always “open” for cv2-style guards.
         self._is_hdr_pipe = True
         self.isOpened = lambda: True
@@ -1260,6 +1298,9 @@ class FfmpegPipeReader:
             self._frame_bytes_f32 = self._w * self._h * 3 * 4
 
     # ---- libplacebo capability helpers ----
+    def _ff_input_path(self) -> str:
+        return self._win_longpath(self._path) if (os.name == "nt" and os.getenv("PC_WIN_LONGPATH", "1").lower() not in ("0","false","no")) else self._path
+
     def _lp_supports_any(self, *names: str) -> str | None:
         """Return the first supported option name from names, or None."""
         opts = getattr(self, "_lp_opts", None) or {}
@@ -1362,6 +1403,37 @@ class FfmpegPipeReader:
             return s.lower() in tail
 
         if self._mode == "libplacebo":
+            # Input-open ENOMEM: shrink probe/analyze/packets and retry, then force long-path.
+            _open_err = (
+                _stderr_contains("error opening input file")
+                or _stderr_contains("error opening input files")
+            )
+            if _open_err and _stderr_contains("cannot allocate memory"):
+                if not getattr(self, "_reduced_probe", False):
+                    self._reduced_probe = True
+                    old_p, old_a = self._probe_m, self._analyze_m
+                    old_pk = getattr(self, "_max_probe_pkts", 1024)
+                    self._probe_m = max(4, old_p // 3)
+                    self._analyze_m = max(4, old_a // 3)
+                    self._max_probe_pkts = max(64, old_pk // 2)
+                    self._log.warning(
+                        "ffmpeg: input open ENOMEM → reduce probe/analyze/packets "
+                        "%sM→%sM / %sM→%sM / %spkts→%spkts",
+                        old_p,
+                        self._probe_m,
+                        old_a,
+                        self._analyze_m,
+                        old_pk,
+                        self._max_probe_pkts,
+                    )
+                    _restart(max(self._pos + 1, 0))
+                    return True
+                if os.name == "nt" and not getattr(self, "_forced_longpath", False):
+                    self._forced_longpath = True
+                    self._log.warning("ffmpeg: input open ENOMEM → retry with Windows long-path prefix")
+                    _restart(max(self._pos + 1, 0))
+                    return True
+
             # Classify common faults
             mem_fault = any(_stderr_contains(k) for k in (
                 "cannot allocate memory",
@@ -1803,15 +1875,17 @@ class FfmpegPipeReader:
             "-hide_banner",
             "-loglevel", ll,
             "-nostdin",
-            "-max_alloc", "0",
-            "-ignore_unknown",  # flag option; do not append dummy value (passing "1" breaks launch)
+            "-ignore_unknown",
             # Make weird HEVC/DOVI intros and broken containers more robust:
             "-fflags",
             "+genpts",
             "-analyzeduration",
-            "200M",
+            f"{self._analyze_m}M",
             "-probesize",
-            "200M",
+            f"{self._probe_m}M",
+            # cap the number of packets probes scan to keep allocations in check
+            "-max_probe_packets",
+            str(self._max_probe_pkts),
             "-err_detect",
             "ignore_err",
             "-threads",
@@ -1831,7 +1905,7 @@ class FfmpegPipeReader:
         vf = self._chain()
         if self._mode == "libplacebo" and self._use_libplacebo:
             self._log.debug("LP vf: %s", vf)
-        cmd += ["-i", self._path]
+        cmd += ["-safe", "0", "-i", self._ff_input_path()]
         # keep only the primary video; drop audio/subs/data/attachments
         cmd += ["-map", "0:v:0", "-an", "-sn", "-dn", "-map", "-0:t"]
         cmd += ["-map_metadata", "-1", "-map_chapters", "-1", "-vf", vf]
