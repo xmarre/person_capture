@@ -1015,6 +1015,9 @@ class FfmpegPipeReader:
         self._tm_algo = (os.getenv("PC_TM_ALGO", "auto") or "auto")
         # Strict LP (default on): LP+Vulkan only — no CPU diag, no zscale/scale fallbacks.
         self._strict_lp = os.getenv("PC_LP_STRICT", "1").lower() not in ("0", "false", "no")
+        # Identify as HDR pipe and always “open” for cv2-style guards.
+        self._is_hdr_pipe = True
+        self.isOpened = lambda: True
 
         # --- quoting helper for libplacebo string enums (bt.2390/mobius/hable/clip) ---
         # Some ffmpeg builds require quotes, otherwise "bt2390" is parsed as an expression → EINVAL.
@@ -1801,7 +1804,7 @@ class FfmpegPipeReader:
             "-loglevel", ll,
             "-nostdin",
             "-max_alloc", "0",
-            "-ignore_unknown",  # flag option; do not append dummy value
+            "-ignore_unknown",  # flag option; do not append dummy value (passing "1" breaks launch)
             # Make weird HEVC/DOVI intros and broken containers more robust:
             "-fflags",
             "+genpts",

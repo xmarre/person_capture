@@ -11,10 +11,10 @@ Run:
 """
 
 from __future__ import annotations
+import time
 
 import os, sys, subprocess, shutil, threading, struct
 import json, csv, traceback
-import time
 import logging
 import cv2
 import numpy as np
@@ -2613,15 +2613,11 @@ class Processor(QtCore.QObject):
                         cap = cv2.VideoCapture(cfg.video)
             except Exception:
                 cap = cv2.VideoCapture(cfg.video)
-            # Treat LP/Vulkan HDR pipe as opened; it needs a warm-up grab before frames appear.
-            _is_hdr_pipe = False
-            try:
-                from person_capture.video_io import FfmpegPipeReader as _HDRPipe
+            # Do not early-exit on “not opened” if this is a custom pipe or duck-types like one.
+            def _pipe_like(obj) -> bool:
+                return hasattr(obj, "try_fallback_chain") or (hasattr(obj, "grab") and hasattr(obj, "retrieve"))
 
-                _is_hdr_pipe = isinstance(cap, _HDRPipe)
-            except Exception:
-                pass
-            if (not _is_hdr_pipe) and (not cap.isOpened()):
+            if hasattr(cap, "isOpened") and not cap.isOpened() and not _pipe_like(cap):
                 raise RuntimeError(f"Cannot open video: {cfg.video}")
             try:
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
@@ -2636,7 +2632,7 @@ class Processor(QtCore.QObject):
                 except Exception:
                     tries = 12
                 ok_any = False
-                warmup_ms = int(os.getenv("PC_HDR_PIPE_WARMUP_MS", "2500"))
+                warmup_ms = int(os.getenv("PC_HDR_PIPE_WARMUP_MS", "3000"))
                 warmup_deadline = time.time() + (warmup_ms / 1000.0)
                 # some wrappers may not expose get/set; fall back to 0
                 get = getattr(c, "get", None)
@@ -2645,23 +2641,19 @@ class Processor(QtCore.QObject):
                 for _ in range(tries):
                     ok, fr = c.read()
                     if not ok:
-                        # FFmpeg/libplacebo may need a few grabs before first retrieve.
+                        # Warm-up by grab/retrieve if available.
                         grab = getattr(c, "grab", None)
                         retrieve = getattr(c, "retrieve", None)
-                        while (
-                            time.time() < warmup_deadline
-                            and callable(grab)
-                            and callable(retrieve)
-                            and not ok
-                        ):
-                            try:
-                                if grab():
-                                    ok, fr = retrieve()
-                                    if ok:
-                                        break
-                            except Exception:
-                                break
-                            time.sleep(0.05)
+                        if callable(grab) and callable(retrieve):
+                            while time.time() < warmup_deadline and not ok:
+                                try:
+                                    if grab():
+                                        ok, fr = retrieve()
+                                        if ok:
+                                            break
+                                except Exception:
+                                    break
+                                time.sleep(0.05)
                     if ok and fr is not None and getattr(fr, "size", 0):
                         ok_any = True
                         # show first frame immediately so UI proves the pipeline is alive
