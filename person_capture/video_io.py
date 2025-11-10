@@ -1812,6 +1812,11 @@ class FfmpegPipeReader:
         maxw = int(getattr(self, "_maxw", 0))
         tail_fmt = self._pipe_pixfmt if self._pipe_pixfmt in ("bgr24", "nv12") else "bgr24"
         lp_out_fmt = os.getenv("PC_LP_OUT_FMT", "gbrp10le").strip().lower() or "gbrp10le"
+        dl_fmt = os.getenv("PC_LP_DL_FMT", "rgba").strip().lower() or "rgba"
+        # Only allow hwdownload-safe pixel formats.
+        if dl_fmt not in ("rgba", "bgra", "rgb0", "bgr0"):
+            self._log.warning("PC_LP_DL_FMT=%s not supported for hwdownload; using rgba", dl_fmt)
+            dl_fmt = "rgba"
         if self._mode == "libplacebo" and self._use_libplacebo:
             # ensure libplacebo capabilities are available when building args
             self._lp_opts = getattr(self, "_lp_opts", None) or self._probe_libplacebo_opts()
@@ -1831,6 +1836,8 @@ class FfmpegPipeReader:
                         ),
                         "libplacebo=" + ":".join(lp_args),
                         "hwdownload",
+                        # Vulkan hwdownload cannot output gbrp10le directly.
+                        f"format={dl_fmt}",
                         f"format={lp_out_fmt}",
                     ]
                     if maxw > 0:
@@ -1864,7 +1871,11 @@ class FfmpegPipeReader:
                     filters.append(f"scale_vulkan=w=min(iw\\,{gpuw}):h=-2")
                     scaled_gpu = True
                 # download already-tonemapped and 709/full-range RGB to compact format
-                filters.extend(["hwdownload", f"format={lp_out_fmt}"])
+                filters.extend([
+                    "hwdownload",
+                    f"format={dl_fmt}",
+                    f"format={lp_out_fmt}",
+                ])
                 if maxw > 0 and not scaled_gpu:
                     filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                 if tail_fmt == "nv12":
@@ -1976,9 +1987,6 @@ class FfmpegPipeReader:
             "ignore_err",
             "-threads",
             "1",
-            # Keep filter graph single-threaded to bound buffer queues at creation time.
-            "-filter_threads",
-            os.getenv("PC_FF_FILTER_THREADS", "1"),
         ]
         # Required for hwupload/scale_vulkan to bind to a Vulkan context.
         if self._mode == "libplacebo" and self._use_libplacebo and self._has_vulkan:
@@ -1991,13 +1999,15 @@ class FfmpegPipeReader:
             cmd += ["-ss", f"{t:.6f}"]
         vf = self._chain()
         if self._mode == "libplacebo" and self._use_libplacebo:
-            self._log.debug("LP vf: %s", vf)
+            self._log.info("LP vf: %s", vf)
         # Plain file input; no '-safe 0' (that option is for certain demuxers only).
         cmd += ["-i", self._ff_input_path()]
         # keep only the primary video; drop audio/subs/data/attachments
         # also be robust if streams are missing via '?'.
         cmd += ["-map", "0:v:0", "-an", "-sn", "-dn", "-map", "-0:t?", "-map", "-0:s?", "-map", "-0:d?"]
         cmd += ["-map_metadata", "-1", "-map_chapters", "-1", "-vf", vf]
+        # Keep filter graph single-threaded to bound buffer queues at creation time.
+        cmd += ["-filter_threads", os.getenv("PC_FF_FILTER_THREADS", "1")]
         try:
             fps_passthrough = self._supports_fps_mode()
         except Exception:
