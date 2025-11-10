@@ -1069,6 +1069,22 @@ class FfmpegPipeReader:
             else self._frame_bytes_bgr24(self._w, self._h)
         )
 
+        # Vulkan hwdownload formats: prefer RGBA surfaces, with staged fallbacks for faults.
+        _dl_env = os.getenv("PC_LP_DL_FMT", "rgba64le")
+        dl_fmt = (_dl_env or "rgba64le").strip().lower() or "rgba64le"
+        _dl_allow = ("rgba", "bgra", "rgb0", "bgr0", "rgba64le", "bgra64le")
+        if dl_fmt not in _dl_allow:
+            self._log.warning(
+                "PC_LP_DL_FMT=%s not supported for Vulkan hwdownload; using rgba64le",
+                dl_fmt,
+            )
+            dl_fmt = "rgba64le"
+        self._dl_fmts: list[str] = []
+        for cand in (dl_fmt,) + _dl_allow:
+            if cand not in self._dl_fmts:
+                self._dl_fmts.append(cand)
+        self._dl_ai = 0
+
         # --- quoting helper for libplacebo string enums (bt.2390/mobius/hable/clip) ---
         # Some ffmpeg builds require quotes, otherwise "bt2390" is parsed as an expression → EINVAL.
         def _q(s: str) -> str:
@@ -1276,6 +1292,7 @@ class FfmpegPipeReader:
         n += 1                                                # surface alt
         n += 1                                                # minimal LP chain
         n += max(0, len(getattr(self, "_tm_algos", [])) - 1)  # algo rotations
+        n += max(0, len(getattr(self, "_dl_fmts", [])) - 1)   # hwdownload fmt rotations
         n += 2                                                # zscale + scale fallbacks
         return n + 4                                          # headroom
 
@@ -1425,6 +1442,22 @@ class FfmpegPipeReader:
         def _stderr_contains(s: str) -> bool:
             tail = " | ".join(getattr(self, "_stderr_tail", [])[-50:]).lower()
             return s.lower() in tail
+
+        if self._mode == "libplacebo" and (
+            _stderr_contains("invalid output format")
+            or _stderr_contains("failed to configure output pad")
+        ):
+            dl_fmts = getattr(self, "_dl_fmts", None)
+            dl_ai = getattr(self, "_dl_ai", 0)
+            if dl_fmts and dl_ai + 1 < len(dl_fmts):
+                dl_ai += 1
+                self._dl_ai = dl_ai
+                self._log.warning(
+                    "LP(Vulkan): hwdownload format fault → trying %s",
+                    dl_fmts[dl_ai],
+                )
+                _restart(max(self._pos + 1, 0))
+                return True
 
         if self._mode == "libplacebo":
             # Normalize common “no frame yet” hard failures
@@ -1812,15 +1845,14 @@ class FfmpegPipeReader:
         maxw = int(getattr(self, "_maxw", 0))
         tail_fmt = self._pipe_pixfmt if self._pipe_pixfmt in ("bgr24", "nv12") else "bgr24"
         lp_out_fmt = os.getenv("PC_LP_OUT_FMT", "gbrp10le").strip().lower() or "gbrp10le"
-        # hwdownload-safe defaults for Vulkan. For 10-bit sources you can keep the
-        # download in high bit depth by exporting PC_LP_DL_FMT=p010le, which delays
-        # the final NV12 conversion until the tail pixel format step.
-        dl_fmt = os.getenv("PC_LP_DL_FMT", "nv12").strip().lower() or "nv12"
-        if dl_fmt not in ("nv12", "p010le", "yuv420p", "yuv420p10le"):
-            self._log.warning(
-                "PC_LP_DL_FMT=%s not supported for Vulkan hwdownload; using nv12", dl_fmt
-            )
-            dl_fmt = "nv12"
+        # hwdownload-safe defaults for Vulkan. Download to an RGBA software surface
+        # before performing any final color conversions in software.
+        dl_fmts = getattr(self, "_dl_fmts", ["rgba64le", "rgba", "bgra", "rgb0", "bgr0"])
+        dl_ai = getattr(self, "_dl_ai", 0)
+        if dl_ai >= len(dl_fmts):
+            dl_ai = 0
+            self._dl_ai = dl_ai
+        dl_fmt = dl_fmts[dl_ai]
         if self._mode == "libplacebo" and self._use_libplacebo:
             # ensure libplacebo capabilities are available when building args
             self._lp_opts = getattr(self, "_lp_opts", None) or self._probe_libplacebo_opts()
@@ -1844,8 +1876,7 @@ class FfmpegPipeReader:
                     ]
                     if maxw > 0:
                         filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
-                    if tail_fmt != dl_fmt:
-                        filters.append(f"format={tail_fmt}")
+                    filters.append(f"format={tail_fmt}")
                     filters.append("setsar=1")
                     return ",".join(filters)
                 # Vulkan path: do all colorspace/range in libplacebo to avoid huge CPU float buffers.
@@ -1870,12 +1901,11 @@ class FfmpegPipeReader:
                     gpuw = max(maxw & ~1, 2)
                     filters.append(f"scale_vulkan=w=min(iw\\,{gpuw}):h=-2")
                     scaled_gpu = True
-                # download tonemapped frames to a hwdownload-safe YUV format
+                # download tonemapped frames to a hwdownload-safe RGBA format
                 filters.extend(["hwdownload", f"format={dl_fmt}"])
                 if maxw > 0 and not scaled_gpu:
                     filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
-                if tail_fmt != dl_fmt:
-                    filters.append(f"format={tail_fmt}")
+                filters.append(f"format={tail_fmt}")
                 filters.append("setsar=1")
                 return ",".join(filters)
             if self._strict_lp:
