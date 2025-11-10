@@ -1039,10 +1039,9 @@ class FfmpegPipeReader:
         self._tm_algo = (os.getenv("PC_TM_ALGO", "auto") or "auto")
         # Strict LP (default on): LP+Vulkan only — no CPU diag, no zscale/scale fallbacks.
         self._strict_lp = os.getenv("PC_LP_STRICT", "1").lower() not in ("0", "false", "no")
-        # Soft escape: if libplacebo fails due to memory before first frame, allow a one-shot
-        # fallback to zscale+tonemap even with strict on. Default enabled to unblock preview.
-        # Disable with PC_LP_STRICT_OOM_OK=0 if you want hard-fail semantics.
-        self._strict_oom_ok = os.getenv("PC_LP_STRICT_OOM_OK", "1").lower() not in ("0", "false", "no")
+        # Pipe pixel format: keep pipe light to avoid ENOMEM on pipe:1
+        # Default nv12 (1.5 B/px). Change to bgr24 if you explicitly want RGB pipe.
+        self._pipe_pixfmt = (os.getenv("PC_PIPE_PIXFMT", "nv12") or "nv12").lower()
         # Input/demux probe budgets
         try:
             self._probe_m = max(1, int(os.getenv("PC_FF_PROBE_M", "48")))
@@ -1060,6 +1059,15 @@ class FfmpegPipeReader:
         # Identify as HDR pipe and always “open” for cv2-style guards.
         self._is_hdr_pipe = True
         self.isOpened = lambda: True
+
+        # ---- derived sizes for pipe reads ----
+        self._frame_bytes_bgr24 = lambda w, h: (w * h * 3)
+        self._frame_bytes_nv12 = lambda w, h: (w * h * 3) // 2
+        self._pipe_frame_bytes = (
+            self._frame_bytes_nv12(self._w, self._h)
+            if self._pipe_pixfmt == "nv12"
+            else self._frame_bytes_bgr24(self._w, self._h)
+        )
 
         # --- quoting helper for libplacebo string enums (bt.2390/mobius/hable/clip) ---
         # Some ffmpeg builds require quotes, otherwise "bt2390" is parsed as an expression → EINVAL.
@@ -1148,6 +1156,7 @@ class FfmpegPipeReader:
         self._pos = -1
         self._proc = None
         self._arr: Optional[np.ndarray] = None
+        self._pipe_buf: Optional[bytes] = None
         self._stderr_thread = None
         self._stderr_tail: list[str] = []
         self._lp_opts: dict[str, bool] = {}
@@ -1297,9 +1306,15 @@ class FfmpegPipeReader:
         if maxw > 0 and self._w > maxw:
             ratio = float(maxw) / float(self._w or 1)
             self._w = int(maxw)
+            self._w &= ~1  # NV12 requires even width
             self._h = max(2, int(math.floor(self._h * ratio)) & ~1)
             self._frame_bytes_u8 = self._w * self._h * 3
             self._frame_bytes_f32 = self._w * self._h * 3 * 4
+            self._pipe_frame_bytes = (
+                self._frame_bytes_nv12(self._w, self._h)
+                if self._pipe_pixfmt == "nv12"
+                else self._frame_bytes_bgr24(self._w, self._h)
+            )
 
     # ---- libplacebo capability helpers ----
     def _ff_input_path(self) -> str:
@@ -1451,6 +1466,25 @@ class FfmpegPipeReader:
                     _restart(max(self._pos + 1, 0))
                     return True
 
+            # Pipe ENOMEM before first frame: tighten pipe format/bandwidth while staying on LP/Vulkan.
+            if _stderr_contains("error opening output file pipe:1") and _stderr_contains("cannot allocate memory"):
+                if getattr(self, "_pipe_tightened", False) is not True:
+                    self._pipe_tightened = True
+                    if self._pipe_pixfmt != "nv12":
+                        self._pipe_pixfmt = "nv12"
+                        self._pipe_frame_bytes = self._frame_bytes_nv12(self._w, self._h)
+                        self._log.warning("ffmpeg: pipe ENOMEM → forcing nv12 pipe to cut bandwidth")
+                        _restart(max(self._pos + 1, 0))
+                        return True
+                if getattr(self, "_mem_relief_stage", 0) < 6:
+                    self._mem_relief_stage = 6
+                    new_w = max(640, int(self._w // 2))
+                    self._maxw = min(self._w, new_w)
+                    self._apply_cap_dims()
+                    self._log.warning("ffmpeg: pipe ENOMEM → halve GPU output width to %d", self._w)
+                    _restart(max(self._pos + 1, 0))
+                    return True
+
             # Classify common faults
             mem_fault = any(_stderr_contains(k) for k in (
                 "cannot allocate memory",
@@ -1465,26 +1499,6 @@ class FfmpegPipeReader:
                 or _stderr_contains("return code -22")
                 or _stderr_contains("invalid argument")
             )
-            # If still no frames and we are in strict mode, permit a *single* zscale escape
-            # when the failure is clearly memory-related before any output.
-            if self._strict_lp and self._strict_oom_ok and (mem_fault or _is_open_or_pipe_oom()):
-                if (self._has_zscale and self._has_tonemap) and not getattr(self, "_tried_zscale", False):
-                    self._log.warning(
-                        "LP(Vulkan): ENOMEM before first frame → soft-strict escape to zscale+tonemap"
-                    )
-                    self._mode = "zscale"
-                    self._tried_zscale = True
-                    _restart(max(self._pos + 1, 0))
-                    return True
-                if self._has_scale and not getattr(self, "_tried_scale", False):
-                    self._log.warning(
-                        "LP(Vulkan): ENOMEM before first frame → soft-strict escape to linear+python-tonemap"
-                    )
-                    self._mode = "scale"
-                    self._tried_scale = True
-                    _restart(max(self._pos + 1, 0))
-                    return True
-
             if (mem_fault or arg_fault) and self._use_libplacebo and self._has_vulkan:
                 # First: advance Vulkan probe mode (derive/bind/device) before scaling caps.
                 modes = getattr(self, "_vk_probe_modes", [])
@@ -1782,6 +1796,7 @@ class FfmpegPipeReader:
 
     def _chain(self) -> str:
         maxw = int(getattr(self, "_maxw", 0))
+        tail_fmt = self._pipe_pixfmt if self._pipe_pixfmt in ("bgr24", "nv12") else "bgr24"
         if self._mode == "libplacebo" and self._use_libplacebo:
             # ensure libplacebo capabilities are available when building args
             self._lp_opts = getattr(self, "_lp_opts", None) or self._probe_libplacebo_opts()
@@ -1801,8 +1816,7 @@ class FfmpegPipeReader:
                         ),
                         "libplacebo=" + ":".join(lp_args),
                         "hwdownload",
-                        "format=bgr0",   # RGBA8: cheap and robust out of hwdownload
-                        "format=bgr24",  # final for OpenCV
+                        f"format={tail_fmt}",  # final for pipe
                     ]
                     if maxw > 0:
                         filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
@@ -1831,7 +1845,7 @@ class FfmpegPipeReader:
                     filters.append(f"scale_vulkan=w=min(iw\\,{gpuw}):h=-2")
                     scaled_gpu = True
                 # download already-tonemapped and 709/full-range RGB to compact format
-                filters.extend(["hwdownload", "format=bgr24"])
+                filters.extend(["hwdownload", f"format={tail_fmt}"])
                 if maxw > 0 and not scaled_gpu:
                     filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                 filters.append("setsar=1")
@@ -1845,7 +1859,7 @@ class FfmpegPipeReader:
                 # minimal = tonemap + colorspace/range on CPU, then emit bgr24
                 lp_args = [f"tonemapping={self._q(_tm)}"]
                 self._lp_add_colorspace_args(lp_args)
-                parts = ["libplacebo=" + ":".join(lp_args), "format=bgr24"]
+                parts = ["libplacebo=" + ":".join(lp_args), f"format={tail_fmt}"]
                 if maxw > 0:
                     parts.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                 parts.append("setsar=1")
@@ -1859,12 +1873,12 @@ class FfmpegPipeReader:
                 parts.append("zscale=rangein=tv:range=pc")
             parts.append("libplacebo=" + ":".join(lp_opts))
             if self._lp_opts.get("colorspace") and self._lp_opts.get("color_trc") and self._lp_opts.get("range"):
-                post = ["format=bgr24"]
+                post = [f"format={tail_fmt}"]
             else:
                 post = [
                     "format=gbrpf32le",
                     "zscale=transfer=bt709:primaries=bt709:matrix=bt709:rangein=pc:range=pc:dither=error_diffusion",
-                    "format=bgr24",
+                    f"format={tail_fmt}",
                 ]
             if maxw > 0:
                 post.append(f"scale=w=min(iw\\,{maxw}):h=-2")
@@ -1881,7 +1895,7 @@ class FfmpegPipeReader:
             )
             if maxw > 0:
                 s += f",scale=w=min(iw\\,{maxw}):h=-2"
-            s += ",format=bgr24,setsar=1"
+            s += f",format={tail_fmt},setsar=1"
             return s
         # Fallback path: decode to float RGB (planar), expand to full-range, tonemap in Python.
         range_in = "pc" if (self._range_in or "").lower() in ("pc", "full") else "tv"
@@ -1904,7 +1918,7 @@ class FfmpegPipeReader:
                 )
             # Keep libplacebo active so CPU-only builds can still tonemap; just note the missing Vulkan path.
             self._log.warning("libplacebo: Vulkan not available; using CPU libplacebo chain.")
-        pix_fmt = "bgr24" if self._mode in ("libplacebo", "zscale") else "gbrpf32le"
+        pix_fmt = self._pipe_pixfmt if self._mode in ("libplacebo", "zscale") else "gbrpf32le"
         # Turn up logging while attempting libplacebo so stderr_tail shows the true cause.
         ll = "info" if self._mode == "libplacebo" else "error"
         cmd = [
@@ -1913,7 +1927,7 @@ class FfmpegPipeReader:
             "-loglevel", ll,
             "-nostdin",
             "-ignore_unknown",
-            # Make weird HEVC/DOVI intros and broken containers more robust:
+            # smaller demux-side footprints
             "-fflags",
             "+genpts",
             "-analyzeduration",
@@ -1973,7 +1987,7 @@ class FfmpegPipeReader:
             self._w,
             self._h,
             pix_fmt,
-            (f"{t:.3f}s" if t > 1e-6 else "start"),
+            (f"{t:.3f}s" if t > 0 else "start"),
         )
         try:
             import shlex
@@ -2009,6 +2023,7 @@ class FfmpegPipeReader:
         self._stderr_thread.start()
         self._pos = idx - 1
         self._arr = None
+        self._pipe_buf = None
         self._pix_fmt = pix_fmt
 
     def _probe_vulkan(self) -> bool:
@@ -2059,6 +2074,7 @@ class FfmpegPipeReader:
         self._stderr_thread = None
         self._proc = None
         self._arr = None
+        self._pipe_buf = None
 
     # OpenCV-like API
     def get(self, prop: int) -> float:
@@ -2081,16 +2097,53 @@ class FfmpegPipeReader:
             return True
         return False
 
+    def _nv12_to_bgr(self, raw: bytes) -> np.ndarray | None:
+        try:
+            import numpy as _np
+        except Exception:
+            return None
+        h, w = int(self._h), int(self._w)
+        need = (w * h * 3) // 2
+        if len(raw) < need:
+            return None
+        y_size = w * h
+        y = _np.frombuffer(raw, dtype=_np.uint8, count=y_size).reshape(h, w).astype(_np.float32)
+        uv = _np.frombuffer(raw, dtype=_np.uint8, offset=y_size, count=y_size // 2).reshape(h // 2, w).astype(_np.float32)
+        u = uv[:, 0::2]
+        v = uv[:, 1::2]
+        u = _np.repeat(_np.repeat(u, 2, axis=0), 2, axis=1)
+        v = _np.repeat(_np.repeat(v, 2, axis=0), 2, axis=1)
+        C = y - 16.0
+        D = u - 128.0
+        E = v - 128.0
+        r = 1.16438356 * C + 1.79274107 * E
+        g = 1.16438356 * C - 0.21324861 * D - 0.53290933 * E
+        b = 1.16438356 * C + 2.11240179 * D
+        out = _np.stack((b, g, r), axis=-1)
+        out = _np.clip(out, 0.0, 255.0).astype(_np.uint8)
+        return out
+
+    def _convert_pipe_frame(self, raw: bytes) -> np.ndarray | None:
+        if self._pipe_pixfmt == "nv12":
+            return self._nv12_to_bgr(raw)
+        try:
+            import numpy as _np
+            return _np.frombuffer(raw, dtype=_np.uint8).reshape(self._h, self._w, 3)
+        except Exception:
+            return None
+
     def grab(self) -> bool:
         if not self._proc or not self._proc.stdout:
             return False
-        if self._pix_fmt == "bgr24":
-            buf = self._proc.stdout.read(self._frame_bytes_u8)
-            if not buf or len(buf) < self._frame_bytes_u8:
+        if self._pix_fmt in {"bgr24", "nv12"}:
+            need = self._pipe_frame_bytes
+            buf = self._proc.stdout.read(need)
+            if not buf or len(buf) < need:
                 if self.try_fallback_chain():
                     return self.grab()
                 return False
-            self._arr = np.frombuffer(buf, dtype=np.uint8).reshape(self._h, self._w, 3)
+            self._pipe_buf = buf
+            self._arr = None
             self._pos += 1
             return True
         # Linear+python-tonemap path: read float32 RGB (planar G,B,R)
@@ -2108,15 +2161,22 @@ class FfmpegPipeReader:
         else:
             rgb_linear = _eotf_pq(rgb)
         self._arr = rgb_linear
+        self._pipe_buf = None
         self._pos += 1
         return True
 
     def retrieve(self):
+        if self._pix_fmt in {"bgr24", "nv12"}:
+            raw, self._pipe_buf = self._pipe_buf, None
+            if raw is None:
+                return False, None
+            frame = self._convert_pipe_frame(raw)
+            if frame is None:
+                return False, None
+            return True, frame
         arr, self._arr = self._arr, None
         if arr is None:
             return False, None
-        if self._pix_fmt == "bgr24":
-            return True, arr
         # Python tonemap on linear RGB → BT.709 BGR8
         out = _python_tonemap_to_bgr8(
             arr,
