@@ -1039,6 +1039,10 @@ class FfmpegPipeReader:
         self._tm_algo = (os.getenv("PC_TM_ALGO", "auto") or "auto")
         # Strict LP (default on): LP+Vulkan only — no CPU diag, no zscale/scale fallbacks.
         self._strict_lp = os.getenv("PC_LP_STRICT", "1").lower() not in ("0", "false", "no")
+        # Soft escape: if libplacebo fails due to memory before first frame, allow a one-shot
+        # fallback to zscale+tonemap even with strict on. Default enabled to unblock preview.
+        # Disable with PC_LP_STRICT_OOM_OK=0 if you want hard-fail semantics.
+        self._strict_oom_ok = os.getenv("PC_LP_STRICT_OOM_OK", "1").lower() not in ("0", "false", "no")
         # Input/demux probe budgets
         try:
             self._probe_m = max(1, int(os.getenv("PC_FF_PROBE_M", "48")))
@@ -1403,6 +1407,19 @@ class FfmpegPipeReader:
             return s.lower() in tail
 
         if self._mode == "libplacebo":
+            # Normalize common “no frame yet” hard failures
+            def _is_open_or_pipe_oom() -> bool:
+                return (
+                    (
+                        _stderr_contains("error opening output file pipe:1")
+                        or _stderr_contains("error opening output files")
+                    )
+                    and (
+                        _stderr_contains("cannot allocate memory")
+                        or _stderr_contains("error initializing filters")
+                    )
+                )
+
             # Input-open ENOMEM: shrink probe/analyze/packets and retry, then force long-path.
             _open_err = (
                 _stderr_contains("error opening input file")
@@ -1448,6 +1465,26 @@ class FfmpegPipeReader:
                 or _stderr_contains("return code -22")
                 or _stderr_contains("invalid argument")
             )
+            # If still no frames and we are in strict mode, permit a *single* zscale escape
+            # when the failure is clearly memory-related before any output.
+            if self._strict_lp and self._strict_oom_ok and (mem_fault or _is_open_or_pipe_oom()):
+                if (self._has_zscale and self._has_tonemap) and not getattr(self, "_tried_zscale", False):
+                    self._log.warning(
+                        "LP(Vulkan): ENOMEM before first frame → soft-strict escape to zscale+tonemap"
+                    )
+                    self._mode = "zscale"
+                    self._tried_zscale = True
+                    _restart(max(self._pos + 1, 0))
+                    return True
+                if self._has_scale and not getattr(self, "_tried_scale", False):
+                    self._log.warning(
+                        "LP(Vulkan): ENOMEM before first frame → soft-strict escape to linear+python-tonemap"
+                    )
+                    self._mode = "scale"
+                    self._tried_scale = True
+                    _restart(max(self._pos + 1, 0))
+                    return True
+
             if (mem_fault or arg_fault) and self._use_libplacebo and self._has_vulkan:
                 # First: advance Vulkan probe mode (derive/bind/device) before scaling caps.
                 modes = getattr(self, "_vk_probe_modes", [])
@@ -1905,9 +1942,11 @@ class FfmpegPipeReader:
         vf = self._chain()
         if self._mode == "libplacebo" and self._use_libplacebo:
             self._log.debug("LP vf: %s", vf)
+        # Plain file input; no '-safe 0' (that option is for certain demuxers only).
         cmd += ["-i", self._ff_input_path()]
         # keep only the primary video; drop audio/subs/data/attachments
-        cmd += ["-map", "0:v:0", "-an", "-sn", "-dn", "-map", "-0:t"]
+        # also be robust if streams are missing via '?'.
+        cmd += ["-map", "0:v:0", "-an", "-sn", "-dn", "-map", "-0:t?", "-map", "-0:s?", "-map", "-0:d?"]
         cmd += ["-map_metadata", "-1", "-map_chapters", "-1", "-vf", vf]
         try:
             fps_passthrough = self._supports_fps_mode()
