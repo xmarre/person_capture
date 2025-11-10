@@ -1812,11 +1812,15 @@ class FfmpegPipeReader:
         maxw = int(getattr(self, "_maxw", 0))
         tail_fmt = self._pipe_pixfmt if self._pipe_pixfmt in ("bgr24", "nv12") else "bgr24"
         lp_out_fmt = os.getenv("PC_LP_OUT_FMT", "gbrp10le").strip().lower() or "gbrp10le"
-        dl_fmt = os.getenv("PC_LP_DL_FMT", "rgba").strip().lower() or "rgba"
-        # Only allow hwdownload-safe pixel formats.
-        if dl_fmt not in ("rgba", "bgra", "rgb0", "bgr0"):
-            self._log.warning("PC_LP_DL_FMT=%s not supported for hwdownload; using rgba", dl_fmt)
-            dl_fmt = "rgba"
+        # hwdownload-safe defaults for Vulkan. For 10-bit sources you can keep the
+        # download in high bit depth by exporting PC_LP_DL_FMT=p010le, which delays
+        # the final NV12 conversion until the tail pixel format step.
+        dl_fmt = os.getenv("PC_LP_DL_FMT", "nv12").strip().lower() or "nv12"
+        if dl_fmt not in ("nv12", "p010le", "yuv420p", "yuv420p10le"):
+            self._log.warning(
+                "PC_LP_DL_FMT=%s not supported for Vulkan hwdownload; using nv12", dl_fmt
+            )
+            dl_fmt = "nv12"
         if self._mode == "libplacebo" and self._use_libplacebo:
             # ensure libplacebo capabilities are available when building args
             self._lp_opts = getattr(self, "_lp_opts", None) or self._probe_libplacebo_opts()
@@ -1836,15 +1840,11 @@ class FfmpegPipeReader:
                         ),
                         "libplacebo=" + ":".join(lp_args),
                         "hwdownload",
-                        # Vulkan hwdownload cannot output gbrp10le directly.
                         f"format={dl_fmt}",
-                        f"format={lp_out_fmt}",
                     ]
                     if maxw > 0:
                         filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
-                    if tail_fmt == "nv12":
-                        filters.append("format=nv12")
-                    elif tail_fmt != lp_out_fmt:
+                    if tail_fmt != dl_fmt:
                         filters.append(f"format={tail_fmt}")
                     filters.append("setsar=1")
                     return ",".join(filters)
@@ -1870,17 +1870,11 @@ class FfmpegPipeReader:
                     gpuw = max(maxw & ~1, 2)
                     filters.append(f"scale_vulkan=w=min(iw\\,{gpuw}):h=-2")
                     scaled_gpu = True
-                # download already-tonemapped and 709/full-range RGB to compact format
-                filters.extend([
-                    "hwdownload",
-                    f"format={dl_fmt}",
-                    f"format={lp_out_fmt}",
-                ])
+                # download tonemapped frames to a hwdownload-safe YUV format
+                filters.extend(["hwdownload", f"format={dl_fmt}"])
                 if maxw > 0 and not scaled_gpu:
                     filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
-                if tail_fmt == "nv12":
-                    filters.append("format=nv12")
-                elif tail_fmt != lp_out_fmt:
+                if tail_fmt != dl_fmt:
                     filters.append(f"format={tail_fmt}")
                 filters.append("setsar=1")
                 return ",".join(filters)
