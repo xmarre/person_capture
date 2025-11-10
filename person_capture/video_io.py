@@ -1037,8 +1037,8 @@ class FfmpegPipeReader:
         self._tm_ai = int(os.getenv("PC_LP_TM_INDEX", "0"))
         # Tonemap selection: 'auto' enables fallback rotation via _tm_ai
         self._tm_algo = (os.getenv("PC_TM_ALGO", "auto") or "auto")
-        # Strict LP (default on): LP+Vulkan only — no CPU diag, no zscale/scale fallbacks.
-        self._strict_lp = os.getenv("PC_LP_STRICT", "1").lower() not in ("0", "false", "no")
+        # Strict libplacebo: never allow CPU/zscale fallback and avoid multi-probe churn.
+        self._strict_lp = (os.getenv("PC_LP_STRICT", "1").lower() not in ("0", "false", "no"))
         # Pipe pixel format: keep pipe light to avoid ENOMEM on pipe:1
         # Default nv12 (1.5 B/px). Change to bgr24 if you explicitly want RGB pipe.
         self._pipe_pixfmt = (os.getenv("PC_PIPE_PIXFMT", "nv12") or "nv12").lower()
@@ -1088,20 +1088,26 @@ class FfmpegPipeReader:
         self._hwupload_derive = (
             os.getenv("PC_LP_HWUPLOAD_DERIVE", "0").lower() not in ("0", "false", "no")
         )
-        # Vulkan probing modes (derive/bind/device) to auto-work around ICD quirks.
-        # Try the least-allocating modes first to dodge ENOMEM at init_hw_device.
+        # Vulkan probing modes. Pinned device FIRST to avoid device-churn OOM at init.
         self._vk_probe_modes = [
-            {"derive": False, "bind": False, "dev": "",  "noinit": True},  # FULL BYPASS: no global init/bind
-            {"derive": True,  "bind": False, "dev": "",  "noinit": True},  # derive-only
-            {"derive": True,  "bind": True,  "dev": ""},                    # default
-            {"derive": False, "bind": True,  "dev": ""},                    # no derive
-            {"derive": False, "bind": True,  "dev": "0"},                   # pin :0
-            {"derive": True,  "bind": True,  "dev": "0"},                   # derive + :0
-            {"derive": True,  "bind": False, "dev": "0"},                   # no filter_hw_device, rely on derive
+            {"derive": False, "bind": True,  "dev": "0", "noinit": False},  # pinned :0, single context
+            {"derive": True,  "bind": True,  "dev": "0", "noinit": False},  # pinned + derive hwupload
+            {"derive": False, "bind": True,  "dev": "",  "noinit": False},  # init default GPU
+            # fallback/diagnostic modes only if not strict:
+            {"derive": True,  "bind": False, "dev": "",  "noinit": True},   # derive-only (no global init)
+            {"derive": False, "bind": False, "dev": "",  "noinit": True},   # fully no-init
         ]
         self._vk_probe_i = 0
         self._vk_bind = True
         self._vk_noinit = False
+        # Under strict LP, disable the churny noinit/derive fallbacks entirely.
+        if self._strict_lp:
+            self._vk_probe_modes = [
+                {"derive": False, "bind": True, "dev": "0", "noinit": False}
+            ]
+            # Also force a concrete device index for the first attempt.
+            if not self._vk_device:
+                self._vk_device = "0"
         # GPU queue / memory controls
         self._extra_hw_frames = max(1, int(os.getenv("PC_LP_EXTRA_FRAMES", "1")))
         # staged memory relief (0=none, 1=queue=1, 2=queue=2, 3=cap 2560, 4=cap 1920, 5=cap 1280)
@@ -1254,24 +1260,6 @@ class FfmpegPipeReader:
         # Stage-specific fallback flags so we can attempt zscale, then scale (non-strict mode).
         self._tried_zscale = False
         self._tried_scale = False
-        # Prime first Vulkan probe mode so the initial run uses the least-allocating path.
-        if (
-            self._mode == "libplacebo"
-            and self._use_libplacebo
-            and self._has_vulkan
-            and self._vk_probe_i == 0
-            and self._vk_probe_modes
-        ):
-            m0 = self._vk_probe_modes[0]
-            self._apply_vk_mode(m0)
-            self._vk_probe_i = 1
-            self._log.info(
-                "LP(Vulkan): priming mode derive=%s bind=%s noinit=%s dev=%s",
-                m0.get("derive"),
-                m0.get("bind"),
-                m0.get("noinit"),
-                m0.get("dev") or "<auto>",
-            )
         self._start(0)
         mode = (
             "libplacebo"
@@ -1399,6 +1387,22 @@ class FfmpegPipeReader:
         setattr(self, "_fps_mode_cap", result)
         return result
 
+    def _apply_current_vk_mode(self) -> None:
+        if not self._vk_probe_modes:
+            return
+        if self._vk_probe_i >= len(self._vk_probe_modes):
+            self._vk_probe_i = len(self._vk_probe_modes) - 1
+        m = self._vk_probe_modes[self._vk_probe_i]
+        self._apply_vk_mode(m)
+        dev = str(self._vk_device or "").strip()
+        self._log.info(
+            "LP(Vulkan): priming mode derive=%s bind=%s noinit=%s dev=%s",
+            "True" if m.get("derive", False) else "False",
+            "True" if self._vk_bind else "False",
+            "True" if self._vk_noinit else "False",
+            (dev if dev else "<auto>")
+        )
+
     # --- Fallback helper used if a chain produces no frames (e.g., Vulkan init issues) ---
     def try_fallback_chain(self) -> bool:
         """
@@ -1503,13 +1507,16 @@ class FfmpegPipeReader:
             if (mem_fault or arg_fault) and self._use_libplacebo and self._has_vulkan:
                 # First: advance Vulkan probe mode (derive/bind/device) before scaling caps.
                 modes = getattr(self, "_vk_probe_modes", [])
-                i = getattr(self, "_vk_probe_i", 0)
-                if i < len(modes):
-                    m = modes[i]; self._vk_probe_i = i + 1
-                    self._apply_vk_mode(m)
+                if self._vk_probe_i < len(modes) - 1:
+                    self._vk_probe_i += 1
+                    self._apply_current_vk_mode()
+                    m = modes[self._vk_probe_i]
                     self._log.warning(
                         "LP(Vulkan): fault → trying mode derive=%s bind=%s noinit=%s dev=%s",
-                        m["derive"], m["bind"], m.get("noinit", False), m["dev"] or "<auto>",
+                        "True" if m.get("derive", False) else "False",
+                        "True" if m.get("bind", False) else "False",
+                        "True" if m.get("noinit", False) else "False",
+                        m.get("dev") or "<auto>",
                     )
                     _restart(max(self._pos + 1, 0))
                     return True
@@ -1934,6 +1941,9 @@ class FfmpegPipeReader:
     def _start(self, idx: int):
         if self._proc:
             self._stop()
+        # Apply the very first probe mode before constructing the command.
+        if self._mode == "libplacebo" and self._use_libplacebo and self._has_vulkan:
+            self._apply_current_vk_mode()
         t = 0.0 if self._fps <= 0 else max(0.0, idx / float(self._fps))
         # If libplacebo was selected but there is no Vulkan, handle according to strict mode.
         if self._mode == "libplacebo" and self._use_libplacebo and not self._has_vulkan:
