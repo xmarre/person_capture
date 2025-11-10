@@ -1081,6 +1081,7 @@ class FfmpegPipeReader:
         self._q = _q
         # Vulkan device pinning (e.g. "0"); if unset, ffmpeg picks default enumerated device.
         self._vk_device = (os.getenv("PC_LP_VK_DEVICE") or "").strip()
+        self._vulkan_index: Optional[int] = None
         # When a filter hardware device is provided, deriving a new device inside hwupload can
         # cause a second context with different permissions/ICD → allocations fail on Windows.
         # Default off; enable explicitly for experiments.
@@ -1102,7 +1103,7 @@ class FfmpegPipeReader:
         self._vk_bind = True
         self._vk_noinit = False
         # GPU queue / memory controls
-        self._extra_hw_frames = max(1, int(os.getenv("PC_LP_EXTRA_FRAMES", "6")))
+        self._extra_hw_frames = max(1, int(os.getenv("PC_LP_EXTRA_FRAMES", "1")))
         # staged memory relief (0=none, 1=queue=1, 2=queue=2, 3=cap 2560, 4=cap 1920, 5=cap 1280)
         self._mem_relief_stage = 0
         self._fallback_hops = 0
@@ -1784,8 +1785,14 @@ class FfmpegPipeReader:
             self._log.info("libplacebo: Vulkan no-init mode • relying on derive_device path")
             return []
         dev = getattr(self, "_vk_device", "") or ""
-        tag = "pl"
-        init = f"vulkan={tag}" + (f":{dev}" if dev else "")
+        if not dev:
+            idx = getattr(self, "_vulkan_index", None)
+            try:
+                dev = str(int(idx))
+            except (TypeError, ValueError):
+                dev = "0"
+        tag = "vk"
+        init = f"vulkan={tag}:{dev}"
         # Optional: reduce driver allocations
         if (os.getenv("PC_VK_DISABLE_RBA", "0").lower() not in ("0", "false", "no")):
             init += ":disable_robust_buffer_access=1"
@@ -1797,6 +1804,7 @@ class FfmpegPipeReader:
     def _chain(self) -> str:
         maxw = int(getattr(self, "_maxw", 0))
         tail_fmt = self._pipe_pixfmt if self._pipe_pixfmt in ("bgr24", "nv12") else "bgr24"
+        lp_out_fmt = os.getenv("PC_LP_OUT_FMT", "gbrp10le").strip().lower() or "gbrp10le"
         if self._mode == "libplacebo" and self._use_libplacebo:
             # ensure libplacebo capabilities are available when building args
             self._lp_opts = getattr(self, "_lp_opts", None) or self._probe_libplacebo_opts()
@@ -1816,10 +1824,14 @@ class FfmpegPipeReader:
                         ),
                         "libplacebo=" + ":".join(lp_args),
                         "hwdownload",
-                        f"format={tail_fmt}",  # final for pipe
+                        f"format={lp_out_fmt}",
                     ]
                     if maxw > 0:
                         filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
+                    if tail_fmt == "nv12":
+                        filters.append("format=nv12")
+                    elif tail_fmt != lp_out_fmt:
+                        filters.append(f"format={tail_fmt}")
                     filters.append("setsar=1")
                     return ",".join(filters)
                 # Vulkan path: do all colorspace/range in libplacebo to avoid huge CPU float buffers.
@@ -1845,9 +1857,13 @@ class FfmpegPipeReader:
                     filters.append(f"scale_vulkan=w=min(iw\\,{gpuw}):h=-2")
                     scaled_gpu = True
                 # download already-tonemapped and 709/full-range RGB to compact format
-                filters.extend(["hwdownload", f"format={tail_fmt}"])
+                filters.extend(["hwdownload", f"format={lp_out_fmt}"])
                 if maxw > 0 and not scaled_gpu:
                     filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
+                if tail_fmt == "nv12":
+                    filters.append("format=nv12")
+                elif tail_fmt != lp_out_fmt:
+                    filters.append(f"format={tail_fmt}")
                 filters.append("setsar=1")
                 return ",".join(filters)
             if self._strict_lp:
@@ -1859,9 +1875,13 @@ class FfmpegPipeReader:
                 # minimal = tonemap + colorspace/range on CPU, then emit bgr24
                 lp_args = [f"tonemapping={self._q(_tm)}"]
                 self._lp_add_colorspace_args(lp_args)
-                parts = ["libplacebo=" + ":".join(lp_args), f"format={tail_fmt}"]
+                parts = ["libplacebo=" + ":".join(lp_args), f"format={lp_out_fmt}"]
                 if maxw > 0:
                     parts.append(f"scale=w=min(iw\\,{maxw}):h=-2")
+                if tail_fmt == "nv12":
+                    parts.append("format=nv12")
+                elif tail_fmt != lp_out_fmt:
+                    parts.append(f"format={tail_fmt}")
                 parts.append("setsar=1")
                 return ",".join(parts)
             lp_opts = [f"tonemapping={self._q(self._tm_value())}"]
@@ -1873,17 +1893,22 @@ class FfmpegPipeReader:
                 parts.append("zscale=rangein=tv:range=pc")
             parts.append("libplacebo=" + ":".join(lp_opts))
             if self._lp_opts.get("colorspace") and self._lp_opts.get("color_trc") and self._lp_opts.get("range"):
-                post = [f"format={tail_fmt}"]
+                post = [f"format={lp_out_fmt}"]
             else:
                 post = [
                     "format=gbrpf32le",
                     "zscale=transfer=bt709:primaries=bt709:matrix=bt709:rangein=pc:range=pc:dither=error_diffusion",
-                    f"format={tail_fmt}",
+                    f"format={lp_out_fmt}",
                 ]
+            parts.extend(post)
             if maxw > 0:
-                post.append(f"scale=w=min(iw\\,{maxw}):h=-2")
-            post.append("setsar=1")
-            return ",".join(parts + post)
+                parts.append(f"scale=w=min(iw\\,{maxw}):h=-2")
+            if tail_fmt == "nv12":
+                parts.append("format=nv12")
+            elif tail_fmt != lp_out_fmt:
+                parts.append(f"format={tail_fmt}")
+            parts.append("setsar=1")
+            return ",".join(parts)
         if self._mode in ("libplacebo", "zscale") and (self._has_zscale and self._has_tonemap):
             # Full HDR→SDR tonemap tuned for SDR target brightness and optional desaturation.
             s = (
@@ -1941,8 +1966,9 @@ class FfmpegPipeReader:
             "ignore_err",
             "-threads",
             "1",
+            # Keep filter graph single-threaded to bound buffer queues at creation time.
             "-filter_threads",
-            "1",
+            os.getenv("PC_FF_FILTER_THREADS", "1"),
         ]
         # Required for hwupload/scale_vulkan to bind to a Vulkan context.
         if self._mode == "libplacebo" and self._use_libplacebo and self._has_vulkan:
