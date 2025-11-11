@@ -1070,20 +1070,22 @@ class FfmpegPipeReader:
         )
 
         # Vulkan hwdownload formats: prefer RGBA surfaces, with staged fallbacks for faults.
-        _dl_env = os.getenv("PC_LP_DL_FMT", "rgba64le")
-        dl_fmt = (_dl_env or "rgba64le").strip().lower() or "rgba64le"
-        _dl_allow = ("rgba", "bgra", "rgb0", "bgr0", "rgba64le", "bgra64le")
+        _dl_env = os.getenv("PC_LP_DL_FMT", "bgra")
+        dl_fmt = (_dl_env or "bgra").strip().lower() or "bgra"
+        _dl_allow = ("bgra", "rgba", "rgb0", "bgr0")
         if dl_fmt not in _dl_allow:
             self._log.warning(
-                "PC_LP_DL_FMT=%s not supported for Vulkan hwdownload; using rgba64le",
+                "PC_LP_DL_FMT=%s not supported for Vulkan hwdownload; using bgra",
                 dl_fmt,
             )
-            dl_fmt = "rgba64le"
+            dl_fmt = "bgra"
         self._dl_fmts: list[str] = []
         for cand in (dl_fmt,) + _dl_allow:
             if cand not in self._dl_fmts:
                 self._dl_fmts.append(cand)
         self._dl_ai = 0
+        # HW download op: 0 = hwdownload, 1 = hwmap=mode=read
+        self._hw_dl_mode = 0
 
         # --- quoting helper for libplacebo string enums (bt.2390/mobius/hable/clip) ---
         # Some ffmpeg builds require quotes, otherwise "bt2390" is parsed as an expression → EINVAL.
@@ -1293,6 +1295,7 @@ class FfmpegPipeReader:
         n += 1                                                # minimal LP chain
         n += max(0, len(getattr(self, "_tm_algos", [])) - 1)  # algo rotations
         n += max(0, len(getattr(self, "_dl_fmts", [])) - 1)   # hwdownload fmt rotations
+        n += 1                                                # hwdownload→hwmap swap
         n += 2                                                # zscale + scale fallbacks
         return n + 4                                          # headroom
 
@@ -1455,6 +1458,15 @@ class FfmpegPipeReader:
                 self._log.warning(
                     "LP(Vulkan): hwdownload format fault → trying %s",
                     dl_fmts[dl_ai],
+                )
+                _restart(max(self._pos + 1, 0))
+                return True
+            # Exhausted all software formats; try hwmap path once.
+            if getattr(self, "_hw_dl_mode", 0) == 0:
+                self._hw_dl_mode = 1
+                self._dl_ai = 0
+                self._log.warning(
+                    "LP(Vulkan): hwdownload unsupported → switching to hwmap=mode=read"
                 )
                 _restart(max(self._pos + 1, 0))
                 return True
@@ -1847,12 +1859,13 @@ class FfmpegPipeReader:
         lp_out_fmt = os.getenv("PC_LP_OUT_FMT", "gbrp10le").strip().lower() or "gbrp10le"
         # hwdownload-safe defaults for Vulkan. Download to an RGBA software surface
         # before performing any final color conversions in software.
-        dl_fmts = getattr(self, "_dl_fmts", ["rgba64le", "rgba", "bgra", "rgb0", "bgr0"])
+        dl_fmts = getattr(self, "_dl_fmts", ["bgra", "rgba", "rgb0", "bgr0"])
         dl_ai = getattr(self, "_dl_ai", 0)
         if dl_ai >= len(dl_fmts):
             dl_ai = 0
             self._dl_ai = dl_ai
         dl_fmt = dl_fmts[dl_ai]
+        hw_dl_op = "hwdownload" if getattr(self, "_hw_dl_mode", 0) == 0 else "hwmap=mode=read"
         if self._mode == "libplacebo" and self._use_libplacebo:
             # ensure libplacebo capabilities are available when building args
             self._lp_opts = getattr(self, "_lp_opts", None) or self._probe_libplacebo_opts()
@@ -1871,7 +1884,7 @@ class FfmpegPipeReader:
                             else f"hwupload=extra_hw_frames={self._extra_hw_frames}"
                         ),
                         "libplacebo=" + ":".join(lp_args),
-                        "hwdownload",
+                        hw_dl_op,
                         f"format={dl_fmt}",
                     ]
                     if maxw > 0:
@@ -1902,7 +1915,7 @@ class FfmpegPipeReader:
                     filters.append(f"scale_vulkan=w=min(iw\\,{gpuw}):h=-2")
                     scaled_gpu = True
                 # download tonemapped frames to a hwdownload-safe RGBA format
-                filters.extend(["hwdownload", f"format={dl_fmt}"])
+                filters.extend([hw_dl_op, f"format={dl_fmt}"])
                 if maxw > 0 and not scaled_gpu:
                     filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                 filters.append(f"format={tail_fmt}")
