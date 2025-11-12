@@ -1059,8 +1059,10 @@ class FfmpegPipeReader:
         # Identify as HDR pipe and always “open” for cv2-style guards.
         self._is_hdr_pipe = True
         self.isOpened = lambda: True
+        # If libplacebo lacks out_format/out_pfmt, we insert explicit hwdownload+format
+        # for readback (tonemap/colorspace remain on GPU). Default ON to avoid regressions.
         self._allow_dl_fallback = (
-            os.getenv("PC_LP_ALLOW_DL_FALLBACK", "0").lower() not in ("0", "false", "no")
+            os.getenv("PC_LP_ALLOW_DL_FALLBACK", "1").lower() not in ("0", "false", "no")
         )
 
         # ---- derived sizes for pipe reads ----
@@ -1724,43 +1726,49 @@ class FfmpegPipeReader:
 
     def _probe_libplacebo_opts(self) -> dict[str, bool]:
         """
-        Ask ffmpeg which options the libplacebo filter supports.
-        Some Windows builds lack target_primaries/target_trc/gamut_mode.
+        Ask ffmpeg which libplacebo options are available and cache the result.
+        We detect both modern and legacy color knobs, dithering, readback aliases,
+        and the presence of scale_vulkan.
         """
-        out = ""
+        # Probe once per process
+        cache = getattr(self, "_lp_probe_cache", None)
+        if cache is not None:
+            return cache
+        opts: dict[str, bool] = {}
+        ff = getattr(self, "_ffmpeg", None) or shutil.which("ffmpeg") or "ffmpeg"
         try:
-            r = subprocess.run(
-                [self._ffmpeg, "-hide_banner", "-h", "filter=libplacebo"],
-                stdout=subprocess.PIPE,
+            # Example-compatible across many builds; prints option list for vf=libplacebo
+            out = subprocess.check_output(
+                [ff, "-hide_banner", "-h", "filter=libplacebo"],
                 stderr=subprocess.STDOUT,
-                text=True,
-                timeout=3.0,
+                universal_newlines=True,
             )
-            out = r.stdout or ""
         except Exception:
-            return {}
-        # Make a quick lookup table of option names present in help output
-        found: dict[str, bool] = {}
-        for name in (
-            "tonemapping",
-            # modern names
-            "colorspace",
-            "color_primaries",
-            "color_trc",
-            "range",
-            "dithering",          # modern
-            # legacy names still seen in some builds
-            "target_primaries",
-            "target_trc",
-            "dither",             # legacy
-            "deband",
-        ):
-            # match whole words like "  target_primaries  " in the help text
-            found[name] = bool(re.search(rf"(^|\s){re.escape(name)}(\s|=)", out))
-        # Always assume tonemapping is there; older builds still have it
-        if not found.get("tonemapping"):
-            found["tonemapping"] = True
-        return found
+            out = ""
+        low = out.lower()
+        # Color knobs (modern & legacy)
+        opts["colorspace"]       = (" colorspace " in low) or (" colorspace=" in low)
+        opts["color_primaries"]  = (" color_primaries " in low) or (" color_primaries=" in low)
+        opts["color_trc"]        = (" color_trc " in low) or (" color_trc=" in low)
+        opts["range"]            = (" range " in low) or (" range=" in low)
+        opts["target_primaries"] = (" target_primaries " in low) or (" target_primaries=" in low)
+        opts["target_trc"]       = (" target_trc " in low) or (" target_trc=" in low)
+        # Dither/dithering variants
+        opts["dithering"] = (" dithering " in low) or (" dithering=" in low)
+        opts["dither"]    = (" dither " in low) or (" dither=" in low)
+        # CPU readback aliases (name varies by build)
+        opts["out_format"] = (" out_format " in low) or (" out_format=" in low)
+        opts["out_pfmt"]   = (" out_pfmt " in low) or (" out_pfmt=" in low)
+        # Scale-vulkan availability (optional)
+        try:
+            flt = subprocess.check_output(
+                [ff, "-hide_banner", "-filters"], stderr=subprocess.STDOUT, universal_newlines=True
+            ).lower()
+        except Exception:
+            flt = ""
+        opts["scale_vulkan"] = " scale_vulkan " in flt
+        self._lp_probe_cache = opts
+        return opts
 
     def _tm_value(self) -> str:
         """
@@ -1851,8 +1859,8 @@ class FfmpegPipeReader:
             outfmt_key = "out_format" if self._lp_opts.get("out_format") else (
                 "out_pfmt" if self._lp_opts.get("out_pfmt") else None
             )
-            # if neither key exists, we /can/ fall back to explicit hwdownload+format — but only if opted in
-            need_explicit_download = (outfmt_key is None and self._allow_dl_fallback)
+            # If neither key exists, insert explicit hwdownload+format for readback (allowed by default).
+            need_explicit_download = (outfmt_key is None)
             if self._has_vulkan:
                 surf = self._choose_surf()
                 _tm = self._q(self._tm_value())
@@ -1878,16 +1886,9 @@ class FfmpegPipeReader:
                         "libplacebo=" + ":".join(lp_args),
                     ]
                     if need_explicit_download:
+                        if not self._allow_dl_fallback and self._strict_lp:
+                            raise RuntimeError("libplacebo lacks out_format/out_pfmt and PC_LP_ALLOW_DL_FALLBACK=0.")
                         filters += ["hwdownload", f"format={out_sw}"]
-                    elif not outfmt_key:
-                        # strict mode: fail loudly rather than silently inserting CPU readback
-                        if self._strict_lp:
-                            raise RuntimeError(
-                                "ffmpeg/libplacebo lacks out_format/out_pfmt; set PC_LP_ALLOW_DL_FALLBACK=1 or upgrade ffmpeg/libplacebo."
-                            )
-                        self._log.warning(
-                            "libplacebo out_format/out_pfmt not available; non-strict mode will rely on later fallbacks."
-                        )
                     if maxw > 0 and not self._has_scale_vulkan:
                         filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                     if tail_fmt != out_sw:
@@ -1921,15 +1922,9 @@ class FfmpegPipeReader:
                     "libplacebo=" + ":".join(lp_args),
                 ]
                 if need_explicit_download:
+                    if not self._allow_dl_fallback and self._strict_lp:
+                        raise RuntimeError("libplacebo lacks out_format/out_pfmt and PC_LP_ALLOW_DL_FALLBACK=0.")
                     filters += ["hwdownload", f"format={out_sw}"]
-                elif not outfmt_key:
-                    if self._strict_lp:
-                        raise RuntimeError(
-                            "ffmpeg/libplacebo lacks out_format/out_pfmt; set PC_LP_ALLOW_DL_FALLBACK=1 or upgrade ffmpeg/libplacebo."
-                        )
-                    self._log.warning(
-                        "libplacebo out_format/out_pfmt not available; non-strict mode will rely on later fallbacks."
-                    )
                 if maxw > 0 and not self._has_scale_vulkan:
                     filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                 if tail_fmt != out_sw:
