@@ -1059,6 +1059,9 @@ class FfmpegPipeReader:
         # Identify as HDR pipe and always “open” for cv2-style guards.
         self._is_hdr_pipe = True
         self.isOpened = lambda: True
+        self._allow_dl_fallback = (
+            os.getenv("PC_LP_ALLOW_DL_FALLBACK", "0").lower() not in ("0", "false", "no")
+        )
 
         # ---- derived sizes for pipe reads ----
         self._frame_bytes_bgr24 = lambda w, h: (w * h * 3)
@@ -1834,14 +1837,22 @@ class FfmpegPipeReader:
         # GPU tonemaps; vf=libplacebo performs the readback. Internal override beats env.
         sw_pref = (self._sw_fmt_override or os.getenv("PC_LP_SW_FMT", "auto")).strip().lower() or "auto"
         out_sw = ("nv12" if tail_fmt == "nv12" else "bgra") if sw_pref == "auto" else sw_pref
+        # guard against unsupported values
+        _safe_sw = {"nv12", "bgra", "bgr0", "rgb0", "rgba"}
+        if out_sw not in _safe_sw:
+            _auto = "nv12" if tail_fmt == "nv12" else "bgra"
+            self._log.warning("PC_LP_SW_FMT=%s unsupported for libplacebo readback; using %s",
+                              sw_pref, _auto)
+            out_sw = _auto
         if self._mode == "libplacebo" and self._use_libplacebo:
             # ensure libplacebo capabilities are available when building args
             self._lp_opts = getattr(self, "_lp_opts", None) or self._probe_libplacebo_opts()
-            # Option name can differ across ffmpeg builds; detect and adapt. If neither alias
-            # exists, fall back to a post-libplacebo format filter to enforce the software pixfmt.
+            # prefer libplacebo's own CPU readback; alias can be out_format or out_pfmt depending on build
             outfmt_key = "out_format" if self._lp_opts.get("out_format") else (
                 "out_pfmt" if self._lp_opts.get("out_pfmt") else None
             )
+            # if neither key exists, we /can/ fall back to explicit hwdownload+format — but only if opted in
+            need_explicit_download = (outfmt_key is None and self._allow_dl_fallback)
             if self._has_vulkan:
                 surf = self._choose_surf()
                 _tm = self._q(self._tm_value())
@@ -1866,8 +1877,17 @@ class FfmpegPipeReader:
                         ),
                         "libplacebo=" + ":".join(lp_args),
                     ]
-                    if not outfmt_key:
-                        filters.append(f"format={out_sw}")
+                    if need_explicit_download:
+                        filters += ["hwdownload", f"format={out_sw}"]
+                    elif not outfmt_key:
+                        # strict mode: fail loudly rather than silently inserting CPU readback
+                        if self._strict_lp:
+                            raise RuntimeError(
+                                "ffmpeg/libplacebo lacks out_format/out_pfmt; set PC_LP_ALLOW_DL_FALLBACK=1 or upgrade ffmpeg/libplacebo."
+                            )
+                        self._log.warning(
+                            "libplacebo out_format/out_pfmt not available; non-strict mode will rely on later fallbacks."
+                        )
                     if maxw > 0 and not self._has_scale_vulkan:
                         filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                     if tail_fmt != out_sw:
@@ -1900,8 +1920,16 @@ class FfmpegPipeReader:
                     ),
                     "libplacebo=" + ":".join(lp_args),
                 ]
-                if not outfmt_key:
-                    filters.append(f"format={out_sw}")
+                if need_explicit_download:
+                    filters += ["hwdownload", f"format={out_sw}"]
+                elif not outfmt_key:
+                    if self._strict_lp:
+                        raise RuntimeError(
+                            "ffmpeg/libplacebo lacks out_format/out_pfmt; set PC_LP_ALLOW_DL_FALLBACK=1 or upgrade ffmpeg/libplacebo."
+                        )
+                    self._log.warning(
+                        "libplacebo out_format/out_pfmt not available; non-strict mode will rely on later fallbacks."
+                    )
                 if maxw > 0 and not self._has_scale_vulkan:
                     filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                 if tail_fmt != out_sw:
