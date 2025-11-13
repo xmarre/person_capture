@@ -1076,6 +1076,13 @@ class FfmpegPipeReader:
         # Optional override if a chosen out_format fails; toggled by fallback logic.
         self._sw_fmt_override: Optional[str] = None
 
+        # --- Vulkan readback sw-format for hwdownload (Vulkan accepts RGBA-family only) ---
+        self._dl_sw = (os.getenv("PC_LP_DL_SW", "rgba") or "rgba").strip().lower()
+        if self._dl_sw not in ("rgba", "rgb0"):
+            self._dl_sw = "rgba"
+        # track if we’ve already flipped once
+        self._dl_sw_flipped = False
+
         # --- quoting helper for libplacebo string enums (bt.2390/mobius/hable/clip) ---
         # Some ffmpeg builds require quotes, otherwise "bt2390" is parsed as an expression → EINVAL.
         def _q(s: str) -> str:
@@ -1435,6 +1442,28 @@ class FfmpegPipeReader:
         def _stderr_contains(s: str) -> bool:
             tail = " | ".join(getattr(self, "_stderr_tail", [])[-50:]).lower()
             return s.lower() in tail
+
+        # If explicit hwdownload fails with “Invalid output format <fmt> for hwframe download”,
+        # flip rgba <-> rgb0 once and retry while staying in Vulkan.
+        if self._mode == "libplacebo" and (
+            (
+                _stderr_contains("invalid output format")
+                and _stderr_contains("hwdownload")
+            )
+            or _stderr_contains("filter format does not support hardware pixel formats")
+        ):
+            if not getattr(self, "_dl_sw_flipped", False):
+                prev = self._dl_sw
+                self._dl_sw = "rgb0" if prev == "rgba" else "rgba"
+                self._dl_sw_flipped = True
+                self._log.warning(
+                    "LP(Vulkan): hwdownload rejected %s → trying %s",
+                    prev,
+                    self._dl_sw,
+                )
+                _restart(max(self._pos + 1, 0))
+                return True
+            # otherwise continue to other fallbacks
 
         # If libplacebo refuses the chosen software output pixfmt, flip between nv12 and bgra.
         if self._mode == "libplacebo" and (
@@ -1852,10 +1881,10 @@ class FfmpegPipeReader:
             self._log.warning("PC_LP_SW_FMT=%s unsupported for libplacebo readback; using %s",
                               sw_pref, _auto)
             out_sw = _auto
-        # hwdownload-compatible software formats (Vulkan): must be RGBA-family
-        _dl_allowed = {"bgra", "rgba", "rgb0", "bgr0"}
-        # pick a legal download format even if out_sw==nv12
-        dl_sw = out_sw if out_sw in _dl_allowed else "bgra"
+        # hwdownload-compatible software formats (Vulkan): RGBA-family only
+        dl_sw = self._dl_sw
+        if dl_sw not in ("rgba", "rgb0"):
+            dl_sw = "rgba"
         # if pipe wants nv12, we’ll hwdownload to RGBA-family, then format→nv12 on CPU
         if self._mode == "libplacebo" and self._use_libplacebo:
             # ensure libplacebo capabilities are available when building args
@@ -1893,14 +1922,15 @@ class FfmpegPipeReader:
                     if need_explicit_download:
                         if not self._allow_dl_fallback and self._strict_lp:
                             raise RuntimeError("libplacebo lacks out_format/out_pfmt and PC_LP_ALLOW_DL_FALLBACK=0.")
-                        # Vulkan hwdownload only accepts RGBA-family software surfaces
+                        # Vulkan hwdownload → RGBA-family only
                         filters += ["hwdownload", f"format={dl_sw}"]
+                        if tail_fmt == "nv12":
+                            filters.append("format=nv12")
                     if maxw > 0 and not self._has_scale_vulkan:
                         filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                     # ensure pipe pixfmt
-                    if need_explicit_download:
-                        if tail_fmt != dl_sw:
-                            filters.append(f"format={tail_fmt}")
+                    if need_explicit_download and tail_fmt not in ("nv12", dl_sw):
+                        filters.append(f"format={tail_fmt}")
                     else:
                         if tail_fmt != out_sw:
                             filters.append(f"format={tail_fmt}")
@@ -1935,14 +1965,15 @@ class FfmpegPipeReader:
                 if need_explicit_download:
                     if not self._allow_dl_fallback and self._strict_lp:
                         raise RuntimeError("libplacebo lacks out_format/out_pfmt and PC_LP_ALLOW_DL_FALLBACK=0.")
-                    # Vulkan hwdownload only accepts RGBA-family software surfaces
+                    # Vulkan hwdownload → RGBA-family only
                     filters += ["hwdownload", f"format={dl_sw}"]
+                    if tail_fmt == "nv12":
+                        filters.append("format=nv12")
                 if maxw > 0 and not self._has_scale_vulkan:
                     filters.append(f"scale=w=min(iw\\,{maxw}):h=-2")
                 # ensure pipe pixfmt
-                if need_explicit_download:
-                    if tail_fmt != dl_sw:
-                        filters.append(f"format={tail_fmt}")
+                if need_explicit_download and tail_fmt not in ("nv12", dl_sw):
+                    filters.append(f"format={tail_fmt}")
                 else:
                     if tail_fmt != out_sw:
                         filters.append(f"format={tail_fmt}")
