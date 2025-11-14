@@ -1789,6 +1789,10 @@ class FfmpegPipeReader:
         opts["color_primaries"]  = (" color_primaries " in low) or (" color_primaries=" in low)
         opts["color_trc"]        = (" color_trc " in low) or (" color_trc=" in low)
         opts["range"]            = (" range " in low) or (" range=" in low)
+        # Software output format knob (modern libplacebo builds). This is the one
+        # that shows up as:
+        #   format <string> ..FV....... Output video format
+        opts["format"]           = (" format " in low) or (" format=" in low)
         opts["target_primaries"] = (" target_primaries " in low) or (" target_primaries=" in low)
         opts["target_trc"]       = (" target_trc " in low) or (" target_trc=" in low)
         # Dither/dithering variants
