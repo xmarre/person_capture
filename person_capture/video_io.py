@@ -1069,18 +1069,15 @@ class FfmpegPipeReader:
         # Optional override if a chosen out_format fails; toggled by fallback logic.
         self._sw_fmt_override: Optional[str] = None
 
-        # --- Vulkan readback policy ---
-        # Preferred software formats for readback (driver support differs across builds).
-        _dl_pref = (os.getenv("PC_LP_DL_SW", "rgba") or "rgba").strip().lower()
-        self._dl_sw_candidates: tuple[str, ...] = ("rgba", "rgb0", "bgra", "bgr0")
-        try:
-            self._dl_sw_idx = max(0, self._dl_sw_candidates.index(_dl_pref))
-        except ValueError:
-            self._dl_sw_idx = 0  # default to 'rgba'
-        # Readback op: start with hwdownload; auto-swap to hwmap=mode=read on failure.
-        self._dl_use_hwmap = False
-        # Guard to avoid infinite spinning on the same failure signature.
-        self._dl_sw_rotations = 0
+        # --- Vulkan readback sw-format for hwdownload (Vulkan accepts RGBA-family only) ---
+        # Canonical pipeline: CPU → format=p010le → hwupload → libplacebo(Vulkan)
+        # → hwdownload → format={bgra,rgba} → (optional) format=nv12/bgr24 for the pipe.
+        _dl_default = "bgra" if os.name == "nt" else "rgba"
+        self._dl_sw = (os.getenv("PC_LP_DL_SW", _dl_default) or _dl_default).strip().lower()
+        if self._dl_sw not in ("rgba", "bgra"):
+            self._dl_sw = _dl_default
+        # track if we’ve already flipped once (rgba <-> bgra) on hwdownload failures
+        self._dl_sw_flipped = False
 
         # --- quoting helper for libplacebo string enums (bt.2390/mobius/hable/clip) ---
         # Some ffmpeg builds require quotes, otherwise "bt2390" is parsed as an expression → EINVAL.
@@ -1442,9 +1439,9 @@ class FfmpegPipeReader:
             tail = " | ".join(getattr(self, "_stderr_tail", [])[-50:]).lower()
             return s.lower() in tail
 
-        # --- Vulkan readback recovery ---
-        # If explicit hwdownload fails with “Invalid output format <fmt> for hwframe download”,
-        # flip rgba <-> rgb0 once and retry while staying in Vulkan.
+        # --- Vulkan readback recovery (no hwmap juggling, just RGBA↔BGRA) ---
+        # If explicit hwdownload fails with “Invalid output format <fmt> for hwframe download”
+        # or similar, try the other RGBA-family format once while staying on Vulkan.
         if self._mode == "libplacebo" and (
             (
                 _stderr_contains("invalid output format")
@@ -1452,41 +1449,30 @@ class FfmpegPipeReader:
             )
             or _stderr_contains("filter format does not support hardware pixel formats")
         ):
-            # 1) If we were using hwdownload, try switching to hwmap first.
-            if not self._dl_use_hwmap and _stderr_contains("hwdownload"):
-                self._dl_use_hwmap = True
-                # On many Windows builds, hwmap prefers BGRA/BGR0. Jump there immediately.
-                try:
-                    self._dl_sw_idx = self._dl_sw_candidates.index("bgra")
-                except ValueError:
-                    self._dl_sw_idx = 2  # fallback to candidate #2
+            if not getattr(self, "_dl_sw_flipped", False):
+                prev = self._dl_sw
+                self._dl_sw = "bgra" if prev == "rgba" else "rgba"
+                self._dl_sw_flipped = True
                 self._log.warning(
-                    "LP(Vulkan): switching readback hwdownload→hwmap=mode=read (dl_sw=%s)",
-                    self._dl_sw_candidates[self._dl_sw_idx],
+                    "LP(Vulkan): hwdownload rejected %s → trying %s",
+                    prev,
+                    self._dl_sw,
                 )
                 _restart(max(self._pos + 1, 0))
                 return True
-            # 2) Otherwise, rotate software format among allowed candidates.
-            prev_idx = self._dl_sw_idx
-            self._dl_sw_idx = (self._dl_sw_idx + 1) % len(self._dl_sw_candidates)
-            self._dl_sw_rotations += 1
-            self._log.warning(
-                "LP(Vulkan): readback format rejected (%s) → trying %s",
-                self._dl_sw_candidates[prev_idx],
-                self._dl_sw_candidates[self._dl_sw_idx],
-            )
+
+            # Both RGBA and BGRA failed → in strict mode abort, otherwise fall back to CPU tonemap.
+            msg = "libplacebo(Vulkan): no supported RGBA-family readback format (hwdownload)."
+            if self._strict_lp:
+                # You asked for strict: no CPU fallback, so fail loudly here.
+                raise RuntimeError(msg)
+
+            self._log.warning("%s Falling back to zscale/scale CPU tonemapping.", msg)
+            self._stop()
+            self._mode = "zscale" if (self._has_zscale and self._has_tonemap) else "scale"
+            self._fallback_hops = 0
             _restart(max(self._pos + 1, 0))
             return True
-
-        # If we rotated through all RGBA-family formats on hwmap, hard fail instead of falling back to CPU chains.
-        if (
-            self._mode == "libplacebo"
-            and self._dl_use_hwmap
-            and self._dl_sw_rotations >= len(self._dl_sw_candidates)
-        ):
-            raise RuntimeError(
-                "libplacebo(Vulkan): no supported RGBA-family readback format via hwmap."
-            )
 
         # If libplacebo refuses the chosen software output pixfmt, flip between nv12 and bgra.
         if self._mode == "libplacebo" and (
@@ -1904,12 +1890,10 @@ class FfmpegPipeReader:
             self._log.warning("PC_LP_SW_FMT=%s unsupported for libplacebo readback; using %s",
                               sw_pref, _auto)
             out_sw = _auto
-        # Readback op and sw-format (Vulkan): prefer RGBA-family; op may be hwdownload or hwmap=mode=read
-        dl_op = "hwmap=mode=read" if self._dl_use_hwmap else "hwdownload"
-        try:
-            dl_sw = self._dl_sw_candidates[self._dl_sw_idx]
-        except Exception:
-            dl_sw = "rgba"
+        # hwdownload-compatible software formats (Vulkan): RGBA-family only
+        dl_sw = self._dl_sw
+        if dl_sw not in ("rgba", "bgra"):
+            dl_sw = "bgra" if os.name == "nt" else "rgba"
         # if pipe wants nv12, we’ll read back to RGBA-family, then format→nv12 on CPU
         if self._mode == "libplacebo" and self._use_libplacebo:
             # ensure libplacebo capabilities are available when building args
@@ -1947,8 +1931,8 @@ class FfmpegPipeReader:
                     if need_explicit_download:
                         if not self._allow_dl_fallback and self._strict_lp:
                             raise RuntimeError("libplacebo lacks out_format/out_pfmt and PC_LP_ALLOW_DL_FALLBACK=0.")
-                        # Vulkan readback: RGBA-family only
-                        filters += [dl_op, f"format={dl_sw}"]
+                        # Vulkan hwdownload → RGBA-family only
+                        filters += ["hwdownload", f"format={dl_sw}"]
                         if tail_fmt == "nv12":
                             filters.append("format=nv12")
                     if maxw > 0 and not self._has_scale_vulkan:
@@ -1990,8 +1974,8 @@ class FfmpegPipeReader:
                 if need_explicit_download:
                     if not self._allow_dl_fallback and self._strict_lp:
                         raise RuntimeError("libplacebo lacks out_format/out_pfmt and PC_LP_ALLOW_DL_FALLBACK=0.")
-                    # Vulkan readback: RGBA-family only
-                    filters += [dl_op, f"format={dl_sw}"]
+                    # Vulkan hwdownload → RGBA-family only
+                    filters += ["hwdownload", f"format={dl_sw}"]
                     if tail_fmt == "nv12":
                         filters.append("format=nv12")
                 if maxw > 0 and not self._has_scale_vulkan:
