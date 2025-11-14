@@ -1069,6 +1069,14 @@ class FfmpegPipeReader:
         # Optional override if a chosen out_format fails; toggled by fallback logic.
         self._sw_fmt_override: Optional[str] = None
 
+        # --- Decoder hardware acceleration (optional) ---
+        # Example: PC_HWACCEL=cuda  → use NVDEC for HEVC/H.264 and keep frames on GPU.
+        self._hwaccel = (os.getenv("PC_HWACCEL") or "").strip().lower()
+        # For cuda, "cuda" is the canonical hardware frame format.
+        self._hwaccel_output_format = (
+            os.getenv("PC_HWACCEL_OUT_FMT", "cuda").strip().lower()
+        )
+
         # --- Vulkan readback sw-format for hwdownload (Vulkan accepts RGBA-family only) ---
         # Canonical pipeline: CPU → format=p010le → hwupload → libplacebo(Vulkan)
         # → hwdownload → format={bgra,rgba} → (optional) format=nv12/bgr24 for the pipe.
@@ -1809,6 +1817,7 @@ class FfmpegPipeReader:
         except Exception:
             flt = ""
         opts["scale_vulkan"] = " scale_vulkan " in flt
+        opts["scale_cuda"] = " scale_cuda " in flt
         self._lp_probe_cache = opts
         return opts
 
@@ -1924,21 +1933,32 @@ class FfmpegPipeReader:
                     self._lp_add_colorspace_args(lp_args)
                     if outfmt_key:
                         lp_args.append(f"{outfmt_key}={out_sw}")
-                    filters = [
-                        f"format={surf}",
-                        (
-                            f"hwupload=derive_device=1:extra_hw_frames={self._extra_hw_frames}"
-                            if self._hwupload_derive
-                            else f"hwupload=extra_hw_frames={self._extra_hw_frames}"
-                        ),
-                        # optional GPU downscale before readback
-                        *(
-                            [f"scale_vulkan=w=min(iw\\,{maxw & ~1}):h=-2"]
-                            if (maxw > 0 and self._has_scale_vulkan)
-                            else []
-                        ),
-                        "libplacebo=" + ":".join(lp_args),
-                    ]
+                    if self._hwaccel == "cuda":
+                        filters = [
+                            "hwmap=derive_device=vulkan",
+                            *(
+                                [f"scale_vulkan=w=min(iw\\,{maxw & ~1}):h=-2"]
+                                if (maxw > 0 and self._has_scale_vulkan)
+                                else []
+                            ),
+                            "libplacebo=" + ":".join(lp_args),
+                        ]
+                    else:
+                        filters = [
+                            f"format={surf}",
+                            (
+                                f"hwupload=derive_device=1:extra_hw_frames={self._extra_hw_frames}"
+                                if self._hwupload_derive
+                                else f"hwupload=extra_hw_frames={self._extra_hw_frames}"
+                            ),
+                            # optional GPU downscale before readback
+                            *(
+                                [f"scale_vulkan=w=min(iw\\,{maxw & ~1}):h=-2"]
+                                if (maxw > 0 and self._has_scale_vulkan)
+                                else []
+                            ),
+                            "libplacebo=" + ":".join(lp_args),
+                        ]
                     if need_explicit_download:
                         if not self._allow_dl_fallback and self._strict_lp:
                             raise RuntimeError(
@@ -1970,22 +1990,36 @@ class FfmpegPipeReader:
                 self._lp_add_colorspace_args(lp_args)
                 if outfmt_key:
                     lp_args.append(f"{outfmt_key}={out_sw}")
-                filters = [
-                    f"format={surf}",
-                    (
-                        f"hwupload=derive_device=1:extra_hw_frames={self._extra_hw_frames}"
-                        if self._hwupload_derive
-                        else f"hwupload=extra_hw_frames={self._extra_hw_frames}"
-                    ),
-                    *(
-                        [
-                            f"scale_vulkan=w=min(iw\\,{max(maxw & ~1, 2)}):h=-2"
-                        ]
-                        if (maxw > 0 and self._has_scale_vulkan)
-                        else []
-                    ),
-                    "libplacebo=" + ":".join(lp_args),
-                ]
+                if self._hwaccel == "cuda":
+                    # CUDA decode → CUDA hw frames → map to Vulkan with hwmap=derive_device=vulkan
+                    filters = [
+                        "hwmap=derive_device=vulkan",
+                        *(
+                            [
+                                f"scale_vulkan=w=min(iw\\,{max(maxw & ~1, 2)}):h=-2"
+                            ]
+                            if (maxw > 0 and self._has_scale_vulkan)
+                            else []
+                        ),
+                        "libplacebo=" + ":".join(lp_args),
+                    ]
+                else:
+                    filters = [
+                        f"format={surf}",
+                        (
+                            f"hwupload=derive_device=1:extra_hw_frames={self._extra_hw_frames}"
+                            if self._hwupload_derive
+                            else f"hwupload=extra_hw_frames={self._extra_hw_frames}"
+                        ),
+                        *(
+                            [
+                                f"scale_vulkan=w=min(iw\\,{max(maxw & ~1, 2)}):h=-2"
+                            ]
+                            if (maxw > 0 and self._has_scale_vulkan)
+                            else []
+                        ),
+                        "libplacebo=" + ":".join(lp_args),
+                    ]
                 if need_explicit_download:
                     if not self._allow_dl_fallback and self._strict_lp:
                         raise RuntimeError(
@@ -2116,6 +2150,14 @@ class FfmpegPipeReader:
             "-threads",
             ff_threads,
         ]
+
+        # Optional hardware decode (e.g. NVDEC via cuda). Only enable for libplacebo/zscale
+        # chains where it actually matters.
+        if self._mode in ("libplacebo", "zscale") and self._hwaccel == "cuda":
+            cmd += [
+                "-hwaccel", "cuda",
+                "-hwaccel_output_format", self._hwaccel_output_format,
+            ]
         # Required for hwupload/scale_vulkan to bind to a Vulkan context.
         if self._mode == "libplacebo" and self._use_libplacebo and self._has_vulkan:
             vk_args = self._vk_init_args()

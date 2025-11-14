@@ -254,6 +254,10 @@ class SessionConfig:
     frame_stride: int = 2
     min_det_conf: float = 0.35
     face_thresh: float = 0.45
+    # FFmpeg hardware decode for HDR path:
+    #   "off"  → CPU decode
+    #   "cuda" → NVDEC (CUDA) decode + CUDA→Vulkan mapping
+    ff_hwaccel: str = "off"
     reid_thresh: float = 0.42
     combine: str = "min"            # min | avg | face_priority
     match_mode: str = "face_only"        # either | both | face_only | reid_only
@@ -448,6 +452,18 @@ class SessionConfig:
             if hasattr(c, k):
                 setattr(c, k, v)
         return c
+
+
+def _apply_ffmpeg_hwaccel_env(cfg: SessionConfig) -> None:
+    """Configure FFmpeg/libplacebo hardware decode env vars from the session config."""
+
+    mode = str(getattr(cfg, "ff_hwaccel", "off") or "off").strip().lower()
+    if mode == "cuda":
+        os.environ["PC_HWACCEL"] = "cuda"
+        os.environ["PC_HWACCEL_OUT_FMT"] = "cuda"
+    else:
+        os.environ.pop("PC_HWACCEL", None)
+        os.environ.pop("PC_HWACCEL_OUT_FMT", None)
 
 # ---------------------- Worker Thread ----------------------
 
@@ -2390,6 +2406,7 @@ class Processor(QtCore.QObject):
             self._paused = False
             self._init_status()
             cfg = self.cfg
+            _apply_ffmpeg_hwaccel_env(cfg)
             self._clear_lock()
             self._prev_gray = None
             if not os.path.isfile(cfg.video):
@@ -5085,6 +5102,13 @@ class MainWindow(QtWidgets.QMainWindow):
         pref_idx = self.tonemap_pref_combo.findData(self.cfg.hdr_tonemap_pref)
         self.tonemap_pref_combo.setCurrentIndex(pref_idx if pref_idx >= 0 else 0)
         self.tonemap_pref_combo.currentIndexChanged.connect(self._on_ui_change)
+        self.hwaccel_combo = QtWidgets.QComboBox()
+        self.hwaccel_combo.addItem("CPU decode (no hwaccel)", "off")
+        self.hwaccel_combo.addItem("CUDA / NVDEC (GPU decode)", "cuda")
+        _hw_mode = (self.cfg.ff_hwaccel or "off").strip().lower()
+        _hw_idx = self.hwaccel_combo.findData(_hw_mode)
+        self.hwaccel_combo.setCurrentIndex(_hw_idx if _hw_idx >= 0 else 0)
+        self.hwaccel_combo.currentIndexChanged.connect(self._on_ui_change)
         self.stride_spin = QtWidgets.QSpinBox(); self.stride_spin.setRange(1, 1000); self.stride_spin.setValue(2)
         self.det_conf_spin = QtWidgets.QDoubleSpinBox(); self.det_conf_spin.setDecimals(3); self.det_conf_spin.setRange(0.0, 1.0); self.det_conf_spin.setSingleStep(0.01); self.det_conf_spin.setValue(0.35)
         self.face_thr_spin = QtWidgets.QDoubleSpinBox(); self.face_thr_spin.setDecimals(3); self.face_thr_spin.setRange(0.0, 2.0); self.face_thr_spin.setSingleStep(0.01); self.face_thr_spin.setValue(0.45)
@@ -5510,6 +5534,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Tonemap desat", self.tm_desat_spin),
             ("Tonemap Mobius param", self.tm_param_spin),
             ("Tonemap backend", self.tonemap_pref_combo),
+            ("FFmpeg hardware decode", self.hwaccel_combo),
             ("Frame stride", self.stride_spin),
             ("YOLO min conf", self.det_conf_spin),
             ("Face max dist", self.face_thr_spin),
@@ -6645,6 +6670,7 @@ class MainWindow(QtWidgets.QMainWindow):
             tm_desat=float(self.tm_desat_spin.value()),
             tm_param=float(self.tm_param_spin.value()),
             hdr_tonemap_pref=self.tonemap_pref_combo.currentData() or "auto",
+            ff_hwaccel=self.hwaccel_combo.currentData() or "off",
             seek_fast=bool(self.seek_fast_check.isChecked()) if hasattr(self, "seek_fast_check") else bool(getattr(self.cfg, "seek_fast", True)),
             seek_max_grabs=max(0, int(self.seek_max_grabs_spin.value())) if hasattr(self, "seek_max_grabs_spin") else max(0, int(getattr(self.cfg, "seek_max_grabs", 12))),
             frame_stride=int(self.stride_spin.value()),
@@ -6818,6 +6844,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tonemap_pref_combo.setCurrentIndex(idx)
         else:
             self.tonemap_pref_combo.setCurrentIndex(0)
+        hw_mode = str(getattr(cfg, "ff_hwaccel", "off") or "off").strip().lower()
+        hw_idx = self.hwaccel_combo.findData(hw_mode)
+        if hw_idx >= 0:
+            self.hwaccel_combo.setCurrentIndex(hw_idx)
+        else:
+            fallback_idx = self.hwaccel_combo.findData("off")
+            self.hwaccel_combo.setCurrentIndex(fallback_idx if fallback_idx >= 0 else 0)
+        self.cfg.ff_hwaccel = self.hwaccel_combo.currentData() or "off"
         self.stride_spin.setValue(cfg.frame_stride)
         self.det_conf_spin.setValue(cfg.min_det_conf)
         self.face_thr_spin.setValue(cfg.face_thresh)
@@ -7367,6 +7401,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tonemap_pref_combo.setCurrentIndex(idx)
         else:
             self.tonemap_pref_combo.setCurrentIndex(0)
+        hw_mode = str(s.value("ff_hwaccel", self.cfg.ff_hwaccel)).strip().lower()
+        hw_idx = self.hwaccel_combo.findData(hw_mode)
+        if hw_idx >= 0:
+            self.hwaccel_combo.setCurrentIndex(hw_idx)
+        else:
+            fallback_idx = self.hwaccel_combo.findData("off")
+            self.hwaccel_combo.setCurrentIndex(fallback_idx if fallback_idx >= 0 else 0)
+        self.cfg.ff_hwaccel = self.hwaccel_combo.currentData() or "off"
         self.cfg.seek_fast = s.value("seek_fast", True, type=bool)
         try:
             self.cfg.seek_max_grabs = int(s.value("seek_max_grabs", 12))
@@ -7676,6 +7718,7 @@ class MainWindow(QtWidgets.QMainWindow):
             s.setValue("hdr_tonemap_pref", self.tonemap_pref_combo.currentData())
         except Exception:
             pass
+        s.setValue("ff_hwaccel", cfg.ff_hwaccel)
         if hasattr(self, "_ffmpeg_edit"):
             try:
                 s.setValue(_SETTINGS_KEY_FFMPEG_DIR, self._ffmpeg_edit.text().strip())
