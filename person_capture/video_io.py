@@ -1890,7 +1890,8 @@ class FfmpegPipeReader:
             self._log.warning("PC_LP_SW_FMT=%s unsupported for libplacebo readback; using %s",
                               sw_pref, _auto)
             out_sw = _auto
-        # hwdownload-compatible software formats (Vulkan): RGBA-family only
+        # hwdownload-compatible software formats (Vulkan) if we ever need explicit readback:
+        # normally we want libplacebo to output software frames itself via its "format=" option.
         dl_sw = self._dl_sw
         if dl_sw not in ("rgba", "bgra"):
             dl_sw = "bgra" if os.name == "nt" else "rgba"
@@ -1898,10 +1899,16 @@ class FfmpegPipeReader:
         if self._mode == "libplacebo" and self._use_libplacebo:
             # ensure libplacebo capabilities are available when building args
             self._lp_opts = getattr(self, "_lp_opts", None) or self._probe_libplacebo_opts()
-            # prefer libplacebo's own CPU readback; alias can be out_format or out_pfmt depending on build
-            outfmt_key = "out_format" if self._lp_opts.get("out_format") else (
-                "out_pfmt" if self._lp_opts.get("out_pfmt") else None
-            )
+            # Prefer libplacebo's own software readback; use whichever output-format
+            # option this build exposes (newer builds use "format", older ones "out_format"/"out_pfmt").
+            if self._lp_opts.get("format"):
+                outfmt_key = "format"
+            elif self._lp_opts.get("out_format"):
+                outfmt_key = "out_format"
+            elif self._lp_opts.get("out_pfmt"):
+                outfmt_key = "out_pfmt"
+            else:
+                outfmt_key = None
             # If neither key exists, insert explicit hwdownload+format for readback (allowed by default).
             need_explicit_download = (outfmt_key is None)
             if self._has_vulkan:
@@ -1930,8 +1937,12 @@ class FfmpegPipeReader:
                     ]
                     if need_explicit_download:
                         if not self._allow_dl_fallback and self._strict_lp:
-                            raise RuntimeError("libplacebo lacks out_format/out_pfmt and PC_LP_ALLOW_DL_FALLBACK=0.")
-                        # Vulkan hwdownload → RGBA-family only
+                            raise RuntimeError(
+                                "libplacebo lacks a software output format option "
+                                "(format/out_format/out_pfmt) and PC_LP_ALLOW_DL_FALLBACK=0."
+                            )
+                        # Old libplacebo builds without any software-output option: fall back
+                        # to explicit Vulkan hwdownload if allowed.
                         filters += ["hwdownload", f"format={dl_sw}"]
                         if tail_fmt == "nv12":
                             filters.append("format=nv12")
@@ -1973,8 +1984,12 @@ class FfmpegPipeReader:
                 ]
                 if need_explicit_download:
                     if not self._allow_dl_fallback and self._strict_lp:
-                        raise RuntimeError("libplacebo lacks out_format/out_pfmt and PC_LP_ALLOW_DL_FALLBACK=0.")
-                    # Vulkan hwdownload → RGBA-family only
+                        raise RuntimeError(
+                            "libplacebo lacks a software output format option "
+                            "(format/out_format/out_pfmt) and PC_LP_ALLOW_DL_FALLBACK=0."
+                        )
+                    # Old libplacebo builds without any software-output option: fall back
+                    # to explicit Vulkan hwdownload if allowed.
                     filters += ["hwdownload", f"format={dl_sw}"]
                     if tail_fmt == "nv12":
                         filters.append("format=nv12")
