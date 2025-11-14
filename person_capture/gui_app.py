@@ -257,7 +257,7 @@ class SessionConfig:
     # FFmpeg hardware decode for HDR path:
     #   "off"  → CPU decode
     #   "cuda" → NVDEC (CUDA) decode + CUDA→Vulkan mapping
-    ff_hwaccel: str = "off"
+    ff_hwaccel: str = "cuda"
     reid_thresh: float = 0.42
     combine: str = "min"            # min | avg | face_priority
     match_mode: str = "face_only"        # either | both | face_only | reid_only
@@ -593,7 +593,10 @@ class Processor(QtCore.QObject):
             try:
                 _restore_env["PC_DECODE_MAX_W"] = os.environ.get("PC_DECODE_MAX_W", "")
                 _restore_env["PC_FORCE_TONEMAP"] = os.environ.get("PC_FORCE_TONEMAP", "")
+                _restore_env["PC_TONEMAP_MIN_W"] = os.environ.get("PC_TONEMAP_MIN_W", "")
                 os.environ["PC_DECODE_MAX_W"] = str(ps_maxw)
+                # For prescan we allow low-res tonemapping; keep tonemap floor in sync
+                os.environ["PC_TONEMAP_MIN_W"] = str(ps_maxw)
                 os.environ.setdefault("PC_FORCE_TONEMAP", "scale")
                 try:
                     from .video_io import FfmpegPipeReader as _Pipe, _ffmpeg_path as _ffp
