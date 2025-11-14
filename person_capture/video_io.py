@@ -870,11 +870,21 @@ class AvLibplaceboReader(_BaseAvReader):
                 f"pixel_aspect={(sar.numerator if sar else 1)}/{(sar.denominator if sar else 1)}",
             )
             if not self._use_fallback:
-                # Let libplacebo tone-map into RGB; then convert directly to BGR24.
-                # This avoids YUV range ambiguities entirely.
+                # Let libplacebo tone-map into BT.709 FULL-range RGB, then convert
+                # directly to BGR24. Forcing range=full here is critical – otherwise
+                # libplacebo can output limited-range RGB which, when treated as full
+                # range by Qt, looks washed out.
                 f1 = g.add(
                     "libplacebo",
-                    "tonemapping=auto:gamut_mode=perceptual:target_trc=bt709:target_primaries=bt709:deband=yes:dither=yes",
+                    (
+                        "tonemapping=auto:"
+                        "gamut_mode=clip:"
+                        "target_trc=bt709:"
+                        "target_primaries=bt709:"
+                        "range=full:"
+                        "deband=yes:"
+                        "dithering=ordered"
+                    ),
                 )
                 f_down = None
                 try:
@@ -903,8 +913,11 @@ class AvLibplaceboReader(_BaseAvReader):
                     "zscale",
                     "transfer=bt709:primaries=bt709:matrix=bt709:dither=error_diffusion",
                 )
-                # Expand to full-range before RGB conversion
-                f6 = g.add("zscale", f"rangein={self._range_in}:range=full")
+                # Expand to full-range before RGB conversion.
+                # zscale expects pc/tv here, not 'full'/'limited'.
+                range_in = (self._range_in or "").lower()
+                range_in_tag = "pc" if range_in in ("pc", "full", "jpeg") else "tv"
+                f6 = g.add("zscale", f"rangein={range_in_tag}:range=pc")
                 f7 = g.add("format", "bgr24")
                 sink = g.add("buffersink")
                 src.link_to(f1)
