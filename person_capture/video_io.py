@@ -869,11 +869,27 @@ class AvLibplaceboReader(_BaseAvReader):
                 f"time_base={tb.numerator}/{tb.denominator}:"
                 f"pixel_aspect={(sar.numerator if sar else 1)}/{(sar.denominator if sar else 1)}",
             )
+
+            # Tag HDR colorspace on the frames so libplacebo/zscale actually see PQ/BT.2020
+            # instead of generic SDR BT.709. Without this, tone-mapping tends to look flat
+            # and washed out.
+            src_tr = self._transfer or "bt709"
+            src_pr = self._primaries or "bt709"
+            if src_pr in ("bt2020", "smpte432"):
+                cs = "bt2020nc"
+            else:
+                cs = "bt709"
+            range_src = (self._range_in or "").lower()
+            # HDR10 is normally limited/tv; treat anything not explicitly full/pc/jpeg as limited.
+            rng = "full" if range_src in ("full", "pc", "jpeg") else "limited"
+            f_tag = g.add(
+                "setparams",
+                f"color_trc={src_tr}:color_primaries={src_pr}:colorspace={cs}:range={rng}",
+            )
             if not self._use_fallback:
-                # Let libplacebo tone-map into BT.709 FULL-range RGB, then convert
-                # directly to BGR24. Forcing range=full here is critical – otherwise
-                # libplacebo can output limited-range RGB which, when treated as full
-                # range by Qt, looks washed out.
+                # Let libplacebo tone-map into BT.709 full-range RGB, then convert directly to
+                # BGR24. Forcing range=full here is critical – otherwise libplacebo can output
+                # limited-range RGB which, when treated as full range by Qt, looks washed out.
                 f1 = g.add(
                     "libplacebo",
                     (
@@ -895,7 +911,9 @@ class AvLibplaceboReader(_BaseAvReader):
                     f_down = g.add("scale", f"w=min(iw\\,{maxw}):h=-2")
                 f2 = g.add("format", "bgr24")
                 sink = g.add("buffersink")
-                src.link_to(f1)
+                # buffer → setparams(HDR tags) → libplacebo → …
+                src.link_to(f_tag)
+                f_tag.link_to(f1)
                 if f_down is not None:
                     f1.link_to(f_down)
                     f_down.link_to(f2)
@@ -914,13 +932,15 @@ class AvLibplaceboReader(_BaseAvReader):
                     "transfer=bt709:primaries=bt709:matrix=bt709:dither=error_diffusion",
                 )
                 # Expand to full-range before RGB conversion.
-                # zscale expects pc/tv here, not 'full'/'limited'.
+                # zscale expects pc/tv here, not 'full'/'limited' strings.
                 range_in = (self._range_in or "").lower()
-                range_in_tag = "pc" if range_in in ("pc", "full", "jpeg") else "tv"
-                f6 = g.add("zscale", f"rangein={range_in_tag}:range=pc")
+                range_tag = "pc" if range_in in ("pc", "full", "jpeg") else "tv"
+                f6 = g.add("zscale", f"rangein={range_tag}:range=pc")
                 f7 = g.add("format", "bgr24")
                 sink = g.add("buffersink")
-                src.link_to(f1)
+                # buffer → setparams(HDR tags) → zscale/tonemap → …
+                src.link_to(f_tag)
+                f_tag.link_to(f1)
                 f1.link_to(f2)
                 f2.link_to(f3)
                 f3.link_to(f4)
