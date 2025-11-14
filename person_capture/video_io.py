@@ -2090,6 +2090,11 @@ class FfmpegPipeReader:
         pix_fmt = self._pipe_pixfmt if self._mode in ("libplacebo", "zscale") else "gbrpf32le"
         # Turn up logging while attempting libplacebo so stderr_tail shows the true cause.
         ll = "info" if self._mode == "libplacebo" else "error"
+        ff_threads = (os.getenv("PC_FF_THREADS") or "").strip()
+        # Default to ffmpeg's auto-threading (0) unless explicitly overridden via env.
+        if not ff_threads:
+            ff_threads = "0"
+
         cmd = [
             self._ffmpeg,
             "-hide_banner",
@@ -2109,7 +2114,7 @@ class FfmpegPipeReader:
             "-err_detect",
             "ignore_err",
             "-threads",
-            "1",
+            ff_threads,
         ]
         # Required for hwupload/scale_vulkan to bind to a Vulkan context.
         if self._mode == "libplacebo" and self._use_libplacebo and self._has_vulkan:
