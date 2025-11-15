@@ -37,6 +37,12 @@ set PC_TRT_FP16=0
 set PC_TRT_OPT=3
 set PC_TRT_WS=4294967296
 
+:: Force HDR pipe to output BGR instead of NV12 so we skip the manual NV12?BGR conversion.
+set PC_PIPE_PIXFMT=bgr24
+
+:: Prefer a BGRA readback format from libplacebo for BGR pipes.
+set PC_LP_SW_FMT=bgra
+
 rem --- must-have TRT DLLs ---
 for %%F in (nvinfer.dll nvinfer_plugin.dll) do (
   if not exist "%TRT_LIB_DIR%\%%F" goto FAIL_MISS
