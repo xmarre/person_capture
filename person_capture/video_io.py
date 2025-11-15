@@ -1373,8 +1373,11 @@ class FfmpegPipeReader:
 
     def _lp_add_colorspace_args(self, lp_args: list[str]) -> None:
         """
-        Append BT.709 + full-range args using whichever libplacebo option names
+        Append BT.709 + range args using whichever libplacebo option names
         this ffmpeg build supports (modern vs legacy).
+        For NV12 pipes we deliberately request limited-range YUV so that our
+        manual NV12→BGR converter (which assumes TV/limited) sees the expected
+        16–235/16–240 range. For RGB-family pipes we prefer full range.
         """
         # Single modern umbrella first if present
         if self._lp_supports_any("colorspace"):
@@ -1387,7 +1390,9 @@ class FfmpegPipeReader:
             if t:
                 lp_args.append(f"{t}=bt709")
         if self._lp_supports_any("range"):
-            lp_args.append("range=full")
+            tail = (getattr(self, "_pipe_pixfmt", "") or "").lower()
+            rng = "limited" if tail == "nv12" else "full"
+            lp_args.append(f"range={rng}")
         if self._lp_supports_any("gamut_mode"):
             lp_args.append("gamut_mode=clip")
 
