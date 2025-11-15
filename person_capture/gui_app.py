@@ -61,18 +61,30 @@ _log.info("INIT ULTRALYTICS_SETTINGS=%s", os.getenv("ULTRALYTICS_SETTINGS"))
 def _get_open_video_with_tonemap():
     lg = logging.getLogger(__name__)
     try:
-        from .video_io import open_video_with_tonemap as _fn, hdr_detect_reason as _reason  # type: ignore
+        from .video_io import (
+            open_video_with_tonemap as _fn,
+            hdr_detect_reason as _reason,
+            open_hdr_passthrough_reader as _open_hdr_reader,
+        )  # type: ignore
         lg.info("HDR: using package video_io")
-        return _fn, _reason
+        return _fn, _reason, _open_hdr_reader
     except Exception as e1:
         lg.warning("HDR: package video_io import failed (%s), trying flat", e1)
         try:
-            from video_io import open_video_with_tonemap as _fn, hdr_detect_reason as _reason  # type: ignore
+            from video_io import (
+                open_video_with_tonemap as _fn,
+                hdr_detect_reason as _reason,
+                open_hdr_passthrough_reader as _open_hdr_reader,
+            )  # type: ignore
             lg.info("HDR: using flat video_io")
-            return _fn, _reason
+            return _fn, _reason, _open_hdr_reader
         except Exception as e2:
             lg.warning("HDR disabled: cannot import video_io (%s)", e2)
-            return (lambda _path: None, lambda _path: "unknown")
+            return (
+                lambda _path: None,
+                lambda _path: "unknown",
+                lambda _path: None,
+            )
 
 
 # Robust imports: support both package ("from .module") and flat files ("import module").
@@ -83,7 +95,11 @@ def _imp():
             from .updater import UpdateManager  # type: ignore
         except Exception:
             UpdateManager = None  # type: ignore
-        open_video_with_tonemap, hdr_detect_reason = _get_open_video_with_tonemap()
+        (
+            open_video_with_tonemap,
+            hdr_detect_reason,
+            open_hdr_passthrough_reader,
+        ) = _get_open_video_with_tonemap()
 
         from .detectors import PersonDetector  # type: ignore
         from .face_embedder import FaceEmbedder  # type: ignore
@@ -107,6 +123,7 @@ def _imp():
             _phash_bits,
             open_video_with_tonemap,
             hdr_detect_reason,
+            open_hdr_passthrough_reader,
             UpdateManager,
         )
     except Exception:
@@ -121,7 +138,11 @@ def _imp():
             from updater import UpdateManager  # type: ignore
         except Exception:
             UpdateManager = None  # type: ignore
-        open_video_with_tonemap, hdr_detect_reason = _get_open_video_with_tonemap()
+        (
+            open_video_with_tonemap,
+            hdr_detect_reason,
+            open_hdr_passthrough_reader,
+        ) = _get_open_video_with_tonemap()
         try:
             from .utils import ensure_dir, parse_ratio, expand_box_to_ratio, phash_similarity, _phash_bits  # type: ignore
         except Exception:
@@ -137,6 +158,7 @@ def _imp():
             _phash_bits,
             open_video_with_tonemap,
             hdr_detect_reason,
+            open_hdr_passthrough_reader,
             UpdateManager,
         )
 
@@ -151,6 +173,7 @@ def _imp():
     _phash_bits,
     open_video_with_tonemap,
     hdr_detect_reason,
+    open_hdr_passthrough_reader,
     UpdateManager,
 ) = _imp()
 
@@ -171,6 +194,16 @@ from PySide6.QtWidgets import QDockWidget
 
 
 logger = logging.getLogger(__name__)
+
+
+try:
+    from .hdr_preview import hdr_passthrough_available as _hdr_passthrough_available  # type: ignore
+except Exception:
+    try:
+        from hdr_preview import hdr_passthrough_available as _hdr_passthrough_available  # type: ignore
+    except Exception:
+        def _hdr_passthrough_available() -> bool:  # type: ignore
+            return False
 
 
 class FileList(QtWidgets.QListWidget):
@@ -669,6 +702,7 @@ class Processor(QtCore.QObject):
                 preview_step = max(stride, int(getattr(cfg, "preview_every", 3)))
                 last_preview_idx = -preview_step
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                self._hdr_preview_seek(0)
                 processed_samples = 0
                 fd9_streak = 0
                 fd9_skip_samples = 0
@@ -739,6 +773,7 @@ class Processor(QtCore.QObject):
                             tgt,
                             fast=bool(getattr(cfg, "seek_fast", True)),
                             max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
+                            hdr_reader=self._hdr_preview_reader,
                         )
                         # ensure forward progress even if seek advanced < stride
                         i_floor = (new_pos // stride) * stride
@@ -774,6 +809,7 @@ class Processor(QtCore.QObject):
                             next_i,
                             fast=bool(getattr(cfg, "seek_fast", True)),
                             max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
+                            hdr_reader=self._hdr_preview_reader,
                         )
                         # if capped seek didn't reach next_i, still advance one stride to avoid stalls
                         i = i2 if i2 > old_i else old_i + stride
@@ -836,6 +872,7 @@ class Processor(QtCore.QObject):
                             tgt,
                             fast=bool(getattr(cfg, "seek_fast", True)),
                             max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
+                            hdr_reader=self._hdr_preview_reader,
                         )
                         i_floor = (new_pos // stride) * stride
                         if i_floor <= i:
@@ -860,6 +897,7 @@ class Processor(QtCore.QObject):
                     if not ok or frame is None:
                         i += 1
                         continue
+                    self._hdr_preview_capture()
                     idx = i
                     sample_idx = processed_samples
                     processed_samples += 1
@@ -1118,11 +1156,13 @@ class Processor(QtCore.QObject):
                                 j,
                                 fast=bool(getattr(cfg, "seek_fast", True)),
                                 max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
+                                hdr_reader=self._hdr_preview_reader,
                             )
                             ret, frame = cap.read()
                             if not ret or frame is None:
                                 j += stride_ref
                                 continue
+                            self._hdr_preview_capture()
                             h, w = frame.shape[:2]
                             if Wmax > 0 and w > Wmax:
                                 scale = float(Wmax) / float(w)
@@ -1163,11 +1203,13 @@ class Processor(QtCore.QObject):
                                     j,
                                     fast=bool(getattr(cfg, "seek_fast", True)),
                                     max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
+                                    hdr_reader=self._hdr_preview_reader,
                                 )
                                 ret, frame = cap.read()
                                 if not ret or frame is None:
                                     j += stride_ref
                                     continue
+                                self._hdr_preview_capture()
                                 h, w = frame.shape[:2]
                                 if Wmax > 0 and w > Wmax:
                                     scale = float(Wmax) / float(w)
@@ -1609,6 +1651,7 @@ class Processor(QtCore.QObject):
     progress = QtCore.Signal(int)                    # current frame idx
     status = QtCore.Signal(str)                      # status text
     preview = QtCore.Signal(QtGui.QImage)            # annotated frame
+    preview_hdr_p010 = QtCore.Signal(object)         # (y_plane, uv_plane)
     hit = QtCore.Signal(str)                         # crop path
     finished = QtCore.Signal(bool, str)              # success, message
     keyframes = QtCore.Signal(object)                # list[int]
@@ -2053,6 +2096,7 @@ class Processor(QtCore.QObject):
         fast: bool = False,
         max_grabs: int = 0,
         peek_preview: bool = False,
+        hdr_reader=None,
     ) -> int:
         """Keyframe-aware seek. If fast=True, cap forward grabs to max_grabs to avoid long stalls."""
         if self._total_frames is not None:
@@ -2078,6 +2122,7 @@ class Processor(QtCore.QObject):
                     cap.set(cv2.CAP_PROP_POS_FRAMES, base)
             else:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, base)
+            self._hdr_preview_seek(base, reader=hdr_reader)
         idx = base
         limit = max(0, tgt_idx - base)
         # Cap forward grabs in fast mode to keep UI responsive
@@ -2105,13 +2150,19 @@ class Processor(QtCore.QObject):
             idx += 1
             # Light preview peek only when explicitly enabled (UI scrubs)
             peek_n = max(1, int(getattr(self.cfg, "seek_preview_peek_every", 16)))
-            if peek_preview and fast and (i % peek_n) == 0:
+            do_peek = peek_preview and fast and (i % peek_n) == 0
+            if do_peek:
                 ok, frame = cap.retrieve()
                 if ok:
                     try:
+                        self._hdr_preview_capture(reader=hdr_reader)
                         self._emit_preview_bgr(frame)
                     except Exception:
                         pass
+                else:
+                    self._hdr_preview_skip(1, reader=hdr_reader)
+            else:
+                self._hdr_preview_skip(1, reader=hdr_reader)
             if fast and (time.perf_counter() - t0) > budget:
                 try:
                     self._status(
@@ -2145,6 +2196,10 @@ class Processor(QtCore.QObject):
         self._locked_reid_feat: Optional[np.ndarray] = None
         self._prev_gray: Optional[np.ndarray] = None
         self._last_preview_t: float = 0.0
+        self.ui_hdr_passthrough_enabled: bool = False
+        self._hdr_passthrough_active: bool = False
+        self._hdr_preview_reader: Optional[object] = None
+        self._hdr_preview_latest: Optional[tuple[np.ndarray, np.ndarray]] = None
 
     def _emit_hit(self, path: str) -> None:
         emit = getattr(self.hit, "emit", None)
@@ -2644,6 +2699,31 @@ class Processor(QtCore.QObject):
             except Exception:
                 pass
 
+            self._hdr_preview_close()
+            env_hdr_passthrough = os.getenv("PC_HDR_PASSTHROUGH", "0").lower() in {"1", "true", "yes"}
+            want_hdr_passthrough = (
+                hdr_active
+                and env_hdr_passthrough
+                and bool(self.ui_hdr_passthrough_enabled)
+                and _hdr_passthrough_available()
+            )
+            if want_hdr_passthrough:
+                reader = open_hdr_passthrough_reader(cfg.video)
+                if reader is not None:
+                    self._hdr_preview_reader = reader
+                    self._hdr_passthrough_active = True
+                    self._hdr_preview_latest = None
+                    try:
+                        pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+                        self._hdr_preview_seek(pos)
+                    except Exception:
+                        pass
+                    self._status("HDR passthrough preview: enabled", key="hdr_passthrough", interval=30.0)
+                else:
+                    self._status("HDR passthrough preview: unavailable", key="hdr_passthrough", interval=60.0)
+            else:
+                self._hdr_passthrough_active = False
+
             # --- Sanity probe: ensure the selected reader actually delivers frames.
             # If HDR tone-map reader stalls, fall back to OpenCV/FFmpeg so the preview and pre-scan advance.
             def _probe_reader(c, fps_hint: float) -> bool:
@@ -2671,6 +2751,7 @@ class Processor(QtCore.QObject):
                                         ok, fr = retrieve()
                                         if ok:
                                             break
+                                        self._hdr_preview_skip(1)
                                 except Exception:
                                     break
                                 time.sleep(0.05)
@@ -2678,6 +2759,7 @@ class Processor(QtCore.QObject):
                         ok_any = True
                         # show first frame immediately so UI proves the pipeline is alive
                         try:
+                            self._hdr_preview_capture()
                             self._emit_preview_bgr(fr)
                         except Exception:
                             pass
@@ -2688,6 +2770,7 @@ class Processor(QtCore.QObject):
                         set_(cv2.CAP_PROP_POS_FRAMES, pos0)
                     except Exception:
                         pass
+                self._hdr_preview_seek(pos0)
                 return ok_any
 
             fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
@@ -2720,6 +2803,7 @@ class Processor(QtCore.QObject):
                     cap.release()
                 except Exception:
                     pass
+                self._hdr_preview_close()
                 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
                 cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
                 try:
@@ -2833,6 +2917,7 @@ class Processor(QtCore.QObject):
                         fast=bool(getattr(cfg, "seek_fast", True)),
                         max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
                         peek_preview=False,  # segment jump: no peeks
+                        hdr_reader=self._hdr_preview_reader,
                     )
                     # Neutralize any stray cooldown/coalesced state from the jump *before* progress emit.
                     if hasattr(self, "_seek_cooldown_frames"):
@@ -2850,9 +2935,11 @@ class Processor(QtCore.QObject):
                         if ok:
                             ok, frame = cap.retrieve()
                             if ok and frame is not None:
+                                self._hdr_preview_capture()
                                 self._emit_preview_bgr(frame)
                         # Do not advance past s0 for processing—restore read head.
                         cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+                        self._hdr_preview_seek(int(frame_idx))
                     except Exception:
                         pass
                     self._status(f"Pre-scan segments: {len(keep_spans)}", key="prescan", interval=30.0)
@@ -3151,6 +3238,7 @@ class Processor(QtCore.QObject):
                         fast=bool(getattr(self.cfg, "seek_fast", True)),
                         max_grabs=int(getattr(self.cfg, "seek_max_grabs", 12)),
                         peek_preview=True,  # UI scrub: allow peeks
+                        hdr_reader=self._hdr_preview_reader,
                     )
                     self.progress.emit(frame_idx)
                     # reset temporal gates so back/forward scrubs work
@@ -3194,6 +3282,7 @@ class Processor(QtCore.QObject):
                             fast=bool(getattr(self.cfg, "seek_fast", True)),
                             max_grabs=int(getattr(self.cfg, "seek_max_grabs", 12)),
                             peek_preview=False,  # segment jump: no peeks
+                            hdr_reader=self._hdr_preview_reader,
                         )
                         self._seek_cooldown_frames = int(max(2, (self._fps or 30) * 0.25))
                         continue
@@ -3209,6 +3298,7 @@ class Processor(QtCore.QObject):
                             fast=bool(getattr(self.cfg, "seek_fast", True)),
                             max_grabs=int(getattr(self.cfg, "seek_max_grabs", 12)),
                             peek_preview=False,  # segment jump: no peeks
+                            hdr_reader=self._hdr_preview_reader,
                         )
                         self._seek_cooldown_frames = int(max(2, (self._fps or 30) * 0.25))
                         continue
@@ -3279,6 +3369,7 @@ class Processor(QtCore.QObject):
                 ret, frame = cap.retrieve()
                 if not ret:
                     break
+                self._hdr_preview_capture()
                 H, W = frame.shape[:2]
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
@@ -4767,6 +4858,7 @@ class Processor(QtCore.QObject):
                     cap.release()
                 except Exception:
                     pass
+            self._hdr_preview_close()
             if csv_f is not None:
                 try:
                     csv_f.close()
@@ -4898,6 +4990,80 @@ class Processor(QtCore.QObject):
             self._status_last_time[k] = now
             self._status_last_text[k] = msg
 
+    def _hdr_preview_enabled(self, reader=None) -> bool:
+        if reader is None:
+            reader = self._hdr_preview_reader
+        return bool(self._hdr_passthrough_active and reader is not None)
+
+    def _hdr_preview_close(self) -> None:
+        reader = getattr(self, "_hdr_preview_reader", None)
+        if reader is not None:
+            try:
+                release = getattr(reader, "release", None)
+                if callable(release):
+                    release()
+            except Exception:
+                pass
+        self._hdr_preview_reader = None
+        self._hdr_preview_latest = None
+        self._hdr_passthrough_active = False
+
+    def _hdr_preview_seek(self, frame_idx: int, reader=None) -> None:
+        if reader is None:
+            reader = getattr(self, "_hdr_preview_reader", None)
+        if reader is None:
+            return
+        try:
+            set_fn = getattr(reader, "set", None)
+            if callable(set_fn):
+                set_fn(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+        except Exception:
+            self._hdr_preview_close()
+
+    def _hdr_preview_capture(self, reader=None) -> None:
+        if reader is None:
+            reader = self._hdr_preview_reader
+        if not self._hdr_preview_enabled(reader):
+            return
+        try:
+            ok, payload = reader.read() if reader is not None else (False, None)  # type: ignore[attr-defined]
+        except Exception:
+            self._hdr_preview_close()
+            return
+        if not ok or payload is None:
+            self._hdr_preview_latest = None
+            return
+        self._hdr_preview_latest = payload
+
+    def _hdr_preview_skip(self, count: int, reader=None) -> None:
+        if reader is None:
+            reader = self._hdr_preview_reader
+        if not self._hdr_preview_enabled(reader):
+            return
+        try:
+            skip_fn = getattr(reader, "skip", None)
+            if callable(skip_fn):
+                skip_fn(count)
+            else:
+                for _ in range(max(0, int(count))):
+                    ok, _payload = reader.read()  # type: ignore[attr-defined]
+                    if not ok:
+                        break
+        except Exception:
+            self._hdr_preview_close()
+
+    def _emit_preview_hdr_passthrough(self) -> None:
+        if not self._hdr_preview_enabled():
+            return
+        payload = self._hdr_preview_latest
+        if not payload:
+            return
+        self._hdr_preview_latest = None
+        try:
+            self.preview_hdr_p010.emit(payload)
+        except Exception:
+            pass
+
     def _emit_preview_bgr(self, bgr) -> None:
         emit = getattr(self.preview, "emit", None)
         if emit is None or bgr is None:
@@ -4945,6 +5111,7 @@ class Processor(QtCore.QObject):
             emit(qimg)
         except Exception:
             logger.debug("Failed to emit preview frame", exc_info=True)
+        self._emit_preview_hdr_passthrough()
 
     def _cv_bgr_to_qimage(self, bgr) -> QtGui.QImage:
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -5742,12 +5909,41 @@ class MainWindow(QtWidgets.QMainWindow):
         # Center: preview + player (below) + last hit
         mid_split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         # Preview
+        try:
+            from .hdr_preview import HDRPreviewWidget  # type: ignore
+        except Exception:
+            try:
+                from hdr_preview import HDRPreviewWidget  # type: ignore
+            except Exception:  # pragma: no cover - optional dependency
+                HDRPreviewWidget = None  # type: ignore
+
         prev_group = QtWidgets.QGroupBox("Live preview")
         prev_layout = QtWidgets.QVBoxLayout(prev_group)
+
+        # SDR preview (existing path)
         self.preview_label = QtWidgets.QLabel()
         self.preview_label.setAlignment(QtCore.Qt.AlignCenter)
         self.preview_label.setMinimumHeight(1)
-        prev_layout.addWidget(self.preview_label)
+
+        # HDR passthrough widget (no-op placeholder if DLL missing)
+        if HDRPreviewWidget is not None:
+            self.hdr_widget = HDRPreviewWidget()
+        else:
+            self.hdr_widget = QtWidgets.QWidget()
+            self.hdr_widget.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.hdr_widget.setMinimumHeight(1)
+
+        self.preview_stack = QtWidgets.QStackedWidget()
+        self.preview_stack.addWidget(self.preview_label)
+        self.preview_stack.addWidget(self.hdr_widget)
+        self.preview_stack.setCurrentIndex(0)
+        prev_layout.addWidget(self.preview_stack)
+
+        self._hdr_passthrough_enabled = (
+            os.getenv("PC_HDR_PASSTHROUGH", "0").lower() in {"1", "true", "yes"}
+            and HDRPreviewWidget is not None
+            and _hdr_passthrough_available()
+        )
         prev_container = QtWidgets.QWidget()
         prev_container_layout = QtWidgets.QVBoxLayout(prev_container)
         prev_container_layout.setContentsMargins(0, 0, 0, 0)
@@ -7092,6 +7288,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._thread = QtCore.QThread(self)
         self._worker = Processor(cfg)
         self._worker.moveToThread(self._thread)
+        try:
+            self._worker.ui_hdr_passthrough_enabled = bool(getattr(self, "_hdr_passthrough_enabled", False))
+        except Exception:
+            self._worker.ui_hdr_passthrough_enabled = False
 
         # Wire signals
         self._thread.started.connect(self._worker.run)
@@ -7099,6 +7299,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker.progress.connect(self._on_progress)
         self._worker.status.connect(self._on_status)
         self._worker.preview.connect(self._on_preview)
+        try:
+            self._worker.preview_hdr_p010.connect(self._on_hdr_preview_p010)
+        except Exception:
+            pass
         self._worker.hit.connect(self._on_hit)
         self._worker.finished.connect(self._on_finished)
         self._worker.keyframes.connect(self._on_keyframes)
@@ -7165,6 +7369,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log(txt)
 
     def _on_preview(self, img: QtGui.QImage):
+        if hasattr(self, "preview_stack"):
+            self.preview_stack.setCurrentIndex(0)
         # Robust scaling even if label is 0×0 early in layout
         pix = QtGui.QPixmap.fromImage(img)
         w = max(8, self.preview_label.width())
@@ -7177,6 +7383,37 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtCore.Qt.TransformationMode.FastTransformation,
             )
         )
+
+    def _on_hdr_preview_p010(self, planes: object) -> None:
+        if not getattr(self, "_hdr_passthrough_enabled", False):
+            return
+        widget = getattr(self, "hdr_widget", None)
+        if widget is None or not hasattr(widget, "feed_p010"):
+            return
+        try:
+            y_plane, uv_plane = planes  # type: ignore[misc]
+        except Exception:
+            return
+        if not isinstance(y_plane, np.ndarray) or not isinstance(uv_plane, np.ndarray):
+            return
+        if y_plane.ndim != 2 or uv_plane.ndim != 2:
+            return
+        h, w = y_plane.shape[:2]
+        try:
+            widget.init_hdr(w, h)
+        except Exception:
+            return
+        try:
+            y_ptr = int(y_plane.ctypes.data)
+            uv_ptr = int(uv_plane.ctypes.data)
+            stride_y = int(y_plane.strides[0])
+            stride_uv = int(uv_plane.strides[0])
+            widget.feed_p010(y_ptr, uv_ptr, stride_y, stride_uv)
+            if hasattr(self, "preview_stack"):
+                self.preview_stack.setCurrentIndex(1)
+        except Exception:
+            if hasattr(self, "preview_stack"):
+                self.preview_stack.setCurrentIndex(0)
 
     def _on_hit(self, crop_path: str):
         def _set(img: QtGui.QImage) -> bool:
