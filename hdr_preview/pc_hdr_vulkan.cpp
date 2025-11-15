@@ -67,6 +67,7 @@ struct pc_hdr_context {
     // HDR metadata
     PFN_vkSetHdrMetadataEXT pfnSetHdrMetadataEXT{nullptr};
     bool hdrSurfaceRequested{false};
+    bool hdrMetadataEnabled{false};
 };
 
 static bool env_truthy(const char* value) {
@@ -605,10 +606,10 @@ static void createCommands(pc_hdr_context* ctx) {
     }
 }
 
-// Set HDR metadata for the swapchain.
+// Set HDR metadata for the swapchain (only when the extension is enabled).
 static void setHdrMetadata(pc_hdr_context* ctx) {
     ctx->pfnSetHdrMetadataEXT = nullptr;
-    if (!ctx->hdrSurfaceRequested) {
+    if (!ctx->hdrSurfaceRequested || !ctx->hdrMetadataEnabled) {
         return;
     }
 
@@ -845,17 +846,46 @@ pc_hdr_context* pc_hdr_init(HWND hwnd, int width, int height) {
         qci.queueCount = 1;
         qci.pQueuePriorities = &qprio;
 
-        const char* deviceExts[] = {
-            VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-            VK_EXT_HDR_METADATA_EXTENSION_NAME
-        };
+        // Always require swapchain; HDR metadata extension is optional.
+        std::vector<const char*> deviceExts;
+        deviceExts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+
+        ctx->hdrMetadataEnabled = false;
+        if (ctx->hdrSurfaceRequested) {
+            // Only enable VK_EXT_hdr_metadata if the device actually supports it.
+            uint32_t extCount = 0;
+            VkResult r = vkEnumerateDeviceExtensionProperties(
+                ctx->physicalDevice,
+                nullptr,
+                &extCount,
+                nullptr
+            );
+            if (r == VK_SUCCESS && extCount > 0) {
+                std::vector<VkExtensionProperties> props(extCount);
+                r = vkEnumerateDeviceExtensionProperties(
+                    ctx->physicalDevice,
+                    nullptr,
+                    &extCount,
+                    props.data()
+                );
+                if (r == VK_SUCCESS) {
+                    for (const auto& ext : props) {
+                        if (std::strcmp(ext.extensionName, VK_EXT_HDR_METADATA_EXTENSION_NAME) == 0) {
+                            deviceExts.push_back(VK_EXT_HDR_METADATA_EXTENSION_NAME);
+                            ctx->hdrMetadataEnabled = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
 
         VkDeviceCreateInfo dci{};
         dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
-        dci.enabledExtensionCount = sizeof(deviceExts) / sizeof(deviceExts[0]);
-        dci.ppEnabledExtensionNames = deviceExts;
+        dci.enabledExtensionCount = static_cast<uint32_t>(deviceExts.size());
+        dci.ppEnabledExtensionNames = deviceExts.data();
 
         vk_check(vkCreateDevice(ctx->physicalDevice, &dci, nullptr, &ctx->device),
                  "vkCreateDevice");
