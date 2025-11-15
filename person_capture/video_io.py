@@ -798,6 +798,85 @@ class _BaseAvReader:
         return self.retrieve()
 
 
+class AvP010PreviewReader(_BaseAvReader):
+    """Lightweight PyAV reader that yields frames as P010-compatible planes."""
+
+    def __init__(self, path: str):
+        super().__init__(path)
+        self._log = logging.getLogger(__name__)
+        self._w = int(self._vs.width)
+        self._h = int(self._vs.height)
+        self._uv_shape = (max(1, self._h // 2), int(self._w))
+
+    def _configure_graph(self, reset: bool = False):
+        # No filter graph required for raw frame access.
+        return
+
+    def _next_frame(self):
+        try:
+            for packet in self._ct.demux(self._vs):
+                for frame in packet.decode():
+                    idx = _index_from_pts(self._vs, getattr(frame, "pts", None), self._fps)
+                    if idx is None:
+                        idx = self._pos + 1
+                    if self._drop_until is not None and idx < self._drop_until:
+                        self._pos = idx
+                        continue
+                    self._drop_until = None
+                    self._pos = idx
+                    return frame
+        except Exception:
+            self._log.debug("P010 preview demux failed", exc_info=True)
+        return None
+
+    def skip(self, count: int) -> None:
+        if count <= 0:
+            return
+        for _ in range(int(count)):
+            if self._next_frame() is None:
+                break
+
+    def grab(self) -> bool:
+        frame = self._next_frame()
+        if frame is None:
+            return False
+        try:
+            planes = frame.to_ndarray(format="yuv420p10le")
+        except Exception:
+            self._log.debug("P010 preview frame conversion failed", exc_info=True)
+            return False
+        if planes is None or planes.ndim != 3 or planes.shape[0] < 3:
+            return False
+        try:
+            y_plane = np.ascontiguousarray(planes[0], dtype=np.uint16)
+            u_plane = np.ascontiguousarray(planes[1], dtype=np.uint16)
+            v_plane = np.ascontiguousarray(planes[2], dtype=np.uint16)
+        except Exception:
+            self._log.debug("P010 preview plane coercion failed", exc_info=True)
+            return False
+        uv_plane = np.empty(self._uv_shape, dtype=np.uint16)
+        try:
+            uv_plane[:, 0::2] = u_plane
+            uv_plane[:, 1::2] = v_plane
+        except Exception:
+            self._log.debug("P010 preview UV interleave failed", exc_info=True)
+            return False
+        self._buf.arr = (y_plane, uv_plane)
+        return True
+
+    def retrieve(self) -> tuple[bool, Optional[tuple[np.ndarray, np.ndarray]]]:
+        planes = self._buf.arr
+        self._buf.arr = None
+        if planes is None:
+            return False, None
+        return True, planes
+
+    def read(self) -> tuple[bool, Optional[tuple[np.ndarray, np.ndarray]]]:
+        if not self.grab():
+            return False, None
+        return self.retrieve()
+
+
 class AvLibplaceboReader(_BaseAvReader):
     """HDR->SDR via vf_libplacebo on GPU; falls back to CPU zscale+tonemap."""
 
@@ -1008,6 +1087,17 @@ def open_video_with_tonemap(path: str):
     else:
         log.info("HDR detect: %s → using OpenCV SDR path", reason)
         return None
+
+
+def open_hdr_passthrough_reader(path: str):
+    """Return a P010 reader for HDR passthrough preview, or None on failure."""
+
+    try:
+        reader = AvP010PreviewReader(path)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("HDR passthrough preview unavailable: %s", exc)
+        return None
+    return reader
 
 
 # ---------- Minimal external ffmpeg pipe using imageio-ffmpeg binary ----------
