@@ -55,3 +55,4 @@ Thumbs.db
 /scrfd_10g_bnkps.onnx
 /trt_cache
 *.onnx
+/.ultralytics
