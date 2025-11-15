@@ -16,6 +16,13 @@ import time
 import os, sys, subprocess, shutil, threading, struct
 import json, csv, traceback
 import logging
+
+# Ensure logs also go to stdout (console), not only to the Qt log widget.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
 import cv2
 import numpy as np
 import bisect
