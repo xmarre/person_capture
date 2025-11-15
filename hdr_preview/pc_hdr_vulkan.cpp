@@ -129,8 +129,7 @@ static void chooseSurfaceFormat(pc_hdr_context* ctx) {
     if (wantHdrSurface) {
         for (uint32_t i = 0; i < count; ++i) {
             const auto& f = formats[i];
-            if ((f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT ||
-                 f.colorSpace == VK_COLOR_SPACE_BT2020_PQ_EXT) &&
+            if (f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT &&
                 (f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
                  f.format == VK_FORMAT_R16G16B16A16_SFLOAT)) {
                 bestIndex = static_cast<int>(i);
