@@ -2207,7 +2207,9 @@ class Processor(QtCore.QObject):
         self.ui_hdr_passthrough_enabled: bool = False
         self._hdr_passthrough_active: bool = False
         self._hdr_preview_reader: Optional[object] = None
-        self._hdr_preview_latest: Optional[tuple[np.ndarray, np.ndarray]] = None
+        self._hdr_preview_latest: Optional[
+            tuple[int, int, np.ndarray, np.ndarray, int, int]
+        ] = None
 
     def _emit_hit(self, path: str) -> None:
         emit = getattr(self.hit, "emit", None)
@@ -5037,6 +5039,34 @@ class Processor(QtCore.QObject):
         self._hdr_preview_latest = None
         self._hdr_passthrough_active = False
 
+    def _normalize_hdr_preview_payload(
+        self,
+        payload: object,
+    ) -> Optional[tuple[int, int, np.ndarray, np.ndarray, int, int]]:
+        if payload is None:
+            return None
+        if isinstance(payload, tuple):
+            if len(payload) >= 6 and isinstance(payload[0], (int, np.integer)):
+                try:
+                    width = int(payload[0])
+                    height = int(payload[1])
+                    y_plane = payload[2]
+                    uv_plane = payload[3]
+                    stride_y = int(payload[4])
+                    stride_uv = int(payload[5])
+                except Exception:
+                    return None
+                if isinstance(y_plane, np.ndarray) and isinstance(uv_plane, np.ndarray):
+                    return width, height, y_plane, uv_plane, stride_y, stride_uv
+            if len(payload) >= 2:
+                y_plane, uv_plane = payload[:2]
+                if isinstance(y_plane, np.ndarray) and isinstance(uv_plane, np.ndarray):
+                    h, w = y_plane.shape[:2]
+                    stride_y = int(y_plane.strides[0])
+                    stride_uv = int(uv_plane.strides[0])
+                    return w, h, y_plane, uv_plane, stride_y, stride_uv
+        return None
+
     def _hdr_preview_seek(self, frame_idx: int, reader=None) -> None:
         if reader is None:
             reader = getattr(self, "_hdr_preview_reader", None)
@@ -5062,7 +5092,11 @@ class Processor(QtCore.QObject):
         if not ok or payload is None:
             self._hdr_preview_latest = None
             return
-        self._hdr_preview_latest = payload
+        formatted = self._normalize_hdr_preview_payload(payload)
+        if formatted is None:
+            self._hdr_preview_latest = None
+            return
+        self._hdr_preview_latest = formatted
 
     def _hdr_preview_skip(self, count: int, reader=None) -> None:
         if reader is None:
@@ -7425,53 +7459,85 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_status(self, txt: str):
         self.status_lbl.setText(txt)
         self._log(txt)
+        if "HDR passthrough preview:" in (txt or "") and hasattr(self, "preview_stack"):
+            try:
+                if "enabled" in txt.lower():
+                    self.preview_stack.setCurrentIndex(1)
+                else:
+                    self.preview_stack.setCurrentIndex(0)
+            except Exception:
+                pass
 
-    def _on_preview(self, img: QtGui.QImage):
-        if hasattr(self, "preview_stack"):
-            self.preview_stack.setCurrentIndex(0)
-        # Robust scaling even if label is 0×0 early in layout
-        pix = QtGui.QPixmap.fromImage(img)
-        w = max(8, self.preview_label.width())
-        h = max(8, self.preview_label.height())
-        self.preview_label.setPixmap(
-            pix.scaled(
-                w,
-                h,
-                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-                QtCore.Qt.TransformationMode.FastTransformation,
+    def _on_preview(self, img: Optional[QtGui.QImage]):
+        def _update_label(image: QtGui.QImage) -> None:
+            if image is None:
+                return
+            try:
+                pix = QtGui.QPixmap.fromImage(image)
+            except Exception:
+                return
+            w = max(8, self.preview_label.width())
+            h = max(8, self.preview_label.height())
+            self.preview_label.setPixmap(
+                pix.scaled(
+                    w,
+                    h,
+                    QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                    QtCore.Qt.TransformationMode.FastTransformation,
+                )
             )
-        )
 
-    def _on_hdr_preview_p010(self, planes: object) -> None:
+        if getattr(self, "_hdr_passthrough_enabled", False):
+            if img is not None:
+                _update_label(img)
+            return
+
+        if img is None:
+            self.preview_label.clear()
+            return
+
+        _update_label(img)
+        try:
+            if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
+                self.preview_stack.setCurrentIndex(0)
+        except Exception:
+            pass
+
+    def _on_hdr_preview_p010(self, frame: object) -> None:
         if not getattr(self, "_hdr_passthrough_enabled", False):
             return
         widget = getattr(self, "hdr_widget", None)
-        if widget is None or not hasattr(widget, "feed_p010"):
+        if widget is None:
             return
         try:
-            y_plane, uv_plane = planes  # type: ignore[misc]
+            width, height, y_plane, uv_plane, stride_y, stride_uv = frame  # type: ignore[misc]
         except Exception:
             return
         if not isinstance(y_plane, np.ndarray) or not isinstance(uv_plane, np.ndarray):
             return
-        if y_plane.ndim != 2 or uv_plane.ndim != 2:
-            return
-        h, w = y_plane.shape[:2]
         try:
-            widget.init_hdr(w, h)
-        except Exception:
-            return
-        try:
-            y_ptr = int(y_plane.ctypes.data)
-            uv_ptr = int(uv_plane.ctypes.data)
-            stride_y = int(y_plane.strides[0])
-            stride_uv = int(uv_plane.strides[0])
-            widget.feed_p010(y_ptr, uv_ptr, stride_y, stride_uv)
-            if hasattr(self, "preview_stack"):
+            if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 1:
                 self.preview_stack.setCurrentIndex(1)
         except Exception:
-            if hasattr(self, "preview_stack"):
-                self.preview_stack.setCurrentIndex(0)
+            pass
+        try:
+            widget.init_hdr(int(width), int(height))
+            if hasattr(widget, "upload_p010_frame"):
+                widget.upload_p010_frame(
+                    (int(width), int(height), y_plane, uv_plane, int(stride_y), int(stride_uv))
+                )
+            else:
+                widget.feed_p010(
+                    int(y_plane.ctypes.data),
+                    int(uv_plane.ctypes.data),
+                    int(stride_y),
+                    int(stride_uv),
+                )
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "HDR: failed to upload P010 frame to Vulkan widget: %s",
+                exc,
+            )
 
     def _on_hit(self, crop_path: str):
         def _set(img: QtGui.QImage) -> bool:

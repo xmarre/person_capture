@@ -1091,14 +1091,27 @@ def open_video_with_tonemap(path: str):
 
 
 def open_hdr_passthrough_reader(path: str):
-    """Return a P010 reader for HDR passthrough preview, or None on failure."""
+    """Return a raw P010 reader for HDR passthrough preview, or None on failure."""
+
+    log = logging.getLogger(__name__)
+    is_hdr, reason = _detect_hdr(path)
+    if not is_hdr:
+        log.info(
+            "HDR passthrough: %s → not HDR, disabling passthrough reader",
+            reason or "unknown",
+        )
+        return None
+
+    ffmpeg_bin = _ffmpeg_path()
+    if not ffmpeg_bin:
+        log.warning("HDR passthrough: no ffmpeg binary available")
+        return None
 
     try:
-        reader = AvP010PreviewReader(path)
+        return FfmpegPipeReader(path, ffmpeg_bin, mode="p010_passthrough")
     except Exception as exc:
-        logging.getLogger(__name__).warning("HDR passthrough preview unavailable: %s", exc)
+        log.warning("HDR passthrough: failed to open P010 pipe: %s", exc)
         return None
-    return reader
 
 
 # ---------- Minimal external ffmpeg pipe using imageio-ffmpeg binary ----------
@@ -1121,10 +1134,11 @@ class FfmpegPipeReader:
             return "\\\\?\\UNC" + ap[1:]
         return "\\\\?\\" + ap
 
-    def __init__(self, path: str, ffmpeg_exe: str):
+    def __init__(self, path: str, ffmpeg_exe: str, mode: str = "libplacebo"):
         self._log = logging.getLogger(__name__)
         self._path = path
         self._ffmpeg = ffmpeg_exe
+        self._mode = (mode or "libplacebo").strip().lower() or "libplacebo"
         # Use long-path for ffprobe too, or the probe can fail independently of ffmpeg open.
         try:
             if os.name == "nt" and os.getenv("PC_WIN_LONGPATH", "1").lower() not in ("0", "false", "no"):
@@ -1309,6 +1323,45 @@ class FfmpegPipeReader:
         self._stderr_thread = None
         self._stderr_tail: list[str] = []
         self._lp_opts: dict[str, bool] = {}
+        if self._mode == "p010_passthrough":
+            self._filters = set()
+            self._use_libplacebo = False
+            self._has_zscale = False
+            self._has_tonemap = False
+            self._has_scale = False
+            self._has_scale_vulkan = False
+            self._range_in = None
+            self._transfer = None
+            self._primaries = None
+            self._range_in_tag = "pc"
+            self._has_vulkan = False
+            self._maxw = int(self._w)
+            self._frame_bytes_u8 = self._w * self._h * 3
+            self._frame_bytes_f32 = self._w * self._h * 3 * 4
+            self._pipe_pixfmt = "p010le"
+            self._pix_fmt = "p010le"
+            self._pipe_frame_bytes = self._w * self._h * 3
+            self._lp_minimal = False
+            self._sdr_nits = 0.0
+            self._tm_desat = 0.0
+            self._tm_param = 0.0
+            self._force_mode = self._mode
+            self._tried_zscale = True
+            self._tried_scale = True
+            self._fallback_hops = 0
+            self._fallback_hops_max = 0
+            # Ensure probe defaults exist for _start_p010
+            self._analyze_m = getattr(self, "_analyze_m", 16)
+            self._probe_m = getattr(self, "_probe_m", 16)
+            self._max_probe_pkts = getattr(self, "_max_probe_pkts", 250000)
+            self._frame_bytes = self._frame_bytes_u8
+            self._log.info(
+                "HDR passthrough pipe: raw P010 output %dx%d",
+                self._w,
+                self._h,
+            )
+            self._start(0)
+            return
         self._filters = self._list_filters()
         self._use_libplacebo = ("libplacebo" in self._filters)
         self._has_zscale = ("zscale" in self._filters)
@@ -1563,6 +1616,8 @@ class FfmpegPipeReader:
         Non-strict mode continues to fall back to zscale and linear scale.
         Returns True if we switched chains; False if no further fallback exists.
         """
+        if self._mode == "p010_passthrough":
+            return False
         if self._fallback_hops >= getattr(self, "_fallback_hops_max", 12):
             self._log.error("LP fallback exhausted after %s hops.", self._fallback_hops)
             return False
@@ -2222,6 +2277,9 @@ class FfmpegPipeReader:
     def _start(self, idx: int):
         if self._proc:
             self._stop()
+        if self._mode == "p010_passthrough":
+            self._start_p010(idx)
+            return
         # Apply the very first probe mode before constructing the command.
         if self._mode == "libplacebo" and self._use_libplacebo and self._has_vulkan:
             self._apply_current_vk_mode()
@@ -2355,6 +2413,106 @@ class FfmpegPipeReader:
         self._pipe_buf = None
         self._pix_fmt = pix_fmt
 
+    def _start_p010(self, idx: int) -> None:
+        if self._proc:
+            self._stop()
+        t = 0.0 if self._fps <= 0 else max(0.0, idx / float(self._fps))
+        ff_threads = (os.getenv("PC_FF_THREADS") or "").strip() or "0"
+        cmd = [
+            self._ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-ignore_unknown",
+            "-fflags",
+            "+genpts",
+            "-analyzeduration",
+            f"{self._analyze_m}M",
+            "-probesize",
+            f"{self._probe_m}M",
+            "-max_probe_packets",
+            str(self._max_probe_pkts),
+            "-threads",
+            ff_threads,
+        ]
+        if t > 1e-6:
+            cmd += ["-ss", f"{t:.6f}"]
+        cmd += ["-i", self._ff_input_path()]
+        cmd += [
+            "-map",
+            "0:v:0",
+            "-an",
+            "-sn",
+            "-dn",
+            "-map",
+            "-0:t?",
+            "-map",
+            "-0:s?",
+            "-map",
+            "-0:d?",
+        ]
+        cmd += ["-map_metadata", "-1", "-map_chapters", "-1"]
+        try:
+            fps_passthrough = self._supports_fps_mode()
+        except Exception:
+            fps_passthrough = False
+        if fps_passthrough:
+            cmd += ["-fps_mode", "passthrough"]
+        else:
+            cmd += ["-vsync", "0"]
+        cmd += [
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "p010le",
+            "pipe:1",
+        ]
+        flags = 0
+        if os.name == "nt":
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            import shlex
+
+            self._last_cmdline = " ".join(shlex.quote(part) for part in cmd)
+        except Exception:
+            self._last_cmdline = None
+        self._log.info(
+            "Pipe mode=%s • raw P010 passthrough • out=%dx%d",
+            self._mode,
+            self._w,
+            self._h,
+        )
+        self._proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=flags,
+        )
+        self._stderr_tail = []
+
+        def _drain() -> None:
+            try:
+                if not self._proc or not self._proc.stderr:
+                    return
+                for line in iter(self._proc.stderr.readline, b""):
+                    if not line:
+                        break
+                    ln = line.decode("utf-8", "ignore").strip()
+                    if ln:
+                        self._stderr_tail.append(ln)
+                        if len(self._stderr_tail) > 200:
+                            self._stderr_tail.pop(0)
+            except Exception:
+                pass
+
+        self._stderr_thread = threading.Thread(target=_drain, daemon=True)
+        self._stderr_thread.start()
+        self._pos = idx - 1
+        self._arr = None
+        self._pipe_buf = None
+        self._pix_fmt = "p010le"
+
     def _probe_vulkan(self) -> bool:
         """Return True if this ffmpeg can init a Vulkan device for filters."""
         try:
@@ -2461,14 +2619,44 @@ class FfmpegPipeReader:
         except Exception:
             return None
 
+    def _convert_p010_frame(
+        self, raw: bytes
+    ) -> Optional[tuple[int, int, np.ndarray, np.ndarray, int, int]]:
+        try:
+            import numpy as _np
+        except Exception:
+            return None
+        h = int(self._h)
+        w = int(self._w)
+        if h <= 0 or w <= 0:
+            return None
+        y_count = w * h
+        uv_count = (w * h) // 2
+        need = (y_count + uv_count) * 2
+        if len(raw) < need:
+            return None
+        try:
+            y_plane = _np.frombuffer(raw, dtype=_np.uint16, count=y_count).reshape(h, w)
+            uv_plane = _np.frombuffer(
+                raw,
+                dtype=_np.uint16,
+                count=uv_count,
+                offset=y_count * 2,
+            ).reshape(max(1, h // 2), w)
+        except Exception:
+            return None
+        stride_y = int(y_plane.strides[0])
+        stride_uv = int(uv_plane.strides[0])
+        return w, h, y_plane, uv_plane, stride_y, stride_uv
+
     def grab(self) -> bool:
         if not self._proc or not self._proc.stdout:
             return False
-        if self._pix_fmt in {"bgr24", "nv12"}:
+        if self._pix_fmt in {"bgr24", "nv12", "p010le"}:
             need = self._pipe_frame_bytes
             buf = self._proc.stdout.read(need)
             if not buf or len(buf) < need:
-                if self.try_fallback_chain():
+                if self._mode != "p010_passthrough" and self.try_fallback_chain():
                     return self.grab()
                 return False
             self._pipe_buf = buf
@@ -2503,6 +2691,14 @@ class FfmpegPipeReader:
             if frame is None:
                 return False, None
             return True, frame
+        if self._pix_fmt == "p010le":
+            raw, self._pipe_buf = self._pipe_buf, None
+            if raw is None:
+                return False, None
+            frame = self._convert_p010_frame(raw)
+            if frame is None:
+                return False, None
+            return True, frame
         arr, self._arr = self._arr, None
         if arr is None:
             return False, None
@@ -2524,7 +2720,7 @@ class FfmpegPipeReader:
         if not self.grab():
             # grab() failed (end-of-stream or short read). If we haven't tried fallback yet,
             # switch to a safer chain once.
-            if self.try_fallback_chain():
+            if self._mode != "p010_passthrough" and self.try_fallback_chain():
                 if not self.grab():
                     return False, None
             else:
