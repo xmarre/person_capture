@@ -1,6 +1,7 @@
 #version 450
 
 layout(location = 0) in vec2 vUV;
+
 layout(location = 0) out vec4 outColor;
 
 layout(std430, binding = 0) readonly buffer YBuf {
@@ -43,6 +44,21 @@ float pq_to_linear(float x) {
     return pow(num / max(den, 1e-6), 1.0 / m1);
 }
 
+// PQ (ST.2084) OETF: linear relative luminance -> PQ code (0..1)
+float linear_to_pq(float L) {
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 128.0;
+    const float c3 = 2392.0 / 128.0;
+    // Clamp to a sensible HDR range relative to 10,000 nits.
+    L = clamp(L, 0.0, 1.0);
+    float Lm1 = pow(L, m1);
+    float num = c1 + c2 * Lm1;
+    float den = 1.0 + c3 * Lm1;
+    return pow(num / max(den, 1e-6), m2);
+}
+
 void main() {
     ivec2 coord = ivec2(vUV * vec2(pc.width, pc.height));
     coord = clamp(coord, ivec2(0), ivec2(pc.width - 1, pc.height - 1));
@@ -56,17 +72,27 @@ void main() {
     // Recover 10-bit code from stored 16-bit P010 sample (bits 6..15).
     uint y10 = (yRaw & 0xFFFFu) >> 6;
     float Ycode = float(y10);
+    // HDR10 limited range for luma: Y [64, 940] in 10-bit
     float Yn = clamp((Ycode - 64.0) / (940.0 - 64.0), 0.0, 1.0);
+    // Decode PQ to linear relative luminance.
     float Ylin = pq_to_linear(Yn);
 
+    // Chroma: use full 16-bit planes, center around 0.
     uint uRaw = (uvRaw >> 16) & 0xFFFFu;
     uint vRaw = uvRaw & 0xFFFFu;
-
     float Cb = (float(uRaw) / 65535.0) - 0.5;
     float Cr = (float(vRaw) / 65535.0) - 0.5;
 
-    vec3 rgb = yuv_to_rgb_bt2020(Ylin, Cb, Cr);
-    rgb = max(rgb, vec3(0.0));
+    // Convert to linear BT.2020 RGB.
+    vec3 rgbLinear = yuv_to_rgb_bt2020(Ylin, Cb, Cr);
+    rgbLinear = max(rgbLinear, vec3(0.0));
 
-    outColor = vec4(rgb, 1.0);
+    // Encode linear BT.2020 RGB back to PQ for HDR10 swapchain.
+    vec3 rgbPQ = vec3(
+        linear_to_pq(rgbLinear.r),
+        linear_to_pq(rgbLinear.g),
+        linear_to_pq(rgbLinear.b)
+    );
+
+    outColor = vec4(rgbPQ, 1.0);
 }
