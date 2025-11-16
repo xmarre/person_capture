@@ -1061,10 +1061,11 @@ def open_video_with_tonemap(path: str):
             if fmpeg:
                 return FfmpegPipeReader(path, fmpeg)
             return None
-    # Robust detect
-    is_hdr, reason = _detect_hdr(path)
     # Respect explicit GUI/backend override only for HDR content: skip PyAV when forcing zscale/scale.
     pref = (os.getenv("PC_FORCE_TONEMAP", "") or "").strip().lower()
+
+    # Robust detect
+    is_hdr, reason = _detect_hdr(path)
     if is_hdr and pref in ("zscale", "scale"):
         log.info(
             "HDR detect: %s → forcing external ffmpeg pipe (%s)",
