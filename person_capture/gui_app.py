@@ -5230,6 +5230,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.toolbar.addActions([self.act_start, self.act_pause, self.act_stop, self.act_compact, self.act_reset_layout])
         self._thread: Optional[QtCore.QThread] = None
         self._worker: Optional[Processor] = None
+
+        # HDR preview UI state flag (mirrors cfg.hdr_passthrough_preview)
+        self._hdr_passthrough_enabled: bool = False
         self._curator_fallback: Optional[Processor] = None
         self._fps: Optional[float] = None
         self._total_frames: Optional[int] = None
@@ -6048,7 +6051,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.chk_hdr_passthrough.setToolTip(
                     "HDR passthrough unavailable (pc_hdr_vulkan.dll missing or Vulkan HDR not supported)."
                 )
-        self._hdr_passthrough_enabled = False
         prev_container = QtWidgets.QWidget()
         prev_container_layout = QtWidgets.QVBoxLayout(prev_container)
         prev_container_layout.setContentsMargins(0, 0, 0, 0)
@@ -7388,9 +7390,14 @@ class MainWindow(QtWidgets.QMainWindow):
             os.environ["PC_HDR_SWAPCHAIN_HDR"] = "1"
         else:
             os.environ.pop("PC_HDR_SWAPCHAIN_HDR", None)
-        self._hdr_passthrough_enabled = bool(
+
+        # Single source of truth: HDR passthrough is active iff the main pipeline
+        # is in HDR passthrough mode AND the Vulkan widget is actually available.
+        passthrough_active = bool(
             cfg.hdr_passthrough and getattr(self, "_hdr_passthrough_supported", False)
         )
+        self._hdr_passthrough_enabled = passthrough_active
+
         # basic validation
         if not os.path.isfile(cfg.video):
             QtWidgets.QMessageBox.warning(self, "Missing", "Select a video file")
@@ -7409,9 +7416,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker = Processor(cfg)
         self._worker.moveToThread(self._thread)
         try:
-            self._worker.ui_hdr_passthrough_enabled = bool(
-                cfg.hdr_passthrough and getattr(self, "_hdr_passthrough_supported", False)
-            )
+            # Use the same flag on the worker so reader+UI stay in lockstep.
+            self._worker.ui_hdr_passthrough_enabled = passthrough_active
         except Exception:
             self._worker.ui_hdr_passthrough_enabled = False
 
@@ -7491,6 +7497,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log(txt)
 
     def _on_preview(self, img: Optional[QtGui.QImage]):
+        """SDR preview path (tonemapped BGR). Always updates the label,
+        but only takes over the stacked widget when HDR passthrough is OFF.
+        """
+        log = logging.getLogger(__name__)
+
         def _update_label(image: QtGui.QImage) -> None:
             if image is None:
                 return
@@ -7509,24 +7520,35 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             )
 
-        # Always keep the last SDR frame in the label, even if hidden.
         if img is None:
             self.preview_label.clear()
             return
 
         _update_label(img)
 
-        # IMPORTANT:
-        # Only force the SDR widget visible when HDR passthrough is NOT enabled.
-        # When HDR passthrough is enabled, _on_hdr_preview_p010 controls the stack.
+        # If HDR passthrough is not active, SDR preview owns the stack.
         if not getattr(self, "_hdr_passthrough_enabled", False):
             try:
                 if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
+                    log.debug("SDR preview taking over preview_stack (index 0)")
                     self.preview_stack.setCurrentIndex(0)
             except Exception:
                 pass
 
+    @QtCore.Slot(object)
     def _on_hdr_preview_p010(self, frame: object) -> None:
+        """HDR passthrough path: receives normalized P010 tuple
+        (w, h, y_plane, uv_plane, stride_y, stride_uv) from the worker.
+        Owns the stacked widget while HDR passthrough is enabled.
+        """
+        log = logging.getLogger(__name__)
+
+        # If the UI has HDR passthrough enabled, it should own the stack.
+        if not getattr(self, "_hdr_passthrough_enabled", False):
+            # Defensive: if we see HDR frames, mark the flag anyway so SDR
+            # preview stops fighting for the stack.
+            self._hdr_passthrough_enabled = True
+
         widget = getattr(self, "hdr_widget", None)
         if widget is None:
             return
@@ -7558,6 +7580,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
 
             if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 1:
+                log.debug("HDR preview taking over preview_stack (index 1)")
                 self.preview_stack.setCurrentIndex(1)
         except Exception:
             return
