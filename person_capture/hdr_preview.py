@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import POINTER, c_int, c_uint16, c_void_p
+import logging
 from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+_log = logging.getLogger(__name__)
+
 try:
     _dll = ctypes.CDLL("pc_hdr_vulkan.dll")
-except OSError:
+    _log.info("HDR: loaded pc_hdr_vulkan.dll")
+except OSError as e:
+    _log.warning("HDR: failed to load pc_hdr_vulkan.dll (%s)", e)
     _dll = None
 
 

@@ -306,6 +306,7 @@ class SessionConfig:
     min_gap_sec: float = 1.5
     min_box_pixels: int = 8000
     auto_crop_borders: bool = True
+    hdr_passthrough: bool = False  # Vulkan HDR path + no tone-map reader
     log_interval_sec: float = 1.0
     lock_after_hits: int = 1
     lock_face_thresh: float = 0.28
@@ -2665,34 +2666,49 @@ class Processor(QtCore.QObject):
             except Exception:
                 pass
             try:
-                # Prefer HDR->SDR via libplacebo if HDR; else OpenCV path.
-                try:
-                    tonemap_cap = open_video_with_tonemap(cfg.video)
-                except Exception:
-                    tonemap_cap = None
+                hdr_reason = hdr_detect_reason(cfg.video)
+            except Exception:
                 hdr_reason = "unknown"
-                try:
-                    hdr_reason = hdr_detect_reason(cfg.video)
-                except Exception:
-                    pass
-                if tonemap_cap is not None:
-                    logger.info("Video open: HDR tone-map reader selected")
-                    self._status(f"HDR: active ({hdr_reason})")
+
+            hdr_passthrough = bool(getattr(cfg, "hdr_passthrough", False))
+
+            try:
+                if hdr_passthrough:
+                    logger.info("Video open: HDR passthrough requested; skipping tone-map reader")
+                    self._status(
+                        f"HDR: passthrough mode ({hdr_reason})",
+                        key="hdr_state",
+                        interval=60.0,
+                    )
                     hdr_active = True
-                    cap = tonemap_cap
-                else:
-                    logger.info("Video open: OpenCV/FFmpeg reader selected")
-                    self._status(f"HDR: inactive ({hdr_reason})")
-                    hdr_active = False
                     os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
                     cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
                     try:
                         cap.set(cv2.CAP_PROP_HW_ACCELERATION, 1)
                     except Exception:
                         pass
-                    if not cap.isOpened():
+                    if hasattr(cap, "isOpened") and not cap.isOpened():
                         cap.release()
                         cap = cv2.VideoCapture(cfg.video)
+                else:
+                    cap = open_video_with_tonemap(cfg.video)
+                    if cap is not None:
+                        logger.info("Video open: HDR tone-map reader selected")
+                        self._status(f"HDR: active ({hdr_reason})", key="hdr_state", interval=60.0)
+                        hdr_active = True
+                    else:
+                        logger.info("Video open: OpenCV/FFmpeg reader selected")
+                        self._status(f"HDR: inactive ({hdr_reason})", key="hdr_state", interval=60.0)
+                        hdr_active = False
+                        os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
+                        cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
+                        try:
+                            cap.set(cv2.CAP_PROP_HW_ACCELERATION, 1)
+                        except Exception:
+                            pass
+                        if hasattr(cap, "isOpened") and not cap.isOpened():
+                            cap.release()
+                            cap = cv2.VideoCapture(cfg.video)
             except Exception:
                 cap = cv2.VideoCapture(cfg.video)
             # Do not early-exit on “not opened” if this is a custom pipe or duck-types like one.
@@ -2707,12 +2723,18 @@ class Processor(QtCore.QObject):
                 pass
 
             self._hdr_preview_close()
-            env_hdr_passthrough = os.getenv("PC_HDR_PASSTHROUGH", "0").lower() in {"1", "true", "yes"}
+            cfg_hdr_passthrough = bool(getattr(cfg, "hdr_passthrough", False))
             want_hdr_passthrough = (
                 hdr_active
-                and env_hdr_passthrough
+                and cfg_hdr_passthrough
                 and bool(self.ui_hdr_passthrough_enabled)
                 and _hdr_passthrough_available()
+            )
+            self._status(
+                f"HDR passthrough gate: hdr={hdr_active} cfg={cfg_hdr_passthrough} "
+                f"ui={self.ui_hdr_passthrough_enabled} dll={_hdr_passthrough_available()}",
+                key="hdr_gate",
+                interval=10.0,
             )
             if want_hdr_passthrough:
                 reader = open_hdr_passthrough_reader(cfg.video)
@@ -5245,6 +5267,12 @@ class MainWindow(QtWidgets.QMainWindow):
         file_layout.addWidget(QtWidgets.QLabel("FFmpeg folder"), 4, 0)
         file_layout.addWidget(ffmpeg_row, 4, 1, 1, 2)
 
+        self.chk_hdr_passthrough = QtWidgets.QCheckBox("HDR passthrough (Vulkan)")
+        self.chk_hdr_passthrough.setToolTip(
+            "Use Vulkan HDR swapchain preview for HDR videos and disable the HDR tone-map reader."
+        )
+        file_layout.addWidget(self.chk_hdr_passthrough, 5, 0, 1, 3)
+
         # Params
         param_group = QtWidgets.QGroupBox("Parameters")
         grid = QtWidgets.QGridLayout(param_group)
@@ -5946,11 +5974,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.preview_stack.setCurrentIndex(0)
         prev_layout.addWidget(self.preview_stack)
 
-        self._hdr_passthrough_enabled = (
-            os.getenv("PC_HDR_PASSTHROUGH", "0").lower() in {"1", "true", "yes"}
-            and HDRPreviewWidget is not None
-            and _hdr_passthrough_available()
+        self._hdr_passthrough_supported = (
+            HDRPreviewWidget is not None and _hdr_passthrough_available()
         )
+        if hasattr(self, "chk_hdr_passthrough"):
+            if not self._hdr_passthrough_supported:
+                self.chk_hdr_passthrough.setChecked(False)
+                self.chk_hdr_passthrough.setEnabled(False)
+                self.chk_hdr_passthrough.setToolTip(
+                    "HDR passthrough unavailable (pc_hdr_vulkan.dll missing or Vulkan HDR not supported)."
+                )
+        self._hdr_passthrough_enabled = False
         prev_container = QtWidgets.QWidget()
         prev_container_layout = QtWidgets.QVBoxLayout(prev_container)
         prev_container_layout.setContentsMargins(0, 0, 0, 0)
@@ -6998,6 +7032,11 @@ class MainWindow(QtWidgets.QMainWindow):
             face_min_frac_in_crop=float(self.face_min_frac_spin.value()) if hasattr(self, "face_min_frac_spin") else 0.18,
             crop_min_height_frac=float(self.crop_min_height_frac_spin.value()) if hasattr(self, "crop_min_height_frac_spin") else 0.28,
         )
+        cfg.hdr_passthrough = (
+            getattr(self, "chk_hdr_passthrough", None) is not None
+            and self.chk_hdr_passthrough.isEnabled()
+            and self.chk_hdr_passthrough.isChecked()
+        )
         return cfg
 
     def _apply_cfg(self, cfg: SessionConfig):
@@ -7031,6 +7070,8 @@ class MainWindow(QtWidgets.QMainWindow):
         paths = [part.strip() for part in (cfg.ref or "").split(';') if part.strip()]
         self._set_ref_paths(paths)
         self.out_edit.setText(cfg.out_dir)
+        if hasattr(self, "chk_hdr_passthrough"):
+            self.chk_hdr_passthrough.setChecked(bool(getattr(cfg, "hdr_passthrough", False)))
         self.ratio_edit.setText(cfg.ratio)
         try:
             self.sdr_nits_spin.setValue(float(getattr(cfg, "sdr_nits", 125.0)))
@@ -7278,6 +7319,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         cfg = self._collect_cfg()
+
+        if cfg.hdr_passthrough:
+            os.environ["PC_HDR_SWAPCHAIN_HDR"] = "1"
+        else:
+            os.environ.pop("PC_HDR_SWAPCHAIN_HDR", None)
+        self._hdr_passthrough_enabled = bool(
+            cfg.hdr_passthrough and getattr(self, "_hdr_passthrough_supported", False)
+        )
         # basic validation
         if not os.path.isfile(cfg.video):
             QtWidgets.QMessageBox.warning(self, "Missing", "Select a video file")
@@ -7296,7 +7345,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._worker = Processor(cfg)
         self._worker.moveToThread(self._thread)
         try:
-            self._worker.ui_hdr_passthrough_enabled = bool(getattr(self, "_hdr_passthrough_enabled", False))
+            self._worker.ui_hdr_passthrough_enabled = bool(
+                cfg.hdr_passthrough and getattr(self, "_hdr_passthrough_supported", False)
+            )
         except Exception:
             self._worker.ui_hdr_passthrough_enabled = False
 

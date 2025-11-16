@@ -1,5 +1,6 @@
 @echo off
 setlocal EnableExtensions
+
 set "REPO=%~dp0"
 pushd "%REPO%"
 set "PERSON_CAPTURE_ROOT=%REPO%"
@@ -17,8 +18,6 @@ set ORT_DISABLE_ALL_DEFAULT_EP=1
 set ORT_LOG_SEVERITY_LEVEL=0
 set ORT_TENSORRT_VERBOSE_LOGGING=1
 set ORT_TENSORRT_DUMP_SUBGRAPHS=1
-set PC_HDR_PASSTHROUGH=1
-set PC_HDR_SWAPCHAIN_HDR=1
 
 > "%LOG%" echo ==== PersonCapture %DATE% %TIME% ====
 
