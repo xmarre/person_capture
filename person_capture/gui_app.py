@@ -2739,6 +2739,7 @@ class Processor(QtCore.QObject):
                 interval=10.0,
             )
             if want_hdr_passthrough:
+                # STRICT HDR mode: do not open tone-mapped HDR preview readers here.
                 reader = open_hdr_passthrough_reader(cfg.video)
                 if reader is not None:
                     self._hdr_preview_reader = reader
@@ -2749,9 +2750,20 @@ class Processor(QtCore.QObject):
                         self._hdr_preview_seek(pos)
                     except Exception:
                         pass
-                    self._status("HDR passthrough preview: enabled", key="hdr_passthrough", interval=30.0)
+                    self._status(
+                        "HDR passthrough preview: enabled (no SDR fallback)",
+                        key="hdr_passthrough",
+                        interval=30.0,
+                    )
                 else:
-                    self._status("HDR passthrough preview: unavailable", key="hdr_passthrough", interval=60.0)
+                    # Passthrough was requested but the reader could not be opened.
+                    # Do not silently fall back to the tone-mapped HDR preview in this path.
+                    self._hdr_passthrough_active = False
+                    self._status(
+                        "HDR passthrough requested but reader open failed; preview disabled until passthrough is turned off",
+                        key="hdr_passthrough",
+                        interval=30.0,
+                    )
             else:
                 self._hdr_passthrough_active = False
 
