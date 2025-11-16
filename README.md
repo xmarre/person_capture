@@ -134,6 +134,14 @@ python -c "import onnxruntime as ort; print(ort.__version__, ort.get_available_p
 - **First seek pauses**: ORT session warm‑up or TensorRT engine build. Later seeks are faster.
 - **Missed faces on extreme close‑ups**: Raise `face_det_conf` slightly and check `face_max_frac_in_crop`.
 
+
+### HDR passthrough debug checklist
+
+1. **Confirm P010 planes carry signal.** Enable DEBUG logging (`set PERSON_CAPTURE_LOG_LEVEL=DEBUG`) and watch the `HDR: P010 … min/max` lines emitted by `HDRPreviewWidget`. If Y/UV min & max both read `0`, FFmpeg’s passthrough pipe is feeding zeros and the shader will only show the clear color.
+2. **Validate stride + plane sizes.** The preview widget now warns when the provided width/height do not match the numpy plane shapes, or when the UV plane is too small. Fix the upstream dimensions before calling into `pc_hdr_upload_p010`.
+3. **Trace the DLL upload.** Set `PC_HDR_TRACE_UPLOAD=1` before launching the GUI to emit `OutputDebugStringA` markers before/after the CPU repack inside `uploadP010ToBuffers`. If the function throws because of a bad stride or size, the trace shows where it failed.
+4. **Check the Vulkan draw path.** If the upload looks good, confirm the fullscreen-triangle path in `hdr_preview/pc_hdr_vulkan.cpp` renders: `recordCommandBuffer` clears to black, binds the descriptors, pushes the width/height constants, and issues `vkCmdDraw(cmd, 3, 1, 0, 0)`. When that draw does not run you will only see the clear color.
+
 ---
 
 ## Legal
