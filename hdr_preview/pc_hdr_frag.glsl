@@ -48,9 +48,9 @@ void main() {
     uint u10 = u16 >> 6;
     uint v10 = v16 >> 6;
 
-    // Center around 0, normalized to roughly [-0.5, 0.5].
-    float Cb = (float(u10) - 512.0) / 512.0;
-    float Cr = (float(v10) - 512.0) / 512.0;
+    // Center around 0, normalizing the HDR10 limited chroma range (64–960 codes).
+    float Cb = (float(u10) - 512.0) / 896.0;
+    float Cr = (float(v10) - 512.0) / 896.0;
 
     // Convert BT.2020 Y′CbCr (non-constant luminance) to BT.2020 RGB′ in PQ code space.
     vec3 rgbPQ = yuv_to_rgb_bt2020(Yp, Cb, Cr);
