@@ -247,7 +247,19 @@ static void chooseSurfaceFormat(pc_hdr_context* ctx) {
                 return;
             }
         }
-        OutputDebugStringA("[pc_hdr] ERROR: HDR10 colorspace not available on this surface\n");
+        // Dump available formats/colorspaces for debugging.
+        OutputDebugStringA("[pc_hdr] ERROR: HDR10 colorspace not available on this surface.\n");
+        for (size_t i = 0; i < formats.size(); ++i) {
+            char buf[256];
+            std::snprintf(
+                buf, sizeof(buf),
+                "[pc_hdr] surface format[%zu]: format=%d colorspace=%d\n",
+                i,
+                (int)formats[i].format,
+                (int)formats[i].colorSpace
+            );
+            OutputDebugStringA(buf);
+        }
         throw std::runtime_error("HDR10 swapchain colorspace not available");
     }
 
