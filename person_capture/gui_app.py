@@ -7564,6 +7564,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.preview_stack.setCurrentIndex(0)
             return
 
+        # HDRPreviewWidget stores the Vulkan/DLL context in `_ctx`,
+        # so we must look at that, not a non-existent `ctx` attribute.
         if not getattr(widget, "_ctx", None):
             self._hdr_passthrough_enabled = False
             if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
@@ -7575,10 +7577,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hdr_passthrough_enabled = True
 
         try:
+            frame_tuple = (
+                int(width),
+                int(height),
+                y_plane,
+                uv_plane,
+                int(stride_y),
+                int(stride_uv),
+            )
             if hasattr(widget, "upload_p010_frame"):
-                widget.upload_p010_frame(
-                    (int(width), int(height), y_plane, uv_plane, int(stride_y), int(stride_uv))
-                )
+                widget.upload_p010_frame(frame_tuple)
             else:
                 widget.feed_p010(
                     int(y_plane.ctypes.data),
