@@ -905,7 +905,7 @@ class Processor(QtCore.QObject):
                     if not ok or frame is None:
                         i += 1
                         continue
-                    self._hdr_preview_capture()
+                    self._pump_hdr_preview()
                     idx = i
                     sample_idx = processed_samples
                     processed_samples += 1
@@ -1170,7 +1170,7 @@ class Processor(QtCore.QObject):
                             if not ret or frame is None:
                                 j += stride_ref
                                 continue
-                            self._hdr_preview_capture()
+                            self._pump_hdr_preview()
                             h, w = frame.shape[:2]
                             if Wmax > 0 and w > Wmax:
                                 scale = float(Wmax) / float(w)
@@ -1217,7 +1217,7 @@ class Processor(QtCore.QObject):
                                 if not ret or frame is None:
                                     j += stride_ref
                                     continue
-                                self._hdr_preview_capture()
+                                self._pump_hdr_preview()
                                 h, w = frame.shape[:2]
                                 if Wmax > 0 and w > Wmax:
                                     scale = float(Wmax) / float(w)
@@ -1659,7 +1659,7 @@ class Processor(QtCore.QObject):
     progress = QtCore.Signal(int)                    # current frame idx
     status = QtCore.Signal(str)                      # status text
     preview = QtCore.Signal(QtGui.QImage)            # annotated frame
-    preview_hdr_p010 = QtCore.Signal(object)         # (y_plane, uv_plane)
+    preview_hdr_p010 = QtCore.Signal(object)         # single (w, h, y, uv, stride_y, stride_uv)
     hit = QtCore.Signal(str)                         # crop path
     finished = QtCore.Signal(bool, str)              # success, message
     keyframes = QtCore.Signal(object)                # list[int]
@@ -2163,7 +2163,7 @@ class Processor(QtCore.QObject):
                 ok, frame = cap.retrieve()
                 if ok:
                     try:
-                        self._hdr_preview_capture(reader=hdr_reader)
+                        self._pump_hdr_preview(reader=hdr_reader)
                         self._emit_preview_bgr(frame)
                     except Exception:
                         pass
@@ -2790,7 +2790,7 @@ class Processor(QtCore.QObject):
                         ok_any = True
                         # show first frame immediately so UI proves the pipeline is alive
                         try:
-                            self._hdr_preview_capture()
+                            self._pump_hdr_preview()
                             self._emit_preview_bgr(fr)
                         except Exception:
                             pass
@@ -2966,7 +2966,7 @@ class Processor(QtCore.QObject):
                         if ok:
                             ok, frame = cap.retrieve()
                             if ok and frame is not None:
-                                self._hdr_preview_capture()
+                                self._pump_hdr_preview()
                                 self._emit_preview_bgr(frame)
                         # Do not advance past s0 for processing—restore read head.
                         cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
@@ -3400,7 +3400,7 @@ class Processor(QtCore.QObject):
                 ret, frame = cap.retrieve()
                 if not ret:
                     break
-                self._hdr_preview_capture()
+                self._pump_hdr_preview()
                 H, W = frame.shape[:2]
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
@@ -5097,6 +5097,16 @@ class Processor(QtCore.QObject):
             self._hdr_preview_latest = None
             return
         self._hdr_preview_latest = formatted
+        try:
+            w, h, *_ = formatted
+            logger.info("HDR passthrough preview: got P010 frame %dx%d", int(w), int(h))
+        except Exception:
+            pass
+
+    def _pump_hdr_preview(self, reader=None) -> None:
+        """Advance the HDR passthrough reader and emit the latest normalized frame."""
+        self._hdr_preview_capture(reader=reader)
+        self._emit_preview_hdr_passthrough()
 
     def _hdr_preview_skip(self, count: int, reader=None) -> None:
         if reader is None:
@@ -5121,11 +5131,32 @@ class Processor(QtCore.QObject):
         payload = self._hdr_preview_latest
         if not payload:
             return
+        # one-shot: consume cached frame
         self._hdr_preview_latest = None
+
+        # payload should be normalized already, but guard against malformed tuples
         try:
-            self.preview_hdr_p010.emit(payload)
+            w, h, y_plane, uv_plane, stride_y, stride_uv = payload
         except Exception:
-            pass
+            return
+
+        if not isinstance(y_plane, np.ndarray) or not isinstance(uv_plane, np.ndarray):
+            return
+        if y_plane.ndim != 2 or uv_plane.ndim != 2:
+            return
+
+        normalized = (
+            int(w),
+            int(h),
+            y_plane,
+            uv_plane,
+            int(stride_y),
+            int(stride_uv),
+        )
+        try:
+            self.preview_hdr_p010.emit(normalized)
+        except Exception:
+            return
 
     def _emit_preview_bgr(self, bgr) -> None:
         emit = getattr(self.preview, "emit", None)
@@ -5174,7 +5205,6 @@ class Processor(QtCore.QObject):
             emit(qimg)
         except Exception:
             logger.debug("Failed to emit preview frame", exc_info=True)
-        self._emit_preview_hdr_passthrough()
 
     def _cv_bgr_to_qimage(self, bgr) -> QtGui.QImage:
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -7459,14 +7489,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_status(self, txt: str):
         self.status_lbl.setText(txt)
         self._log(txt)
-        if "HDR passthrough preview:" in (txt or "") and hasattr(self, "preview_stack"):
-            try:
-                if "enabled" in txt.lower():
-                    self.preview_stack.setCurrentIndex(1)
-                else:
-                    self.preview_stack.setCurrentIndex(0)
-            except Exception:
-                pass
 
     def _on_preview(self, img: Optional[QtGui.QImage]):
         def _update_label(image: QtGui.QImage) -> None:
@@ -7488,8 +7510,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
         if getattr(self, "_hdr_passthrough_enabled", False):
-            if img is not None:
-                _update_label(img)
+            self.preview_label.clear()
             return
 
         if img is None:
@@ -7506,22 +7527,25 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_hdr_preview_p010(self, frame: object) -> None:
         if not getattr(self, "_hdr_passthrough_enabled", False):
             return
+
         widget = getattr(self, "hdr_widget", None)
         if widget is None:
             return
+
         try:
             width, height, y_plane, uv_plane, stride_y, stride_uv = frame  # type: ignore[misc]
         except Exception:
             return
+
         if not isinstance(y_plane, np.ndarray) or not isinstance(uv_plane, np.ndarray):
             return
-        try:
-            if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 1:
-                self.preview_stack.setCurrentIndex(1)
-        except Exception:
-            pass
+
         try:
             widget.init_hdr(int(width), int(height))
+        except Exception:
+            return
+
+        try:
             if hasattr(widget, "upload_p010_frame"):
                 widget.upload_p010_frame(
                     (int(width), int(height), y_plane, uv_plane, int(stride_y), int(stride_uv))
@@ -7533,11 +7557,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     int(stride_y),
                     int(stride_uv),
                 )
-        except Exception as exc:
-            logging.getLogger(__name__).warning(
-                "HDR: failed to upload P010 frame to Vulkan widget: %s",
-                exc,
-            )
+
+            if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 1:
+                self.preview_stack.setCurrentIndex(1)
+        except Exception:
+            return
 
     def _on_hit(self, crop_path: str):
         def _set(img: QtGui.QImage) -> bool:
