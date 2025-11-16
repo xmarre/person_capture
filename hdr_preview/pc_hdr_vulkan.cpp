@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstdio>
+#include <cstdarg>
 #include <vulkan/vulkan_win32.h>
 
 struct pc_hdr_context {
@@ -20,6 +21,7 @@ struct pc_hdr_context {
     bool validationEnabled{false};
     bool debugUtilsEnabled{false};
     bool debugUtilsDeviceEnabled{false};
+    bool uploadTracingEnabled{false};
 
     VkInstance instance{VK_NULL_HANDLE};
     VkPhysicalDevice physicalDevice{VK_NULL_HANDLE};
@@ -156,6 +158,18 @@ static void setObjectName(pc_hdr_context* ctx,
     info.objectHandle = handle;
     info.pObjectName = name.c_str();
     ctx->pfnSetDebugUtilsObjectNameEXT(ctx->device, &info);
+}
+
+static void traceUpload(pc_hdr_context* ctx, const char* fmt, ...) {
+    if (!ctx || !ctx->uploadTracingEnabled) {
+        return;
+    }
+    char buffer[256];
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+    OutputDebugStringA(buffer);
 }
 
 static void beginLabel(pc_hdr_context* ctx,
@@ -920,6 +934,13 @@ static void uploadP010ToBuffers(pc_hdr_context* ctx,
     int strideY = strideYBytes / 2;   // 16-bit samples
     int strideUV = strideUVBytes / 2;
 
+    traceUpload(ctx,
+                "[pc_hdr] upload begin W=%u H=%u strideY=%d strideUV=%d\n",
+                W,
+                H,
+                strideYBytes,
+                strideUVBytes);
+
     // Y: one uint per pixel (lower 16 bits store the raw P010 sample)
     for (uint32_t y = 0; y < H; ++y) {
         const std::uint16_t* srcRow = yPlane + y * strideY;
@@ -944,6 +965,8 @@ static void uploadP010ToBuffers(pc_hdr_context* ctx,
                         static_cast<uint32_t>(v);
         }
     }
+
+    traceUpload(ctx, "[pc_hdr] upload finished\n");
 }
 
 /*
@@ -1021,6 +1044,10 @@ pc_hdr_context* pc_hdr_init(HWND hwnd, int width, int height) {
         ctx->pushConstants.width = width;
         ctx->pushConstants.height = height;
         ctx->hdrSurfaceRequested = env_truthy(std::getenv("PC_HDR_SWAPCHAIN_HDR"));
+        ctx->uploadTracingEnabled = env_truthy(std::getenv("PC_HDR_TRACE_UPLOAD"));
+        if (ctx->uploadTracingEnabled) {
+            OutputDebugStringA("[pc_hdr] PC_HDR_TRACE_UPLOAD=1 (upload tracing enabled)\n");
+        }
 
         bool validationRequested = false;
 #if defined(_DEBUG)
@@ -1267,6 +1294,7 @@ void pc_hdr_upload_p010(
     try {
         uploadP010ToBuffers(ctx, yPlane, uvPlane, strideY, strideUV);
     } catch (...) {
+        traceUpload(ctx, "[pc_hdr] upload exception; dropping frame\n");
     }
 }
 

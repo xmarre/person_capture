@@ -191,6 +191,53 @@ class HDRPreviewWidget(QtWidgets.QWidget):
         if y_plane.ndim != 2 or uv_plane.ndim != 2:
             return
 
+        y_h, y_w = y_plane.shape
+        if y_h <= 0 or y_w <= 0:
+            return
+        if y_h != height or y_w != width:
+            _log.warning(
+                "HDR: frame dimensions (%s, %s) differ from Y plane shape %s; using plane shape",
+                width,
+                height,
+                y_plane.shape,
+            )
+            width, height = y_w, y_h
+
+        uv_h, uv_w = uv_plane.shape
+        expected_uv_h = max(1, height // 2)
+        if uv_h < expected_uv_h or uv_w < width:
+            _log.error(
+                "HDR: UV plane shape %s smaller than expected (%s, %s); dropping frame",
+                uv_plane.shape,
+                expected_uv_h,
+                width,
+            )
+            return
+
+        if _log.isEnabledFor(logging.DEBUG):
+            try:
+                y_min = int(np.min(y_plane))
+                y_max = int(np.max(y_plane))
+                uv_min = int(np.min(uv_plane))
+                uv_max = int(np.max(uv_plane))
+                _log.debug(
+                    "HDR: P010 Y[%s] min/max=%s/%s, UV[%s] min/max=%s/%s, strides=%s/%s",
+                    y_plane.shape,
+                    y_min,
+                    y_max,
+                    uv_plane.shape,
+                    uv_min,
+                    uv_max,
+                    stride_y,
+                    stride_uv,
+                )
+                if y_min == 0 and y_max == 0:
+                    _log.warning("HDR: Y plane is zero; passthrough may not be streaming P010 data")
+                if uv_min == 0 and uv_max == 0:
+                    _log.warning("HDR: UV plane is zero; passthrough may not be streaming P010 data")
+            except Exception:
+                pass
+
         self.init_hdr(width, height)
         if not self._ctx:
             return
