@@ -191,17 +191,28 @@ class HDRPreviewWidget(QtWidgets.QWidget):
         if y_plane.ndim != 2 or uv_plane.ndim != 2:
             return
 
+        # Sanity-check Y plane against the **logical** frame size without
+        # treating padded strides as resolution.
         y_h, y_w = y_plane.shape
         if y_h <= 0 or y_w <= 0:
             return
-        if y_h != height or y_w != width:
-            _log.warning(
-                "HDR: frame dimensions (%s, %s) differ from Y plane shape %s; using plane shape",
-                width,
-                height,
+        # Plane must be at least as large as the logical frame; larger is OK
+        # when the decoder aligns rows (e.g. 1920×1080 stored as (1080, 2048)).
+        if y_h < height or y_w < width:
+            _log.error(
+                "HDR: Y plane shape %s smaller than expected (%s, %s); dropping frame",
                 y_plane.shape,
+                height,
+                width,
             )
-            width, height = y_w, y_h
+            return
+        if y_h != height or y_w != width:
+            _log.debug(
+                "HDR: using padded Y plane shape %s for logical frame (%s, %s); relying on stride",
+                y_plane.shape,
+                height,
+                width,
+            )
 
         uv_h, uv_w = uv_plane.shape
         expected_uv_h = max(1, height // 2)
