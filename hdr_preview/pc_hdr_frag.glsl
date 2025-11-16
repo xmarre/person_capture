@@ -1,4 +1,5 @@
 #version 450
+
 layout(location = 0) in vec2 vUV;
 layout(location = 0) out vec4 outColor;
 
@@ -14,14 +15,32 @@ layout(push_constant) uniform Push {
     int height;
 } pc;
 
-// NOTE: This is a pragmatic passthrough preview: luma is normalized and a basic
-// BT.2020-style matrix is applied. It is not a reference-accurate HDR10 PQ transform yet.
+// NOTE: Strict HDR10 path for passthrough mode:
+// - P010 10-bit luma codes (limited range) -> PQ code
+// - PQ code -> linear relative luminance (SMPTE ST.2084)
+// - Limited-range BT.2020 YCbCr -> BT.2020 RGB (linear)
+// This expects an HDR10 ST.2084 swapchain, not SDR.
+
 // Simple BT.2020 YCbCr->RGB matrix (approx, non-constant luminance)
 vec3 yuv_to_rgb_bt2020(float Y, float Cb, float Cr) {
     float R = Y + 1.4746 * Cr;
     float G = Y - 0.164553 * Cb - 0.571353 * Cr;
     float B = Y + 1.8814 * Cb;
     return vec3(R, G, B);
+}
+
+// PQ (ST.2084) EOTF: code -> linear relative luminance (0..1 relative to 10,000 nits)
+float pq_to_linear(float x) {
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 128.0;
+    const float c3 = 2392.0 / 128.0;
+    x = clamp(x, 1e-6, 1.0);
+    float xp = pow(x, 1.0 / m2);
+    float num = max(xp - c1, 0.0);
+    float den = c2 - c3 * xp;
+    return pow(num / max(den, 1e-6), 1.0 / m1);
 }
 
 void main() {
@@ -34,18 +53,20 @@ void main() {
     uint yRaw = yData[idxY];
     uint uvRaw = uvData[idxUV];
 
-    // Raw P010 stores 10-bit codes in the upper bits of 16-bit words; shift down here.
-    float yCode = float((yRaw >> 6) & 0x3FFu);
-    float uCode = float(((uvRaw >> 16) >> 6) & 0x3FFu);
-    float vCode = float((uvRaw >> 6) & 0x3FFu);
+    // Recover 10-bit code from stored 16-bit P010 sample (bits 6..15).
+    uint y10 = (yRaw & 0xFFFFu) >> 6;
+    float Ycode = float(y10);
+    float Yn = clamp((Ycode - 64.0) / (940.0 - 64.0), 0.0, 1.0);
+    float Ylin = pq_to_linear(Yn);
 
-    // HDR10 limited range (10-bit):
-    //   Y:    [64, 940]
-    //   Cb/Cr:[64, 960] with 512 as center
-    float Y = clamp((yCode - 64.0) / 876.0, 0.0, 1.0);
-    float Cb = clamp((uCode - 512.0) / 896.0, -0.5, 0.5);
-    float Cr = clamp((vCode - 512.0) / 896.0, -0.5, 0.5);
+    uint uRaw = (uvRaw >> 16) & 0xFFFFu;
+    uint vRaw = uvRaw & 0xFFFFu;
 
-    vec3 rgb = yuv_to_rgb_bt2020(Y, Cb, Cr);
-    outColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);
+    float Cb = (float(uRaw) / 65535.0) - 0.5;
+    float Cr = (float(vRaw) / 65535.0) - 0.5;
+
+    vec3 rgb = yuv_to_rgb_bt2020(Ylin, Cb, Cr);
+    rgb = max(rgb, vec3(0.0));
+
+    outColor = vec4(rgb, 1.0);
 }

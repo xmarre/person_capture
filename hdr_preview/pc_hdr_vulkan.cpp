@@ -239,34 +239,28 @@ static void chooseSurfaceFormat(pc_hdr_context* ctx) {
 
     const bool wantHdrSurface = ctx->hdrSurfaceRequested;
 
-    int bestIndex = -1;
     if (wantHdrSurface) {
-        for (uint32_t i = 0; i < count; ++i) {
-            const auto& f = formats[i];
-            if (f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT &&
-                (f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
-                 f.format == VK_FORMAT_R16G16B16A16_SFLOAT)) {
-                bestIndex = static_cast<int>(i);
-                break;
+        for (const auto& f : formats) {
+            if (f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+                ctx->swapchainFormat = f.format;
+                ctx->swapchainColorSpace = f.colorSpace;
+                return;
             }
         }
-    }
-    if (bestIndex < 0) {
-        // Default to SDR sRGB when HDR passthrough is disabled or unsupported.
-        for (uint32_t i = 0; i < count; ++i) {
-            const auto& f = formats[i];
-            if (f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-                bestIndex = static_cast<int>(i);
-                break;
-            }
-        }
-    }
-    if (bestIndex < 0) {
-        bestIndex = 0;
+        OutputDebugStringA("[pc_hdr] ERROR: HDR10 colorspace not available on this surface\n");
+        throw std::runtime_error("HDR10 swapchain colorspace not available");
     }
 
-    ctx->swapchainFormat = formats[bestIndex].format;
-    ctx->swapchainColorSpace = formats[bestIndex].colorSpace;
+    for (const auto& f : formats) {
+        if (f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+            ctx->swapchainFormat = f.format;
+            ctx->swapchainColorSpace = f.colorSpace;
+            return;
+        }
+    }
+
+    ctx->swapchainFormat = formats[0].format;
+    ctx->swapchainColorSpace = formats[0].colorSpace;
 }
 
 // Choose queue family with graphics+present.
@@ -1043,14 +1037,16 @@ pc_hdr_context* pc_hdr_init(HWND hwnd, int width, int height) {
         ctx->videoHeight = height;
         ctx->pushConstants.width = width;
         ctx->pushConstants.height = height;
-        // Default to requesting an HDR10 ST.2084 swapchain when the driver
-        // supports it. The PC_HDR_SWAPCHAIN_HDR env var can be used to force
-        // SDR behavior (set to 0/false) or to explicitly disable HDR.
+        // STRICT HDR: default to HDR10 swapchain when running in passthrough mode.
+        // PC_HDR_SWAPCHAIN_HDR can only force-disable HDR (0/false/off).
+        bool hdrReq = true;
         if (const char* envHdr = std::getenv("PC_HDR_SWAPCHAIN_HDR")) {
-            ctx->hdrSurfaceRequested = env_truthy(envHdr);
-        } else {
-            ctx->hdrSurfaceRequested = true;
+            // If the user explicitly sets this to 0/false/off, treat it as "no HDR".
+            if (!env_truthy(envHdr)) {
+                hdrReq = false;
+            }
         }
+        ctx->hdrSurfaceRequested = hdrReq;
         ctx->uploadTracingEnabled = env_truthy(std::getenv("PC_HDR_TRACE_UPLOAD"));
         if (ctx->uploadTracingEnabled) {
             OutputDebugStringA("[pc_hdr] PC_HDR_TRACE_UPLOAD=1 (upload tracing enabled)\n");
