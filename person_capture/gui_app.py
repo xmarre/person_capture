@@ -7509,16 +7509,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             )
 
+        # Always keep the last SDR frame in the label, even if hidden.
         if img is None:
             self.preview_label.clear()
             return
 
         _update_label(img)
-        try:
-            if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
-                self.preview_stack.setCurrentIndex(0)
-        except Exception:
-            pass
+
+        # IMPORTANT:
+        # Only force the SDR widget visible when HDR passthrough is NOT enabled.
+        # When HDR passthrough is enabled, _on_hdr_preview_p010 controls the stack.
+        if not getattr(self, "_hdr_passthrough_enabled", False):
+            try:
+                if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
+                    self.preview_stack.setCurrentIndex(0)
+            except Exception:
+                pass
 
     def _on_hdr_preview_p010(self, frame: object) -> None:
         widget = getattr(self, "hdr_widget", None)
