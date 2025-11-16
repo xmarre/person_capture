@@ -7509,10 +7509,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             )
 
-        if getattr(self, "_hdr_passthrough_enabled", False):
-            self.preview_label.clear()
-            return
-
         if img is None:
             self.preview_label.clear()
             return
@@ -7525,9 +7521,6 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     def _on_hdr_preview_p010(self, frame: object) -> None:
-        if not getattr(self, "_hdr_passthrough_enabled", False):
-            return
-
         widget = getattr(self, "hdr_widget", None)
         if widget is None:
             return
