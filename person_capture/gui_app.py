@@ -6056,6 +6056,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hdr_passthrough_supported = (
             HDRPreviewWidget is not None and _hdr_passthrough_available()
         )
+        _log.info(
+            "HDR passthrough support: %s (HDRPreviewWidget=%s, available=%s)",
+            self._hdr_passthrough_supported,
+            HDRPreviewWidget is not None,
+            _hdr_passthrough_available(),
+        )
         if hasattr(self, "chk_hdr_passthrough"):
             if not self._hdr_passthrough_supported:
                 self.chk_hdr_passthrough.setChecked(False)
@@ -6063,6 +6069,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.chk_hdr_passthrough.setToolTip(
                     "HDR passthrough unavailable (pc_hdr_vulkan.dll missing or Vulkan HDR not supported)."
                 )
+                self.chk_hdr_passthrough.setVisible(False)
         prev_container = QtWidgets.QWidget()
         prev_container_layout = QtWidgets.QVBoxLayout(prev_container)
         prev_container_layout.setContentsMargins(0, 0, 0, 0)
@@ -7570,23 +7577,13 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             widget.init_hdr(int(width), int(height))
         except Exception:
+            if self._hdr_passthrough_enabled:
+                log.info("HDR passthrough: disabling (init failed)")
             self._hdr_passthrough_enabled = False
             if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
                 log.debug("SDR preview taking over preview_stack (index 0)")
                 self.preview_stack.setCurrentIndex(0)
             return
-
-        # HDRPreviewWidget stores the Vulkan/DLL context in `_ctx`,
-        # so we must look at that, not a non-existent `ctx` attribute.
-        if not getattr(widget, "_ctx", None):
-            self._hdr_passthrough_enabled = False
-            if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
-                log.debug("SDR preview taking over preview_stack (index 0)")
-                self.preview_stack.setCurrentIndex(0)
-            return
-
-        # HDR context exists; mark passthrough active.
-        self._hdr_passthrough_enabled = True
 
         try:
             frame_tuple = (
@@ -7607,15 +7604,38 @@ class MainWindow(QtWidgets.QMainWindow):
                     int(stride_uv),
                 )
 
-            if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 1:
-                log.debug("HDR preview taking over preview_stack (index 1)")
-                self.preview_stack.setCurrentIndex(1)
         except Exception:
+            if self._hdr_passthrough_enabled:
+                log.info("HDR passthrough: disabling (upload failed)")
             self._hdr_passthrough_enabled = False
             if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
                 log.debug("SDR preview taking over preview_stack (index 0)")
                 self.preview_stack.setCurrentIndex(0)
             return
+
+        try:
+            has_ctx = getattr(widget, "has_valid_ctx", None)
+            ctx_ok = bool(has_ctx()) if callable(has_ctx) else bool(getattr(widget, "_ctx", None))
+        except Exception:
+            ctx_ok = False
+
+        if not ctx_ok:
+            if self._hdr_passthrough_enabled:
+                log.info("HDR passthrough: disabling (no valid context)")
+            self._hdr_passthrough_enabled = False
+            if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
+                log.debug("SDR preview taking over preview_stack (index 0)")
+                self.preview_stack.setCurrentIndex(0)
+            return
+
+        # HDR context exists; mark passthrough active.
+        if not self._hdr_passthrough_enabled:
+            log.info("HDR passthrough: enabling (context OK)")
+        self._hdr_passthrough_enabled = True
+
+        if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 1:
+            log.debug("HDR preview taking over preview_stack (index 1)")
+            self.preview_stack.setCurrentIndex(1)
 
     def _on_hit(self, crop_path: str):
         def _set(img: QtGui.QImage) -> bool:

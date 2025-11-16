@@ -141,16 +141,30 @@ class HDRPreviewWidget(QtWidgets.QWidget):
             self._ctx = None
 
         if self._ctx:
+            # Already have a context with the right size.
             return
 
         self._frame_w = width
         self._frame_h = height
         hwnd_c = c_void_p(int(self.winId()))
         if _pc_hdr_init is None:
+            _log.error("HDR: _pc_hdr_init missing despite hdr_passthrough_available()")
             return
+
         ctx = _pc_hdr_init(hwnd_c, self._frame_w, self._frame_h)
-        if ctx:
-            self._ctx = ctx
+        if not ctx:
+            _log.error(
+                "HDR: pc_hdr_init() returned NULL for hwnd=%s, size=%dx%d "
+                "(Vulkan/HDR init failed in pc_hdr_vulkan.dll)",
+                hwnd_c, self._frame_w, self._frame_h,
+            )
+            return
+
+        _log.info(
+            "HDR: pc_hdr_init() OK, ctx=%r, size=%dx%d",
+            ctx, self._frame_w, self._frame_h,
+        )
+        self._ctx = ctx
 
     def feed_p010(
         self,
@@ -251,6 +265,12 @@ class HDRPreviewWidget(QtWidgets.QWidget):
 
         self.init_hdr(width, height)
         if not self._ctx:
+            # Vulkan/HDR path is dead; let the caller fall back to SDR/libplacebo.
+            _log.warning(
+                "HDR: context not available after init_hdr(%d, %d); "
+                "skipping upload and relying on SDR preview.",
+                width, height,
+            )
             return
 
         try:
@@ -271,3 +291,7 @@ class HDRPreviewWidget(QtWidgets.QWidget):
             _pc_hdr_shutdown(self._ctx)
             self._ctx = None
         super().closeEvent(ev)
+
+    def has_valid_ctx(self) -> bool:
+        """Return True when the Vulkan HDR context is alive."""
+        return bool(self._ctx)
