@@ -56,3 +56,5 @@ Thumbs.db
 /trt_cache
 *.onnx
 /.ultralytics
+
+pc_hdr_frag.spv

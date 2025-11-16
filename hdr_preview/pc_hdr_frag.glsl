@@ -12,8 +12,10 @@ layout(std430, binding = 1) readonly buffer UVBuf {
 };
 
 layout(push_constant) uniform Push {
-    int width;
-    int height;
+    int videoWidth;
+    int videoHeight;
+    int outWidth;
+    int outHeight;
 } pc;
 
 // Simple BT.2020 YCbCr->RGB matrix (approx, non-constant luminance)
@@ -25,11 +27,29 @@ vec3 yuv_to_rgb_bt2020(float Y, float Cb, float Cr) {
 }
 
 void main() {
-    ivec2 coord = ivec2(vUV * vec2(pc.width, pc.height));
-    coord = clamp(coord, ivec2(0), ivec2(pc.width - 1, pc.height - 1));
+    float videoAspect = float(pc.videoWidth) / float(pc.videoHeight);
+    float outAspect   = float(pc.outWidth) / float(pc.outHeight);
 
-    int idxY  = coord.y * pc.width + coord.x;
-    int idxUV = (coord.y / 2) * (pc.width / 2) + (coord.x / 2);
+    vec2 uv = vUV;
+
+    if (outAspect > videoAspect) {
+        float scale = videoAspect / outAspect;
+        uv.x = (uv.x - 0.5) / scale + 0.5;
+    } else if (outAspect < videoAspect) {
+        float scale = outAspect / videoAspect;
+        uv.y = (uv.y - 0.5) / scale + 0.5;
+    }
+
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        outColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+
+    ivec2 coord = ivec2(uv * vec2(pc.videoWidth, pc.videoHeight));
+    coord = clamp(coord, ivec2(0), ivec2(pc.videoWidth - 1, pc.videoHeight - 1));
+
+    int idxY  = coord.y * pc.videoWidth + coord.x;
+    int idxUV = (coord.y / 2) * (pc.videoWidth / 2) + (coord.x / 2);
 
     uint yRaw = yData[idxY];
     uint uvRaw = uvData[idxUV];
