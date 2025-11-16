@@ -5,18 +5,44 @@ from __future__ import annotations
 import ctypes
 from ctypes import POINTER, c_int, c_uint16, c_void_p
 import logging
+import os
+from pathlib import Path
 from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 _log = logging.getLogger(__name__)
 
-try:
-    _dll = ctypes.CDLL("pc_hdr_vulkan.dll")
-    _log.info("HDR: loaded pc_hdr_vulkan.dll")
-except OSError as e:
-    _log.warning("HDR: failed to load pc_hdr_vulkan.dll (%s)", e)
-    _dll = None
+
+def _load_hdr_dll() -> Optional[ctypes.CDLL]:
+    """Try PERSON_CAPTURE_ROOT, repo root, then CWD when loading pc_hdr_vulkan.dll."""
+
+    root_env = os.getenv("PERSON_CAPTURE_ROOT")
+    candidates = []
+    if root_env:
+        candidates.append(Path(root_env) / "pc_hdr_vulkan.dll")
+
+    candidates.append(Path(__file__).resolve().parent.parent / "pc_hdr_vulkan.dll")
+    candidates.append(Path("pc_hdr_vulkan.dll"))
+
+    last_err: Optional[BaseException] = None
+    for candidate in candidates:
+        try:
+            dll = ctypes.CDLL(str(candidate))
+            _log.info("HDR: loaded pc_hdr_vulkan.dll from %s", candidate)
+            return dll
+        except OSError as exc:
+            last_err = exc
+
+    _log.warning(
+        "HDR: failed to load pc_hdr_vulkan.dll; tried %s (last error: %s)",
+        ", ".join(str(c) for c in candidates),
+        last_err,
+    )
+    return None
+
+
+_dll = _load_hdr_dll()
 
 
 class _HDRContext(ctypes.Structure):
