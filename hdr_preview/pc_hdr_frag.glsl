@@ -34,10 +34,10 @@ void main() {
     uint yRaw = yData[idxY];
     uint uvRaw = uvData[idxUV];
 
-    // 10-bit code values packed into 16 bits.
-    float yCode = float(yRaw & 0x3FFu);
-    float uCode = float((uvRaw >> 16) & 0x3FFu);
-    float vCode = float(uvRaw & 0x3FFu);
+    // Raw P010 stores 10-bit codes in the upper bits of 16-bit words; shift down here.
+    float yCode = float((yRaw >> 6) & 0x3FFu);
+    float uCode = float(((uvRaw >> 16) >> 6) & 0x3FFu);
+    float vCode = float((uvRaw >> 6) & 0x3FFu);
 
     // HDR10 limited range (10-bit):
     //   Y:    [64, 940]
