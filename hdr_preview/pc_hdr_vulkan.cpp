@@ -794,11 +794,26 @@ pc_hdr_context* pc_hdr_init(HWND hwnd, int width, int height) {
         ctx->hdrSurfaceRequested = env_truthy(std::getenv("PC_HDR_SWAPCHAIN_HDR"));
 
         // Instance
-        const char* instanceExts[] = {
-            VK_KHR_SURFACE_EXTENSION_NAME,
-            VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
-            VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME
-        };
+        // Build instance extension list dynamically so we don't fail on drivers
+        // that do not expose VK_EXT_swapchain_colorspace.
+        std::vector<const char*> instanceExts;
+        instanceExts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+        instanceExts.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
+
+        uint32_t instExtCount = 0;
+        VkResult r = vkEnumerateInstanceExtensionProperties(nullptr, &instExtCount, nullptr);
+        if (r == VK_SUCCESS && instExtCount > 0) {
+            std::vector<VkExtensionProperties> instExtProps(instExtCount);
+            r = vkEnumerateInstanceExtensionProperties(nullptr, &instExtCount, instExtProps.data());
+            if (r == VK_SUCCESS) {
+                for (const auto& ext : instExtProps) {
+                    if (std::strcmp(ext.extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) == 0) {
+                        instanceExts.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+                        break;
+                    }
+                }
+            }
+        }
         VkApplicationInfo app{};
         app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         app.pApplicationName = "PersonCapture HDR";
@@ -810,8 +825,8 @@ pc_hdr_context* pc_hdr_init(HWND hwnd, int width, int height) {
         VkInstanceCreateInfo ci{};
         ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
         ci.pApplicationInfo = &app;
-        ci.enabledExtensionCount = sizeof(instanceExts) / sizeof(instanceExts[0]);
-        ci.ppEnabledExtensionNames = instanceExts;
+        ci.enabledExtensionCount = static_cast<uint32_t>(instanceExts.size());
+        ci.ppEnabledExtensionNames = instanceExts.data();
 
         vk_check(vkCreateInstance(&ci, nullptr, &ctx->instance), "vkCreateInstance");
 

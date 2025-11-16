@@ -7543,12 +7543,6 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         log = logging.getLogger(__name__)
 
-        # If the UI has HDR passthrough enabled, it should own the stack.
-        if not getattr(self, "_hdr_passthrough_enabled", False):
-            # Defensive: if we see HDR frames, mark the flag anyway so SDR
-            # preview stops fighting for the stack.
-            self._hdr_passthrough_enabled = True
-
         widget = getattr(self, "hdr_widget", None)
         if widget is None:
             return
@@ -7564,7 +7558,21 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             widget.init_hdr(int(width), int(height))
         except Exception:
+            self._hdr_passthrough_enabled = False
+            if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
+                log.debug("SDR preview taking over preview_stack (index 0)")
+                self.preview_stack.setCurrentIndex(0)
             return
+
+        if not getattr(widget, "_ctx", None):
+            self._hdr_passthrough_enabled = False
+            if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
+                log.debug("SDR preview taking over preview_stack (index 0)")
+                self.preview_stack.setCurrentIndex(0)
+            return
+
+        # HDR context exists; mark passthrough active.
+        self._hdr_passthrough_enabled = True
 
         try:
             if hasattr(widget, "upload_p010_frame"):
@@ -7583,6 +7591,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 log.debug("HDR preview taking over preview_stack (index 1)")
                 self.preview_stack.setCurrentIndex(1)
         except Exception:
+            self._hdr_passthrough_enabled = False
+            if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
+                log.debug("SDR preview taking over preview_stack (index 0)")
+                self.preview_stack.setCurrentIndex(0)
             return
 
     def _on_hit(self, crop_path: str):
