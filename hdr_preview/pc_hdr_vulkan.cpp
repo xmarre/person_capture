@@ -9,6 +9,7 @@
 #include <string>
 #include <cctype>
 #include <cstdlib>
+#include <cstdio>
 #include <vulkan/vulkan_win32.h>
 
 struct pc_hdr_context {
@@ -16,11 +17,21 @@ struct pc_hdr_context {
     int videoWidth{};
     int videoHeight{};
 
+    bool validationEnabled{false};
+    bool debugUtilsEnabled{false};
+    bool debugUtilsDeviceEnabled{false};
+
     VkInstance instance{VK_NULL_HANDLE};
     VkPhysicalDevice physicalDevice{VK_NULL_HANDLE};
     VkDevice device{VK_NULL_HANDLE};
     uint32_t graphicsQueueFamily{0};
     VkQueue graphicsQueue{VK_NULL_HANDLE};
+
+    VkDebugUtilsMessengerEXT debugMessenger{VK_NULL_HANDLE};
+    PFN_vkDestroyDebugUtilsMessengerEXT pfnDestroyDebugUtilsMessengerEXT{nullptr};
+    PFN_vkSetDebugUtilsObjectNameEXT pfnSetDebugUtilsObjectNameEXT{nullptr};
+    PFN_vkCmdBeginDebugUtilsLabelEXT pfnCmdBeginDebugUtilsLabelEXT{nullptr};
+    PFN_vkCmdEndDebugUtilsLabelEXT pfnCmdEndDebugUtilsLabelEXT{nullptr};
 
     VkSurfaceKHR surface{VK_NULL_HANDLE};
     VkSwapchainKHR swapchain{VK_NULL_HANDLE};
@@ -34,13 +45,15 @@ struct pc_hdr_context {
     VkRenderPass renderPass{VK_NULL_HANDLE};
     VkPipelineLayout pipelineLayout{VK_NULL_HANDLE};
     VkPipeline pipeline{VK_NULL_HANDLE};
+    VkPipelineCache pipelineCache{VK_NULL_HANDLE};
 
     VkCommandPool commandPool{VK_NULL_HANDLE};
     std::vector<VkCommandBuffer> commandBuffers;
 
     VkSemaphore imageAvailableSemaphore{VK_NULL_HANDLE};
     VkSemaphore renderFinishedSemaphore{VK_NULL_HANDLE};
-    VkFence inFlightFence{VK_NULL_HANDLE};
+    std::vector<VkFence> swapchainImageFences;
+    std::vector<bool> imageFenceInUse;
 
     // Y / UV data buffers (contiguous layout, repacked by CPU)
     VkBuffer yBuffer{VK_NULL_HANDLE};
@@ -79,6 +92,93 @@ static bool env_truthy(const char* value) {
         return static_cast<char>(std::tolower(c));
     });
     return lowered == "1" || lowered == "true" || lowered == "yes" || lowered == "on";
+}
+
+static constexpr const wchar_t* kPipelineCacheFilename = L"pc_hdr_pipelines.cache";
+
+static std::vector<char> readFileIfExists(const wchar_t* filename) {
+    std::ifstream file(filename, std::ios::ate | std::ios::binary);
+    if (!file.is_open()) {
+        return {};
+    }
+    const size_t fileSize = static_cast<size_t>(file.tellg());
+    std::vector<char> buffer(fileSize);
+    file.seekg(0);
+    file.read(buffer.data(), fileSize);
+    file.close();
+    return buffer;
+}
+
+static void writeBinaryFile(const wchar_t* filename, const std::vector<char>& data) {
+    std::ofstream file(filename, std::ios::binary | std::ios::trunc);
+    if (!file.is_open()) {
+        return;
+    }
+    file.write(data.data(), static_cast<std::streamsize>(data.size()));
+    file.close();
+}
+
+static VKAPI_ATTR VkBool32 VKAPI_CALL debugMessengerCallback(
+    VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
+    VkDebugUtilsMessageTypeFlagsEXT messageType,
+    const VkDebugUtilsMessengerCallbackDataEXT* callbackData,
+    void* /*userData*/) {
+    const char* severity = "INFO";
+    if (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
+        severity = "ERROR";
+    } else if (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
+        severity = "WARN";
+    } else if (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT) {
+        severity = "VERBOSE";
+    }
+
+    char buffer[2048];
+    std::snprintf(buffer,
+                  sizeof(buffer),
+                  "[pc_hdr_vulkan][%s] (%u) %s\n",
+                  severity,
+                  messageType,
+                  callbackData && callbackData->pMessage ? callbackData->pMessage : "(no message)");
+    OutputDebugStringA(buffer);
+    return VK_FALSE;
+}
+
+static void setObjectName(pc_hdr_context* ctx,
+                          uint64_t handle,
+                          VkObjectType type,
+                          const std::string& name) {
+    if (!ctx || !ctx->pfnSetDebugUtilsObjectNameEXT || handle == 0) {
+        return;
+    }
+    VkDebugUtilsObjectNameInfoEXT info{};
+    info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
+    info.objectType = type;
+    info.objectHandle = handle;
+    info.pObjectName = name.c_str();
+    ctx->pfnSetDebugUtilsObjectNameEXT(ctx->device, &info);
+}
+
+static void beginLabel(pc_hdr_context* ctx,
+                       VkCommandBuffer cmd,
+                       const char* name,
+                       const float color[4]) {
+    if (!ctx || !ctx->pfnCmdBeginDebugUtilsLabelEXT) {
+        return;
+    }
+    VkDebugUtilsLabelEXT label{};
+    label.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+    label.pLabelName = name;
+    if (color) {
+        std::copy(color, color + 4, label.color);
+    }
+    ctx->pfnCmdBeginDebugUtilsLabelEXT(cmd, &label);
+}
+
+static void endLabel(pc_hdr_context* ctx, VkCommandBuffer cmd) {
+    if (!ctx || !ctx->pfnCmdEndDebugUtilsLabelEXT) {
+        return;
+    }
+    ctx->pfnCmdEndDebugUtilsLabelEXT(cmd);
 }
 
 static void vk_check(VkResult res, const char* where) {
@@ -220,6 +320,10 @@ static void createSwapchain(pc_hdr_context* ctx, int widgetWidth, int widgetHeig
     VkSwapchainKHR old = ctx->swapchain;
     vk_check(vkCreateSwapchainKHR(ctx->device, &createInfo, nullptr, &ctx->swapchain),
              "vkCreateSwapchainKHR");
+    setObjectName(ctx,
+                  reinterpret_cast<uint64_t>(ctx->swapchain),
+                  VK_OBJECT_TYPE_SWAPCHAIN_KHR,
+                  "pc_hdr_swapchain");
     if (old != VK_NULL_HANDLE) {
         vkDestroySwapchainKHR(ctx->device, old, nullptr);
     }
@@ -233,6 +337,12 @@ static void createSwapchain(pc_hdr_context* ctx, int widgetWidth, int widgetHeig
     ctx->swapchainImages.resize(count);
     vk_check(vkGetSwapchainImagesKHR(ctx->device, ctx->swapchain, &count, ctx->swapchainImages.data()),
              "vkGetSwapchainImagesKHR(data)");
+    for (size_t i = 0; i < ctx->swapchainImages.size(); ++i) {
+        setObjectName(ctx,
+                      reinterpret_cast<uint64_t>(ctx->swapchainImages[i]),
+                      VK_OBJECT_TYPE_IMAGE,
+                      std::string("pc_hdr_swapchain_image_") + std::to_string(i));
+    }
 
     // Image views
     for (auto view : ctx->swapchainImageViews) {
@@ -260,6 +370,10 @@ static void createSwapchain(pc_hdr_context* ctx, int widgetWidth, int widgetHeig
         VkImageView imageView;
         vk_check(vkCreateImageView(ctx->device, &viewInfo, nullptr, &imageView),
                  "vkCreateImageView");
+        setObjectName(ctx,
+                      reinterpret_cast<uint64_t>(imageView),
+                      VK_OBJECT_TYPE_IMAGE_VIEW,
+                      std::string("pc_hdr_swapchain_view_") + std::to_string(ctx->swapchainImageViews.size()));
         ctx->swapchainImageViews.push_back(imageView);
     }
 }
@@ -296,6 +410,10 @@ static void createRenderPass(pc_hdr_context* ctx) {
 
     vk_check(vkCreateRenderPass(ctx->device, &rpInfo, nullptr, &ctx->renderPass),
              "vkCreateRenderPass");
+    setObjectName(ctx,
+                  reinterpret_cast<uint64_t>(ctx->renderPass),
+                  VK_OBJECT_TYPE_RENDER_PASS,
+                  "pc_hdr_render_pass");
 }
 
 static void createFramebuffers(pc_hdr_context* ctx) {
@@ -320,6 +438,10 @@ static void createFramebuffers(pc_hdr_context* ctx) {
         VkFramebuffer fb;
         vk_check(vkCreateFramebuffer(ctx->device, &fbInfo, nullptr, &fb),
                  "vkCreateFramebuffer");
+        setObjectName(ctx,
+                      reinterpret_cast<uint64_t>(fb),
+                      VK_OBJECT_TYPE_FRAMEBUFFER,
+                      std::string("pc_hdr_framebuffer_") + std::to_string(ctx->framebuffers.size()));
         ctx->framebuffers.push_back(fb);
     }
 }
@@ -373,7 +495,15 @@ static void createBuffers(pc_hdr_context* ctx) {
     };
 
     createBuffer(ySize, ctx->yBuffer, ctx->yBufferMemory, &ctx->yBufferMapped);
+    setObjectName(ctx,
+                  reinterpret_cast<uint64_t>(ctx->yBuffer),
+                  VK_OBJECT_TYPE_BUFFER,
+                  "pc_hdr_y_buffer");
     createBuffer(uvSize, ctx->uvBuffer, ctx->uvBufferMemory, &ctx->uvBufferMapped);
+    setObjectName(ctx,
+                  reinterpret_cast<uint64_t>(ctx->uvBuffer),
+                  VK_OBJECT_TYPE_BUFFER,
+                  "pc_hdr_uv_buffer");
 }
 
 // Descriptor set (storage buffers)
@@ -397,6 +527,10 @@ static void createDescriptors(pc_hdr_context* ctx) {
 
     vk_check(vkCreateDescriptorSetLayout(ctx->device, &layoutInfo, nullptr, &ctx->descriptorSetLayout),
              "vkCreateDescriptorSetLayout");
+    setObjectName(ctx,
+                  reinterpret_cast<uint64_t>(ctx->descriptorSetLayout),
+                  VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT,
+                  "pc_hdr_descriptor_set_layout");
 
     // Pool
     VkDescriptorPoolSize poolSize{};
@@ -411,6 +545,10 @@ static void createDescriptors(pc_hdr_context* ctx) {
 
     vk_check(vkCreateDescriptorPool(ctx->device, &poolInfo, nullptr, &ctx->descriptorPool),
              "vkCreateDescriptorPool");
+    setObjectName(ctx,
+                  reinterpret_cast<uint64_t>(ctx->descriptorPool),
+                  VK_OBJECT_TYPE_DESCRIPTOR_POOL,
+                  "pc_hdr_descriptor_pool");
 
     // Allocate
     VkDescriptorSetAllocateInfo allocInfo{};
@@ -421,6 +559,10 @@ static void createDescriptors(pc_hdr_context* ctx) {
 
     vk_check(vkAllocateDescriptorSets(ctx->device, &allocInfo, &ctx->descriptorSet),
              "vkAllocateDescriptorSets");
+    setObjectName(ctx,
+                  reinterpret_cast<uint64_t>(ctx->descriptorSet),
+                  VK_OBJECT_TYPE_DESCRIPTOR_SET,
+                  "pc_hdr_descriptor_set");
 
     // Update
     VkDescriptorBufferInfo yInfo{};
@@ -454,8 +596,42 @@ static void createDescriptors(pc_hdr_context* ctx) {
     vkUpdateDescriptorSets(ctx->device, 2, writes, 0, nullptr);
 }
 
+static void createPipelineCache(pc_hdr_context* ctx) {
+    if (ctx->pipelineCache != VK_NULL_HANDLE) {
+        return;
+    }
+    auto cacheData = readFileIfExists(kPipelineCacheFilename);
+    VkPipelineCacheCreateInfo cacheInfo{};
+    cacheInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    cacheInfo.initialDataSize = cacheData.size();
+    cacheInfo.pInitialData = cacheData.empty() ? nullptr : cacheData.data();
+
+    vk_check(vkCreatePipelineCache(ctx->device, &cacheInfo, nullptr, &ctx->pipelineCache),
+             "vkCreatePipelineCache");
+    setObjectName(ctx,
+                  reinterpret_cast<uint64_t>(ctx->pipelineCache),
+                  VK_OBJECT_TYPE_PIPELINE_CACHE,
+                  "pc_hdr_pipeline_cache");
+}
+
+static void savePipelineCache(pc_hdr_context* ctx) {
+    if (!ctx || ctx->pipelineCache == VK_NULL_HANDLE) {
+        return;
+    }
+    size_t dataSize = 0;
+    if (vkGetPipelineCacheData(ctx->device, ctx->pipelineCache, &dataSize, nullptr) != VK_SUCCESS ||
+        dataSize == 0) {
+        return;
+    }
+    std::vector<char> data(dataSize);
+    if (vkGetPipelineCacheData(ctx->device, ctx->pipelineCache, &dataSize, data.data()) == VK_SUCCESS) {
+        writeBinaryFile(kPipelineCacheFilename, data);
+    }
+}
+
 // Graphics pipeline
 static void createPipeline(pc_hdr_context* ctx) {
+    createPipelineCache(ctx);
     // Load SPIR-V from files next to the DLL (adjust path as needed)
     auto vertCode = readFile(L"pc_hdr_vert.spv");
     auto fragCode = readFile(L"pc_hdr_frag.spv");
@@ -538,6 +714,10 @@ static void createPipeline(pc_hdr_context* ctx) {
 
     vk_check(vkCreatePipelineLayout(ctx->device, &plInfo, nullptr, &ctx->pipelineLayout),
              "vkCreatePipelineLayout");
+    setObjectName(ctx,
+                  reinterpret_cast<uint64_t>(ctx->pipelineLayout),
+                  VK_OBJECT_TYPE_PIPELINE_LAYOUT,
+                  "pc_hdr_pipeline_layout");
 
     VkGraphicsPipelineCreateInfo gp{};
     gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -553,8 +733,17 @@ static void createPipeline(pc_hdr_context* ctx) {
     gp.renderPass = ctx->renderPass;
     gp.subpass = 0;
 
-    vk_check(vkCreateGraphicsPipelines(ctx->device, VK_NULL_HANDLE, 1, &gp, nullptr, &ctx->pipeline),
+    vk_check(vkCreateGraphicsPipelines(ctx->device,
+                                       ctx->pipelineCache,
+                                       1,
+                                       &gp,
+                                       nullptr,
+                                       &ctx->pipeline),
              "vkCreateGraphicsPipelines");
+    setObjectName(ctx,
+                  reinterpret_cast<uint64_t>(ctx->pipeline),
+                  VK_OBJECT_TYPE_PIPELINE,
+                  "pc_hdr_pipeline");
 
     vkDestroyShaderModule(ctx->device, vertModule, nullptr);
     vkDestroyShaderModule(ctx->device, fragModule, nullptr);
@@ -569,6 +758,10 @@ static void createCommands(pc_hdr_context* ctx) {
         poolInfo.queueFamilyIndex = ctx->graphicsQueueFamily;
         vk_check(vkCreateCommandPool(ctx->device, &poolInfo, nullptr, &ctx->commandPool),
                  "vkCreateCommandPool");
+        setObjectName(ctx,
+                      reinterpret_cast<uint64_t>(ctx->commandPool),
+                      VK_OBJECT_TYPE_COMMAND_POOL,
+                      "pc_hdr_command_pool");
     }
 
     if (!ctx->commandBuffers.empty()) {
@@ -588,6 +781,33 @@ static void createCommands(pc_hdr_context* ctx) {
 
     vk_check(vkAllocateCommandBuffers(ctx->device, &alloc, ctx->commandBuffers.data()),
              "vkAllocateCommandBuffers");
+    for (size_t i = 0; i < ctx->commandBuffers.size(); ++i) {
+        setObjectName(ctx,
+                      reinterpret_cast<uint64_t>(ctx->commandBuffers[i]),
+                      VK_OBJECT_TYPE_COMMAND_BUFFER,
+                      std::string("pc_hdr_command_buffer_") + std::to_string(i));
+    }
+
+    for (auto fence : ctx->swapchainImageFences) {
+        if (fence != VK_NULL_HANDLE) {
+            vkDestroyFence(ctx->device, fence, nullptr);
+        }
+    }
+    ctx->swapchainImageFences.clear();
+    ctx->imageFenceInUse.assign(ctx->commandBuffers.size(), false);
+    ctx->swapchainImageFences.resize(ctx->commandBuffers.size(), VK_NULL_HANDLE);
+
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    for (size_t i = 0; i < ctx->swapchainImageFences.size(); ++i) {
+        vk_check(vkCreateFence(ctx->device, &fenceInfo, nullptr, &ctx->swapchainImageFences[i]),
+                 "vkCreateFence");
+        setObjectName(ctx,
+                      reinterpret_cast<uint64_t>(ctx->swapchainImageFences[i]),
+                      VK_OBJECT_TYPE_FENCE,
+                      std::string("pc_hdr_inflight_fence_") + std::to_string(i));
+    }
 
     if (ctx->imageAvailableSemaphore == VK_NULL_HANDLE) {
         VkSemaphoreCreateInfo semInfo{};
@@ -596,12 +816,14 @@ static void createCommands(pc_hdr_context* ctx) {
                  "vkCreateSemaphore");
         vk_check(vkCreateSemaphore(ctx->device, &semInfo, nullptr, &ctx->renderFinishedSemaphore),
                  "vkCreateSemaphore");
-
-        VkFenceCreateInfo fenceInfo{};
-        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-        vk_check(vkCreateFence(ctx->device, &fenceInfo, nullptr, &ctx->inFlightFence),
-                 "vkCreateFence");
+        setObjectName(ctx,
+                      reinterpret_cast<uint64_t>(ctx->imageAvailableSemaphore),
+                      VK_OBJECT_TYPE_SEMAPHORE,
+                      "pc_hdr_image_available_semaphore");
+        setObjectName(ctx,
+                      reinterpret_cast<uint64_t>(ctx->renderFinishedSemaphore),
+                      VK_OBJECT_TYPE_SEMAPHORE,
+                      "pc_hdr_render_finished_semaphore");
     }
 }
 
@@ -640,7 +862,11 @@ static void recordCommandBuffer(pc_hdr_context* ctx, uint32_t imageIndex) {
 
     VkCommandBufferBeginInfo begin{};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vk_check(vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer");
+
+    const float hdrLabelColor[4] = {0.35f, 0.65f, 0.95f, 1.0f};
+    beginLabel(ctx, cmd, "pc_hdr_present", hdrLabelColor);
 
     VkClearValue clear{};
     clear.color = { {0.0f, 0.0f, 0.0f, 1.0f} };
@@ -674,6 +900,7 @@ static void recordCommandBuffer(pc_hdr_context* ctx, uint32_t imageIndex) {
     vkCmdDraw(cmd, 3, 1, 0, 0); // fullscreen triangle
 
     vkCmdEndRenderPass(cmd);
+    endLabel(ctx, cmd);
 
     vk_check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
 }
@@ -693,13 +920,13 @@ static void uploadP010ToBuffers(pc_hdr_context* ctx,
     int strideY = strideYBytes / 2;   // 16-bit samples
     int strideUV = strideUVBytes / 2;
 
-    // Y: one uint per pixel (lower 16 bits store sample)
+    // Y: one uint per pixel (lower 16 bits store the raw P010 sample)
     for (uint32_t y = 0; y < H; ++y) {
         const std::uint16_t* srcRow = yPlane + y * strideY;
         uint32_t* dstRow = yDst + y * W;
         for (uint32_t x = 0; x < W; ++x) {
-            std::uint16_t s = static_cast<std::uint16_t>(srcRow[x] & 0x03FFu);
-            dstRow[x] = uint32_t(s);
+            // P010: 16-bit word with 10-bit code in the upper bits; keep it as-is.
+            dstRow[x] = static_cast<uint32_t>(srcRow[x]);
         }
     }
 
@@ -710,9 +937,11 @@ static void uploadP010ToBuffers(pc_hdr_context* ctx,
         const std::uint16_t* srcRow = uvPlane + y * strideUV;
         uint32_t* dstRow = uvDst + y * Wc;
         for (uint32_t x = 0; x < Wc; ++x) {
-            std::uint16_t u = static_cast<std::uint16_t>(srcRow[2 * x + 0] & 0x03FFu);
-            std::uint16_t v = static_cast<std::uint16_t>(srcRow[2 * x + 1] & 0x03FFu);
-            dstRow[x] = (uint32_t(u) << 16) | uint32_t(v);
+            // Store the raw 16-bit P010 chroma samples (U in high 16, V in low 16).
+            std::uint16_t u = srcRow[2 * x + 0];
+            std::uint16_t v = srcRow[2 * x + 1];
+            dstRow[x] = (static_cast<uint32_t>(u) << 16) |
+                        static_cast<uint32_t>(v);
         }
     }
 }
@@ -793,12 +1022,31 @@ pc_hdr_context* pc_hdr_init(HWND hwnd, int width, int height) {
         ctx->pushConstants.height = height;
         ctx->hdrSurfaceRequested = env_truthy(std::getenv("PC_HDR_SWAPCHAIN_HDR"));
 
+        bool validationRequested = false;
+#if defined(_DEBUG)
+        validationRequested = true;
+#endif
+        if (const char* envValidation = std::getenv("PC_HDR_VALIDATION")) {
+            validationRequested = env_truthy(envValidation);
+        }
+
+        bool debugUtilsRequested = validationRequested;
+#if defined(_DEBUG)
+        debugUtilsRequested = true;
+#endif
+        if (const char* envDebug = std::getenv("PC_HDR_DEBUG_UTILS")) {
+            debugUtilsRequested = env_truthy(envDebug);
+        }
+
         // Instance
         // Build instance extension list dynamically so we don't fail on drivers
         // that do not expose VK_EXT_swapchain_colorspace.
         std::vector<const char*> instanceExts;
         instanceExts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
         instanceExts.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
+
+        bool swapchainColorSpaceSupported = false;
+        bool debugUtilsSupported = false;
 
         uint32_t instExtCount = 0;
         VkResult r = vkEnumerateInstanceExtensionProperties(nullptr, &instExtCount, nullptr);
@@ -808,7 +1056,33 @@ pc_hdr_context* pc_hdr_init(HWND hwnd, int width, int height) {
             if (r == VK_SUCCESS) {
                 for (const auto& ext : instExtProps) {
                     if (std::strcmp(ext.extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) == 0) {
-                        instanceExts.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+                        swapchainColorSpaceSupported = true;
+                    }
+                    if (std::strcmp(ext.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) {
+                        debugUtilsSupported = true;
+                    }
+                }
+            }
+        }
+        if (swapchainColorSpaceSupported) {
+            instanceExts.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+        }
+        if (debugUtilsRequested && debugUtilsSupported) {
+            instanceExts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+            ctx->debugUtilsEnabled = true;
+        }
+
+        std::vector<const char*> instanceLayers;
+        if (validationRequested) {
+            uint32_t layerCount = 0;
+            vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
+            if (layerCount > 0) {
+                std::vector<VkLayerProperties> layerProps(layerCount);
+                vkEnumerateInstanceLayerProperties(&layerCount, layerProps.data());
+                for (const auto& layer : layerProps) {
+                    if (std::strcmp(layer.layerName, "VK_LAYER_KHRONOS_validation") == 0) {
+                        instanceLayers.push_back("VK_LAYER_KHRONOS_validation");
+                        ctx->validationEnabled = true;
                         break;
                     }
                 }
@@ -827,8 +1101,32 @@ pc_hdr_context* pc_hdr_init(HWND hwnd, int width, int height) {
         ci.pApplicationInfo = &app;
         ci.enabledExtensionCount = static_cast<uint32_t>(instanceExts.size());
         ci.ppEnabledExtensionNames = instanceExts.data();
+        ci.enabledLayerCount = static_cast<uint32_t>(instanceLayers.size());
+        ci.ppEnabledLayerNames = instanceLayers.empty() ? nullptr : instanceLayers.data();
 
         vk_check(vkCreateInstance(&ci, nullptr, &ctx->instance), "vkCreateInstance");
+
+        if (ctx->debugUtilsEnabled && ctx->validationEnabled) {
+            auto createMessenger = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
+                vkGetInstanceProcAddr(ctx->instance, "vkCreateDebugUtilsMessengerEXT"));
+            ctx->pfnDestroyDebugUtilsMessengerEXT = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
+                vkGetInstanceProcAddr(ctx->instance, "vkDestroyDebugUtilsMessengerEXT"));
+            if (createMessenger) {
+                VkDebugUtilsMessengerCreateInfoEXT dbgInfo{};
+                dbgInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+                dbgInfo.messageSeverity =
+                    VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                    VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT |
+                    VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT;
+                dbgInfo.messageType =
+                    VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                    VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                    VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+                dbgInfo.pfnUserCallback = debugMessengerCallback;
+                vk_check(createMessenger(ctx->instance, &dbgInfo, nullptr, &ctx->debugMessenger),
+                         "vkCreateDebugUtilsMessengerEXT");
+            }
+        }
 
         // Surface
         VkWin32SurfaceCreateInfoKHR surfInfo{};
@@ -860,38 +1158,39 @@ pc_hdr_context* pc_hdr_init(HWND hwnd, int width, int height) {
         qci.queueCount = 1;
         qci.pQueuePriorities = &qprio;
 
-        // Always require swapchain; HDR metadata extension is optional.
+        // Always require swapchain; add optional extensions when supported.
         std::vector<const char*> deviceExts;
         deviceExts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
 
-        ctx->hdrMetadataEnabled = false;
-        if (ctx->hdrSurfaceRequested) {
-            // Only enable VK_EXT_hdr_metadata if the device actually supports it.
-            uint32_t extCount = 0;
-            VkResult r = vkEnumerateDeviceExtensionProperties(
-                ctx->physicalDevice,
-                nullptr,
-                &extCount,
-                nullptr
-            );
-            if (r == VK_SUCCESS && extCount > 0) {
-                std::vector<VkExtensionProperties> props(extCount);
-                r = vkEnumerateDeviceExtensionProperties(
-                    ctx->physicalDevice,
-                    nullptr,
-                    &extCount,
-                    props.data()
-                );
-                if (r == VK_SUCCESS) {
-                    for (const auto& ext : props) {
-                        if (std::strcmp(ext.extensionName, VK_EXT_HDR_METADATA_EXTENSION_NAME) == 0) {
-                            deviceExts.push_back(VK_EXT_HDR_METADATA_EXTENSION_NAME);
-                            ctx->hdrMetadataEnabled = true;
-                            break;
-                        }
-                    }
-                }
+        uint32_t devExtCount = 0;
+        vk_check(vkEnumerateDeviceExtensionProperties(ctx->physicalDevice, nullptr, &devExtCount, nullptr),
+                 "vkEnumerateDeviceExtensionProperties(count)");
+        std::vector<VkExtensionProperties> devExtProps(devExtCount);
+        vk_check(vkEnumerateDeviceExtensionProperties(ctx->physicalDevice,
+                                                      nullptr,
+                                                      &devExtCount,
+                                                      devExtProps.data()),
+                 "vkEnumerateDeviceExtensionProperties(data)");
+
+        bool hdrMetadataSupported = false;
+        bool debugUtilsDeviceSupported = false;
+        for (const auto& ext : devExtProps) {
+            if (std::strcmp(ext.extensionName, VK_EXT_HDR_METADATA_EXTENSION_NAME) == 0) {
+                hdrMetadataSupported = true;
             }
+            if (std::strcmp(ext.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) {
+                debugUtilsDeviceSupported = true;
+            }
+        }
+
+        ctx->hdrMetadataEnabled = false;
+        if (ctx->hdrSurfaceRequested && hdrMetadataSupported) {
+            deviceExts.push_back(VK_EXT_HDR_METADATA_EXTENSION_NAME);
+            ctx->hdrMetadataEnabled = true;
+        }
+        if (ctx->debugUtilsEnabled && debugUtilsDeviceSupported) {
+            deviceExts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+            ctx->debugUtilsDeviceEnabled = true;
         }
 
         VkDeviceCreateInfo dci{};
@@ -905,6 +1204,15 @@ pc_hdr_context* pc_hdr_init(HWND hwnd, int width, int height) {
                  "vkCreateDevice");
 
         vkGetDeviceQueue(ctx->device, ctx->graphicsQueueFamily, 0, &ctx->graphicsQueue);
+
+        if (ctx->debugUtilsDeviceEnabled) {
+            ctx->pfnSetDebugUtilsObjectNameEXT = reinterpret_cast<PFN_vkSetDebugUtilsObjectNameEXT>(
+                vkGetDeviceProcAddr(ctx->device, "vkSetDebugUtilsObjectNameEXT"));
+            ctx->pfnCmdBeginDebugUtilsLabelEXT = reinterpret_cast<PFN_vkCmdBeginDebugUtilsLabelEXT>(
+                vkGetDeviceProcAddr(ctx->device, "vkCmdBeginDebugUtilsLabelEXT"));
+            ctx->pfnCmdEndDebugUtilsLabelEXT = reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(
+                vkGetDeviceProcAddr(ctx->device, "vkCmdEndDebugUtilsLabelEXT"));
+        }
 
         // Swapchain + render path
         createSwapchain(ctx, width, height);
@@ -965,9 +1273,6 @@ void pc_hdr_upload_p010(
 void pc_hdr_present(pc_hdr_context* ctx) {
     if (!ctx) return;
     try {
-        vkWaitForFences(ctx->device, 1, &ctx->inFlightFence, VK_TRUE, UINT64_MAX);
-        vkResetFences(ctx->device, 1, &ctx->inFlightFence);
-
         uint32_t imageIndex = 0;
         VkResult acq = vkAcquireNextImageKHR(ctx->device,
                                              ctx->swapchain,
@@ -979,6 +1284,16 @@ void pc_hdr_present(pc_hdr_context* ctx) {
             return;
         }
         vk_check(acq, "vkAcquireNextImageKHR");
+
+        if (imageIndex >= ctx->swapchainImageFences.size()) {
+            return;
+        }
+        VkFence frameFence = ctx->swapchainImageFences[imageIndex];
+        if (ctx->imageFenceInUse[imageIndex]) {
+            vkWaitForFences(ctx->device, 1, &frameFence, VK_TRUE, UINT64_MAX);
+            ctx->imageFenceInUse[imageIndex] = false;
+        }
+        vkResetFences(ctx->device, 1, &frameFence);
 
         recordCommandBuffer(ctx, imageIndex);
 
@@ -993,8 +1308,9 @@ void pc_hdr_present(pc_hdr_context* ctx) {
         submit.signalSemaphoreCount = 1;
         submit.pSignalSemaphores = &ctx->renderFinishedSemaphore;
 
-        vk_check(vkQueueSubmit(ctx->graphicsQueue, 1, &submit, ctx->inFlightFence),
+        vk_check(vkQueueSubmit(ctx->graphicsQueue, 1, &submit, frameFence),
                  "vkQueueSubmit");
+        ctx->imageFenceInUse[imageIndex] = true;
 
         VkPresentInfoKHR present{};
         present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -1017,6 +1333,8 @@ void pc_hdr_shutdown(pc_hdr_context* ctx) {
     } catch (...) {
     }
 
+    savePipelineCache(ctx);
+
     if (ctx->yBufferMapped)  vkUnmapMemory(ctx->device, ctx->yBufferMemory);
     if (ctx->uvBufferMapped) vkUnmapMemory(ctx->device, ctx->uvBufferMemory);
 
@@ -1030,6 +1348,7 @@ void pc_hdr_shutdown(pc_hdr_context* ctx) {
 
     if (ctx->pipeline != VK_NULL_HANDLE)       vkDestroyPipeline(ctx->device, ctx->pipeline, nullptr);
     if (ctx->pipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(ctx->device, ctx->pipelineLayout, nullptr);
+    if (ctx->pipelineCache != VK_NULL_HANDLE)  vkDestroyPipelineCache(ctx->device, ctx->pipelineCache, nullptr);
 
     for (auto fb : ctx->framebuffers) {
         vkDestroyFramebuffer(ctx->device, fb, nullptr);
@@ -1045,12 +1364,18 @@ void pc_hdr_shutdown(pc_hdr_context* ctx) {
         vkDestroyCommandPool(ctx->device, ctx->commandPool, nullptr);
     }
 
+    for (auto fence : ctx->swapchainImageFences) {
+        if (fence != VK_NULL_HANDLE) {
+            vkDestroyFence(ctx->device, fence, nullptr);
+        }
+    }
+    ctx->swapchainImageFences.clear();
+    ctx->imageFenceInUse.clear();
+
     if (ctx->imageAvailableSemaphore != VK_NULL_HANDLE)
         vkDestroySemaphore(ctx->device, ctx->imageAvailableSemaphore, nullptr);
     if (ctx->renderFinishedSemaphore != VK_NULL_HANDLE)
         vkDestroySemaphore(ctx->device, ctx->renderFinishedSemaphore, nullptr);
-    if (ctx->inFlightFence != VK_NULL_HANDLE)
-        vkDestroyFence(ctx->device, ctx->inFlightFence, nullptr);
 
     for (auto iv : ctx->swapchainImageViews) {
         vkDestroyImageView(ctx->device, iv, nullptr);
@@ -1065,6 +1390,10 @@ void pc_hdr_shutdown(pc_hdr_context* ctx) {
 
     if (ctx->device != VK_NULL_HANDLE)
         vkDestroyDevice(ctx->device, nullptr);
+
+    if (ctx->debugMessenger != VK_NULL_HANDLE && ctx->pfnDestroyDebugUtilsMessengerEXT) {
+        ctx->pfnDestroyDebugUtilsMessengerEXT(ctx->instance, ctx->debugMessenger, nullptr);
+    }
 
     if (ctx->instance != VK_NULL_HANDLE)
         vkDestroyInstance(ctx->instance, nullptr);
