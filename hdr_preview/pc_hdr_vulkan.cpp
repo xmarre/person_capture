@@ -1043,7 +1043,14 @@ pc_hdr_context* pc_hdr_init(HWND hwnd, int width, int height) {
         ctx->videoHeight = height;
         ctx->pushConstants.width = width;
         ctx->pushConstants.height = height;
-        ctx->hdrSurfaceRequested = env_truthy(std::getenv("PC_HDR_SWAPCHAIN_HDR"));
+        // Default to requesting an HDR10 ST.2084 swapchain when the driver
+        // supports it. The PC_HDR_SWAPCHAIN_HDR env var can be used to force
+        // SDR behavior (set to 0/false) or to explicitly disable HDR.
+        if (const char* envHdr = std::getenv("PC_HDR_SWAPCHAIN_HDR")) {
+            ctx->hdrSurfaceRequested = env_truthy(envHdr);
+        } else {
+            ctx->hdrSurfaceRequested = true;
+        }
         ctx->uploadTracingEnabled = env_truthy(std::getenv("PC_HDR_TRACE_UPLOAD"));
         if (ctx->uploadTracingEnabled) {
             OutputDebugStringA("[pc_hdr] PC_HDR_TRACE_UPLOAD=1 (upload tracing enabled)\n");
