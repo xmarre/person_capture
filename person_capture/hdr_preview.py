@@ -7,7 +7,9 @@ from ctypes import POINTER, c_int, c_uint16, c_void_p
 import logging
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
+
+import numpy as np
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -170,6 +172,36 @@ class HDRPreviewWidget(QtWidgets.QWidget):
             int(stride_uv_bytes),
         )
         _pc_hdr_present(self._ctx)
+
+    def upload_p010_frame(self, frame: Sequence[object]) -> None:
+        """Convenience wrapper that accepts the normalized preview tuple."""
+
+        if frame is None or len(frame) < 6:
+            return
+        try:
+            width = int(frame[0])
+            height = int(frame[1])
+            y_plane = np.asarray(frame[2])
+            uv_plane = np.asarray(frame[3])
+            stride_y = int(frame[4]) or int(y_plane.strides[0])
+            stride_uv = int(frame[5]) or int(uv_plane.strides[0])
+        except Exception:
+            return
+
+        if y_plane.ndim != 2 or uv_plane.ndim != 2:
+            return
+
+        self.init_hdr(width, height)
+        if not self._ctx:
+            return
+
+        try:
+            y_ptr = int(y_plane.ctypes.data)
+            uv_ptr = int(uv_plane.ctypes.data)
+        except Exception:
+            return
+
+        self.feed_p010(y_ptr, uv_ptr, stride_y, stride_uv)
 
     def resizeEvent(self, ev: QtGui.QResizeEvent) -> None:
         super().resizeEvent(ev)
