@@ -2488,8 +2488,15 @@ class Processor(QtCore.QObject):
 
             ensure_dir(cfg.out_dir)
             crops_dir = os.path.join(cfg.out_dir, "crops")
+            hdr_crops_dir = (
+                os.path.join(cfg.out_dir, "hdr_crops")
+                if bool(getattr(cfg, "hdr_passthrough", False))
+                else None
+            )
             ann_dir = os.path.join(cfg.out_dir, "annot") if cfg.save_annot else None
             ensure_dir(crops_dir)
+            if hdr_crops_dir:
+                ensure_dir(hdr_crops_dir)
             if ann_dir:
                 ensure_dir(ann_dir)
             # Debug I/O
@@ -3926,6 +3933,9 @@ class Processor(QtCore.QObject):
                 def save_hit(c, idx):
                     nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box, ref_face_feat, ref_bank_list
                     crop_img_path = os.path.join(crops_dir, f"f{idx:08d}.jpg")
+                    hdr_out_path = None
+                    if self._hdr_passthrough_active and hdr_crops_dir:
+                        hdr_out_path = os.path.join(hdr_crops_dir, f"f{idx:08d}.mkv")
                     # Start from candidate box in GLOBAL coords
                     gx1, gy1, gx2, gy2 = c["box"]
                     ratio_str = str(
@@ -4325,6 +4335,8 @@ class Processor(QtCore.QObject):
                             )
                             # skip this hit, keep processing
                             pass
+                    if hdr_out_path:
+                        self._save_hdr_crop_p010(idx, (cx1, cy1, cx2, cy2), hdr_out_path)
                     reasons_list = c.get("reasons") or []
                     reasons = "|".join(reasons_list)
                     bx1, by1, bx2, by2 = c["box"]
@@ -5043,6 +5055,113 @@ class Processor(QtCore.QObject):
             self._status_last_time[k] = now
             self._status_last_text[k] = msg
 
+    def _resolve_ffmpeg_bin(self) -> Optional[str]:
+        ffmpeg_cached = getattr(self, "_ffmpeg_cached", None)
+        if isinstance(ffmpeg_cached, str) and ffmpeg_cached:
+            return ffmpeg_cached
+
+        try:
+            reader = getattr(self, "_hdr_preview_reader", None)
+            ffmpeg_reader = getattr(reader, "_ffmpeg", None)
+            if isinstance(ffmpeg_reader, str) and ffmpeg_reader:
+                self._ffmpeg_cached = ffmpeg_reader
+                return ffmpeg_reader
+        except Exception:
+            pass
+
+        _ffp = None
+        try:
+            from .video_io import _ffmpeg_path as _ffp  # type: ignore
+        except Exception:
+            try:
+                from video_io import _ffmpeg_path as _ffp  # type: ignore
+            except Exception:
+                _ffp = None
+        if _ffp is not None:
+            try:
+                ffmpeg = _ffp()
+                if ffmpeg:
+                    self._ffmpeg_cached = ffmpeg
+                    return ffmpeg
+            except Exception:
+                pass
+        return None
+
+    def _save_hdr_crop_p010(
+        self, frame_idx: int, crop_xyxy: tuple[int, int, int, int], out_path: str
+    ) -> None:
+        """Use ffmpeg directly to export an HDR crop from the original source."""
+
+        if not getattr(self, "_hdr_passthrough_active", False):
+            return
+
+        ffmpeg_bin = self._resolve_ffmpeg_bin()
+        if not ffmpeg_bin:
+            self._status(
+                "HDR crop export skipped: ffmpeg unavailable",
+                key="hdr_crop_export",
+                interval=30.0,
+            )
+            return
+
+        x1, y1, x2, y2 = crop_xyxy
+        w = max(1, int(x2 - x1))
+        h = max(1, int(y2 - y1))
+        try:
+            ensure_dir(os.path.dirname(out_path))
+        except Exception:
+            pass
+
+        vf = f"crop={w}:{h}:{int(x1)}:{int(y1)}"
+        fps = float(getattr(self, "_fps", 0.0) or 0.0)
+        seek_sec: Optional[float] = None
+        if fps > 0:
+            seek_sec = max(0.0, float(frame_idx) / fps)
+
+        is_avif = out_path.lower().endswith(".avif")
+        cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error"]
+        if seek_sec is not None:
+            cmd += ["-ss", f"{seek_sec:.6f}"]
+        cmd += [
+            "-i",
+            self.cfg.video,
+            "-vf",
+            vf,
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            "1",
+        ]
+        if is_avif:
+            cmd += [
+                "-c:v",
+                "libaom-av1",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-color_range",
+                "1",
+                "-colorspace",
+                "bt2020nc",
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                "smpte2084",
+            ]
+        else:
+            if not out_path.lower().endswith(".mkv"):
+                cmd += ["-f", "matroska"]
+            cmd += ["-pix_fmt", "p010le"]
+        cmd.append(out_path)
+
+        try:
+            subprocess.run(cmd, check=True)
+        except Exception as exc:
+            self.status(
+                f"HDR crop export failed: {exc}",
+                key="hdr_crop_export",
+                interval=10.0,
+            )
+        
     def _hdr_preview_enabled(self, reader=None) -> bool:
         if reader is None:
             reader = self._hdr_preview_reader
@@ -5261,7 +5380,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._keyframes: List[int] = []
         self._current_idx: int = 0
         self._last_preview_qimage: Optional[QtGui.QImage] = None
-        self._last_hdr_p010: Optional[tuple] = None
 
         self.cfg = SessionConfig()
         self._updating_refs = False
@@ -7581,63 +7699,14 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-    def _p010_to_bgr_for_snapshot(self, payload: object) -> Optional[np.ndarray]:
-        """
-        Convert a cached P010 HDR passthrough payload into a BGR uint8 frame
-        for saving a screenshot. Uses (width, height, y_plane, uv_plane,
-        stride_y, stride_uv) layout.
-        """
-        try:
-            if not isinstance(payload, tuple) or len(payload) < 6:
-                return None
-            width, height, y_plane, uv_plane, stride_y, stride_uv = payload
-            w = int(width)
-            h = int(height)
-            if not isinstance(y_plane, np.ndarray) or not isinstance(uv_plane, np.ndarray):
-                return None
-            # Crop to logical frame, ignoring padded stride.
-            y = y_plane[:h, :w]
-            uv = uv_plane[: max(1, h // 2), :w]
-            # Downshift 10-bit P010 to 8-bit and pack as NV12.
-            y8 = (y >> 2).astype(np.uint8)
-            uv8 = (uv >> 2).astype(np.uint8)
-            yuv = np.empty((h + h // 2, w), dtype=np.uint8)
-            yuv[0:h, :] = y8
-            yuv[h:, :] = uv8
-            bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
-            return bgr
-        except Exception:
-            return None
-
     @QtCore.Slot()
     def on_save_preview_frame(self) -> None:
         """
-        Save a screenshot of the current preview.
-        - When HDR passthrough is enabled and a P010 frame is cached, use that
-          payload and convert to BGR from the HDR passthrough stream.
-        - Otherwise, fall back to the last SDR/tone-mapped preview QImage.
+        Save the last SDR/tone-mapped preview frame to disk.
+        This produces a BGR/8-bit image in the same domain the face embedder sees.
         """
-        qimg: Optional[QtGui.QImage] = None
-        # Prefer HDR passthrough payload if active.
-        if getattr(self, "_hdr_passthrough_enabled", False) and self._last_hdr_p010 is not None:
-            bgr = self._p010_to_bgr_for_snapshot(self._last_hdr_p010)
-            if bgr is not None:
-                try:
-                    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                    h, w, ch = rgb.shape
-                    qimg = QtGui.QImage(
-                        rgb.data,
-                        int(w),
-                        int(h),
-                        int(rgb.strides[0]),
-                        QtGui.QImage.Format.Format_RGB888,
-                    ).copy()
-                except Exception:
-                    qimg = None
-        # Fallback: SDR preview frame.
-        if qimg is None:
-            qimg = self._last_preview_qimage
-        if qimg is None:
+        img = self._last_preview_qimage
+        if img is None:
             QtWidgets.QMessageBox.warning(
                 self,
                 "No preview",
@@ -7667,7 +7736,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             if not fname:
                 return
-            qimg.save(fname)
+            img.save(fname)
             self.statusbar.showMessage(f"Saved preview frame to {fname}", 5000)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(
@@ -7695,12 +7764,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if not isinstance(y_plane, np.ndarray) or not isinstance(uv_plane, np.ndarray):
             return
-
-        # Cache latest HDR P010 payload for screenshots.
-        try:
-            self._last_hdr_p010 = (int(width), int(height), y_plane, uv_plane, int(stride_y), int(stride_uv))
-        except Exception:
-            self._last_hdr_p010 = None
 
         try:
             widget.init_hdr(int(width), int(height))
