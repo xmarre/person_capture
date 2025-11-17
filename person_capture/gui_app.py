@@ -2676,66 +2676,31 @@ class Processor(QtCore.QObject):
             # Ensure any previous preview reader is torn down before opening a new one.
             self._hdr_preview_close()
 
-            hdr_passthrough = bool(
-                getattr(cfg, "hdrpassthrough", getattr(cfg, "hdr_passthrough", False))
-            )
+            # Processing/cropping path: always HDR→SDR tone-mapped BGR (or OpenCV fallback).
             cap = None
 
             try:
-                if hdr_passthrough:
-                    # Apply GUI-selected FFmpeg hwaccel mode before opening the P010 reader.
-                    hwmode = (getattr(cfg, "ffhwaccel", "off") or "off").strip().lower()
-                    if hwmode != "off":
-                        os.environ["PC_HWACCEL"] = hwmode
-                        os.environ["PCHWACCELOUTFMT"] = hwmode
-                    else:
-                        os.environ.pop("PC_HWACCEL", None)
-                        os.environ.pop("PCHWACCELOUTFMT", None)
-
-                    # STRICT HDR passthrough: single P010 pipeline drives both preview and crops.
-                    logger.info(
-                        "Video open: HDR passthrough requested; using P010 reader for capture/crop"
-                    )
-                    cap = open_hdr_passthrough_reader(cfg.video)
-                    if cap is not None and getattr(cap, "isOpened", lambda: True)():
-                        self._status(
-                            f"HDR: passthrough mode ({hdr_reason})",
-                            key="hdr_state",
-                            interval=60.0,
-                        )
-                        hdr_active = True
-                        # expose the same reader to the preview side
-                        self._hdr_preview_reader = cap
-                        self._hdr_passthrough_active = True
-                    else:
-                        logger.warning(
-                            "HDR passthrough requested but P010 reader failed; falling back to tone-map reader"
-                        )
-                        hdr_passthrough = False
-                        self._hdr_passthrough_active = False
-
-                if not hdr_passthrough:
-                    # Normal HDR→SDR tone-mapped path for both preview and crops.
-                    cap = open_video_with_tonemap(cfg.video)
-                    if cap is not None:
-                        logger.info("Video open: HDR tone-map reader selected")
-                        self._status(f"HDR: active ({hdr_reason})", key="hdr_state", interval=60.0)
-                        hdr_active = True
-                    else:
-                        logger.info("Video open: OpenCV/FFmpeg reader selected")
-                        self._status(f"HDR: inactive ({hdr_reason})", key="hdr_state", interval=60.0)
-                        hdr_active = False
-                        os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
-                        cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
-                        try:
-                            cap.set(cv2.CAP_PROP_HW_ACCELERATION, 1)
-                        except Exception:
-                            pass
-                        if hasattr(cap, "isOpened") and not cap.isOpened():
-                            cap.release()
-                            cap = cv2.VideoCapture(cfg.video)
+                cap = open_video_with_tonemap(cfg.video)
+                if cap is not None:
+                    logger.info("Video open: HDR tone-map reader selected")
+                    self._status(f"HDR: active ({hdr_reason})", key="hdr_state", interval=60.0)
+                    hdr_active = True
+                else:
+                    logger.info("Video open: OpenCV/FFmpeg reader selected")
+                    self._status(f"HDR: inactive ({hdr_reason})", key="hdr_state", interval=60.0)
+                    hdr_active = False
+                    os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
+                    cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
+                    try:
+                        cap.set(cv2.CAP_PROP_HW_ACCELERATION, 1)
+                    except Exception:
+                        pass
+                    if hasattr(cap, "isOpened") and not cap.isOpened():
+                        cap.release()
+                        cap = cv2.VideoCapture(cfg.video)
             except Exception:
                 cap = cv2.VideoCapture(cfg.video)
+
             # Do not early-exit on “not opened” if this is a custom pipe or duck-types like one.
             def _pipe_like(obj) -> bool:
                 return hasattr(obj, "try_fallback_chain") or (hasattr(obj, "grab") and hasattr(obj, "retrieve"))
@@ -2761,20 +2726,48 @@ class Processor(QtCore.QObject):
                 key="hdr_gate",
                 interval=10.0,
             )
-            if want_hdr_passthrough and self._hdr_preview_reader is not None:
-                # Reuse the same P010 reader that is already driving capture/crops.
-                self._hdr_passthrough_active = True
-                self._hdr_preview_latest = None
-                try:
-                    pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
-                    self._hdr_preview_seek(pos)
-                except Exception:
-                    pass
-                self._status(
-                    "HDR passthrough preview: enabled (shared P010 reader)",
-                    key="hdr_passthrough",
-                    interval=30.0,
-                )
+            if want_hdr_passthrough:
+                if self._hdr_preview_reader is None:
+                    try:
+                        hwmode = (getattr(cfg, "ffhwaccel", "off") or "off").strip().lower()
+                        if hwmode != "off":
+                            os.environ["PC_HWACCEL"] = hwmode
+                            os.environ["PCHWACCELOUTFMT"] = hwmode
+                        else:
+                            os.environ.pop("PC_HWACCEL", None)
+                            os.environ.pop("PCHWACCELOUTFMT", None)
+
+                        logger.info(
+                            "HDR passthrough preview requested; opening P010 reader for preview"
+                        )
+                        preview_reader = open_hdr_passthrough_reader(cfg.video)
+                        if preview_reader is not None and getattr(
+                            preview_reader, "isOpened", lambda: True
+                        )():
+                            self._hdr_preview_reader = preview_reader
+                        else:
+                            logger.warning(
+                                "HDR passthrough preview requested but P010 reader failed"
+                            )
+                    except Exception:
+                        logger.exception("Failed to open HDR passthrough preview reader")
+
+                if self._hdr_preview_reader is not None:
+                    # Drive preview from a dedicated P010 reader.
+                    self._hdr_passthrough_active = True
+                    self._hdr_preview_latest = None
+                    try:
+                        pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+                        self._hdr_preview_seek(pos)
+                    except Exception:
+                        pass
+                    self._status(
+                        "HDR passthrough preview: enabled (P010 preview reader)",
+                        key="hdr_passthrough",
+                        interval=30.0,
+                    )
+                else:
+                    self._hdr_passthrough_active = False
             else:
                 self._hdr_passthrough_active = False
 
@@ -2815,7 +2808,7 @@ class Processor(QtCore.QObject):
                         try:
                             mode = getattr(c, "mode", "")
                             if mode == "p010_passthrough":
-                                # HDR passthrough: fr is a P010 payload; drive Vulkan widget via shared reader.
+                                # HDR passthrough: fr is a P010 payload; drive Vulkan widget via passthrough reader.
                                 self._pump_hdr_preview(reader=c)
                             else:
                                 # Tonemapped path: fr is BGR; show first SDR frame to prove the pipe is alive.
@@ -3425,23 +3418,10 @@ class Processor(QtCore.QObject):
                     frame_idx = current_idx + 1
                     self.progress.emit(current_idx)
                     continue
-                ret, frame_raw = cap.retrieve()
+                ret, frame = cap.retrieve()
                 if not ret:
                     break
                 self._pump_hdr_preview()
-
-                # Normalize to a BGR frame for all downstream processing.
-                # - SDR / tone-mapped path: frame_raw is already BGR.
-                # - HDR passthrough path: frame_raw is the P010 tuple; convert to BGR.
-                if isinstance(frame_raw, tuple):
-                    frame = self._p010_to_bgr_for_processing(frame_raw)
-                    if frame is None:
-                        # Failed to convert this frame; skip to the next one.
-                        frame_idx = current_idx + 1
-                        self.progress.emit(current_idx)
-                        continue
-                else:
-                    frame = frame_raw
 
                 H, W = frame.shape[:2]
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -5108,47 +5088,6 @@ class Processor(QtCore.QObject):
                     stride_uv = int(uv_plane.strides[0])
                     return w, h, y_plane, uv_plane, stride_y, stride_uv
         return None
-
-    def _p010_to_bgr_for_processing(self, payload: object) -> Optional[np.ndarray]:
-        """
-        Convert a P010 HDR passthrough payload into a BGR uint8 frame for
-        detection/cropping steps. Uses the normalized tuple
-        (width, height, yplane, uvplane, stride_y, stride_uv).
-        """
-        try:
-            normalized = self._normalize_hdr_preview_payload(payload)
-        except Exception:
-            normalized = None
-        if normalized is None:
-            return None
-
-        width, height, yplane, uvplane, stride_y, stride_uv = normalized
-        try:
-            # Ensure we only use the logical frame region; ignore any padded stride.
-            w = int(width)
-            h = int(height)
-            y = yplane[:h, :w]
-            uv = uvplane[: max(1, h // 2), :w]
-
-            # Downshift 10-bit P010 to 8-bit and pack as NV12 for OpenCV.
-            y8 = (y >> 2).astype(np.uint8)
-            uv8 = (uv >> 2).astype(np.uint8)
-
-            # OpenCV expects NV12 layout: [H x W] Y followed by [H/2 x W] interleaved UV.
-            yuv = np.empty((h + h // 2, w), dtype=np.uint8)
-            yuv[0:h, :] = y8
-            yuv[h:, :] = uv8
-
-            bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
-            return bgr
-        except Exception as exc:
-            # Do not crash the job on conversion failure; log and signal upstream.
-            self.status(
-                f"HDR P010→BGR conversion failed: {exc}",
-                key="hdr_proc_convert",
-                interval=10.0,
-            )
-            return None
 
     def _hdr_preview_seek(self, frame_idx: int, reader=None) -> None:
         if reader is None:
