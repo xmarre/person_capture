@@ -1210,8 +1210,6 @@ class FfmpegPipeReader:
         # --- Decoder hardware acceleration (optional) ---
         # Example: PC_HWACCEL=cuda  → use NVDEC for HEVC/H.264 and keep frames on GPU.
         self._hwaccel = (os.getenv("PC_HWACCEL") or "").strip().lower()
-        # Passthrough P010 reader uses a dedicated override to avoid colliding with the main pipe.
-        self.hwaccel = (os.getenv("PCHWACCEL") or self._hwaccel).strip().lower()
         # For cuda, "cuda" is the canonical hardware frame format.
         self._hwaccel_output_format = (
             os.getenv("PC_HWACCEL_OUT_FMT", "cuda").strip().lower()
@@ -2439,8 +2437,8 @@ class FfmpegPipeReader:
             ff_threads,
         ]
 
-        # Optional hardware decode (PCHWACCEL=cuda → NVDEC).
-        hwaccel = (getattr(self, "hwaccel", "") or "").strip().lower()
+        # Optional hardware decode (PC_HWACCEL=cuda → NVDEC).
+        hwaccel = (getattr(self, "_hwaccel", "") or "").strip().lower()
         if hwaccel and hwaccel != "off":
             cmd += ["-hwaccel", hwaccel]
         if t > 1e-6:
