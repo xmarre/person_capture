@@ -5322,6 +5322,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._keyframes: List[int] = []
         self._current_idx: int = 0
         self._last_preview_qimage: Optional[QtGui.QImage] = None
+        self._last_hdr_p010: Optional[tuple] = None
 
         self.cfg = SessionConfig()
         self._updating_refs = False
@@ -7641,14 +7642,63 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+    def _p010_to_bgr_for_snapshot(self, payload: object) -> Optional[np.ndarray]:
+        """
+        Convert a cached P010 HDR passthrough payload into a BGR uint8 frame
+        for saving a screenshot. Uses (width, height, y_plane, uv_plane,
+        stride_y, stride_uv) layout.
+        """
+        try:
+            if not isinstance(payload, tuple) or len(payload) < 6:
+                return None
+            width, height, y_plane, uv_plane, stride_y, stride_uv = payload
+            w = int(width)
+            h = int(height)
+            if not isinstance(y_plane, np.ndarray) or not isinstance(uv_plane, np.ndarray):
+                return None
+            # Crop to logical frame, ignoring padded stride.
+            y = y_plane[:h, :w]
+            uv = uv_plane[: max(1, h // 2), :w]
+            # Downshift 10-bit P010 to 8-bit and pack as NV12.
+            y8 = (y >> 2).astype(np.uint8)
+            uv8 = (uv >> 2).astype(np.uint8)
+            yuv = np.empty((h + h // 2, w), dtype=np.uint8)
+            yuv[0:h, :] = y8
+            yuv[h:, :] = uv8
+            bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
+            return bgr
+        except Exception:
+            return None
+
     @QtCore.Slot()
     def on_save_preview_frame(self) -> None:
         """
-        Save the last SDR/tone-mapped preview frame to disk.
-        This produces a BGR/8-bit image in the same domain the face embedder sees.
+        Save a screenshot of the current preview.
+        - When HDR passthrough is enabled and a P010 frame is cached, use that
+          payload and convert to BGR from the HDR passthrough stream.
+        - Otherwise, fall back to the last SDR/tone-mapped preview QImage.
         """
-        img = self._last_preview_qimage
-        if img is None:
+        qimg: Optional[QtGui.QImage] = None
+        # Prefer HDR passthrough payload if active.
+        if getattr(self, "_hdr_passthrough_enabled", False) and self._last_hdr_p010 is not None:
+            bgr = self._p010_to_bgr_for_snapshot(self._last_hdr_p010)
+            if bgr is not None:
+                try:
+                    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                    h, w, ch = rgb.shape
+                    qimg = QtGui.QImage(
+                        rgb.data,
+                        int(w),
+                        int(h),
+                        int(rgb.strides[0]),
+                        QtGui.QImage.Format.Format_RGB888,
+                    ).copy()
+                except Exception:
+                    qimg = None
+        # Fallback: SDR preview frame.
+        if qimg is None:
+            qimg = self._last_preview_qimage
+        if qimg is None:
             QtWidgets.QMessageBox.warning(
                 self,
                 "No preview",
@@ -7678,7 +7728,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             if not fname:
                 return
-            img.save(fname)
+            qimg.save(fname)
             self.statusbar.showMessage(f"Saved preview frame to {fname}", 5000)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(
@@ -7706,6 +7756,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if not isinstance(y_plane, np.ndarray) or not isinstance(uv_plane, np.ndarray):
             return
+
+        # Cache latest HDR P010 payload for screenshots.
+        try:
+            self._last_hdr_p010 = (int(width), int(height), y_plane, uv_plane, int(stride_y), int(stride_uv))
+        except Exception:
+            self._last_hdr_p010 = None
 
         try:
             widget.init_hdr(int(width), int(height))
