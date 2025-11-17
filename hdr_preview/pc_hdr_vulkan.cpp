@@ -684,31 +684,13 @@ static void createPipeline(pc_hdr_context* ctx) {
     ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
-    // Aspect-correct viewport: letterbox/pillarbox video inside swapchainExtent.
-    float videoAspect = (float)ctx->videoWidth / (float)ctx->videoHeight;
-    float outAspect   = (float)ctx->swapchainExtent.width / (float)ctx->swapchainExtent.height;
-
     VkViewport viewport{};
+    viewport.x        = 0.0f;
+    viewport.y        = 0.0f;
+    viewport.width    = (float)ctx->swapchainExtent.width;
+    viewport.height   = (float)ctx->swapchainExtent.height;
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
-
-    if (outAspect > videoAspect) {
-        // Swapchain wider than video: pillarbox left/right.
-        float newWidth = (float)ctx->swapchainExtent.height * videoAspect;
-        float xOffset  = ((float)ctx->swapchainExtent.width - newWidth) * 0.5f;
-        viewport.x      = xOffset;
-        viewport.y      = 0.0f;
-        viewport.width  = newWidth;
-        viewport.height = (float)ctx->swapchainExtent.height;
-    } else {
-        // Swapchain taller than video (or equal): letterbox top/bottom.
-        float newHeight = (float)ctx->swapchainExtent.width / videoAspect;
-        float yOffset   = ((float)ctx->swapchainExtent.height - newHeight) * 0.5f;
-        viewport.x      = 0.0f;
-        viewport.y      = yOffset;
-        viewport.width  = (float)ctx->swapchainExtent.width;
-        viewport.height = newHeight;
-    }
 
     VkRect2D scissor{};
     scissor.offset = {0, 0};
