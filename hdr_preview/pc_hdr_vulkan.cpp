@@ -1024,41 +1024,60 @@ vec3 yuv_to_rgb_bt2020(float Y, float Cb, float Cr) {
 
 void main() {
     float videoAspect = float(pc.videoWidth) / float(pc.videoHeight);
-    float outAspect   = float(pc.outWidth) / float(pc.outHeight);
+    float outAspect   = float(pc.outWidth)  / float(pc.outHeight);
 
     vec2 uv = vUV;
 
     if (outAspect > videoAspect) {
+        // Window wider than video: pillarbox left/right.
         float scale = videoAspect / outAspect;
         uv.x = (uv.x - 0.5) / scale + 0.5;
     } else if (outAspect < videoAspect) {
+        // Window taller than video: letterbox top/bottom.
         float scale = outAspect / videoAspect;
         uv.y = (uv.y - 0.5) / scale + 0.5;
     }
 
+    // Outside the video area: draw black bars.
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
         outColor = vec4(0.0, 0.0, 0.0, 1.0);
         return;
     }
 
     ivec2 coord = ivec2(uv * vec2(pc.videoWidth, pc.videoHeight));
-    coord = clamp(coord, ivec2(0), ivec2(pc.videoWidth - 1, pc.videoHeight - 1));
+    coord = clamp(
+        coord,
+        ivec2(0),
+        ivec2(pc.videoWidth - 1, pc.videoHeight - 1)
+    );
 
-    int idxY = coord.y * pc.videoWidth + coord.x;
+    int idxY  = coord.y * pc.videoWidth + coord.x;
     int idxUV = (coord.y / 2) * (pc.videoWidth / 2) + (coord.x / 2);
 
     uint yRaw = yData[idxY];
     uint uvRaw = uvData[idxUV];
 
-    float Y = float(yRaw & 0xFFFFu) / 65535.0; // PQ-coded luma, normalized
-    uint uRaw = (uvRaw >> 16) & 0xFFFFu;
-    uint vRaw = uvRaw & 0xFFFFu;
+    // P010: 10-bit code in the upper bits of a 16-bit word.
+    uint y10 = (yRaw & 0xFFFFu) >> 6;
 
-    float Cb = float(uRaw) / 65535.0 - 0.5;
-    float Cr = float(vRaw) / 65535.0 - 0.5;
+    // Map HDR10 limited range [64, 940] in 10-bit to [0, 1] PQ code.
+    float Ycode = float(y10);
+    float Yp = clamp((Ycode - 64.0) / (940.0 - 64.0), 0.0, 1.0);
 
-    vec3 rgb = yuv_to_rgb_bt2020(Y, Cb, Cr);
-    outColor = vec4(rgb, 1.0);
+    // Chroma: also 10-bit codes in upper bits of 16-bit.
+    uint u16 = (uvRaw >> 16) & 0xFFFFu;
+    uint v16 =  uvRaw        & 0xFFFFu;
+    uint u10 = u16 >> 6;
+    uint v10 = v16 >> 6;
+
+    // Normalize HDR10 chroma around 0.
+    float Cb = (float(u10) - 512.0) / 896.0;
+    float Cr = (float(v10) - 512.0) / 896.0;
+
+    vec3 rgbPQ = yuv_to_rgb_bt2020(Yp, Cb, Cr);
+    rgbPQ = clamp(rgbPQ, vec3(0.0), vec3(1.0));
+
+    outColor = vec4(rgbPQ, 1.0);
 }
 */
 
