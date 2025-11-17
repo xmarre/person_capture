@@ -7656,7 +7656,20 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
         try:
-            outdir = self.cfg.outdir or os.getcwd()
+            # Be robust against older SessionConfig versions that do not expose outdir.
+            outdir = ""
+            try:
+                outdir = getattr(self.cfg, "outdir", "") or ""
+            except Exception:
+                outdir = ""
+            if not outdir:
+                try:
+                    outdir = self.outedit.text().strip()
+                except Exception:
+                    outdir = ""
+            if not outdir:
+                outdir = os.getcwd()
+
             fname, _ = QtWidgets.QFileDialog.getSaveFileName(
                 self,
                 "Save preview frame",
