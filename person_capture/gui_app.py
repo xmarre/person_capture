@@ -710,9 +710,7 @@ class Processor(QtCore.QObject):
                 preview_step = max(stride, int(getattr(cfg, "preview_every", 3)))
                 last_preview_idx = -preview_step
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                # During prescan, do not drive the HDR passthrough reader.
-                # This avoids spawning a second ffmpeg decode path.
-                # self._hdr_preview_seek(0)
+                self._hdr_preview_seek(0)
                 processed_samples = 0
                 fd9_streak = 0
                 fd9_skip_samples = 0
@@ -907,10 +905,7 @@ class Processor(QtCore.QObject):
                     if not ok or frame is None:
                         i += 1
                         continue
-                    # Skip HDR passthrough pumping during prescan; otherwise we
-                    # decode the video a second time in parallel. Interactive
-                    # playback still keeps HDR preview live.
-                    # self._pump_hdr_preview()
+                    self._pump_hdr_preview()
                     idx = i
                     sample_idx = processed_samples
                     processed_samples += 1
@@ -2751,14 +2746,14 @@ class Processor(QtCore.QObject):
                 if hwmode != "off":
                     # Match FfmpegPipeReader env expectations; CUDA example:
                     #   set PC_HWACCEL=cuda
-                    #   set PC_HWACCEL_OUT_FMT=cuda
+                    #   set PCHWACCELOUTFMT=cuda
                     os.environ["PC_HWACCEL"] = hwmode
-                    # For libplacebo/zscale paths this controls the GPU frame format.
-                    os.environ["PC_HWACCEL_OUT_FMT"] = hwmode
+                    # For now, use the same symbol for output format (e.g. "cuda").
+                    os.environ["PCHWACCELOUTFMT"] = hwmode
                 else:
                     # Explicitly clear to force pure CPU decode when user selects CPU.
                     os.environ.pop("PC_HWACCEL", None)
-                    os.environ.pop("PC_HWACCEL_OUT_FMT", None)
+                    os.environ.pop("PCHWACCELOUTFMT", None)
 
                 # STRICT HDR mode: do not open tone-mapped HDR preview readers here.
                 reader = open_hdr_passthrough_reader(cfg.video)
