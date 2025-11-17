@@ -2805,16 +2805,21 @@ class Processor(QtCore.QObject):
                                         ok, fr = retrieve()
                                         if ok:
                                             break
-                                        self._hdr_preview_skip(1)
+                                    self._hdr_preview_skip(1)
                                 except Exception:
                                     break
                                 time.sleep(0.05)
-                    if ok and fr is not None and getattr(fr, "size", 0):
+
+                    if ok and fr is not None:
                         ok_any = True
-                        # show first frame immediately so UI proves the pipeline is alive
                         try:
-                            self._pump_hdr_preview()
-                            self._emit_preview_bgr(fr)
+                            mode = getattr(c, "mode", "")
+                            if mode == "p010_passthrough":
+                                # HDR passthrough: fr is a P010 payload; drive Vulkan widget via shared reader.
+                                self._pump_hdr_preview(reader=c)
+                            else:
+                                # Tonemapped path: fr is BGR; show first SDR frame to prove the pipe is alive.
+                                self._emit_preview_bgr(fr)
                         except Exception:
                             pass
                         break
