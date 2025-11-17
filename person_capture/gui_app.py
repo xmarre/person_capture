@@ -5321,6 +5321,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._total_frames: Optional[int] = None
         self._keyframes: List[int] = []
         self._current_idx: int = 0
+        self._last_preview_qimage: Optional[QtGui.QImage] = None
 
         self.cfg = SessionConfig()
         self._updating_refs = False
@@ -5335,6 +5336,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_ui()
         self._load_qsettings()
         self.statusbar = self.statusBar()
+        # --- Preview screenshot button ---
+        try:
+            toolbar = self.addToolBar("Preview")
+            toolbar.setObjectName("previewToolbar")
+            act_ss = QtGui.QAction("Save preview frame", self)
+            act_ss.triggered.connect(self.on_save_preview_frame)
+            toolbar.addAction(act_ss)
+        except Exception:
+            pass
         # --- Updater wiring ---
         self.updater = UpdateManager(APP_NAME) if "UpdateManager" in globals() and UpdateManager is not None else None
         self._last_update_compare_url: Optional[str] = None
@@ -7611,8 +7621,14 @@ class MainWindow(QtWidgets.QMainWindow):
             )
 
         if img is None:
+            self._last_preview_qimage = None
             self.preview_label.clear()
             return
+
+        try:
+            self._last_preview_qimage = img.copy()
+        except Exception:
+            self._last_preview_qimage = None
 
         _update_label(img)
 
@@ -7624,6 +7640,39 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.preview_stack.setCurrentIndex(0)
             except Exception:
                 pass
+
+    @QtCore.Slot()
+    def on_save_preview_frame(self) -> None:
+        """
+        Save the last SDR/tone-mapped preview frame to disk.
+        This produces a BGR/8-bit image in the same domain the face embedder sees.
+        """
+        img = self._last_preview_qimage
+        if img is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "No preview",
+                "No preview frame available to save.",
+            )
+            return
+        try:
+            outdir = self.cfg.outdir or os.getcwd()
+            fname, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Save preview frame",
+                os.path.join(outdir, "preview_ref.jpg"),
+                "JPEG image (*.jpg);;PNG image (*.png);;All files (*)",
+            )
+            if not fname:
+                return
+            img.save(fname)
+            self.statusbar.showMessage(f"Saved preview frame to {fname}", 5000)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Save failed",
+                f"Could not save preview frame:\n{exc}",
+            )
 
     @QtCore.Slot(object)
     def _on_hdr_preview_p010(self, frame: object) -> None:
