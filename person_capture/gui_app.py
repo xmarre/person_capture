@@ -2725,7 +2725,8 @@ class Processor(QtCore.QObject):
                 pass
 
             self._hdr_preview_close()
-            cfg_hdr_passthrough = bool(getattr(cfg, "hdr_passthrough", False))
+            # Default: HDR passthrough ON when available unless explicitly disabled in cfg.
+            cfg_hdr_passthrough = bool(getattr(cfg, "hdrpassthrough", True))
             want_hdr_passthrough = (
                 hdr_active
                 and cfg_hdr_passthrough
@@ -2739,6 +2740,21 @@ class Processor(QtCore.QObject):
                 interval=10.0,
             )
             if want_hdr_passthrough:
+                # Apply GUI-selected FFmpeg hwaccel mode to the HDR passthrough P010 reader.
+                # This uses the same setting as the main HDR tone-map pipe (CPU / CUDA, etc.).
+                hwmode = (getattr(cfg, "ffhwaccel", "off") or "off").strip().lower()
+                if hwmode != "off":
+                    # Match FfmpegPipeReader env expectations; CUDA example:
+                    #   set PC_HWACCEL=cuda
+                    #   set PCHWACCELOUTFMT=cuda
+                    os.environ["PC_HWACCEL"] = hwmode
+                    # For now, use the same symbol for output format (e.g. "cuda").
+                    os.environ["PCHWACCELOUTFMT"] = hwmode
+                else:
+                    # Explicitly clear to force pure CPU decode when user selects CPU.
+                    os.environ.pop("PC_HWACCEL", None)
+                    os.environ.pop("PCHWACCELOUTFMT", None)
+
                 # STRICT HDR mode: do not open tone-mapped HDR preview readers here.
                 reader = open_hdr_passthrough_reader(cfg.video)
                 if reader is not None:
