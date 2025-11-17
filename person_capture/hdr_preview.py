@@ -151,6 +151,14 @@ class HDRPreviewWidget(QtWidgets.QWidget):
             _log.error("HDR: _pc_hdr_init missing despite hdr_passthrough_available()")
             return
 
+        _log.info(
+            "HDR: init ctx with video=%dx%d, widget=%dx%d",
+            self._frame_w,
+            self._frame_h,
+            self.width(),
+            self.height(),
+        )
+
         ctx = _pc_hdr_init(hwnd_c, self._frame_w, self._frame_h)
         if not ctx:
             _log.error(
@@ -284,7 +292,9 @@ class HDRPreviewWidget(QtWidgets.QWidget):
     def resizeEvent(self, ev: QtGui.QResizeEvent) -> None:
         super().resizeEvent(ev)
         if self._ctx and _pc_hdr_resize is not None:
-            _pc_hdr_resize(self._ctx, self.width(), self.height())
+            w = max(1, self.width())
+            h = max(1, self.height())
+            _pc_hdr_resize(self._ctx, w, h)
 
     def closeEvent(self, ev: QtGui.QCloseEvent) -> None:
         if self._ctx and _pc_hdr_shutdown is not None:
