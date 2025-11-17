@@ -307,6 +307,7 @@ class SessionConfig:
     min_box_pixels: int = 8000
     auto_crop_borders: bool = True
     hdr_passthrough: bool = False  # Vulkan HDR path + no tone-map reader
+    hdr_crop_format: str = "mkv"   # mkv (FFV1 lossless) | avif (AV1 lossless)
     log_interval_sec: float = 1.0
     lock_after_hits: int = 1
     lock_face_thresh: float = 0.28
@@ -3935,7 +3936,9 @@ class Processor(QtCore.QObject):
                     crop_img_path = os.path.join(crops_dir, f"f{idx:08d}.jpg")
                     hdr_out_path = None
                     if self._hdr_passthrough_active and hdr_crops_dir:
-                        hdr_out_path = os.path.join(hdr_crops_dir, f"f{idx:08d}.mkv")
+                        hdr_fmt = str(getattr(self.cfg, "hdr_crop_format", "mkv") or "mkv").lower()
+                        hdr_ext = ".avif" if hdr_fmt == "avif" else ".mkv"
+                        hdr_out_path = os.path.join(hdr_crops_dir, f"f{idx:08d}{hdr_ext}")
                     # Start from candidate box in GLOBAL coords
                     gx1, gy1, gx2, gy2 = c["box"]
                     ratio_str = str(
@@ -5119,6 +5122,7 @@ class Processor(QtCore.QObject):
             seek_sec = max(0.0, float(frame_idx) / fps)
 
         is_avif = out_path.lower().endswith(".avif")
+
         cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error"]
         if seek_sec is not None:
             cmd += ["-ss", f"{seek_sec:.6f}"]
@@ -5133,24 +5137,28 @@ class Processor(QtCore.QObject):
             "1",
         ]
         if is_avif:
+            # 10-bit HDR AVIF (PQ, BT.2020), encoded as a *lossless* AV1 still picture.
             cmd += [
-                "-c:v",
-                "libaom-av1",
-                "-pix_fmt",
-                "yuv420p10le",
-                "-color_range",
-                "1",
-                "-colorspace",
-                "bt2020nc",
-                "-color_primaries",
-                "bt2020",
-                "-color_trc",
-                "smpte2084",
+                "-c:v", "libaom-av1",
+                "-still-picture", "1",
+                "-lossless", "1",
+                "-pix_fmt", "yuv420p10le",
+                "-color_range", "1",
+                "-colorspace", "bt2020nc",
+                "-color_primaries", "bt2020",
+                "-color_trc", "smpte2084",
             ]
         else:
+            # Lossless 10-bit HDR in Matroska via FFV1.
+            # Decoded pixels in the crop match the original decode bit-for-bit.
             if not out_path.lower().endswith(".mkv"):
                 cmd += ["-f", "matroska"]
-            cmd += ["-pix_fmt", "p010le"]
+            cmd += [
+                "-c:v", "ffv1",
+                "-level", "3",
+                "-g", "1",
+                "-pix_fmt", "yuv420p10le",
+            ]
         cmd.append(out_path)
 
         try:
@@ -5532,6 +5540,12 @@ class MainWindow(QtWidgets.QMainWindow):
         _hw_idx = self.hwaccel_combo.findData(_hw_mode)
         self.hwaccel_combo.setCurrentIndex(_hw_idx if _hw_idx >= 0 else 0)
         self.hwaccel_combo.currentIndexChanged.connect(self._on_ui_change)
+        self.hdr_crop_format_combo = QtWidgets.QComboBox()
+        self.hdr_crop_format_combo.addItems(["mkv", "avif"])
+        _hdr_fmt = str(getattr(self.cfg, "hdr_crop_format", "mkv") or "mkv").lower()
+        _hdr_fmt_idx = self.hdr_crop_format_combo.findText(_hdr_fmt)
+        self.hdr_crop_format_combo.setCurrentIndex(_hdr_fmt_idx if _hdr_fmt_idx >= 0 else 0)
+        self.hdr_crop_format_combo.currentIndexChanged.connect(self._on_ui_change)
         self.stride_spin = QtWidgets.QSpinBox(); self.stride_spin.setRange(1, 1000); self.stride_spin.setValue(2)
         self.det_conf_spin = QtWidgets.QDoubleSpinBox(); self.det_conf_spin.setDecimals(3); self.det_conf_spin.setRange(0.0, 1.0); self.det_conf_spin.setSingleStep(0.01); self.det_conf_spin.setValue(0.35)
         self.face_thr_spin = QtWidgets.QDoubleSpinBox(); self.face_thr_spin.setDecimals(3); self.face_thr_spin.setRange(0.0, 2.0); self.face_thr_spin.setSingleStep(0.01); self.face_thr_spin.setValue(0.45)
@@ -5958,6 +5972,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Tonemap Mobius param", self.tm_param_spin),
             ("Tonemap backend", self.tonemap_pref_combo),
             ("FFmpeg hardware decode", self.hwaccel_combo),
+            ("HDR crop format", self.hdr_crop_format_combo),
             ("Frame stride", self.stride_spin),
             ("YOLO min conf", self.det_conf_spin),
             ("Face max dist", self.face_thr_spin),
@@ -7261,6 +7276,10 @@ class MainWindow(QtWidgets.QMainWindow):
             and self.chk_hdr_passthrough.isEnabled()
             and self.chk_hdr_passthrough.isChecked()
         )
+        try:
+            cfg.hdr_crop_format = self.hdr_crop_format_combo.currentText().lower()
+        except Exception:
+            cfg.hdr_crop_format = "mkv"
         return cfg
 
     def _apply_cfg(self, cfg: SessionConfig):
@@ -7323,6 +7342,13 @@ class MainWindow(QtWidgets.QMainWindow):
             fallback_idx = self.hwaccel_combo.findData("off")
             self.hwaccel_combo.setCurrentIndex(fallback_idx if fallback_idx >= 0 else 0)
         self.cfg.ff_hwaccel = self.hwaccel_combo.currentData() or "off"
+        fmt = str(getattr(cfg, "hdr_crop_format", "mkv") or "mkv").lower()
+        fmt_idx = self.hdr_crop_format_combo.findText(fmt)
+        if fmt_idx >= 0:
+            self.hdr_crop_format_combo.setCurrentIndex(fmt_idx)
+        else:
+            self.hdr_crop_format_combo.setCurrentIndex(0)
+        self.cfg.hdr_crop_format = self.hdr_crop_format_combo.currentText().lower()
         self.stride_spin.setValue(cfg.frame_stride)
         self.det_conf_spin.setValue(cfg.min_det_conf)
         self.face_thr_spin.setValue(cfg.face_thresh)
@@ -8062,6 +8088,13 @@ class MainWindow(QtWidgets.QMainWindow):
             fallback_idx = self.hwaccel_combo.findData("off")
             self.hwaccel_combo.setCurrentIndex(fallback_idx if fallback_idx >= 0 else 0)
         self.cfg.ff_hwaccel = self.hwaccel_combo.currentData() or "off"
+        fmt = str(s.value("hdr_crop_format", self.cfg.hdr_crop_format)).lower()
+        fmt_idx = self.hdr_crop_format_combo.findText(fmt)
+        if fmt_idx >= 0:
+            self.hdr_crop_format_combo.setCurrentIndex(fmt_idx)
+        else:
+            self.hdr_crop_format_combo.setCurrentIndex(0)
+        self.cfg.hdr_crop_format = self.hdr_crop_format_combo.currentText().lower()
         self.cfg.seek_fast = s.value("seek_fast", True, type=bool)
         try:
             self.cfg.seek_max_grabs = int(s.value("seek_max_grabs", 12))
