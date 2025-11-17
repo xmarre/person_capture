@@ -3429,7 +3429,19 @@ class Processor(QtCore.QObject):
                 if not ret:
                     break
                 self._pump_hdr_preview()
-                H, W = frame.shape[:2]
+
+                # cap can be either a BGR reader or the P010 passthrough reader.
+                # In P010 mode, frame is (w, h, yplane, uvplane, stride_y, stride_uv).
+                if isinstance(frame, tuple):
+                    try:
+                        W = int(frame[0])
+                        H = int(frame[1])
+                    except Exception:
+                        raise RuntimeError(
+                            f"HDR P010 frame has unexpected layout: {type(frame)}"
+                        )
+                else:
+                    H, W = frame.shape[:2]
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
                 
