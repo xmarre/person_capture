@@ -2648,6 +2648,7 @@ class Processor(QtCore.QObject):
 
             # Video
             hdr_active = False
+            # --- Video / HDR setup ---
             # Apply HDR tonemap env overrides from cfg (GUI always supplies defaults)
             try:
                 os.environ["PC_SDR_NITS"] = str(float(getattr(cfg, "sdr_nits", 125.0)))
@@ -2672,27 +2673,49 @@ class Processor(QtCore.QObject):
             except Exception:
                 hdr_reason = "unknown"
 
-            hdr_passthrough = bool(getattr(cfg, "hdr_passthrough", False))
+            # Ensure any previous preview reader is torn down before opening a new one.
+            self._hdr_preview_close()
+
+            hdr_passthrough = bool(
+                getattr(cfg, "hdrpassthrough", getattr(cfg, "hdr_passthrough", False))
+            )
+            cap = None
 
             try:
                 if hdr_passthrough:
-                    logger.info("Video open: HDR passthrough requested; skipping tone-map reader")
-                    self._status(
-                        f"HDR: passthrough mode ({hdr_reason})",
-                        key="hdr_state",
-                        interval=60.0,
+                    # Apply GUI-selected FFmpeg hwaccel mode before opening the P010 reader.
+                    hwmode = (getattr(cfg, "ffhwaccel", "off") or "off").strip().lower()
+                    if hwmode != "off":
+                        os.environ["PC_HWACCEL"] = hwmode
+                        os.environ["PCHWACCELOUTFMT"] = hwmode
+                    else:
+                        os.environ.pop("PC_HWACCEL", None)
+                        os.environ.pop("PCHWACCELOUTFMT", None)
+
+                    # STRICT HDR passthrough: single P010 pipeline drives both preview and crops.
+                    logger.info(
+                        "Video open: HDR passthrough requested; using P010 reader for capture/crop"
                     )
-                    hdr_active = True
-                    os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
-                    cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
-                    try:
-                        cap.set(cv2.CAP_PROP_HW_ACCELERATION, 1)
-                    except Exception:
-                        pass
-                    if hasattr(cap, "isOpened") and not cap.isOpened():
-                        cap.release()
-                        cap = cv2.VideoCapture(cfg.video)
-                else:
+                    cap = open_hdr_passthrough_reader(cfg.video)
+                    if cap is not None and getattr(cap, "isOpened", lambda: True)():
+                        self._status(
+                            f"HDR: passthrough mode ({hdr_reason})",
+                            key="hdr_state",
+                            interval=60.0,
+                        )
+                        hdr_active = True
+                        # expose the same reader to the preview side
+                        self._hdr_preview_reader = cap
+                        self._hdr_passthrough_active = True
+                    else:
+                        logger.warning(
+                            "HDR passthrough requested but P010 reader failed; falling back to tone-map reader"
+                        )
+                        hdr_passthrough = False
+                        self._hdr_passthrough_active = False
+
+                if not hdr_passthrough:
+                    # Normal HDR→SDR tone-mapped path for both preview and crops.
                     cap = open_video_with_tonemap(cfg.video)
                     if cap is not None:
                         logger.info("Video open: HDR tone-map reader selected")
@@ -2724,7 +2747,6 @@ class Processor(QtCore.QObject):
             except Exception:
                 pass
 
-            self._hdr_preview_close()
             # Default: HDR passthrough ON when available unless explicitly disabled in cfg.
             cfg_hdr_passthrough = bool(getattr(cfg, "hdrpassthrough", True))
             want_hdr_passthrough = (
@@ -2739,47 +2761,20 @@ class Processor(QtCore.QObject):
                 key="hdr_gate",
                 interval=10.0,
             )
-            if want_hdr_passthrough:
-                # Apply GUI-selected FFmpeg hwaccel mode to the HDR passthrough P010 reader.
-                # This uses the same setting as the main HDR tone-map pipe (CPU / CUDA, etc.).
-                hwmode = (getattr(cfg, "ffhwaccel", "off") or "off").strip().lower()
-                if hwmode != "off":
-                    # Match FfmpegPipeReader env expectations; CUDA example:
-                    #   set PC_HWACCEL=cuda
-                    #   set PCHWACCELOUTFMT=cuda
-                    os.environ["PC_HWACCEL"] = hwmode
-                    # For now, use the same symbol for output format (e.g. "cuda").
-                    os.environ["PCHWACCELOUTFMT"] = hwmode
-                else:
-                    # Explicitly clear to force pure CPU decode when user selects CPU.
-                    os.environ.pop("PC_HWACCEL", None)
-                    os.environ.pop("PCHWACCELOUTFMT", None)
-
-                # STRICT HDR mode: do not open tone-mapped HDR preview readers here.
-                reader = open_hdr_passthrough_reader(cfg.video)
-                if reader is not None:
-                    self._hdr_preview_reader = reader
-                    self._hdr_passthrough_active = True
-                    self._hdr_preview_latest = None
-                    try:
-                        pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
-                        self._hdr_preview_seek(pos)
-                    except Exception:
-                        pass
-                    self._status(
-                        "HDR passthrough preview: enabled (no SDR fallback)",
-                        key="hdr_passthrough",
-                        interval=30.0,
-                    )
-                else:
-                    # Passthrough was requested but the reader could not be opened.
-                    # Do not silently fall back to the tone-mapped HDR preview in this path.
-                    self._hdr_passthrough_active = False
-                    self._status(
-                        "HDR passthrough requested but reader open failed; preview disabled until passthrough is turned off",
-                        key="hdr_passthrough",
-                        interval=30.0,
-                    )
+            if want_hdr_passthrough and self._hdr_preview_reader is not None:
+                # Reuse the same P010 reader that is already driving capture/crops.
+                self._hdr_passthrough_active = True
+                self._hdr_preview_latest = None
+                try:
+                    pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+                    self._hdr_preview_seek(pos)
+                except Exception:
+                    pass
+                self._status(
+                    "HDR passthrough preview: enabled (shared P010 reader)",
+                    key="hdr_passthrough",
+                    interval=30.0,
+                )
             else:
                 self._hdr_passthrough_active = False
 
