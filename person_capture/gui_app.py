@@ -2750,15 +2750,15 @@ class Processor(QtCore.QObject):
                 hwmode = (getattr(cfg, "ffhwaccel", "off") or "off").strip().lower()
                 if hwmode != "off":
                     # Match FfmpegPipeReader env expectations; CUDA example:
-                    #   set PCHWACCEL=cuda
-                    #   set PCHWACCELOUTFMT=cuda
-                    os.environ["PCHWACCEL"] = hwmode
+                    #   set PC_HWACCEL=cuda
+                    #   set PC_HWACCEL_OUT_FMT=cuda
+                    os.environ["PC_HWACCEL"] = hwmode
                     # For libplacebo/zscale paths this controls the GPU frame format.
-                    os.environ["PCHWACCELOUTFMT"] = hwmode
+                    os.environ["PC_HWACCEL_OUT_FMT"] = hwmode
                 else:
                     # Explicitly clear to force pure CPU decode when user selects CPU.
-                    os.environ.pop("PCHWACCEL", None)
-                    os.environ.pop("PCHWACCELOUTFMT", None)
+                    os.environ.pop("PC_HWACCEL", None)
+                    os.environ.pop("PC_HWACCEL_OUT_FMT", None)
 
                 # STRICT HDR mode: do not open tone-mapped HDR preview readers here.
                 reader = open_hdr_passthrough_reader(cfg.video)
