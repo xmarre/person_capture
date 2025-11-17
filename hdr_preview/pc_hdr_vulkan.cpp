@@ -649,6 +649,54 @@ static void savePipelineCache(pc_hdr_context* ctx) {
     }
 }
 
+static void chooseViewportForVideoAspect(pc_hdr_context* ctx,
+                                         VkViewport& viewport,
+                                         VkRect2D& scissor) {
+    float videoAspect =
+        ctx->videoHeight > 0
+        ? static_cast<float>(ctx->videoWidth) / static_cast<float>(ctx->videoHeight)
+        : 1.0f;
+
+    float swapAspect =
+        ctx->swapchainExtent.height > 0
+        ? static_cast<float>(ctx->swapchainExtent.width) /
+              static_cast<float>(ctx->swapchainExtent.height)
+        : 1.0f;
+
+    float vpWidth = static_cast<float>(ctx->swapchainExtent.width);
+    float vpHeight = static_cast<float>(ctx->swapchainExtent.height);
+    float vpX = 0.0f;
+    float vpY = 0.0f;
+
+    if (swapAspect > videoAspect) {
+        // Window is wider than the video: pillarbox
+        vpHeight = static_cast<float>(ctx->swapchainExtent.height);
+        vpWidth = vpHeight * videoAspect;
+        vpX = 0.5f * (static_cast<float>(ctx->swapchainExtent.width) - vpWidth);
+        vpY = 0.0f;
+    } else if (swapAspect < videoAspect) {
+        // Window is taller than the video: letterbox
+        vpWidth = static_cast<float>(ctx->swapchainExtent.width);
+        vpHeight = vpWidth / videoAspect;
+        vpX = 0.0f;
+        vpY = 0.5f * (static_cast<float>(ctx->swapchainExtent.height) - vpHeight);
+    }
+
+    viewport.x = vpX;
+    viewport.y = vpY;
+    viewport.width = vpWidth;
+    viewport.height = vpHeight;
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+
+    scissor.offset.x = static_cast<int32_t>(std::max(0.0f, vpX));
+    scissor.offset.y = static_cast<int32_t>(std::max(0.0f, vpY));
+    scissor.extent.width = static_cast<uint32_t>(
+        std::min(vpWidth, static_cast<float>(ctx->swapchainExtent.width) - vpX));
+    scissor.extent.height = static_cast<uint32_t>(
+        std::min(vpHeight, static_cast<float>(ctx->swapchainExtent.height) - vpY));
+}
+
 // Graphics pipeline
 static void createPipeline(pc_hdr_context* ctx) {
     createPipelineCache(ctx);
@@ -681,16 +729,9 @@ static void createPipeline(pc_hdr_context* ctx) {
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
     VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width  = (float)ctx->swapchainExtent.width;
-    viewport.height = (float)ctx->swapchainExtent.height;
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-
     VkRect2D scissor{};
-    scissor.offset = {0, 0};
-    scissor.extent = ctx->swapchainExtent;
+
+    chooseViewportForVideoAspect(ctx, viewport, scissor);
 
     VkPipelineViewportStateCreateInfo vp{};
     vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
@@ -1049,6 +1090,19 @@ pc_hdr_context* pc_hdr_init(HWND hwnd, int width, int height) {
         ctx->videoHeight = height;
         ctx->pushConstants.width = width;
         ctx->pushConstants.height = height;
+
+        // Derive the initial widget dimensions from the window's client area to
+        // avoid creating a zero-sized swapchain when the window is not yet
+        // fully realized. If the client rect is empty, fall back to the video
+        // size passed by the caller.
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        int widgetW = rc.right - rc.left;
+        int widgetH = rc.bottom - rc.top;
+        if (widgetW <= 0 || widgetH <= 0) {
+            widgetW = width;
+            widgetH = height;
+        }
         // STRICT HDR: default to HDR10 swapchain when running in passthrough mode.
         // PC_HDR_SWAPCHAIN_HDR can only force-disable HDR (0/false/off).
         bool hdrReq = true;
@@ -1257,7 +1311,7 @@ pc_hdr_context* pc_hdr_init(HWND hwnd, int width, int height) {
         }
 
         // Swapchain + render path
-        createSwapchain(ctx, width, height);
+        createSwapchain(ctx, widgetW, widgetH);
         createRenderPass(ctx);
         createFramebuffers(ctx);
         createBuffers(ctx);
