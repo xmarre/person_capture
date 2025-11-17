@@ -5158,6 +5158,10 @@ class Processor(QtCore.QObject):
                 "-level", "3",
                 "-g", "1",
                 "-pix_fmt", "yuv420p10le",
+                "-color_range", "1",
+                "-colorspace", "bt2020nc",
+                "-color_primaries", "bt2020",
+                "-color_trc", "smpte2084",
             ]
         cmd.append(out_path)
 
