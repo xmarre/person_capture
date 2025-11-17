@@ -174,6 +174,13 @@ class HDRPreviewWidget(QtWidgets.QWidget):
         )
         self._ctx = ctx
 
+        # Force one resize so the swapchain matches the current widget size.
+        if _pc_hdr_resize is not None:
+            w = max(1, self.width())
+            h = max(1, self.height())
+            _log.info("HDR: initial resize to widget=%dx%d", w, h)
+            _pc_hdr_resize(self._ctx, w, h)
+
     def feed_p010(
         self,
         y_ptr: int,
