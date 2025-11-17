@@ -56,3 +56,5 @@ Thumbs.db
 /trt_cache
 *.onnx
 /.ultralytics
+/person_capture/pc_hdr_pipelines.cache
+/person_capture/output/index.csv
