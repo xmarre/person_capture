@@ -12,10 +12,12 @@ layout(std430, binding = 1) readonly buffer UVBuf {
 };
 
 layout(push_constant) uniform Push {
+    // Only video dimensions are really needed here; outWidth/outHeight
+    // will be handled via the Vulkan viewport, not in the shader.
     int videoWidth;
     int videoHeight;
-    int outWidth;
-    int outHeight;
+    int outWidth;   // kept for layout compatibility, but unused
+    int outHeight;  // kept for layout compatibility, but unused
 } pc;
 
 // Simple BT.2020 YCbCr->RGB matrix (approx, non-constant luminance)
@@ -27,26 +29,8 @@ vec3 yuv_to_rgb_bt2020(float Y, float Cb, float Cr) {
 }
 
 void main() {
-    float videoAspect = float(pc.videoWidth) / float(pc.videoHeight);
-    float outAspect   = float(pc.outWidth)  / float(pc.outHeight);
-
+    // Use vUV directly; aspect/black bars are handled by the Vulkan viewport.
     vec2 uv = vUV;
-
-    if (outAspect > videoAspect) {
-        // Window wider than video: pillarbox left/right.
-        float scale = videoAspect / outAspect;
-        uv.x = (uv.x - 0.5) / scale + 0.5;
-    } else if (outAspect < videoAspect) {
-        // Window taller than video: letterbox top/bottom.
-        float scale = outAspect / videoAspect;
-        uv.y = (uv.y - 0.5) / scale + 0.5;
-    }
-
-    // Outside the video area: draw black bars.
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-        outColor = vec4(0.0, 0.0, 0.0, 1.0);
-        return;
-    }
 
     ivec2 coord = ivec2(uv * vec2(pc.videoWidth, pc.videoHeight));
     coord = clamp(

@@ -684,13 +684,31 @@ static void createPipeline(pc_hdr_context* ctx) {
     ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
+    // Aspect-correct viewport: letterbox/pillarbox video inside swapchainExtent.
+    float videoAspect = (float)ctx->videoWidth / (float)ctx->videoHeight;
+    float outAspect   = (float)ctx->swapchainExtent.width / (float)ctx->swapchainExtent.height;
+
     VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width  = (float)ctx->swapchainExtent.width;
-    viewport.height = (float)ctx->swapchainExtent.height;
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
+
+    if (outAspect > videoAspect) {
+        // Swapchain wider than video: pillarbox left/right.
+        float newWidth = (float)ctx->swapchainExtent.height * videoAspect;
+        float xOffset  = ((float)ctx->swapchainExtent.width - newWidth) * 0.5f;
+        viewport.x      = xOffset;
+        viewport.y      = 0.0f;
+        viewport.width  = newWidth;
+        viewport.height = (float)ctx->swapchainExtent.height;
+    } else {
+        // Swapchain taller than video (or equal): letterbox top/bottom.
+        float newHeight = (float)ctx->swapchainExtent.width / videoAspect;
+        float yOffset   = ((float)ctx->swapchainExtent.height - newHeight) * 0.5f;
+        viewport.x      = 0.0f;
+        viewport.y      = yOffset;
+        viewport.width  = (float)ctx->swapchainExtent.width;
+        viewport.height = newHeight;
+    }
 
     VkRect2D scissor{};
     scissor.offset = {0, 0};
@@ -1008,10 +1026,12 @@ layout(std430, binding = 1) readonly buffer UVBuf {
 };
 
 layout(push_constant) uniform Push {
+    // Only video dimensions are really needed here; outWidth/outHeight
+    // will be handled via the Vulkan viewport, not in the shader.
     int videoWidth;
     int videoHeight;
-    int outWidth;
-    int outHeight;
+    int outWidth;   // kept for layout compatibility, but unused
+    int outHeight;  // kept for layout compatibility, but unused
 } pc;
 
 // Simple BT.2020 YCbCr->RGB matrix (approx, non-constant luminance)
@@ -1023,26 +1043,8 @@ vec3 yuv_to_rgb_bt2020(float Y, float Cb, float Cr) {
 }
 
 void main() {
-    float videoAspect = float(pc.videoWidth) / float(pc.videoHeight);
-    float outAspect   = float(pc.outWidth)  / float(pc.outHeight);
-
+    // Use vUV directly; aspect/black bars are handled by the Vulkan viewport.
     vec2 uv = vUV;
-
-    if (outAspect > videoAspect) {
-        // Window wider than video: pillarbox left/right.
-        float scale = videoAspect / outAspect;
-        uv.x = (uv.x - 0.5) / scale + 0.5;
-    } else if (outAspect < videoAspect) {
-        // Window taller than video: letterbox top/bottom.
-        float scale = outAspect / videoAspect;
-        uv.y = (uv.y - 0.5) / scale + 0.5;
-    }
-
-    // Outside the video area: draw black bars.
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-        outColor = vec4(0.0, 0.0, 0.0, 1.0);
-        return;
-    }
 
     ivec2 coord = ivec2(uv * vec2(pc.videoWidth, pc.videoHeight));
     coord = clamp(
