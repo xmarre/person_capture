@@ -3425,26 +3425,28 @@ class Processor(QtCore.QObject):
                     frame_idx = current_idx + 1
                     self.progress.emit(current_idx)
                     continue
-                ret, frame = cap.retrieve()
+                ret, frame_raw = cap.retrieve()
                 if not ret:
                     break
                 self._pump_hdr_preview()
 
-                # cap can be either a BGR reader or the P010 passthrough reader.
-                # In P010 mode, frame is (w, h, yplane, uvplane, stride_y, stride_uv).
-                if isinstance(frame, tuple):
-                    try:
-                        W = int(frame[0])
-                        H = int(frame[1])
-                    except Exception:
-                        raise RuntimeError(
-                            f"HDR P010 frame has unexpected layout: {type(frame)}"
-                        )
+                # Normalize to a BGR frame for all downstream processing.
+                # - SDR / tone-mapped path: frame_raw is already BGR.
+                # - HDR passthrough path: frame_raw is the P010 tuple; convert to BGR.
+                if isinstance(frame_raw, tuple):
+                    frame = self._p010_to_bgr_for_processing(frame_raw)
+                    if frame is None:
+                        # Failed to convert this frame; skip to the next one.
+                        frame_idx = current_idx + 1
+                        self.progress.emit(current_idx)
+                        continue
                 else:
-                    H, W = frame.shape[:2]
+                    frame = frame_raw
+
+                H, W = frame.shape[:2]
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-                
+
                 # Optional black border crop
                 frame_for_det = frame
                 off_x, off_y = 0, 0
@@ -5106,6 +5108,47 @@ class Processor(QtCore.QObject):
                     stride_uv = int(uv_plane.strides[0])
                     return w, h, y_plane, uv_plane, stride_y, stride_uv
         return None
+
+    def _p010_to_bgr_for_processing(self, payload: object) -> Optional[np.ndarray]:
+        """
+        Convert a P010 HDR passthrough payload into a BGR uint8 frame for
+        detection/cropping steps. Uses the normalized tuple
+        (width, height, yplane, uvplane, stride_y, stride_uv).
+        """
+        try:
+            normalized = self._normalize_hdr_preview_payload(payload)
+        except Exception:
+            normalized = None
+        if normalized is None:
+            return None
+
+        width, height, yplane, uvplane, stride_y, stride_uv = normalized
+        try:
+            # Ensure we only use the logical frame region; ignore any padded stride.
+            w = int(width)
+            h = int(height)
+            y = yplane[:h, :w]
+            uv = uvplane[: max(1, h // 2), :w]
+
+            # Downshift 10-bit P010 to 8-bit and pack as NV12 for OpenCV.
+            y8 = (y >> 2).astype(np.uint8)
+            uv8 = (uv >> 2).astype(np.uint8)
+
+            # OpenCV expects NV12 layout: [H x W] Y followed by [H/2 x W] interleaved UV.
+            yuv = np.empty((h + h // 2, w), dtype=np.uint8)
+            yuv[0:h, :] = y8
+            yuv[h:, :] = uv8
+
+            bgr = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_NV12)
+            return bgr
+        except Exception as exc:
+            # Do not crash the job on conversion failure; log and signal upstream.
+            self.status(
+                f"HDR P010→BGR conversion failed: {exc}",
+                key="hdr_proc_convert",
+                interval=10.0,
+            )
+            return None
 
     def _hdr_preview_seek(self, frame_idx: int, reader=None) -> None:
         if reader is None:
