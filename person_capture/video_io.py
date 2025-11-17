@@ -2437,16 +2437,10 @@ class FfmpegPipeReader:
             ff_threads,
         ]
 
-        # Optional decoder hwaccel for HDR P010 passthrough (e.g. PC_HWACCEL=cuda).
-        # This offloads 4K decode to NVDEC (or other hwaccel) while keeping a raw P010 pipe.
-        hwaccel = getattr(self, "hwaccel", "") or ""
-        hwaccel_out = getattr(self, "hwacceloutputformat", "") or ""
-        hwaccel = hwaccel.strip().lower()
-        hwaccel_out = hwaccel_out.strip().lower()
+        # Optional hardware decode (PC_HWACCEL=cuda → NVDEC).
+        hwaccel = (getattr(self, "_hwaccel", "") or "").strip().lower()
         if hwaccel and hwaccel != "off":
             cmd += ["-hwaccel", hwaccel]
-            if hwaccel_out:
-                cmd += ["-hwaccel_output_format", hwaccel_out]
         if t > 1e-6:
             cmd += ["-ss", f"{t:.6f}"]
         cmd += ["-i", self._ff_input_path()]
@@ -2473,10 +2467,10 @@ class FfmpegPipeReader:
         else:
             cmd += ["-vsync", "0"]
         cmd += [
-            "-f",
-            "rawvideo",
             "-pix_fmt",
             "p010le",
+            "-f",
+            "rawvideo",
             "pipe:1",
         ]
         flags = 0
