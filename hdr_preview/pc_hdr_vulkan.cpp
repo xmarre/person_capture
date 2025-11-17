@@ -1073,6 +1073,9 @@ pc_hdr_context* pc_hdr_init(HWND hwnd, int width, int height) {
         ctx->videoHeight = height;
         ctx->pushConstants.videoWidth = width;
         ctx->pushConstants.videoHeight = height;
+        // Initialize outWidth/outHeight to something sane before the first swapchain.
+        ctx->pushConstants.outWidth = width;
+        ctx->pushConstants.outHeight = height;
         // STRICT HDR: default to HDR10 swapchain when running in passthrough mode.
         // PC_HDR_SWAPCHAIN_HDR can only force-disable HDR (0/false/off).
         bool hdrReq = true;
