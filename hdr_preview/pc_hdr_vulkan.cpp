@@ -1352,6 +1352,34 @@ void pc_hdr_resize(pc_hdr_context* ctx, int width, int height) {
     }
 }
 
+static void recreateSwapchainForCurrentWindow(pc_hdr_context* ctx) {
+    if (!ctx) return;
+
+    RECT rc{};
+    int w = 0;
+    int h = 0;
+
+    if (ctx->hwnd && GetClientRect(ctx->hwnd, &rc)) {
+        w = rc.right - rc.left;
+        h = rc.bottom - rc.top;
+    }
+
+    if (w <= 0 || h <= 0) {
+        // Fallback to last known extent, then to video size.
+        if (ctx->swapchainExtent.width > 0 && ctx->swapchainExtent.height > 0) {
+            w = static_cast<int>(ctx->swapchainExtent.width);
+            h = static_cast<int>(ctx->swapchainExtent.height);
+        } else if (ctx->videoWidth > 0 && ctx->videoHeight > 0) {
+            w = ctx->videoWidth;
+            h = ctx->videoHeight;
+        } else {
+            return;
+        }
+    }
+
+    pc_hdr_resize(ctx, w, h);
+}
+
 void pc_hdr_upload_p010(
     pc_hdr_context* ctx,
     const std::uint16_t* yPlane,
@@ -1378,7 +1406,8 @@ void pc_hdr_present(pc_hdr_context* ctx) {
                                              VK_NULL_HANDLE,
                                              &imageIndex);
         if (acq == VK_ERROR_OUT_OF_DATE_KHR || acq == VK_SUBOPTIMAL_KHR) {
-            return;
+            recreateSwapchainForCurrentWindow(ctx);
+            return;  // skip this frame; next frame will use the rebuilt swapchain
         }
         vk_check(acq, "vkAcquireNextImageKHR");
 
@@ -1417,7 +1446,12 @@ void pc_hdr_present(pc_hdr_context* ctx) {
         present.pSwapchains = &ctx->swapchain;
         present.pImageIndices = &imageIndex;
 
-        vkQueuePresentKHR(ctx->graphicsQueue, &present);
+        VkResult pres = vkQueuePresentKHR(ctx->graphicsQueue, &present);
+        if (pres == VK_ERROR_OUT_OF_DATE_KHR || pres == VK_SUBOPTIMAL_KHR) {
+            recreateSwapchainForCurrentWindow(ctx);
+            return;
+        }
+        vk_check(pres, "vkQueuePresentKHR");
     } catch (...) {
     }
 }
