@@ -5137,16 +5137,39 @@ class Processor(QtCore.QObject):
             "1",
         ]
         if is_avif:
-            # 10-bit HDR AVIF (PQ, BT.2020), encoded as a *lossless* AV1 still picture.
+            # High-quality / effectively lossless AVIF still, 10-bit HDR (BT.2020 + PQ).
             cmd += [
-                "-c:v", "libaom-av1",
-                "-still-picture", "1",
-                "-lossless", "1",
-                "-pix_fmt", "yuv420p10le",
-                "-color_range", "1",
-                "-colorspace", "bt2020nc",
-                "-color_primaries", "bt2020",
-                "-color_trc", "smpte2084",
+                "-an",
+                "-c:v",
+                "libaom-av1",
+                "-still-picture",
+                "1",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-g",
+                "1",
+                "-tile-columns",
+                "0",
+                "-tile-rows",
+                "0",
+                "-row-mt",
+                "1",
+                "-cpu-used",
+                "4",
+                # Lossless-ish: CRF 0 + no bitrate cap.
+                "-crf",
+                "0",
+                "-b:v",
+                "0",
+                # Preserve HDR10 signaling in the AVIF container.
+                "-color_range",
+                "1",
+                "-colorspace",
+                "bt2020nc",
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                "smpte2084",
             ]
         else:
             # Lossless 10-bit HDR in Matroska via FFV1.
