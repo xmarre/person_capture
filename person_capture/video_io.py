@@ -1436,15 +1436,27 @@ class FfmpegPipeReader:
         # Tunables (env overrides). Defaults align with MPC VR feel.
         # Strict LP mode = no CPU/zscale fallback. We'll try one minimal LP chain retry, then error.
         self._lp_minimal = False
-        self._sdr_nits = float(os.getenv("PC_SDR_NITS", "125"))       # 80–200 typical
+        self._sdr_nits = float(os.getenv("PC_SDR_NITS", "125.0"))     # 80–200 typical
         self._tm_desat = float(os.getenv("PC_TM_DESAT", "0.25"))      # 0=keep chroma, 1=desaturate more
         self._tm_param = float(os.getenv("PC_TM_PARAM", "0.40"))      # Mobius curve softness
-        self._force_mode = (os.getenv("PC_FORCE_TONEMAP", "") or "").strip().lower()
+        # Canonical backend override from GUI / CLI.
+        # Prefer PC_FORCE_TONEMAP (new name), then legacy PCFORCETONEMAP, then old per-backend flags.
+        env_force = (
+            os.getenv("PC_FORCE_TONEMAP")  # new, used by gui_app + open_video_with_tonemap
+            or os.getenv("PCFORCETONEMAP")  # legacy name kept for backward compatibility
+            or ""
+        )
+        self._force_mode = env_force.strip().lower()
         if not self._force_mode:
             if os.getenv("PC_FORCE_ZSCALE", ""):
                 self._force_mode = "zscale"
             elif os.getenv("PC_FORCE_SCALE", ""):
                 self._force_mode = "scale"
+        self._log.info(
+            "HDR pipe mode init: requested_forcemode=%s strict_lp=%s",
+            self._force_mode or "auto",
+            self._strict_lp,
+        )
         # Track the currently active filter mode so we can fall back if needed.
         if self._strict_lp:
             if not self._use_libplacebo:
