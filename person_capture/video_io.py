@@ -1204,6 +1204,18 @@ class FfmpegPipeReader:
             if self._pipe_pixfmt == "nv12"
             else self._frame_bytes_bgr24(self._w, self._h)
         )
+
+        # Helpful diagnostics: how the external pipe is configured at init.
+        self._log.info(
+            "HDR pipe init: src_pixfmt=%s pipe_pixfmt=%s size=%dx%d pipe_frame_bytes=%d",
+            self._src_pixfmt or "unknown",
+            self._pipe_pixfmt,
+            self._w,
+            self._h,
+            self._pipe_frame_bytes,
+        )
+        # Guard so we only log frame shape/dtype once per reader.
+        self._debug_logged_frame = False
         # Optional override if a chosen out_format fails; toggled by fallback logic.
         self._sw_fmt_override: Optional[str] = None
 
@@ -2093,6 +2105,24 @@ class FfmpegPipeReader:
         if dl_sw not in ("rgba", "bgra"):
             dl_sw = "bgra" if os.name == "nt" else "rgba"
         # if pipe wants nv12, we’ll read back to RGBA-family, then format→nv12 on CPU
+
+        # Optional HDR tagging to mirror AvLibplaceboReader: ensure filters see
+        # the correct transfer, primaries, colorspace, and range.
+        src_tr = self._transfer or "bt709"
+        src_pr = self._primaries or "bt709"
+        if src_pr in ("bt2020", "smpte432"):
+            cs = "bt2020nc"
+        else:
+            cs = "bt709"
+        range_src = (self._range_in or "").lower()
+        rng = "full" if range_src in ("full", "pc", "jpeg") else "limited"
+        setparams = (
+            f"setparams=color_trc={src_tr}:"
+            f"color_primaries={src_pr}:"
+            f"colorspace={cs}:"
+            f"range={rng}"
+        )
+
         if self._mode == "libplacebo" and self._use_libplacebo:
             # ensure libplacebo capabilities are available when building args
             self._lp_opts = getattr(self, "_lp_opts", None) or self._probe_libplacebo_opts()
@@ -2122,7 +2152,9 @@ class FfmpegPipeReader:
                     prefix: list[str] = []
                     if self._hwaccel == "cuda":
                         prefix = ["hwdownload", "format=p010le"]
-                    filters = prefix + [
+                    filters = [
+                        *prefix,
+                        setparams,
                         f"format={surf}",
                         (
                             f"hwupload=derive_device=1:extra_hw_frames={self._extra_hw_frames}"
@@ -2172,7 +2204,9 @@ class FfmpegPipeReader:
                 prefix = []
                 if self._hwaccel == "cuda":
                     prefix = ["hwdownload", "format=p010le"]
-                filters = prefix + [
+                filters = [
+                    *prefix,
+                    setparams,
                     f"format={surf}",
                     (
                         f"hwupload=derive_device=1:extra_hw_frames={self._extra_hw_frames}"
@@ -2226,7 +2260,7 @@ class FfmpegPipeReader:
                 elif tail_fmt != lp_out_fmt:
                     parts.append(f"format={tail_fmt}")
                 parts.append("setsar=1")
-                return ",".join(parts)
+                return ",".join([setparams, *parts])
             lp_opts = [f"tonemapping={self._q(self._tm_value())}"]
 
             # Always target BT.709 + appropriate range/gamut for SDR output
@@ -2286,7 +2320,7 @@ class FfmpegPipeReader:
             if self._lp_opts.get("dithering"):
                 lp_opts.append("dithering=ordered")
 
-            parts: list[str] = []
+            parts: list[str] = [setparams]
             if self._range_in_tag != "pc":
                 parts.append("zscale=rangein=tv:range=pc")
             parts.append("libplacebo=" + ":".join(lp_opts))
@@ -2309,12 +2343,15 @@ class FfmpegPipeReader:
             return ",".join(parts)
         if self._mode in ("libplacebo", "zscale") and (self._has_zscale and self._has_tonemap):
             # Full HDR→SDR tonemap tuned for SDR target brightness and optional desaturation.
-            s = (
-                "zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc,"
-                "zscale=transfer=linear:npl=1000,format=gbrpf32le,"
-                f"tonemap=tonemap=mobius:param={self._tm_param}:desat={self._tm_desat}:peak={self._sdr_nits},"
-                "zscale=transfer=bt709:primaries=bt709:matrix=bt709:dither=error_diffusion,"
-                f"zscale=rangein={'pc' if (self._range_in or '').lower() in ('pc','full') else 'tv'}:range=pc"
+            s = "".join(
+                [
+                    f"{setparams},",
+                    "zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc,",
+                    "zscale=transfer=linear:npl=1000,format=gbrpf32le,",
+                    f"tonemap=tonemap=mobius:param={self._tm_param}:desat={self._tm_desat}:peak={self._sdr_nits},",
+                    "zscale=transfer=bt709:primaries=bt709:matrix=bt709:dither=error_diffusion,",
+                    f"zscale=rangein={'pc' if (self._range_in or '').lower() in ('pc','full') else 'tv'}:range=pc",
+                ]
             )
             if maxw > 0:
                 s += f",scale=w=min(iw\\,{maxw}):h=-2"
@@ -2323,7 +2360,7 @@ class FfmpegPipeReader:
         # Fallback path: decode to float RGB (planar), expand to full-range, tonemap in Python.
         range_in = "pc" if (self._range_in or "").lower() in ("pc", "full") else "tv"
         mat = "bt2020nc" if self._primaries == "bt2020" else "bt709"
-        s = f"scale=in_color_matrix={mat}:in_range={range_in}:out_range=pc"
+        s = f"{setparams},scale=in_color_matrix={mat}:in_range={range_in}:out_range=pc"
         if maxw > 0:
             s += f",scale=w=min(iw\\,{maxw}):h=-2"
         s += ",format=gbrpf32le,setsar=1"
@@ -2431,13 +2468,16 @@ class FfmpegPipeReader:
             pix_fmt,
             (f"{t:.3f}s" if t > 0 else "start"),
         )
+        # Cache the exact command line for debugging, and log it once per start.
+        self._last_cmdline = list(cmd)
         try:
-            import shlex
-
-            self._last_cmdline = " ".join(shlex.quote(part) for part in cmd)
-            self._log.debug("LP cmd: %s", self._last_cmdline)
+            self._log.info(
+                "HDR ffmpeg cmd (%s): %s",
+                self._mode,
+                " ".join(cmd),
+            )
         except Exception:
-            self._last_cmdline = None
+            pass
         self._proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -2756,6 +2796,18 @@ class FfmpegPipeReader:
             frame = self._convert_pipe_frame(raw)
             if frame is None:
                 return False, None
+            if not getattr(self, "_debug_logged_frame", False):
+                try:
+                    self._log.info(
+                        "HDR pipe frame: pix_fmt=%s pipe_pixfmt=%s shape=%s dtype=%s",
+                        self._pix_fmt,
+                        self._pipe_pixfmt,
+                        getattr(frame, "shape", None),
+                        getattr(frame, "dtype", None),
+                    )
+                except Exception:
+                    pass
+                self._debug_logged_frame = True
             return True, frame
         if self._pix_fmt == "p010le":
             raw, self._pipe_buf = self._pipe_buf, None
@@ -2764,6 +2816,20 @@ class FfmpegPipeReader:
             frame = self._convert_p010_frame(raw)
             if frame is None:
                 return False, None
+            if not getattr(self, "_debug_logged_frame", False):
+                try:
+                    self._log.info(
+                        "HDR pipe P010 frame: shape=%s dtype=%s",
+                        getattr(frame, "shape", None)
+                        if hasattr(frame, "shape")
+                        else None,
+                        getattr(frame, "dtype", None)
+                        if hasattr(frame, "dtype")
+                        else None,
+                    )
+                except Exception:
+                    pass
+                self._debug_logged_frame = True
             return True, frame
         arr, self._arr = self._arr, None
         if arr is None:

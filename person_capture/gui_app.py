@@ -2690,12 +2690,32 @@ class Processor(QtCore.QObject):
             try:
                 cap = open_video_with_tonemap(cfg.video)
                 if cap is not None:
-                    logger.info("Video open: HDR tone-map reader selected")
-                    self._status(f"HDR: active ({hdr_reason})", key="hdr_state", interval=60.0)
+                    # Log which HDR reader implementation and mode we actually ended up using.
+                    reader_type = type(cap).__name__
+                    mode = getattr(cap, "mode", None)
+                    _mode = getattr(cap, "_mode", None)
+                    logger.info(
+                        "Video open: HDR tone-map reader selected (reader=%s mode=%s _mode=%s reason=%s)",
+                        reader_type,
+                        mode,
+                        _mode,
+                        hdr_reason,
+                    )
+                    self._status(
+                        f"HDR: active ({hdr_reason}) [{reader_type}/{mode or _mode or 'n/a'}]",
+                        key="hdr_state",
+                        interval=60.0,
+                    )
                     hdr_active = True
                 else:
-                    logger.info("Video open: OpenCV/FFmpeg reader selected")
-                    self._status(f"HDR: inactive ({hdr_reason})", key="hdr_state", interval=60.0)
+                    logger.info(
+                        "Video open: OpenCV/FFmpeg reader selected (reason=%s)", hdr_reason
+                    )
+                    self._status(
+                        f"HDR: inactive ({hdr_reason}) [OpenCV/FFmpeg]",
+                        key="hdr_state",
+                        interval=60.0,
+                    )
                     hdr_active = False
                     os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
                     cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
@@ -2843,6 +2863,22 @@ class Processor(QtCore.QObject):
                 try:
                     # If HDR pipe failed on libplacebo (e.g., Vulkan), ask it to fall back to zscale+tonemap.
                     if cap.try_fallback_chain():
+                        # Log which chain we fell back to, and (if available) a small
+                        # slice of the stderr tail from the previous ffmpeg run.
+                        mode = getattr(cap, "mode", None)
+                        _mode = getattr(cap, "_mode", None)
+                        tail = ""
+                        try:
+                            tail_list = getattr(cap, "_stderr_tail", []) or []
+                            tail = " | ".join(tail_list[-5:])
+                        except Exception:
+                            tail = ""
+                        logger.warning(
+                            "HDR reader fallback: now mode=%s _mode=%s (stderr_tail=%s)",
+                            mode,
+                            _mode,
+                            tail,
+                        )
                         self._status(
                             "HDR: libplacebo emitted no frames; retrying with alternate filter chain…"
                         )
