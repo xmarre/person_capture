@@ -2228,9 +2228,64 @@ class FfmpegPipeReader:
                 parts.append("setsar=1")
                 return ",".join(parts)
             lp_opts = [f"tonemapping={self._q(self._tm_value())}"]
+
+            # Always target BT.709 + appropriate range/gamut for SDR output
             self._lp_add_colorspace_args(lp_opts)
+
+            # ---- Map GUI tonemap sliders onto libplacebo options when available ----
+            #
+            # _sdr_nits    (float): desired SDR white in cd/m^2
+            # _tm_desat    (float): 0..1 desaturation; in libplacebo terms we usually
+            #                       express this as a saturation multiplier.
+            # _tm_param    (float): generic “contrast/curve” control; map to contrast
+            #                       if the filter exposes it.
+            #
+            # All lookups go through _lp_supports_any so we only emit options that
+            # this ffmpeg/libplacebo build actually understands.
+
+            # 1) SDR peak / target luminance
+            try:
+                peak = float(getattr(self, "_sdr_nits", 0.0) or 0.0)
+            except Exception:
+                peak = 0.0
+            peak = max(1.0, min(1000.0, peak))  # Clamp to a sane HDR→SDR range
+            peak_key = self._lp_supports_any("sdr_peak", "target_peak", "peak")
+            if peak_key:
+                # libplacebo expects cd/m^2 for peak luminance
+                lp_opts.append(f"{peak_key}={peak:.1f}")
+
+            # 2) Desaturation / saturation control
+            try:
+                desat = float(getattr(self, "_tm_desat", 0.0) or 0.0)
+            except Exception:
+                desat = 0.0
+            desat = max(0.0, min(1.0, desat))
+
+            # Prefer a direct desaturation knob if present; otherwise map onto saturation
+            desat_key = self._lp_supports_any("desaturation", "desat")
+            if desat_key:
+                lp_opts.append(f"{desat_key}={desat:.3f}")
+            else:
+                sat_key = self._lp_supports_any("saturation", "sat")
+                if sat_key:
+                    # Desat=0 → saturation=1.0, desat=1 → saturation≈0
+                    sat = max(0.0, 1.0 - desat)
+                    lp_opts.append(f"{sat_key}={sat:.3f}")
+
+            # 3) Generic contrast / curve parameter
+            try:
+                tm_param = float(getattr(self, "_tm_param", 0.0) or 0.0)
+            except Exception:
+                tm_param = 0.0
+            contrast_key = self._lp_supports_any("contrast", "tone_mapping_param")
+            if contrast_key:
+                # Leave value as-is; caller is responsible for picking a sensible range
+                lp_opts.append(f"{contrast_key}={tm_param:.3f}")
+
+            # 4) Dithering (if supported)
             if self._lp_opts.get("dithering"):
                 lp_opts.append("dithering=ordered")
+
             parts: list[str] = []
             if self._range_in_tag != "pc":
                 parts.append("zscale=rangein=tv:range=pc")
