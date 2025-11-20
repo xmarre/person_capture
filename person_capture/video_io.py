@@ -2159,6 +2159,10 @@ class FfmpegPipeReader:
                     self._lp_add_colorspace_args(lp_args)
                     if outfmt_key:
                         lp_args.append(f"{outfmt_key}={out_sw}")
+                    if maxw > 0:
+                        w_cap = max(maxw & ~1, 2)
+                        lp_args.append(f"w=min(iw\\,{w_cap})")
+                        lp_args.append("h=-2")
                     # When decoding via CUDA, frames arrive as CUDA hwframes. Vulkan hwmap is
                     # unavailable on some builds, so download to system memory and re-upload.
                     prefix: list[str] = []
@@ -2172,12 +2176,6 @@ class FfmpegPipeReader:
                             f"hwupload=derive_device=1:extra_hw_frames={self._extra_hw_frames}"
                             if self._hwupload_derive
                             else f"hwupload=extra_hw_frames={self._extra_hw_frames}"
-                        ),
-                        # optional GPU downscale before readback
-                        *(
-                            [f"scale_vulkan=w=min(iw\\,{maxw & ~1}):h=-2"]
-                            if (maxw > 0 and self._has_scale_vulkan)
-                            else []
                         ),
                         "libplacebo=" + ":".join(lp_args),
                     ]
@@ -2212,6 +2210,10 @@ class FfmpegPipeReader:
                 self._lp_add_colorspace_args(lp_args)
                 if outfmt_key:
                     lp_args.append(f"{outfmt_key}={out_sw}")
+                if maxw > 0:
+                    w_cap = max(maxw & ~1, 2)
+                    lp_args.append(f"w=min(iw\\,{w_cap})")
+                    lp_args.append("h=-2")
                 # Same approach for the full Vulkan path: download CUDA frames and re-upload.
                 prefix = []
                 if self._hwaccel == "cuda":
@@ -2224,13 +2226,6 @@ class FfmpegPipeReader:
                         f"hwupload=derive_device=1:extra_hw_frames={self._extra_hw_frames}"
                         if self._hwupload_derive
                         else f"hwupload=extra_hw_frames={self._extra_hw_frames}"
-                    ),
-                    *(
-                        [
-                            f"scale_vulkan=w=min(iw\\,{max(maxw & ~1, 2)}):h=-2"
-                        ]
-                        if (maxw > 0 and self._has_scale_vulkan)
-                        else []
                     ),
                     "libplacebo=" + ":".join(lp_args),
                 ]
