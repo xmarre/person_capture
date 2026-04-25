@@ -2709,6 +2709,25 @@ class Processor(QtCore.QObject):
             # Processing/cropping path: always HDR→SDR tone-mapped BGR (or OpenCV fallback).
             cap = None
 
+            def _open_opencv_reader(video_path: str):
+                prev_ffmpeg_opts = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+                try:
+                    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "hwaccel;cuda"
+                    reader = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+                finally:
+                    if prev_ffmpeg_opts is None:
+                        os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
+                    else:
+                        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = prev_ffmpeg_opts
+                try:
+                    reader.set(cv2.CAP_PROP_HW_ACCELERATION, 1)
+                except Exception:
+                    pass
+                if hasattr(reader, "isOpened") and not reader.isOpened():
+                    reader.release()
+                    reader = cv2.VideoCapture(video_path)
+                return reader
+
             try:
                 cap = open_video_with_tonemap(cfg.video)
                 if cap is not None:
@@ -2739,15 +2758,7 @@ class Processor(QtCore.QObject):
                         interval=60.0,
                     )
                     hdr_active = False
-                    os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
-                    cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
-                    try:
-                        cap.set(cv2.CAP_PROP_HW_ACCELERATION, 1)
-                    except Exception:
-                        pass
-                    if hasattr(cap, "isOpened") and not cap.isOpened():
-                        cap.release()
-                        cap = cv2.VideoCapture(cfg.video)
+                    cap = _open_opencv_reader(cfg.video)
             except Exception:
                 cap = cv2.VideoCapture(cfg.video)
 
@@ -2937,15 +2948,7 @@ class Processor(QtCore.QObject):
                 except Exception:
                     pass
                 self._hdr_preview_close()
-                os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
-                cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
-                try:
-                    cap.set(cv2.CAP_PROP_HW_ACCELERATION, 1)
-                except Exception:
-                    pass
-                if not cap.isOpened():
-                    cap.release()
-                    cap = cv2.VideoCapture(cfg.video)
+                cap = _open_opencv_reader(cfg.video)
                 if not cap.isOpened():
                     raise RuntimeError(f"Cannot open video after HDR fallback: {cfg.video}")
                 try:
@@ -3037,21 +3040,30 @@ class Processor(QtCore.QObject):
                         except Exception:
                             pass
                         self._hdr_preview_close()
-                        os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
-                        cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
-                        try:
-                            cap.set(cv2.CAP_PROP_HW_ACCELERATION, 1)
-                        except Exception:
-                            pass
-                        if not cap.isOpened():
-                            cap.release()
-                            cap = cv2.VideoCapture(cfg.video)
+                        cap = _open_opencv_reader(cfg.video)
                         if not cap.isOpened():
                             raise RuntimeError(f"Cannot open video after deferred HDR fallback: {cfg.video}")
                         hdr_active = False
                         cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
                         fps = float(cap.get(cv2.CAP_PROP_FPS) or fps or 30.0)
                         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or total_frames or 0)
+                        self._fps = fps
+                        self._total_frames = total_frames
+                        try:
+                            self._keyframes = self._read_keyframes_worker(cfg.video, fps, total_frames)
+                        except Exception:
+                            self._keyframes = []
+                        try:
+                            self.keyframes.emit(list(self._keyframes))
+                        except Exception:
+                            pass
+                        self.setup.emit(total_frames, fps)
+                        try:
+                            self.status.emit(
+                                f"KFs={len(self._keyframes)} fps={float(fps):.3f} total={total_frames}"
+                            )
+                        except Exception:
+                            pass
                 if keep_spans:
                     s0 = keep_spans[0][0]
                     #

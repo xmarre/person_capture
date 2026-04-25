@@ -58,3 +58,5 @@ Thumbs.db
 /.ultralytics
 /person_capture/output/index.csv
 /person_capture/pc_hdr_pipelines.cache
+
+.codex
