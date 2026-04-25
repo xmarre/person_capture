@@ -1497,16 +1497,36 @@ class FfmpegPipeReader:
             return
         self._start(0)
 
+    def _known_total_frames(self) -> int:
+        try:
+            total = int(getattr(self, "_nb", 0) or getattr(self, "_total", 0) or 0)
+        except (TypeError, ValueError):
+            total = 0
+        return max(0, total)
+
+    def _next_frame_index(self) -> int:
+        try:
+            return max(0, int(getattr(self, "_pos", -1)) + 1)
+        except (TypeError, ValueError):
+            return 0
+
+    def _at_known_eof(self, next_idx: Optional[int] = None) -> bool:
+        total = self._known_total_frames()
+        if total <= 0:
+            return False
+        if next_idx is None:
+            next_idx = self._next_frame_index()
+        return int(next_idx) >= total
+
     def _ensure_started(self) -> bool:
         proc = self._proc
         if proc is not None and getattr(proc, "poll", lambda: 1)() is None:
             return True
         if proc is not None:
             self._stop()
-        try:
-            next_idx = max(0, int(getattr(self, "_pos", -1)) + 1)
-        except (TypeError, ValueError):
-            next_idx = 0
+        next_idx = self._next_frame_index()
+        if self._at_known_eof(next_idx):
+            return False
         try:
             self._start(next_idx)
         except Exception as exc:
@@ -1669,6 +1689,12 @@ class FfmpegPipeReader:
         Returns True if we switched chains; False if no further fallback exists.
         """
         if self._mode == "p010_passthrough":
+            return False
+        # A short read at or past the known frame count is normal end-of-stream,
+        # not evidence that the active filter chain failed. This matters for
+        # late pre-scan skips and deferred probes: strict LP must not turn EOF
+        # into a fatal "produced no frames" error.
+        if self._at_known_eof():
             return False
         if self._fallback_hops >= getattr(self, "_fallback_hops_max", 12):
             self._log.error("LP fallback exhausted after %s hops.", self._fallback_hops)
@@ -2792,12 +2818,15 @@ class FfmpegPipeReader:
 
     def grab(self) -> bool:
         while True:
+            if self._at_known_eof():
+                return False
+
             try:
                 started = self._ensure_started()
                 self._last_startup_error = None
             except Exception as exc:
                 self._last_startup_error = exc
-                if self._mode != "p010_passthrough":
+                if self._mode != "p010_passthrough" and not self._at_known_eof():
                     self._log.warning(
                         "HDR pipe startup failed during grab; trying fallback: %s",
                         exc,
@@ -2808,40 +2837,48 @@ class FfmpegPipeReader:
                 return False
 
             if not started or not self._proc or not self._proc.stdout:
-                if self._mode != "p010_passthrough" and self.try_fallback_chain():
+                if (
+                    self._mode != "p010_passthrough"
+                    and not self._at_known_eof()
+                    and self.try_fallback_chain()
+                ):
                     continue
                 return False
-            break
 
-        if self._pix_fmt in {"bgr24", "nv12", "p010le"}:
-            need = self._pipe_frame_bytes
-            buf = self._proc.stdout.read(need)
-            if not buf or len(buf) < need:
-                if self._mode != "p010_passthrough" and self.try_fallback_chain():
-                    return self.grab()
+            if self._pix_fmt in {"bgr24", "nv12", "p010le"}:
+                need = self._pipe_frame_bytes
+                buf = self._proc.stdout.read(need)
+                if not buf or len(buf) < need:
+                    # EOF/late-seek-empty is a normal false return. Only run
+                    # the expensive LP fallback ladder when the short read
+                    # occurs before the known end of the stream.
+                    if self._mode != "p010_passthrough" and not self._at_known_eof():
+                        if self.try_fallback_chain():
+                            continue
+                    return False
+                self._pipe_buf = buf
+                self._arr = None
+                self._pos += 1
+                return True
+
+            # Linear+python-tonemap path: read float32 RGB (planar G,B,R)
+            fbytes = self._frame_bytes_f32
+            buf = self._proc.stdout.read(fbytes)
+            if not buf or len(buf) < fbytes:
                 return False
-            self._pipe_buf = buf
-            self._arr = None
+            planar = np.frombuffer(buf, dtype=np.float32)
+            if planar.size != self._w * self._h * 3:
+                return False
+            planar = planar.reshape(3, self._h, self._w)
+            rgb = np.stack((planar[2], planar[0], planar[1]), axis=-1)
+            if getattr(self, "_transfer", "") == "arib-std-b67":
+                rgb_linear = _eotf_hlg(rgb)
+            else:
+                rgb_linear = _eotf_pq(rgb)
+            self._arr = rgb_linear
+            self._pipe_buf = None
             self._pos += 1
             return True
-        # Linear+python-tonemap path: read float32 RGB (planar G,B,R)
-        fbytes = self._frame_bytes_f32
-        buf = self._proc.stdout.read(fbytes)
-        if not buf or len(buf) < fbytes:
-            return False
-        planar = np.frombuffer(buf, dtype=np.float32)
-        if planar.size != self._w * self._h * 3:
-            return False
-        planar = planar.reshape(3, self._h, self._w)
-        rgb = np.stack((planar[2], planar[0], planar[1]), axis=-1)
-        if getattr(self, "_transfer", "") == "arib-std-b67":
-            rgb_linear = _eotf_hlg(rgb)
-        else:
-            rgb_linear = _eotf_pq(rgb)
-        self._arr = rgb_linear
-        self._pipe_buf = None
-        self._pos += 1
-        return True
 
     def retrieve(self):
         if self._pix_fmt in {"bgr24", "nv12"}:
@@ -2901,13 +2938,19 @@ class FfmpegPipeReader:
         # If the process died prematurely (e.g., libplacebo failed to init),
         # attempt a one-time filter-chain fallback before giving up.
         if self._proc is not None and self._proc.poll() is not None:
+            if self._at_known_eof():
+                return False, None
             if not self.try_fallback_chain():
                 return False, None
 
         if not self.grab():
             # grab() failed (end-of-stream or short read). If we haven't tried fallback yet,
             # switch to a safer chain once.
-            if self._mode != "p010_passthrough" and self.try_fallback_chain():
+            if (
+                self._mode != "p010_passthrough"
+                and not self._at_known_eof()
+                and self.try_fallback_chain()
+            ):
                 if not self.grab():
                     return False, None
             else:

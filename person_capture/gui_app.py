@@ -618,14 +618,34 @@ class Processor(QtCore.QObject):
 
     def _prescan_skip_forward(self, cap, count: int) -> int:
         """Discard up to ``count`` decoded frames without restarting the reader."""
+
+        def _at_known_eof() -> bool:
+            try:
+                total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            except Exception:
+                total = 0
+            if total <= 0:
+                return False
+            try:
+                pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+            except Exception:
+                pos = 0
+            if bool(getattr(cap, "_is_hdr_pipe", False)):
+                # FfmpegPipeReader reports the last emitted frame index.
+                return pos >= total - 1
+            # OpenCV usually reports the next frame index.
+            return pos >= total
+
         advanced = 0
         remaining = max(0, int(count))
         for _ in range(remaining):
-            if self._abort:
+            if self._abort or _at_known_eof():
                 break
             try:
                 grabbed = cap.grab()
             except Exception as exc:
+                if _at_known_eof():
+                    break
                 self._status(
                     f"Pre-scan skip failed: {exc}",
                     key="prescan_skip_error",
@@ -634,7 +654,7 @@ class Processor(QtCore.QObject):
                 raise
             if not grabbed:
                 startup_exc = getattr(cap, "_last_startup_error", None)
-                if startup_exc is not None:
+                if startup_exc is not None and not _at_known_eof():
                     self._status(
                         f"Pre-scan skip failed: {startup_exc}",
                         key="prescan_skip_error",
@@ -927,10 +947,14 @@ class Processor(QtCore.QObject):
                         break
                     ok, frame = cap.retrieve()
                     if not ok or frame is None:
-                        skipped = self._prescan_skip_forward(cap, max(0, stride - 1))
-                        if skipped < max(0, stride - 1):
+                        target_skip = min(
+                            max(0, stride - 1),
+                            max(0, total_frames - i - 1),
+                        )
+                        skipped = self._prescan_skip_forward(cap, target_skip)
+                        if skipped < target_skip:
                             break
-                        i += stride
+                        i = i + 1 + skipped
                         continue
                     if self._hdr_preview_enabled():
                         self._hdr_preview_seek(i)
@@ -1110,10 +1134,14 @@ class Processor(QtCore.QObject):
                             self._emit_preview_bgr(vis)
                         except Exception:
                             pass
-                    skipped = self._prescan_skip_forward(cap, max(0, stride - 1))
-                    if skipped < max(0, stride - 1):
+                    target_skip = min(
+                        max(0, stride - 1),
+                        max(0, total_frames - idx - 1),
+                    )
+                    skipped = self._prescan_skip_forward(cap, target_skip)
+                    if skipped < target_skip:
                         break
-                    i += stride
+                    i = idx + 1 + skipped
                 if active:
                     s = max(0, start - pad)
                     e = total_frames - 1
