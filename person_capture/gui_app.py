@@ -4682,30 +4682,39 @@ class Processor(QtCore.QObject):
                     ]
                     primary_saved_or_enqueued = False
                     if save_q is not None:
-                        try:
-                            if hdr_primary_fullres:
-                                save_q.put_nowait({
-                                    "type": "hdr_sdr",
-                                    "path": crop_img_path,
-                                    "row": row,
-                                    "frame_idx": int(idx),
-                                    "frame_pts_sec": frame_pts_sec,
-                                    "crop_xyxy": source_crop_xyxy,
-                                })
-                            else:
+                        if hdr_primary_fullres:
+                            # No saver ack exists for HDR->SDR export success.
+                            # Keep primary HDR export synchronous so hit bookkeeping
+                            # only advances after the file is actually written.
+                            ok, why = self._save_hdr_sdr_screencap(
+                                int(idx),
+                                frame_pts_sec,
+                                source_crop_xyxy,
+                                crop_img_path,
+                            )
+                            if not ok:
+                                self._status(
+                                    f"Save failed ({why}): {crop_img_path}",
+                                    key="save_err",
+                                    interval=0.5,
+                                )
+                                return False
+                            primary_saved_or_enqueued = True
+                        else:
+                            try:
                                 # enqueue a contiguous copy; slices are views into `frame`
                                 buf = np.ascontiguousarray(crop_img2)
                                 if not buf.flags.owndata:
                                     buf = buf.copy()
                                 save_q.put_nowait((crop_img_path, buf, row))
-                            primary_saved_or_enqueued = True
-                        except queue.Full:
-                            self._status(
-                                f"Save queue full: {crop_img_path}",
-                                key="save_backpressure",
-                                interval=0.5,
-                            )
-                            return False
+                                primary_saved_or_enqueued = True
+                            except queue.Full:
+                                self._status(
+                                    f"Save queue full: {crop_img_path}",
+                                    key="save_backpressure",
+                                    interval=0.5,
+                                )
+                                return False
                     else:
                         if hdr_primary_fullres:
                             ok, why = self._save_hdr_sdr_screencap(
