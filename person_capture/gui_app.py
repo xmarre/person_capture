@@ -840,6 +840,7 @@ class Processor(QtCore.QObject):
                             tgt,
                             fast=bool(getattr(cfg, "seek_fast", True)),
                             max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
+                            allow_partial=True,
                             hdr_reader=self._hdr_preview_reader,
                         )
                         # ensure forward progress even if seek advanced < stride
@@ -932,6 +933,7 @@ class Processor(QtCore.QObject):
                             tgt,
                             fast=bool(getattr(cfg, "seek_fast", True)),
                             max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
+                            allow_partial=True,
                             hdr_reader=self._hdr_preview_reader,
                         )
                         i_floor = (new_pos // stride) * stride
@@ -1268,6 +1270,7 @@ class Processor(QtCore.QObject):
                                 j,
                                 fast=bool(getattr(cfg, "seek_fast", True)),
                                 max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
+                                allow_partial=False,
                                 hdr_reader=self._hdr_preview_reader,
                             )
                             ret, frame = cap.read()
@@ -1315,6 +1318,7 @@ class Processor(QtCore.QObject):
                                     j,
                                     fast=bool(getattr(cfg, "seek_fast", True)),
                                     max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
+                                    allow_partial=False,
                                     hdr_reader=self._hdr_preview_reader,
                                 )
                                 ret, frame = cap.read()
@@ -2208,7 +2212,7 @@ class Processor(QtCore.QObject):
         fast: bool = False,
         max_grabs: int = 0,
         peek_preview: bool = False,
-        allow_partial: bool = True,
+        allow_partial: bool = False,
         hdr_reader=None,
     ) -> int:
         """Keyframe-aware seek. Fast UI seeks may return before target; internal jumps must not."""
@@ -3575,6 +3579,7 @@ class Processor(QtCore.QObject):
                         fast=bool(getattr(self.cfg, "seek_fast", True)),
                         max_grabs=int(getattr(self.cfg, "seek_max_grabs", 12)),
                         peek_preview=True,  # UI scrub: allow peeks
+                        allow_partial=True,
                         hdr_reader=self._hdr_preview_reader,
                     )
                     self.progress.emit(frame_idx)

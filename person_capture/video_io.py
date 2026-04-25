@@ -1176,7 +1176,7 @@ class FfmpegPipeReader:
         # converter. This is both faster in the capture loop and avoids range/matrix
         # ambiguity that can make HDR screenshots look washed out. The fallback ladder
         # still switches to NV12 if pipe allocation fails.
-        self._pipe_pixfmt = (os.getenv("PC_PIPE_PIXFMT", "bgr24") or "bgr24").lower()
+        self._pipe_pixfmt = (os.getenv("PC_PIPE_PIXFMT", "bgr24") or "bgr24").strip().lower()
         if self._pipe_pixfmt not in ("bgr24", "nv12"):
             self._log.warning("Unsupported PC_PIPE_PIXFMT=%s; using bgr24", self._pipe_pixfmt)
             self._pipe_pixfmt = "bgr24"
