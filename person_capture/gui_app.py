@@ -5955,7 +5955,7 @@ class Processor(QtCore.QObject):
 
         is_avif = out_path.lower().endswith(".avif")
 
-        cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error"]
+        cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
         if seek_sec is not None:
             cmd += ["-ss", f"{seek_sec:.6f}"]
         cmd += [
@@ -6020,6 +6020,11 @@ class Processor(QtCore.QObject):
             ]
         out_ext = Path(out_path).suffix or ".mkv"
         tmp_out = out_path + f".tmp{out_ext}"
+        try:
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+        except Exception:
+            pass
         cmd.append(tmp_out)
 
         timeout_sec = max(5, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
