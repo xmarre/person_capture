@@ -8159,6 +8159,16 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             root = _REPO_ROOT / "prescan_cache"
         try:
+            root = root.resolve()
+            repo_root = _REPO_ROOT.resolve()
+            home = Path.home().resolve()
+            fs_root = Path(root.anchor)
+            if root in {fs_root, home, repo_root}:
+                raise ValueError(f"Refusing to clear unsafe cache path: {root}")
+            try:
+                root.relative_to(repo_root)
+            except ValueError as exc:
+                raise ValueError(f"Refusing to clear non-repo cache path: {root}") from exc
             if root.exists():
                 shutil.rmtree(root)
             root.mkdir(parents=True, exist_ok=True)
