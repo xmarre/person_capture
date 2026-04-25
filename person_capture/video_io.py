@@ -692,8 +692,13 @@ def _seconds_from_pts(vs, pts: Optional[int]) -> Optional[float]:
         sec = float(pts * tb)
         if math.isfinite(sec):
             return sec
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger(__name__).debug(
+            "_seconds_from_pts conversion failed: pts=%r time_base=%r err=%s",
+            pts,
+            getattr(vs, "time_base", None),
+            exc,
+        )
     return None
 
 

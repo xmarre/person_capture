@@ -3433,6 +3433,7 @@ class Processor(QtCore.QObject):
             locked_face = None
             locked_reid = None
             prev_box = None
+            source_size_cached: Optional[tuple[int, int]] = None
             frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
             if keep_spans:
                 span_i = self._span_index_for(frame_idx, keep_spans)
@@ -4255,7 +4256,7 @@ class Processor(QtCore.QObject):
 
                 # Choose best and save with cadence + lock + margin + IoU gate
                 def save_hit(c, idx):
-                    nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box, ref_face_feat, ref_bank_list
+                    nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box, ref_face_feat, ref_bank_list, source_size_cached
                     crop_img_path = os.path.join(crops_dir, f"f{idx:08d}.jpg")
                     hdr_primary_fullres = bool(
                         hdr_active and bool(getattr(self.cfg, "hdr_screencap_fullres", True))
@@ -4620,12 +4621,18 @@ class Processor(QtCore.QObject):
                     )
 
                     processed_crop_xyxy = (int(cx1), int(cy1), int(cx2), int(cy2))
-                    source_size = self._capture_source_size(cap, frame.shape[:2])
-                    source_crop_xyxy = self._scale_crop_xyxy_to_source(
-                        processed_crop_xyxy,
-                        (int(W), int(H)),
-                        source_size,
-                    )
+                    source_size = (int(W), int(H))
+                    source_crop_xyxy = processed_crop_xyxy
+                    needs_source_space = bool(hdr_primary_fullres or hdr_out_path)
+                    if needs_source_space:
+                        if source_size_cached is None:
+                            source_size_cached = self._capture_source_size(cap, frame.shape[:2])
+                        source_size = source_size_cached
+                        source_crop_xyxy = self._scale_crop_xyxy_to_source(
+                            processed_crop_xyxy,
+                            (int(W), int(H)),
+                            source_size,
+                        )
                     primary_row_crop = source_crop_xyxy if hdr_primary_fullres else processed_crop_xyxy
                     crop_img2 = frame[cy1:cy2, cx1:cx2]
                     row = [
@@ -5481,7 +5488,7 @@ class Processor(QtCore.QObject):
         try:
             if cap is not None and hasattr(cap, "get"):
                 pos_msec = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
-                if math.isfinite(pos_msec) and pos_msec >= 0.0:
+                if math.isfinite(pos_msec) and (pos_msec > 0.0 or int(frame_idx) == 0):
                     return pos_msec / 1000.0
         except Exception:
             pass
@@ -5756,10 +5763,31 @@ class Processor(QtCore.QObject):
             ]
         cmd.append(out_path)
 
+        timeout_sec = max(5, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
         try:
-            subprocess.run(cmd, check=True)
+            cp = subprocess.run(
+                cmd,
+                check=False,
+                timeout=timeout_sec,
+                capture_output=True,
+                text=True,
+            )
+            if cp.returncode != 0:
+                tail = (cp.stderr or cp.stdout or "").splitlines()[-4:]
+                why = " | ".join(tail) if tail else f"ffmpeg_rc={cp.returncode}"
+                self._status(
+                    f"HDR crop export failed: {why}",
+                    key="hdr_crop_export",
+                    interval=10.0,
+                )
+        except subprocess.TimeoutExpired as exc:
+            self._status(
+                f"HDR crop export timeout after {timeout_sec}s: {exc}",
+                key="hdr_crop_export",
+                interval=10.0,
+            )
         except Exception as exc:
-            self.status(
+            self._status(
                 f"HDR crop export failed: {exc}",
                 key="hdr_crop_export",
                 interval=10.0,
