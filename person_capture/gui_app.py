@@ -5595,6 +5595,15 @@ class Processor(QtCore.QObject):
                 save_q.join()
             if saver_thread is not None:
                 saver_thread.join()
+            # Saver acks can arrive before hit enqueue; drain once more after saver exit.
+            if hit_q is not None:
+                try:
+                    while True:
+                        _p = hit_q.get_nowait()
+                        self._emit_hit(_p)
+                        hit_q.task_done()
+                except queue.Empty:
+                    pass
             if archive_q is not None:
                 archive_q.put(None)
                 archive_q.join()
@@ -8470,6 +8479,11 @@ class MainWindow(QtWidgets.QMainWindow):
             prescan_max_width=int(self.spin_prescan_max_width.value()) if hasattr(self, "spin_prescan_max_width") else 416,
             prescan_decode_max_w=int(self.spin_prescan_decode_max_w.value()) if hasattr(self, "spin_prescan_decode_max_w") else int(getattr(self.cfg, "prescan_decode_max_w", 384)),
             prescan_cache_mode=(self.prescan_cache_combo.currentData() if hasattr(self, "prescan_cache_combo") else getattr(self.cfg, "prescan_cache_mode", "auto")) or "auto",
+            prescan_cache_dir=(
+                self.edit_prescan_cache_dir.text().strip()
+                if hasattr(self, "edit_prescan_cache_dir")
+                else str(getattr(self.cfg, "prescan_cache_dir", "prescan_cache") or "prescan_cache")
+            ),
             prescan_face_conf=float(self.spin_prescan_face_conf.value()) if hasattr(self, "spin_prescan_face_conf") else 0.5,
             prescan_fd_enter=float(self.spin_prescan_fd_enter.value()) if hasattr(self, "spin_prescan_fd_enter") else 0.45,
             prescan_fd_exit=float(self.spin_prescan_fd_exit.value()) if hasattr(self, "spin_prescan_fd_exit") else 0.52,
@@ -8637,6 +8651,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.prescan_decode_max_w = int(getattr(cfg, "prescan_decode_max_w", 384))
         except Exception:
             self.cfg.prescan_decode_max_w = 384
+        self.cfg.prescan_cache_dir = str(getattr(cfg, "prescan_cache_dir", "prescan_cache") or "prescan_cache")
         try:
             self.cfg.hdr_export_timeout_sec = max(5, int(getattr(cfg, "hdr_export_timeout_sec", 300) or 300))
         except Exception:
@@ -8752,6 +8767,8 @@ class MainWindow(QtWidgets.QMainWindow):
             mode = str(getattr(cfg, "prescan_cache_mode", "auto") or "auto")
             idx = self.prescan_cache_combo.findData(mode)
             self.prescan_cache_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        if hasattr(self, "edit_prescan_cache_dir"):
+            self.edit_prescan_cache_dir.setText(str(getattr(cfg, "prescan_cache_dir", "prescan_cache") or "prescan_cache"))
         if hasattr(self, 'spin_prescan_face_conf'):
             self.spin_prescan_face_conf.setValue(float(cfg.prescan_face_conf))
         if hasattr(self, 'spin_prescan_fd_enter'):
@@ -9570,6 +9587,12 @@ class MainWindow(QtWidgets.QMainWindow):
             idx = self.prescan_cache_combo.findData(mode)
             self.prescan_cache_combo.setCurrentIndex(idx if idx >= 0 else 0)
             self.cfg.prescan_cache_mode = self.prescan_cache_combo.currentData() or "auto"
+        self.cfg.prescan_cache_dir = str(
+            s.value("prescan_cache_dir", getattr(self.cfg, "prescan_cache_dir", "prescan_cache"))
+            or "prescan_cache"
+        )
+        if hasattr(self, "edit_prescan_cache_dir"):
+            self.edit_prescan_cache_dir.setText(self.cfg.prescan_cache_dir)
         if hasattr(self, 'spin_prescan_face_conf'):
             self.spin_prescan_face_conf.setValue(float(s.value("prescan_face_conf", self.cfg.prescan_face_conf)))
         if hasattr(self, 'spin_prescan_fd_enter'):
