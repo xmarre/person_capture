@@ -840,6 +840,7 @@ class Processor(QtCore.QObject):
                             tgt,
                             fast=bool(getattr(cfg, "seek_fast", True)),
                             max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
+                            allow_partial=True,
                             hdr_reader=self._hdr_preview_reader,
                         )
                         # ensure forward progress even if seek advanced < stride
@@ -932,6 +933,7 @@ class Processor(QtCore.QObject):
                             tgt,
                             fast=bool(getattr(cfg, "seek_fast", True)),
                             max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
+                            allow_partial=True,
                             hdr_reader=self._hdr_preview_reader,
                         )
                         i_floor = (new_pos // stride) * stride
@@ -1268,6 +1270,7 @@ class Processor(QtCore.QObject):
                                 j,
                                 fast=bool(getattr(cfg, "seek_fast", True)),
                                 max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
+                                allow_partial=False,
                                 hdr_reader=self._hdr_preview_reader,
                             )
                             ret, frame = cap.read()
@@ -1315,6 +1318,7 @@ class Processor(QtCore.QObject):
                                     j,
                                     fast=bool(getattr(cfg, "seek_fast", True)),
                                     max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
+                                    allow_partial=False,
                                     hdr_reader=self._hdr_preview_reader,
                                 )
                                 ret, frame = cap.read()
@@ -2208,24 +2212,49 @@ class Processor(QtCore.QObject):
         fast: bool = False,
         max_grabs: int = 0,
         peek_preview: bool = False,
+        allow_partial: bool = False,
         hdr_reader=None,
     ) -> int:
-        """Keyframe-aware seek. If fast=True, cap forward grabs to max_grabs to avoid long stalls."""
+        """Keyframe-aware seek. Fast UI seeks may return before target; internal jumps must not."""
         if self._total_frames is not None:
             tgt_idx = max(0, min(self._total_frames - 1, int(tgt_idx)))
-        base = tgt_idx
-        ks = self._keyframes
-        if ks:
-            i = bisect.bisect_right(ks, tgt_idx) - 1
-            if i >= 0:
-                base = int(ks[i])
-        # If we have no KF info or landed exactly on tgt, choose a near target base in fast mode
-        if fast and (not ks or base == tgt_idx):
-            mg = max_grabs
-            if mg <= 0:
-                f = float(self._fps or 30.0)
-                mg = max(15, min(240, int(round(f))))
-            base = max(0, tgt_idx - int(mg))
+
+        # The external HDR ffmpeg pipe already seeks by timestamp and lets ffmpeg do
+        # accurate decode/drop internally. Rewinding it to the previous container
+        # keyframe and then capped-grabbing in Python is both slower and can livelock
+        # when a segment jump is repeatedly time-capped before reaching tgt_idx.
+        direct_pipe_seek = bool(getattr(cap, "_is_hdr_pipe", False))
+        if direct_pipe_seek:
+            base = tgt_idx
+            ks = []
+        else:
+            base = tgt_idx
+            ks = self._keyframes
+            if ks:
+                i = bisect.bisect_right(ks, tgt_idx) - 1
+                if i >= 0:
+                    base = int(ks[i])
+
+            # If a previous partial fast seek already decoded past the selected
+            # keyframe, continue forward from the current position instead of
+            # seeking backward to the same base again. Otherwise repeated
+            # time-capped seeks can make zero net progress.
+            try:
+                cur_i = int(cur_idx)
+            except Exception:
+                cur_i = -1
+            if fast and base < cur_i <= tgt_idx:
+                base = cur_i
+
+            # If we have no KF info or landed exactly on tgt, choose a near target
+            # base only for partial/UI seeks. Internal segment jumps must reach
+            # their target in a single call.
+            if fast and allow_partial and (not ks or base == tgt_idx):
+                mg = max_grabs
+                if mg <= 0:
+                    f = float(self._fps or 30.0)
+                    mg = max(15, min(240, int(round(f))))
+                base = max(0, tgt_idx - int(mg))
         if base != cur_idx:
             # time-based reposition is often faster on some backends; fall back if it fails
             if fast and self._fps:
@@ -2237,8 +2266,9 @@ class Processor(QtCore.QObject):
             self._hdr_preview_seek(base, reader=hdr_reader)
         idx = base
         limit = max(0, tgt_idx - base)
-        # Cap forward grabs in fast mode to keep UI responsive
-        if fast:
+        # Cap forward grabs only for partial/UI fast seeks. Segment jumps in the
+        # processing pass must not return before the requested keep-span start.
+        if fast and allow_partial:
             if max_grabs <= 0:
                 f = float(self._fps or 30.0)
                 max_grabs = max(15, min(240, int(round(f))))
@@ -2253,9 +2283,9 @@ class Processor(QtCore.QObject):
                     )
                 except Exception:
                     pass
-        # Time-budgeted forward grabs to avoid long decode stalls
-        t0 = time.perf_counter() if fast else None
-        budget = 0.15  # ~150 ms max spent per seek
+        # Time-budgeted forward grabs to avoid long decode stalls during UI seeks.
+        t0 = time.perf_counter() if (fast and allow_partial) else None
+        budget = 0.15  # ~150 ms max spent per partial/UI seek
         for i in range(limit):
             if not cap.grab():
                 break
@@ -2275,7 +2305,7 @@ class Processor(QtCore.QObject):
                     self._hdr_preview_skip(1, reader=hdr_reader)
             else:
                 self._hdr_preview_skip(1, reader=hdr_reader)
-            if fast and (time.perf_counter() - t0) > budget:
+            if fast and allow_partial and t0 is not None and (time.perf_counter() - t0) > budget:
                 try:
                     self._status(
                         f"Fast-seek time-capped at {idx - base} grabs",
@@ -3223,6 +3253,7 @@ class Processor(QtCore.QObject):
                         fast=bool(getattr(cfg, "seek_fast", True)),
                         max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
                         peek_preview=False,  # segment jump: no peeks
+                        allow_partial=False,
                         hdr_reader=self._hdr_preview_reader,
                     )
                     # Neutralize any stray cooldown/coalesced state from the jump *before* progress emit.
@@ -3548,6 +3579,7 @@ class Processor(QtCore.QObject):
                         fast=bool(getattr(self.cfg, "seek_fast", True)),
                         max_grabs=int(getattr(self.cfg, "seek_max_grabs", 12)),
                         peek_preview=True,  # UI scrub: allow peeks
+                        allow_partial=True,
                         hdr_reader=self._hdr_preview_reader,
                     )
                     self.progress.emit(frame_idx)
@@ -3592,6 +3624,7 @@ class Processor(QtCore.QObject):
                             fast=bool(getattr(self.cfg, "seek_fast", True)),
                             max_grabs=int(getattr(self.cfg, "seek_max_grabs", 12)),
                             peek_preview=False,  # segment jump: no peeks
+                            allow_partial=False,
                             hdr_reader=self._hdr_preview_reader,
                         )
                         self._seek_cooldown_frames = int(max(2, (self._fps or 30) * 0.25))
@@ -3608,6 +3641,7 @@ class Processor(QtCore.QObject):
                             fast=bool(getattr(self.cfg, "seek_fast", True)),
                             max_grabs=int(getattr(self.cfg, "seek_max_grabs", 12)),
                             peek_preview=False,  # segment jump: no peeks
+                            allow_partial=False,
                             hdr_reader=self._hdr_preview_reader,
                         )
                         self._seek_cooldown_frames = int(max(2, (self._fps or 30) * 0.25))

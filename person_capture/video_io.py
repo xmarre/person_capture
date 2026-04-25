@@ -1171,9 +1171,15 @@ class FfmpegPipeReader:
         self._tm_algo = (os.getenv("PC_TM_ALGO", "auto") or "auto")
         # Strict libplacebo: never allow CPU/zscale fallback and avoid multi-probe churn.
         self._strict_lp = (os.getenv("PC_LP_STRICT", "1").lower() not in ("0", "false", "no"))
-        # Pipe pixel format: keep pipe light to avoid ENOMEM on pipe:1
-        # Default nv12 (1.5 B/px). Change to bgr24 if you explicitly want RGB pipe.
-        self._pipe_pixfmt = (os.getenv("PC_PIPE_PIXFMT", "nv12") or "nv12").lower()
+        # Pipe pixel format for tone-mapped output. Default to BGR24 so saved crops
+        # use ffmpeg/libplacebo's RGB conversion directly instead of the Python NV12
+        # converter. This is both faster in the capture loop and avoids range/matrix
+        # ambiguity that can make HDR screenshots look washed out. The fallback ladder
+        # still switches to NV12 if pipe allocation fails.
+        self._pipe_pixfmt = (os.getenv("PC_PIPE_PIXFMT", "bgr24") or "bgr24").strip().lower()
+        if self._pipe_pixfmt not in ("bgr24", "nv12"):
+            self._log.warning("Unsupported PC_PIPE_PIXFMT=%s; using bgr24", self._pipe_pixfmt)
+            self._pipe_pixfmt = "bgr24"
         # Input/demux probe budgets
         try:
             self._probe_m = max(1, int(os.getenv("PC_FF_PROBE_M", "48")))
