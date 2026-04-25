@@ -3421,6 +3421,12 @@ class Processor(QtCore.QObject):
                             img_path, img, row = item
                             ok, why = _atomic_jpeg_write(img, img_path, jpg_q)
 
+                        if ack_q is not None:
+                            try:
+                                ack_q.put_nowait((bool(ok), str(why or "")))
+                            except Exception:
+                                pass
+
                         if ok:
                             # hand off to worker thread for emitting
                             try:
@@ -3443,12 +3449,6 @@ class Processor(QtCore.QObject):
                                 key="save_err_async",
                                 interval=0.5,
                             )
-
-                        if ack_q is not None:
-                            try:
-                                ack_q.put_nowait((bool(ok), str(why or "")))
-                            except Exception:
-                                pass
 
                         save_q.task_done()
 
