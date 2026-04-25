@@ -654,7 +654,7 @@ class Processor(QtCore.QObject):
                 raise
             if not grabbed:
                 startup_exc = getattr(cap, "_last_startup_error", None)
-                if startup_exc is not None and not _at_known_eof():
+                if startup_exc is not None:
                     self._status(
                         f"Pre-scan skip failed: {startup_exc}",
                         key="prescan_skip_error",
@@ -947,6 +947,14 @@ class Processor(QtCore.QObject):
                         break
                     ok, frame = cap.retrieve()
                     if not ok or frame is None:
+                        startup_exc = getattr(cap, "_last_startup_error", None)
+                        if startup_exc is not None:
+                            self._status(
+                                f"Pre-scan read failed: {startup_exc}",
+                                key="prescan_skip_error",
+                                interval=0.5,
+                            )
+                            raise RuntimeError("Pre-scan reader failed during retrieve") from startup_exc
                         target_skip = min(
                             max(0, stride - 1),
                             max(0, total_frames - i - 1),

@@ -1153,6 +1153,7 @@ class FfmpegPipeReader:
         self._h = int(s.get("height") or 0)
         self._fps = _safe_fps(s.get("avg_frame_rate") or "0/1")
         self._nb = int(s.get("nb_frames") or 0)
+        self._total_is_exact = self._nb > 0
         self._src_pixfmt = _str_lower_nonempty(s.get("pix_fmt"))
         try:
             self._bits_per_raw_sample = int(s.get("bits_per_raw_sample") or 0)
@@ -1498,6 +1499,8 @@ class FfmpegPipeReader:
         self._start(0)
 
     def _known_total_frames(self) -> int:
+        if not bool(getattr(self, "_total_is_exact", False)):
+            return 0
         try:
             total = int(getattr(self, "_nb", 0) or getattr(self, "_total", 0) or 0)
         except (TypeError, ValueError):
@@ -2819,6 +2822,7 @@ class FfmpegPipeReader:
     def grab(self) -> bool:
         while True:
             if self._at_known_eof():
+                self._last_startup_error = None
                 return False
 
             try:
@@ -2939,6 +2943,7 @@ class FfmpegPipeReader:
         # attempt a one-time filter-chain fallback before giving up.
         if self._proc is not None and self._proc.poll() is not None:
             if self._at_known_eof():
+                self._last_startup_error = None
                 return False, None
             if not self.try_fallback_chain():
                 return False, None
