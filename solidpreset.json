@@ -171,5 +171,11 @@
   ],
   "curate_use_yaw_quota": true,
   "hdr_screencap_fullres": true,
-  "hdr_archive_crops": true
+  "hdr_archive_crops": true,
+  "hdr_sdr_quality": "resolve_like",
+  "hdr_sdr_tonemap": "spline",
+  "hdr_sdr_gamut_mapping": "perceptual",
+  "hdr_sdr_contrast_recovery": 0.3,
+  "hdr_sdr_peak_detect": true,
+  "hdr_sdr_allow_inaccurate_fallback": false
 }

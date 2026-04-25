@@ -312,6 +312,14 @@ class SessionConfig:
     hdr_screencap_fullres: bool = True   # write primary crops from original-resolution source frames
     hdr_archive_crops: bool = False      # additionally write source HDR crops to hdr_crops/
     hdr_crop_format: str = "mkv"        # mkv (FFV1 lossless) | avif (AV1 lossless)
+    # Full-resolution HDR->SDR still-render quality controls. These affect only
+    # primary crops/f*.jpg source export, not pre-scan/detection preview.
+    hdr_sdr_quality: str = "resolve_like"  # resolve_like | madvr_like | balanced | fast
+    hdr_sdr_tonemap: str = "spline"        # spline | bt.2390 | st2094-40 | mobius | hable
+    hdr_sdr_gamut_mapping: str = "perceptual"  # perceptual | relative | saturation | clip
+    hdr_sdr_contrast_recovery: float = 0.30
+    hdr_sdr_peak_detect: bool = True
+    hdr_sdr_allow_inaccurate_fallback: bool = False
     log_interval_sec: float = 1.0
     lock_after_hits: int = 1
     lock_face_thresh: float = 0.28
@@ -3539,6 +3547,12 @@ class Processor(QtCore.QObject):
                             "hdr_screencap_fullres",
                             "hdr_archive_crops",
                             "hdr_crop_format",
+                            "hdr_sdr_quality",
+                            "hdr_sdr_tonemap",
+                            "hdr_sdr_gamut_mapping",
+                            "hdr_sdr_contrast_recovery",
+                            "hdr_sdr_peak_detect",
+                            "hdr_sdr_allow_inaccurate_fallback",
                         }
                         rot_keys = {
                             "rot_adaptive",
@@ -5537,6 +5551,48 @@ class Processor(QtCore.QObject):
                 y1 -= 1
         return x1, y1, x2, y2
 
+    def _ffmpeg_libplacebo_options(self, ffmpeg_bin: str) -> set[str]:
+        """Return supported ffmpeg libplacebo option names for this binary."""
+        cache = getattr(self, "_ffmpeg_lp_opts_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._ffmpeg_lp_opts_cache = cache
+        cached = cache.get(ffmpeg_bin)
+        if isinstance(cached, set):
+            return cached
+        opts: set[str] = set()
+        try:
+            cp = subprocess.run(
+                [ffmpeg_bin, "-hide_banner", "-h", "filter=libplacebo"],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            text = (cp.stdout or "") + "\n" + (cp.stderr or "")
+            for line in text.splitlines():
+                parts = line.strip().split()
+                if not parts:
+                    continue
+                name = parts[0].strip()
+                if name and all((ch.isalnum() or ch == "_") for ch in name):
+                    opts.add(name)
+        except Exception as exc:
+            self._status(
+                f"HDR libplacebo option probe failed: {exc}",
+                key="hdr_lp_probe",
+                interval=30.0,
+            )
+        cache[ffmpeg_bin] = opts
+        return opts
+
+    @staticmethod
+    def _add_lp_opt(opts: list[str], supported: set[str], name: str, value: str) -> bool:
+        if supported and name not in supported:
+            return False
+        opts.append(f"{name}={value}")
+        return True
+
     def _hdr_tonemap_filter_cmds(
         self,
         ffmpeg_bin: str,
@@ -5571,24 +5627,77 @@ class Processor(QtCore.QObject):
         param = float(getattr(self.cfg, "tm_param", 0.40))
         nits = float(getattr(self.cfg, "sdr_nits", 125.0))
         pref = str(getattr(self.cfg, "hdr_tonemap_pref", "auto") or "auto").lower()
+        quality = str(getattr(self.cfg, "hdr_sdr_quality", "resolve_like") or "resolve_like").lower()
+        algo = str(getattr(self.cfg, "hdr_sdr_tonemap", "spline") or "spline").lower()
+        if algo not in {"spline", "bt.2390", "st2094-40", "mobius", "hable", "reinhard", "clip"}:
+            algo = "spline"
+        gamut = str(getattr(self.cfg, "hdr_sdr_gamut_mapping", "perceptual") or "perceptual").lower()
+        if gamut not in {"perceptual", "relative", "saturation", "clip"}:
+            gamut = "perceptual"
+        try:
+            contrast_recovery = max(0.0, min(2.0, float(getattr(self.cfg, "hdr_sdr_contrast_recovery", 0.30))))
+        except Exception:
+            contrast_recovery = 0.30
+        peak_detect = bool(getattr(self.cfg, "hdr_sdr_peak_detect", True))
+        allow_inaccurate = bool(getattr(self.cfg, "hdr_sdr_allow_inaccurate_fallback", False))
 
         filters = ffmpeg_has_hdr_filters(ffmpeg_bin)
         cmds: list[list[str]] = []
         if filters.get("libplacebo") and pref in ("auto", "libplacebo"):
-            lp = (
-                f"{crop},format=p010le,{src},"
-                "hwupload=extra_hw_frames=1,"
-                "libplacebo=tonemapping='bt.2390':"
-                "colorspace=bt709:color_primaries=bt709:color_trc=bt709:"
-                "range=full:format=bgra,format=bgr24"
-            )
-            cmds.append(
-                base[:1]
-                + ["-init_hw_device", "vulkan=vk:0", "-filter_hw_device", "vk"]
-                + base[1:]
-                + ["-vf", lp]
-                + enc
-            )
+            supported = self._ffmpeg_libplacebo_options(ffmpeg_bin)
+            base_lp_opts = [
+                f"tonemapping='{algo}'",
+                "colorspace=bt709",
+                "color_primaries=bt709",
+                "color_trc=bt709",
+                "range=full",
+                "format=bgra",
+            ]
+            self._add_lp_opt(base_lp_opts, supported, "peak_detect", "true" if peak_detect else "false")
+            if quality in ("resolve_like", "madvr_like"):
+                self._add_lp_opt(base_lp_opts, supported, "peak_detection_preset", "high_quality")
+                self._add_lp_opt(base_lp_opts, supported, "color_map_preset", "high_quality")
+                self._add_lp_opt(base_lp_opts, supported, "gamut_mapping", gamut)
+                self._add_lp_opt(base_lp_opts, supported, "contrast_recovery", f"{contrast_recovery:.6g}")
+                self._add_lp_opt(base_lp_opts, supported, "contrast_smoothness", "3.5")
+                if not self._add_lp_opt(base_lp_opts, supported, "tonemapping_lut_size", "1024"):
+                    self._add_lp_opt(base_lp_opts, supported, "tone_lut_size", "1024")
+                if not self._add_lp_opt(base_lp_opts, supported, "dithering", "blue"):
+                    self._add_lp_opt(base_lp_opts, supported, "dither_method", "blue")
+            elif quality == "balanced":
+                self._add_lp_opt(base_lp_opts, supported, "gamut_mapping", gamut)
+                self._add_lp_opt(base_lp_opts, supported, "contrast_recovery", f"{min(contrast_recovery, 0.20):.6g}")
+                self._add_lp_opt(base_lp_opts, supported, "tonemapping_lut_size", "512")
+
+            lp_variants: list[list[str]] = [base_lp_opts]
+            if quality in ("resolve_like", "madvr_like", "balanced"):
+                alt = [opt for opt in base_lp_opts if not opt.startswith("gamut_mapping=")]
+                if supported and "gamut_mode" in supported:
+                    alt.append(f"gamut_mode={gamut}")
+                    lp_variants.append(alt)
+            lp_variants.append([
+                f"tonemapping='{algo}'",
+                "colorspace=bt709",
+                "color_primaries=bt709",
+                "color_trc=bt709",
+                "range=full",
+                "format=bgra",
+            ])
+
+            seen_lp: set[str] = set()
+            for opts in lp_variants:
+                opt_str = ":".join(opts)
+                if opt_str in seen_lp:
+                    continue
+                seen_lp.add(opt_str)
+                lp = f"{crop},format=p010le,{src},hwupload=extra_hw_frames=1,libplacebo={opt_str},format=bgr24"
+                cmds.append(
+                    base[:1]
+                    + ["-init_hw_device", "vulkan=vk:0", "-filter_hw_device", "vk"]
+                    + base[1:]
+                    + ["-vf", lp]
+                    + enc
+                )
         if filters.get("zscale") and filters.get("tonemap") and pref in ("auto", "zscale", "libplacebo"):
             # CPU fallback. It is slower, but it only runs on accepted captures and
             # preserves the main invariant: full-resolution source crop, not preview crop.
@@ -5601,9 +5710,11 @@ class Processor(QtCore.QObject):
                 "zscale=rangein=pc:range=pc,format=bgr24"
             )
             cmds.append(base + ["-vf", zf] + enc)
-        if pref in ("auto", "scale", "zscale", "libplacebo"):
+        if allow_inaccurate and pref in ("auto", "scale", "zscale", "libplacebo"):
             # Last-resort full-res export. This is not correct HDR tone mapping,
             # but it is still original-resolution and only used if the HDR filters fail.
+            # Disabled by default because the goal is faithful HDR->SDR rendering,
+            # not silently saving a washed-out fallback frame.
             sf = f"{crop},scale=in_range=limited:out_range=full,format=bgr24"
             cmds.append(base + ["-vf", sf] + enc)
         return cmds
@@ -6197,6 +6308,57 @@ class MainWindow(QtWidgets.QMainWindow):
         pref_idx = self.tonemap_pref_combo.findData(self.cfg.hdr_tonemap_pref)
         self.tonemap_pref_combo.setCurrentIndex(pref_idx if pref_idx >= 0 else 0)
         self.tonemap_pref_combo.currentIndexChanged.connect(self._on_ui_change)
+
+        self.hdr_sdr_quality_combo = QtWidgets.QComboBox()
+        self.hdr_sdr_quality_combo.addItem("Resolve-like high quality", "resolve_like")
+        self.hdr_sdr_quality_combo.addItem("MadVR-like high quality", "madvr_like")
+        self.hdr_sdr_quality_combo.addItem("Balanced", "balanced")
+        self.hdr_sdr_quality_combo.addItem("Fast", "fast")
+        _hdrq = str(getattr(self.cfg, "hdr_sdr_quality", "resolve_like") or "resolve_like")
+        _hdrq_idx = self.hdr_sdr_quality_combo.findData(_hdrq)
+        self.hdr_sdr_quality_combo.setCurrentIndex(_hdrq_idx if _hdrq_idx >= 0 else 0)
+        self.hdr_sdr_quality_combo.setToolTip(
+            "Quality preset for full-res HDR->SDR screencap export. Does not affect pre-scan."
+        )
+        self.hdr_sdr_quality_combo.currentIndexChanged.connect(self._on_ui_change)
+
+        self.hdr_sdr_tonemap_combo = QtWidgets.QComboBox()
+        for _label, _data in (
+            ("Spline", "spline"),
+            ("BT.2390", "bt.2390"),
+            ("ST 2094-40", "st2094-40"),
+            ("Mobius", "mobius"),
+            ("Hable", "hable"),
+        ):
+            self.hdr_sdr_tonemap_combo.addItem(_label, _data)
+        _hdrtm = str(getattr(self.cfg, "hdr_sdr_tonemap", "spline") or "spline")
+        _hdrtm_idx = self.hdr_sdr_tonemap_combo.findData(_hdrtm)
+        self.hdr_sdr_tonemap_combo.setCurrentIndex(_hdrtm_idx if _hdrtm_idx >= 0 else 0)
+        self.hdr_sdr_tonemap_combo.setToolTip("Tone mapping curve for full-res HDR->SDR screencap export.")
+        self.hdr_sdr_tonemap_combo.currentIndexChanged.connect(self._on_ui_change)
+
+        self.hdr_sdr_gamut_combo = QtWidgets.QComboBox()
+        for _label, _data in (("Perceptual", "perceptual"), ("Relative", "relative"), ("Saturation", "saturation"), ("Clip", "clip")):
+            self.hdr_sdr_gamut_combo.addItem(_label, _data)
+        _hdrgm = str(getattr(self.cfg, "hdr_sdr_gamut_mapping", "perceptual") or "perceptual")
+        _hdrgm_idx = self.hdr_sdr_gamut_combo.findData(_hdrgm)
+        self.hdr_sdr_gamut_combo.setCurrentIndex(_hdrgm_idx if _hdrgm_idx >= 0 else 0)
+        self.hdr_sdr_gamut_combo.setToolTip("Gamut mapping for full-res HDR->SDR screencap export.")
+        self.hdr_sdr_gamut_combo.currentIndexChanged.connect(self._on_ui_change)
+
+        self.hdr_sdr_contrast_spin = _mk_fspin(0.0, 2.0, 0.05, 2, "float: hdr_sdr_contrast_recovery")
+        self.hdr_sdr_contrast_spin.setValue(float(getattr(self.cfg, "hdr_sdr_contrast_recovery", 0.30)))
+        self.hdr_sdr_contrast_spin.valueChanged.connect(self._on_ui_change)
+        self.hdr_sdr_peak_check = QtWidgets.QCheckBox()
+        self.hdr_sdr_peak_check.setChecked(bool(getattr(self.cfg, "hdr_sdr_peak_detect", True)))
+        self.hdr_sdr_peak_check.setToolTip("bool: hdr_sdr_peak_detect (dynamic libplacebo peak detection)")
+        self.hdr_sdr_peak_check.stateChanged.connect(self._on_ui_change)
+        self.hdr_sdr_bad_fallback_check = QtWidgets.QCheckBox()
+        self.hdr_sdr_bad_fallback_check.setChecked(bool(getattr(self.cfg, "hdr_sdr_allow_inaccurate_fallback", False)))
+        self.hdr_sdr_bad_fallback_check.setToolTip(
+            "Allow inaccurate full-res scale fallback if HDR tone-map filters fail. Off preserves fidelity by failing instead of saving washed-out crops."
+        )
+        self.hdr_sdr_bad_fallback_check.stateChanged.connect(self._on_ui_change)
         self.hwaccel_combo = QtWidgets.QComboBox()
         self.hwaccel_combo.addItem("CPU decode (no hwaccel)", "off")
         self.hwaccel_combo.addItem("CUDA / NVDEC (GPU decode)", "cuda")
@@ -6635,6 +6797,12 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Tonemap desat", self.tm_desat_spin),
             ("Tonemap Mobius param", self.tm_param_spin),
             ("Tonemap backend", self.tonemap_pref_combo),
+            ("HDR SDR quality", self.hdr_sdr_quality_combo),
+            ("HDR SDR tone curve", self.hdr_sdr_tonemap_combo),
+            ("HDR SDR gamut", self.hdr_sdr_gamut_combo),
+            ("HDR contrast recovery", self.hdr_sdr_contrast_spin),
+            ("HDR peak detect", self.hdr_sdr_peak_check),
+            ("Allow inaccurate HDR fallback", self.hdr_sdr_bad_fallback_check),
             ("FFmpeg hardware decode", self.hwaccel_combo),
             ("HDR archive format", self.hdr_crop_format_combo),
             ("Frame stride", self.stride_spin),
@@ -7825,6 +7993,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "hdr_screencap_fullres",
             "hdr_archive_crops",
             "hdr_crop_format",
+            "hdr_sdr_quality",
+            "hdr_sdr_tonemap",
+            "hdr_sdr_gamut_mapping",
+            "hdr_sdr_contrast_recovery",
+            "hdr_sdr_peak_detect",
+            "hdr_sdr_allow_inaccurate_fallback",
         }
         live |= {
             "lambda_facefrac",
@@ -8006,6 +8180,21 @@ class MainWindow(QtWidgets.QMainWindow):
             cfg.hdr_crop_format = self.hdr_crop_format_combo.currentText().lower()
         except Exception:
             cfg.hdr_crop_format = "mkv"
+        try:
+            cfg.hdr_sdr_quality = self.hdr_sdr_quality_combo.currentData() or "resolve_like"
+        except Exception:
+            cfg.hdr_sdr_quality = "resolve_like"
+        try:
+            cfg.hdr_sdr_tonemap = self.hdr_sdr_tonemap_combo.currentData() or "spline"
+        except Exception:
+            cfg.hdr_sdr_tonemap = "spline"
+        try:
+            cfg.hdr_sdr_gamut_mapping = self.hdr_sdr_gamut_combo.currentData() or "perceptual"
+        except Exception:
+            cfg.hdr_sdr_gamut_mapping = "perceptual"
+        cfg.hdr_sdr_contrast_recovery = float(self.hdr_sdr_contrast_spin.value()) if hasattr(self, "hdr_sdr_contrast_spin") else 0.30
+        cfg.hdr_sdr_peak_detect = bool(self.hdr_sdr_peak_check.isChecked()) if hasattr(self, "hdr_sdr_peak_check") else True
+        cfg.hdr_sdr_allow_inaccurate_fallback = bool(self.hdr_sdr_bad_fallback_check.isChecked()) if hasattr(self, "hdr_sdr_bad_fallback_check") else False
         return cfg
 
     def _apply_cfg(self, cfg: SessionConfig):
@@ -8045,6 +8234,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self.chk_hdr_screencap_fullres.setChecked(bool(getattr(cfg, "hdr_screencap_fullres", True)))
         if hasattr(self, "chk_hdr_archive_crops"):
             self.chk_hdr_archive_crops.setChecked(bool(getattr(cfg, "hdr_archive_crops", False)))
+        if hasattr(self, "hdr_sdr_quality_combo"):
+            val = str(getattr(cfg, "hdr_sdr_quality", "resolve_like") or "resolve_like")
+            idx = self.hdr_sdr_quality_combo.findData(val)
+            self.hdr_sdr_quality_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        if hasattr(self, "hdr_sdr_tonemap_combo"):
+            val = str(getattr(cfg, "hdr_sdr_tonemap", "spline") or "spline")
+            idx = self.hdr_sdr_tonemap_combo.findData(val)
+            self.hdr_sdr_tonemap_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        if hasattr(self, "hdr_sdr_gamut_combo"):
+            val = str(getattr(cfg, "hdr_sdr_gamut_mapping", "perceptual") or "perceptual")
+            idx = self.hdr_sdr_gamut_combo.findData(val)
+            self.hdr_sdr_gamut_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        if hasattr(self, "hdr_sdr_contrast_spin"):
+            try:
+                self.hdr_sdr_contrast_spin.setValue(float(getattr(cfg, "hdr_sdr_contrast_recovery", 0.30)))
+            except Exception:
+                self.hdr_sdr_contrast_spin.setValue(0.30)
+        if hasattr(self, "hdr_sdr_peak_check"):
+            self.hdr_sdr_peak_check.setChecked(bool(getattr(cfg, "hdr_sdr_peak_detect", True)))
+        if hasattr(self, "hdr_sdr_bad_fallback_check"):
+            self.hdr_sdr_bad_fallback_check.setChecked(bool(getattr(cfg, "hdr_sdr_allow_inaccurate_fallback", False)))
         self.ratio_edit.setText(cfg.ratio)
         try:
             self.sdr_nits_spin.setValue(float(getattr(cfg, "sdr_nits", 125.0)))
@@ -8835,6 +9045,37 @@ class MainWindow(QtWidgets.QMainWindow):
                 s.value("hdr_archive_crops", self.cfg.hdr_archive_crops, type=bool)
             )
             self.cfg.hdr_archive_crops = bool(self.chk_hdr_archive_crops.isChecked())
+        if hasattr(self, "hdr_sdr_quality_combo"):
+            val = str(s.value("hdr_sdr_quality", getattr(self.cfg, "hdr_sdr_quality", "resolve_like")) or "resolve_like")
+            idx = self.hdr_sdr_quality_combo.findData(val)
+            self.hdr_sdr_quality_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self.cfg.hdr_sdr_quality = self.hdr_sdr_quality_combo.currentData() or "resolve_like"
+        if hasattr(self, "hdr_sdr_tonemap_combo"):
+            val = str(s.value("hdr_sdr_tonemap", getattr(self.cfg, "hdr_sdr_tonemap", "spline")) or "spline")
+            idx = self.hdr_sdr_tonemap_combo.findData(val)
+            self.hdr_sdr_tonemap_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self.cfg.hdr_sdr_tonemap = self.hdr_sdr_tonemap_combo.currentData() or "spline"
+        if hasattr(self, "hdr_sdr_gamut_combo"):
+            val = str(s.value("hdr_sdr_gamut_mapping", getattr(self.cfg, "hdr_sdr_gamut_mapping", "perceptual")) or "perceptual")
+            idx = self.hdr_sdr_gamut_combo.findData(val)
+            self.hdr_sdr_gamut_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self.cfg.hdr_sdr_gamut_mapping = self.hdr_sdr_gamut_combo.currentData() or "perceptual"
+        if hasattr(self, "hdr_sdr_contrast_spin"):
+            try:
+                self.hdr_sdr_contrast_spin.setValue(float(s.value("hdr_sdr_contrast_recovery", getattr(self.cfg, "hdr_sdr_contrast_recovery", 0.30))))
+            except Exception:
+                self.hdr_sdr_contrast_spin.setValue(0.30)
+            self.cfg.hdr_sdr_contrast_recovery = float(self.hdr_sdr_contrast_spin.value())
+        if hasattr(self, "hdr_sdr_peak_check"):
+            self.hdr_sdr_peak_check.setChecked(
+                s.value("hdr_sdr_peak_detect", getattr(self.cfg, "hdr_sdr_peak_detect", True), type=bool)
+            )
+            self.cfg.hdr_sdr_peak_detect = bool(self.hdr_sdr_peak_check.isChecked())
+        if hasattr(self, "hdr_sdr_bad_fallback_check"):
+            self.hdr_sdr_bad_fallback_check.setChecked(
+                s.value("hdr_sdr_allow_inaccurate_fallback", getattr(self.cfg, "hdr_sdr_allow_inaccurate_fallback", False), type=bool)
+            )
+            self.cfg.hdr_sdr_allow_inaccurate_fallback = bool(self.hdr_sdr_bad_fallback_check.isChecked())
         self.cfg.seek_fast = s.value("seek_fast", True, type=bool)
         try:
             self.cfg.seek_max_grabs = int(s.value("seek_max_grabs", 12))
