@@ -5575,22 +5575,35 @@ class Processor(QtCore.QObject):
     @staticmethod
     def _even_hdr_crop_xyxy(crop_xyxy: tuple[int, int, int, int], source_size: tuple[int, int]) -> tuple[int, int, int, int]:
         """Make 4:2:0 HDR still/video crops legal without moving far from the chosen box."""
+        def _legalize_axis(a1: int, a2: int, limit: int) -> tuple[int, int]:
+            # 4:2:0-safe crop: even origin, even extent, in-bounds, size >= 2.
+            a1 = max(0, min(limit - 2, a1 & ~1))
+            a2 = max(a1 + 2, min(limit, a2))
+            if (a2 - a1) & 1:
+                if a2 < limit:
+                    a2 += 1
+                elif a2 > a1 + 2:
+                    a2 -= 1
+                elif a1 >= 2:
+                    a1 -= 2
+                else:
+                    a2 = min(limit, a1 + 2)
+            if a1 & 1:
+                if a1 + 1 <= limit - 2:
+                    a1 += 1
+                    a2 = max(a1 + 2, min(limit, a2 + 1))
+                else:
+                    a1 -= 1
+            a1 = max(0, min(limit - 2, a1 & ~1))
+            a2 = max(a1 + 2, min(limit, a2))
+            if (a2 - a1) & 1:
+                a2 = max(a1 + 2, min(limit, a2 - 1))
+            return a1, a2
+
         sw, sh = max(2, int(source_size[0])), max(2, int(source_size[1]))
         x1, y1, x2, y2 = [int(v) for v in crop_xyxy]
-        x1 = max(0, min(sw - 2, x1 & ~1))
-        y1 = max(0, min(sh - 2, y1 & ~1))
-        x2 = max(x1 + 2, min(sw, x2))
-        y2 = max(y1 + 2, min(sh, y2))
-        if (x2 - x1) & 1:
-            if x2 < sw:
-                x2 += 1
-            elif x1 > 0:
-                x1 -= 1
-        if (y2 - y1) & 1:
-            if y2 < sh:
-                y2 += 1
-            elif y1 > 0:
-                y1 -= 1
+        x1, x2 = _legalize_axis(x1, x2, sw)
+        y1, y2 = _legalize_axis(y1, y2, sh)
         return x1, y1, x2, y2
 
     def _ffmpeg_libplacebo_options(self, ffmpeg_bin: str) -> set[str]:
