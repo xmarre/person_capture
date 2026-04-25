@@ -35,6 +35,8 @@ except Exception:
     CV_CAP_PROP_FRAME_WIDTH = 3
     CV_CAP_PROP_FRAME_HEIGHT = 4
 
+_PRESERVE_DROP_UNTIL = object()
+
 
 def _ffprobe_path() -> Optional[str]:
     """
@@ -1340,6 +1342,11 @@ class FfmpegPipeReader:
         self._proc = None
         self._arr: Optional[np.ndarray] = None
         self._pipe_buf: Optional[bytes] = None
+        self._drop_until: Optional[int] = None
+        try:
+            self._seek_preroll_frames = max(0, int(os.getenv("PC_FF_SEEK_PREROLL_FRAMES", "12")))
+        except Exception:
+            self._seek_preroll_frames = 12
         self._stderr_thread = None
         self._stderr_tail: list[str] = []
         self._lp_opts: dict[str, bool] = {}
@@ -1504,14 +1511,17 @@ class FfmpegPipeReader:
             return
         self._start(0)
 
-    def _known_total_frames(self) -> int:
-        if not bool(getattr(self, "_total_is_exact", False)):
-            return 0
+    def _stream_total_frames(self) -> int:
         try:
             total = int(getattr(self, "_nb", 0) or getattr(self, "_total", 0) or 0)
         except (TypeError, ValueError):
             total = 0
         return max(0, total)
+
+    def _known_total_frames(self) -> int:
+        if not bool(getattr(self, "_total_is_exact", False)):
+            return 0
+        return self._stream_total_frames()
 
     def _next_frame_index(self) -> int:
         try:
@@ -1520,25 +1530,39 @@ class FfmpegPipeReader:
             return 0
 
     def _at_known_eof(self, next_idx: Optional[int] = None) -> bool:
-        total = self._known_total_frames()
-        if total <= 0:
-            return False
         if next_idx is None:
             next_idx = self._next_frame_index()
-        return int(next_idx) >= total
+        total = self._known_total_frames()
+        return total > 0 and int(next_idx) >= total
+
+    def _at_soft_eof(self, next_idx: Optional[int] = None) -> bool:
+        """
+        Best-effort EOF for post-failure handling only.
+        Uses estimated totals when exact frame counts are unavailable so late
+        tail short-reads do not trigger expensive fallback ladders.
+        """
+        if next_idx is None:
+            next_idx = self._next_frame_index()
+        known_total = self._known_total_frames()
+        if known_total > 0:
+            return int(next_idx) >= known_total
+        total = self._stream_total_frames()
+        return total > 0 and int(next_idx) >= max(0, total - 1)
 
     def _ensure_started(self) -> bool:
         proc = self._proc
         if proc is not None and getattr(proc, "poll", lambda: 1)() is None:
             return True
+        pending_drop_until = self._drop_until
         if proc is not None:
             self._stop()
         next_idx = self._next_frame_index()
         if self._at_known_eof(next_idx):
             return False
         try:
-            self._start(next_idx)
+            self._start(next_idx, drop_until=pending_drop_until)
         except Exception as exc:
+            self._drop_until = pending_drop_until
             self._log.warning("HDR pipe lazy start failed at frame %d: %s", next_idx, exc)
             raise
         proc = self._proc
@@ -1604,16 +1628,18 @@ class FfmpegPipeReader:
         manual NV12→BGR converter (which assumes TV/limited) sees the expected
         16–235/16–240 range. For RGB-family pipes we prefer full range.
         """
-        # Single modern umbrella first if present
+        # Set every target color component this build exposes. The umbrella
+        # colorspace option is not enough on all ffmpeg/libplacebo builds; if
+        # color_trc remains inherited from a PQ source, BGR screenshots can look
+        # washed out even though tonemapping ran.
         if self._lp_supports_any("colorspace"):
             lp_args.append("colorspace=bt709")
-        else:
-            p = self._lp_supports_any("target_primaries", "color_primaries")
-            t = self._lp_supports_any("target_trc", "color_trc")
-            if p:
-                lp_args.append(f"{p}=bt709")
-            if t:
-                lp_args.append(f"{t}=bt709")
+        p = self._lp_supports_any("target_primaries", "color_primaries")
+        t = self._lp_supports_any("target_trc", "color_trc")
+        if p:
+            lp_args.append(f"{p}=bt709")
+        if t:
+            lp_args.append(f"{t}=bt709")
         if self._lp_supports_any("range"):
             tail = (getattr(self, "_pipe_pixfmt", "") or "").lower()
             rng = "limited" if tail == "nv12" else "full"
@@ -1703,7 +1729,7 @@ class FfmpegPipeReader:
         # not evidence that the active filter chain failed. This matters for
         # late pre-scan skips and deferred probes: strict LP must not turn EOF
         # into a fatal "produced no frames" error.
-        if self._at_known_eof():
+        if self._at_soft_eof():
             return False
         if self._fallback_hops >= getattr(self, "_fallback_hops_max", 12):
             self._log.error("LP fallback exhausted after %s hops.", self._fallback_hops)
@@ -1747,7 +1773,7 @@ class FfmpegPipeReader:
                 raise RuntimeError(msg)
 
             self._log.warning("%s Falling back to zscale/scale CPU tonemapping.", msg)
-            self._stop()
+            self._stop(clear_drop_until=False)
             self._mode = "zscale" if (self._has_zscale and self._has_tonemap) else "scale"
             self._fallback_hops = 0
             _restart(max(self._pos + 1, 0))
@@ -1932,7 +1958,7 @@ class FfmpegPipeReader:
                         return True
                     if (self._has_zscale and self._has_tonemap) and not self._tried_zscale:
                         self._log.warning("HDR: LP mem fault persists → falling back to zscale+tonemap.")
-                        self._stop()
+                        self._stop(clear_drop_until=False)
                         self._mode = "zscale"
                         self._fallback_hops = 0
                         self._tried_zscale = True
@@ -2013,7 +2039,7 @@ class FfmpegPipeReader:
             if (self._has_zscale and self._has_tonemap) and not self._tried_zscale:
                 _log_tail("HDR: libplacebo yielded no frames;")
                 self._log.warning("HDR: libplacebo yielded no frames; falling back to zscale+tonemap.")
-                self._stop()
+                self._stop(clear_drop_until=False)
                 self._mode = "zscale"
                 self._fallback_hops = 0
                 self._tried_zscale = True
@@ -2022,7 +2048,7 @@ class FfmpegPipeReader:
             if self._has_scale and not self._tried_scale:
                 _log_tail("HDR: libplacebo yielded no frames;")
                 self._log.warning("HDR: libplacebo yielded no frames; falling back to linear scale.")
-                self._stop()
+                self._stop(clear_drop_until=False)
                 self._mode = "scale"
                 self._fallback_hops = 0
                 self._tried_scale = True
@@ -2032,7 +2058,7 @@ class FfmpegPipeReader:
         if self._mode == "zscale":
             if self._has_scale and not self._tried_scale:
                 self._log.warning("HDR: zscale+tonemap yielded no frames; falling back to linear scale.")
-                self._stop()
+                self._stop(clear_drop_until=False)
                 self._mode = "scale"
                 self._fallback_hops = 0
                 self._tried_scale = True
@@ -2436,11 +2462,17 @@ class FfmpegPipeReader:
         s += ",format=gbrpf32le,setsar=1"
         return s
 
-    def _start(self, idx: int):
+    def _start(self, idx: int, *, drop_until: object = _PRESERVE_DROP_UNTIL):
+        if drop_until is _PRESERVE_DROP_UNTIL:
+            pending_drop_until = self._drop_until
+        elif drop_until is None:
+            pending_drop_until = None
+        else:
+            pending_drop_until = int(drop_until)
         if self._proc:
             self._stop()
         if self._mode == "p010_passthrough":
-            self._start_p010(idx)
+            self._start_p010(idx, drop_until=pending_drop_until)
             return
         # Apply the very first probe mode before constructing the command.
         if self._mode == "libplacebo" and self._use_libplacebo and self._has_vulkan:
@@ -2555,6 +2587,7 @@ class FfmpegPipeReader:
             creationflags=flags,
         )
         self._stderr_tail = []
+        self._drop_until = pending_drop_until
 
         def _drain() -> None:
             try:
@@ -2578,7 +2611,13 @@ class FfmpegPipeReader:
         self._pipe_buf = None
         self._pix_fmt = pix_fmt
 
-    def _start_p010(self, idx: int) -> None:
+    def _start_p010(self, idx: int, *, drop_until: object = _PRESERVE_DROP_UNTIL) -> None:
+        if drop_until is _PRESERVE_DROP_UNTIL:
+            pending_drop_until = self._drop_until
+        elif drop_until is None:
+            pending_drop_until = None
+        else:
+            pending_drop_until = int(drop_until)
         if self._proc:
             self._stop()
         t = 0.0 if self._fps <= 0 else max(0.0, idx / float(self._fps))
@@ -2666,6 +2705,7 @@ class FfmpegPipeReader:
             creationflags=flags,
         )
         self._stderr_tail = []
+        self._drop_until = pending_drop_until
 
         def _drain() -> None:
             try:
@@ -2711,7 +2751,7 @@ class FfmpegPipeReader:
         except Exception:
             return False
 
-    def _stop(self):
+    def _stop(self, *, clear_drop_until: bool = True):
         # Idempotent; callers may invoke multiple times during fallback.
         try:
             if self._proc:
@@ -2738,6 +2778,8 @@ class FfmpegPipeReader:
         self._proc = None
         self._arr = None
         self._pipe_buf = None
+        if clear_drop_until:
+            self._drop_until = None
 
     # OpenCV-like API
     def get(self, prop: int) -> float:
@@ -2756,7 +2798,28 @@ class FfmpegPipeReader:
 
     def set(self, prop: int, value: float) -> bool:
         if prop == CV_CAP_PROP_POS_FRAMES:
-            self._start(max(0, int(value)))
+            target = max(0, int(value))
+            try:
+                proc = self._proc
+                if (
+                    proc is not None
+                    and getattr(proc, "poll", lambda: 1)() is None
+                    and self._next_frame_index() == target
+                ):
+                    self._arr = None
+                    self._pipe_buf = None
+                    self._drop_until = None
+                    return True
+            except Exception:
+                self._log.debug(
+                    "HDR seek fast-path probe failed (target=%s, proc_present=%s)",
+                    target,
+                    self._proc is not None,
+                    exc_info=True,
+                )
+            preroll = int(getattr(self, "_seek_preroll_frames", 12) or 0)
+            base = max(0, target - preroll) if target > 0 and preroll > 0 else target
+            self._start(base, drop_until=(target if base < target else None))
             return True
         return False
 
@@ -2836,7 +2899,7 @@ class FfmpegPipeReader:
                 self._last_startup_error = None
             except Exception as exc:
                 self._last_startup_error = exc
-                if self._mode != "p010_passthrough" and not self._at_known_eof():
+                if self._mode != "p010_passthrough" and not self._at_soft_eof():
                     self._log.warning(
                         "HDR pipe startup failed during grab; trying fallback: %s",
                         exc,
@@ -2849,7 +2912,7 @@ class FfmpegPipeReader:
             if not started or not self._proc or not self._proc.stdout:
                 if (
                     self._mode != "p010_passthrough"
-                    and not self._at_known_eof()
+                    and not self._at_soft_eof()
                     and self.try_fallback_chain()
                 ):
                     continue
@@ -2862,13 +2925,19 @@ class FfmpegPipeReader:
                     # EOF/late-seek-empty is a normal false return. Only run
                     # the expensive LP fallback ladder when the short read
                     # occurs before the known end of the stream.
-                    if self._mode != "p010_passthrough" and not self._at_known_eof():
+                    if self._mode != "p010_passthrough" and not self._at_soft_eof():
                         if self.try_fallback_chain():
                             continue
                     return False
+                next_pos = int(self._pos) + 1
+                drop_until = getattr(self, "_drop_until", None)
+                if drop_until is not None and next_pos < int(drop_until):
+                    self._pos = next_pos
+                    continue
+                self._drop_until = None
                 self._pipe_buf = buf
                 self._arr = None
-                self._pos += 1
+                self._pos = next_pos
                 return True
 
             # Linear+python-tonemap path: read float32 RGB (planar G,B,R)
@@ -2885,9 +2954,15 @@ class FfmpegPipeReader:
                 rgb_linear = _eotf_hlg(rgb)
             else:
                 rgb_linear = _eotf_pq(rgb)
+            next_pos = int(self._pos) + 1
+            drop_until = getattr(self, "_drop_until", None)
+            if drop_until is not None and next_pos < int(drop_until):
+                self._pos = next_pos
+                continue
+            self._drop_until = None
             self._arr = rgb_linear
             self._pipe_buf = None
-            self._pos += 1
+            self._pos = next_pos
             return True
 
     def retrieve(self):
@@ -2948,7 +3023,7 @@ class FfmpegPipeReader:
         # If the process died prematurely (e.g., libplacebo failed to init),
         # attempt a one-time filter-chain fallback before giving up.
         if self._proc is not None and self._proc.poll() is not None:
-            if self._at_known_eof():
+            if self._at_soft_eof():
                 self._last_startup_error = None
                 return False, None
             if not self.try_fallback_chain():
@@ -2959,7 +3034,7 @@ class FfmpegPipeReader:
             # switch to a safer chain once.
             if (
                 self._mode != "p010_passthrough"
-                and not self._at_known_eof()
+                and not self._at_soft_eof()
                 and self.try_fallback_chain()
             ):
                 if not self.grab():
