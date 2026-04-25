@@ -1771,7 +1771,7 @@ class FfmpegPipeReader:
                 raise RuntimeError(msg)
 
             self._log.warning("%s Falling back to zscale/scale CPU tonemapping.", msg)
-            self._stop()
+            self._stop(clear_drop_until=False)
             self._mode = "zscale" if (self._has_zscale and self._has_tonemap) else "scale"
             self._fallback_hops = 0
             _restart(max(self._pos + 1, 0))
@@ -1956,7 +1956,7 @@ class FfmpegPipeReader:
                         return True
                     if (self._has_zscale and self._has_tonemap) and not self._tried_zscale:
                         self._log.warning("HDR: LP mem fault persists → falling back to zscale+tonemap.")
-                        self._stop()
+                        self._stop(clear_drop_until=False)
                         self._mode = "zscale"
                         self._fallback_hops = 0
                         self._tried_zscale = True
@@ -2037,7 +2037,7 @@ class FfmpegPipeReader:
             if (self._has_zscale and self._has_tonemap) and not self._tried_zscale:
                 _log_tail("HDR: libplacebo yielded no frames;")
                 self._log.warning("HDR: libplacebo yielded no frames; falling back to zscale+tonemap.")
-                self._stop()
+                self._stop(clear_drop_until=False)
                 self._mode = "zscale"
                 self._fallback_hops = 0
                 self._tried_zscale = True
@@ -2046,7 +2046,7 @@ class FfmpegPipeReader:
             if self._has_scale and not self._tried_scale:
                 _log_tail("HDR: libplacebo yielded no frames;")
                 self._log.warning("HDR: libplacebo yielded no frames; falling back to linear scale.")
-                self._stop()
+                self._stop(clear_drop_until=False)
                 self._mode = "scale"
                 self._fallback_hops = 0
                 self._tried_scale = True
@@ -2056,7 +2056,7 @@ class FfmpegPipeReader:
         if self._mode == "zscale":
             if self._has_scale and not self._tried_scale:
                 self._log.warning("HDR: zscale+tonemap yielded no frames; falling back to linear scale.")
-                self._stop()
+                self._stop(clear_drop_until=False)
                 self._mode = "scale"
                 self._fallback_hops = 0
                 self._tried_scale = True
@@ -2749,7 +2749,7 @@ class FfmpegPipeReader:
         except Exception:
             return False
 
-    def _stop(self):
+    def _stop(self, *, clear_drop_until: bool = True):
         # Idempotent; callers may invoke multiple times during fallback.
         try:
             if self._proc:
@@ -2776,7 +2776,8 @@ class FfmpegPipeReader:
         self._proc = None
         self._arr = None
         self._pipe_buf = None
-        self._drop_until = None
+        if clear_drop_until:
+            self._drop_until = None
 
     # OpenCV-like API
     def get(self, prop: int) -> float:
