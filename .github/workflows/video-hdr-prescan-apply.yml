@@ -1,0 +1,29 @@
+name: Apply video HDR pre-scan patch
+
+on:
+  push:
+    branches:
+      - video-hdr-prescan-fast-path
+  workflow_dispatch:
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: video-hdr-prescan-fast-path
+          fetch-depth: 0
+      - name: Apply and push patch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git apply --check -p2 .github/patches/video_hdr_prescan.patch
+          git apply -p2 .github/patches/video_hdr_prescan.patch
+          python -S -m py_compile person_capture/gui_app.py person_capture/video_io.py
+          rm -f .github/patches/video_hdr_prescan.patch .github/workflows/video-hdr-prescan-apply.yml
+          git config user.name github-actions
+          git config user.email actions@github.com
+          git add -A
+          git commit -m "Improve HDR video load and pre-scan cadence"
+          git push origin HEAD:video-hdr-prescan-fast-path
