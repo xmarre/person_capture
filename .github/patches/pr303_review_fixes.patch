@@ -1,0 +1,139 @@
+--- person_capture/gui_app.py	2026-04-25 12:33:46.949681447 +0000
++++ person_capture/gui_app.py	2026-04-25 12:33:34.956703052 +0000
+@@ -626,8 +626,13 @@
+             try:
+                 if not cap.grab():
+                     break
+-            except Exception:
+-                break
++            except Exception as exc:
++                self._status(
++                    f"Pre-scan skip failed: {exc}",
++                    key="prescan_skip_error",
++                    interval=0.5,
++                )
++                raise
+             advanced += 1
+         return advanced
+ 
+@@ -3004,6 +3009,72 @@
+                 keep_spans, ref_face_feat = self._prescan(
+                     cap, int(round(fps)), total_frames, face, ref_face_feat, cfg
+                 )
++                if defer_reader_probe:
++                    self._status(
++                        "HDR reader first-frame probe running after pre-scan",
++                        key="hdr_probe_deferred",
++                        interval=60.0,
++                    )
++                    ok = _probe_reader(cap, float(fps or 24.0))
++                    strict = bool(getattr(cap, "_strict_lp", False))
++                    if (not ok) and hasattr(cap, "try_fallback_chain") and not strict:
++                        try:
++                            if cap.try_fallback_chain():
++                                mode = getattr(cap, "mode", None)
++                                _mode = getattr(cap, "_mode", None)
++                                tail = ""
++                                try:
++                                    tail_list = getattr(cap, "_stderr_tail", []) or []
++                                    tail = " | ".join(tail_list[-5:])
++                                except Exception:
++                                    tail = ""
++                                logger.warning(
++                                    "HDR reader fallback after pre-scan: now mode=%s _mode=%s (stderr_tail=%s)",
++                                    mode,
++                                    _mode,
++                                    tail,
++                                )
++                                self._status(
++                                    "HDR: deferred reader probe failed; retrying alternate filter chain…",
++                                    key="hdr_probe_deferred",
++                                    interval=1.0,
++                                )
++                                ok = _probe_reader(cap, float(fps or 24.0))
++                        except Exception:
++                            pass
++                    if (not ok) and strict:
++                        raise RuntimeError("libplacebo(Vulkan) produced no frames in strict mode")
++                    if not ok:
++                        self._status(
++                            "HDR reader delivered no frames after pre-scan; falling back to OpenCV reader",
++                            key="hdr_probe_fail",
++                            interval=60.0,
++                        )
++                        try:
++                            cap.release()
++                        except Exception:
++                            pass
++                        self._hdr_preview_close()
++                        os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
++                        cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
++                        try:
++                            cap.set(cv2.CAP_PROP_HW_ACCELERATION, 1)
++                        except Exception:
++                            pass
++                        if not cap.isOpened():
++                            cap.release()
++                            cap = cv2.VideoCapture(cfg.video)
++                        if not cap.isOpened():
++                            raise RuntimeError(f"Cannot open video after deferred HDR fallback: {cfg.video}")
++                        try:
++                            logger.warning("Deferred HDR reader probe failed; reopened with OpenCV/FFmpeg")
++                            self._status("HDR: inactive (fallback)", key="hdr_state", interval=60.0)
++                            hdr_active = False
++                            cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
++                            fps = float(cap.get(cv2.CAP_PROP_FPS) or fps or 30.0)
++                            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or total_frames or 0)
++                        except Exception:
++                            pass
+                 if keep_spans:
+                     s0 = keep_spans[0][0]
+                     #
+--- person_capture/video_io.py	2026-04-25 12:33:46.949984943 +0000
++++ person_capture/video_io.py	2026-04-25 12:33:34.962001920 +0000
+@@ -1372,7 +1372,7 @@
+                 self._w,
+                 self._h,
+             )
+-            self._maybe_start_initial_pipe()
++            self._maybe_start_initial_pipe(force_eager=True)
+             return
+         self._filters = self._list_filters()
+         self._use_libplacebo = ("libplacebo" in self._filters)
+@@ -1490,24 +1490,29 @@
+     def _lazy_start_enabled(self) -> bool:
+         return os.getenv("PC_FF_LAZY_START", "1").lower() not in ("0", "false", "no")
+ 
+-    def _maybe_start_initial_pipe(self) -> None:
+-        if self._lazy_start_enabled():
++    def _maybe_start_initial_pipe(self, *, force_eager: bool = False) -> None:
++        if self._lazy_start_enabled() and not force_eager:
+             self._log.info("HDR pipe start deferred until first frame request")
+             return
+         self._start(0)
+ 
+     def _ensure_started(self) -> bool:
+-        if self._proc is not None:
++        proc = self._proc
++        if proc is not None and getattr(proc, "poll", lambda: 1)() is None:
+             return True
++        if proc is not None:
++            self._stop()
+         try:
+             next_idx = max(0, int(getattr(self, "_pos", -1)) + 1)
+-        except Exception:
++        except (TypeError, ValueError):
+             next_idx = 0
+         try:
+             self._start(next_idx)
+-        except Exception:
+-            return False
+-        return self._proc is not None
++        except Exception as exc:
++            self._log.warning("HDR pipe lazy start failed at frame %d: %s", next_idx, exc)
++            raise
++        proc = self._proc
++        return proc is not None and getattr(proc, "poll", lambda: 1)() is None
+ 
+     def _calc_fallback_budget(self) -> int:
+         n = len(getattr(self, "_vk_probe_modes", []))         # Vulkan probe modes
