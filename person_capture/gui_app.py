@@ -5740,7 +5740,7 @@ class Processor(QtCore.QObject):
                     + ["-vf", lp]
                     + enc
                 )
-        if filters.get("zscale") and filters.get("tonemap") and pref in ("auto", "zscale", "libplacebo"):
+        if filters.get("zscale") and filters.get("tonemap") and pref in ("auto", "zscale"):
             # CPU fallback. It is slower, but it only runs on accepted captures and
             # preserves the main invariant: full-resolution source crop, not preview crop.
             z_algo_map = {
@@ -5783,7 +5783,7 @@ class Processor(QtCore.QObject):
                 "zscale=rangein=pc:range=pc,format=bgr24"
             )
             cmds.append(base + ["-vf", zf] + enc)
-        if allow_inaccurate and pref in ("auto", "scale", "zscale", "libplacebo"):
+        if allow_inaccurate and pref in ("auto", "scale"):
             # Last-resort full-res export. This is not correct HDR tone mapping,
             # but it is still original-resolution and only used if the HDR filters fail.
             # Disabled by default because the goal is faithful HDR->SDR rendering,
