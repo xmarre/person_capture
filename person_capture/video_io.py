@@ -1543,8 +1543,9 @@ class FfmpegPipeReader:
         """
         if next_idx is None:
             next_idx = self._next_frame_index()
-        if self._at_known_eof(next_idx):
-            return True
+        known_total = self._known_total_frames()
+        if known_total > 0:
+            return int(next_idx) >= known_total
         total = self._stream_total_frames()
         return total > 0 and int(next_idx) >= max(0, total - 1)
 
@@ -2804,6 +2805,8 @@ class FfmpegPipeReader:
                     and getattr(proc, "poll", lambda: 1)() is None
                     and self._next_frame_index() == target
                 ):
+                    self._arr = None
+                    self._pipe_buf = None
                     self._drop_until = None
                     return True
             except Exception:
