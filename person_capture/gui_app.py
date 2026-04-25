@@ -3400,21 +3400,39 @@ class Processor(QtCore.QObject):
                                 save_q.task_done()
                             continue
 
-                        if isinstance(item, dict) and item.get("type") == "hdr_sdr":
-                            img_path = str(item.get("path") or "")
-                            row = item.get("row")
-                            frame_pts_sec = item.get("frame_pts_sec")
-                            if frame_pts_sec is not None:
-                                try:
-                                    frame_pts_sec = float(frame_pts_sec)
-                                except Exception:
-                                    frame_pts_sec = None
-                            ok, why = self._save_hdr_sdr_screencap(
-                                int(item.get("frame_idx", 0)),
-                                frame_pts_sec,
-                                tuple(item.get("crop_xyxy") or (0, 0, 1, 1)),
-                                img_path,
-                            )
+                        ack_q = None
+                        ok = False
+                        why = "save_not_attempted"
+                        img_path = ""
+                        row = None
+                        if isinstance(item, dict):
+                            ack_q = item.get("ack_q")
+                            kind = str(item.get("type") or "")
+                            if kind == "hdr_sdr":
+                                img_path = str(item.get("path") or "")
+                                row = item.get("row")
+                                frame_pts_sec = item.get("frame_pts_sec")
+                                if frame_pts_sec is not None:
+                                    try:
+                                        frame_pts_sec = float(frame_pts_sec)
+                                    except Exception:
+                                        frame_pts_sec = None
+                                ok, why = self._save_hdr_sdr_screencap(
+                                    int(item.get("frame_idx", 0)),
+                                    frame_pts_sec,
+                                    tuple(item.get("crop_xyxy") or (0, 0, 1, 1)),
+                                    img_path,
+                                )
+                            elif kind == "jpeg":
+                                img_path = str(item.get("path") or "")
+                                row = item.get("row")
+                                img = item.get("img")
+                                if isinstance(img, np.ndarray):
+                                    ok, why = _atomic_jpeg_write(img, img_path, jpg_q)
+                                else:
+                                    ok, why = False, "invalid_jpeg_payload"
+                            else:
+                                ok, why = False, f"unknown_save_item_type:{kind or 'none'}"
                         else:
                             img_path, img, row = item
                             ok, why = _atomic_jpeg_write(img, img_path, jpg_q)
@@ -3441,6 +3459,12 @@ class Processor(QtCore.QObject):
                                 key="save_err_async",
                                 interval=0.5,
                             )
+
+                        if ack_q is not None:
+                            try:
+                                ack_q.put_nowait((bool(ok), str(why or "")))
+                            except Exception:
+                                pass
 
                         save_q.task_done()
 
@@ -4682,39 +4706,55 @@ class Processor(QtCore.QObject):
                     ]
                     primary_saved_or_enqueued = False
                     if save_q is not None:
-                        if hdr_primary_fullres:
-                            # No saver ack exists for HDR->SDR export success.
-                            # Keep primary HDR export synchronous so hit bookkeeping
-                            # only advances after the file is actually written.
-                            ok, why = self._save_hdr_sdr_screencap(
-                                int(idx),
-                                frame_pts_sec,
-                                source_crop_xyxy,
-                                crop_img_path,
-                            )
-                            if not ok:
-                                self._status(
-                                    f"Save failed ({why}): {crop_img_path}",
-                                    key="save_err",
-                                    interval=0.5,
-                                )
-                                return False
-                            primary_saved_or_enqueued = True
-                        else:
-                            try:
+                        ack_q: queue.Queue = queue.Queue(maxsize=1)
+                        try:
+                            if hdr_primary_fullres:
+                                save_q.put_nowait({
+                                    "type": "hdr_sdr",
+                                    "path": crop_img_path,
+                                    "row": row,
+                                    "frame_idx": int(idx),
+                                    "frame_pts_sec": frame_pts_sec,
+                                    "crop_xyxy": source_crop_xyxy,
+                                    "ack_q": ack_q,
+                                })
+                            else:
                                 # enqueue a contiguous copy; slices are views into `frame`
                                 buf = np.ascontiguousarray(crop_img2)
                                 if not buf.flags.owndata:
                                     buf = buf.copy()
-                                save_q.put_nowait((crop_img_path, buf, row))
-                                primary_saved_or_enqueued = True
-                            except queue.Full:
-                                self._status(
-                                    f"Save queue full: {crop_img_path}",
-                                    key="save_backpressure",
-                                    interval=0.5,
-                                )
-                                return False
+                                save_q.put_nowait({
+                                    "type": "jpeg",
+                                    "path": crop_img_path,
+                                    "row": row,
+                                    "img": buf,
+                                    "ack_q": ack_q,
+                                })
+                        except queue.Full:
+                            self._status(
+                                f"Save queue full: {crop_img_path}",
+                                key="save_backpressure",
+                                interval=0.5,
+                            )
+                            return False
+                        save_timeout_sec = max(5, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
+                        try:
+                            ok, why = ack_q.get(timeout=float(save_timeout_sec))
+                        except queue.Empty:
+                            self._status(
+                                f"Save ack timeout after {save_timeout_sec}s: {crop_img_path}",
+                                key="save_timeout",
+                                interval=0.5,
+                            )
+                            return False
+                        if not ok:
+                            self._status(
+                                f"Save failed ({why}): {crop_img_path}",
+                                key="save_err",
+                                interval=0.5,
+                            )
+                            return False
+                        primary_saved_or_enqueued = True
                     else:
                         if hdr_primary_fullres:
                             ok, why = self._save_hdr_sdr_screencap(
