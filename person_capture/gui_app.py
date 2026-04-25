@@ -2710,22 +2710,32 @@ class Processor(QtCore.QObject):
             cap = None
 
             def _open_opencv_reader(video_path: str):
+                hwmode = str(getattr(cfg, "ff_hwaccel", "off") or "off").strip().lower()
                 prev_ffmpeg_opts = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
                 try:
-                    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "hwaccel;cuda"
+                    if hwmode != "off":
+                        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"hwaccel;{hwmode}"
+                    else:
+                        os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
                     reader = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
                 finally:
                     if prev_ffmpeg_opts is None:
                         os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
                     else:
                         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = prev_ffmpeg_opts
-                try:
-                    reader.set(cv2.CAP_PROP_HW_ACCELERATION, 1)
-                except Exception:
-                    pass
                 if hasattr(reader, "isOpened") and not reader.isOpened():
                     reader.release()
-                    reader = cv2.VideoCapture(video_path)
+                    return cv2.VideoCapture(video_path)
+                pos0 = int(reader.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+                ok = bool(reader.grab())
+                try:
+                    reader.set(cv2.CAP_PROP_POS_FRAMES, pos0)
+                except Exception:
+                    pass
+                if ok:
+                    return reader
+                reader.release()
+                reader = cv2.VideoCapture(video_path)
                 return reader
 
             try:

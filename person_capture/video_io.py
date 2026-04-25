@@ -1216,6 +1216,7 @@ class FfmpegPipeReader:
         )
         # Guard so we only log frame shape/dtype once per reader.
         self._debug_logged_frame = False
+        self._last_startup_error = None
         # Optional override if a chosen out_format fails; toggled by fallback logic.
         self._sw_fmt_override: Optional[str] = None
 
@@ -2790,22 +2791,27 @@ class FfmpegPipeReader:
         return w, h, y_plane, uv_plane, stride_y, stride_uv
 
     def grab(self) -> bool:
-        try:
-            started = self._ensure_started()
-        except Exception as exc:
-            if self._mode != "p010_passthrough":
-                self._log.warning(
-                    "HDR pipe startup failed during grab; trying fallback: %s",
-                    exc,
-                )
-                if self.try_fallback_chain():
-                    return self.grab()
-            raise
+        while True:
+            try:
+                started = self._ensure_started()
+                self._last_startup_error = None
+            except Exception as exc:
+                self._last_startup_error = exc
+                if self._mode != "p010_passthrough":
+                    self._log.warning(
+                        "HDR pipe startup failed during grab; trying fallback: %s",
+                        exc,
+                    )
+                    if self.try_fallback_chain():
+                        continue
+                self._log.error("HDR pipe startup failed during grab", exc_info=True)
+                return False
 
-        if not started or not self._proc or not self._proc.stdout:
-            if self._mode != "p010_passthrough" and self.try_fallback_chain():
-                return self.grab()
-            return False
+            if not started or not self._proc or not self._proc.stdout:
+                if self._mode != "p010_passthrough" and self.try_fallback_chain():
+                    continue
+                return False
+            break
 
         if self._pix_fmt in {"bgr24", "nv12", "p010le"}:
             need = self._pipe_frame_bytes
