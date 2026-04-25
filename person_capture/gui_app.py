@@ -13,7 +13,7 @@ Run:
 from __future__ import annotations
 import time
 
-import os, sys, subprocess, shutil, threading, struct
+import os, sys, subprocess, shutil, threading, struct, hashlib
 import json, csv, traceback
 import logging
 
@@ -306,8 +306,21 @@ class SessionConfig:
     min_gap_sec: float = 1.5
     min_box_pixels: int = 8000
     auto_crop_borders: bool = True
-    hdr_passthrough: bool = False  # Vulkan HDR path + no tone-map reader
-    hdr_crop_format: str = "mkv"   # mkv (FFV1 lossless) | avif (AV1 lossless)
+    # HDR preview is optional. Final screencaps must not depend on this flag.
+    hdr_passthrough: bool = False  # Vulkan HDR preview path
+    # HDR output/export controls.
+    hdr_screencap_fullres: bool = True   # write primary crops from original-resolution source frames
+    hdr_archive_crops: bool = False      # additionally write source HDR crops to hdr_crops/
+    hdr_crop_format: str = "mkv"        # mkv (FFV1 lossless) | avif (AV1 lossless)
+    # Full-resolution HDR->SDR still-render quality controls. These affect only
+    # primary crops/f*.jpg source export, not pre-scan/detection preview.
+    hdr_sdr_quality: str = "resolve_like"  # resolve_like | madvr_like | balanced | fast
+    hdr_sdr_tonemap: str = "spline"        # spline | bt.2390 | st2094-40 | mobius | hable
+    hdr_sdr_gamut_mapping: str = "perceptual"  # perceptual | relative | saturation | clip
+    hdr_sdr_contrast_recovery: float = 0.30
+    hdr_sdr_peak_detect: bool = True
+    hdr_sdr_allow_inaccurate_fallback: bool = False
+    hdr_export_timeout_sec: int = 300
     log_interval_sec: float = 1.0
     lock_after_hits: int = 1
     lock_face_thresh: float = 0.28
@@ -450,6 +463,10 @@ class SessionConfig:
     prescan_fd9_grace: int = 1                  # start skipping after this many consecutive fd≈9 samples
     prescan_fd9_probe_period: int = 3           # while skipping, run a real probe every Nth sample
     prescan_weights: Tuple[float, float, float] = (0.70, 0.25, 0.05)  # (anchor, diversity, quality)
+    # Persistent pre-scan reuse. Keyed only by video/ref identity and pre-scan-affecting settings,
+    # so HDR/export-only changes do not invalidate it.
+    prescan_cache_mode: str = "auto"  # auto | refresh | off
+    prescan_cache_dir: str = "prescan_cache"
     # --- runtime paths ---
     trt_lib_dir: str = ""                  # preferred TensorRT lib directory
     # --- TensorRT / ORT (advanced) ---
@@ -541,6 +558,176 @@ class Processor(QtCore.QObject):
         except Exception:
             return 0.70, 0.25, 0.05
         return wa, wd, wq
+
+    @staticmethod
+    def _cache_file_identity(path: str) -> dict:
+        p = str(path or "").strip()
+        if not p:
+            return {"path": "", "missing": True}
+        try:
+            ap = os.path.abspath(p)
+        except Exception:
+            ap = p
+        try:
+            st = os.stat(ap)
+            return {
+                "path": ap,
+                "size": int(getattr(st, "st_size", 0) or 0),
+                "mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))),
+            }
+        except Exception:
+            return {"path": ap, "missing": True}
+
+    @staticmethod
+    def _jsonable_cfg_value(v):
+        if isinstance(v, tuple):
+            return [Processor._jsonable_cfg_value(x) for x in v]
+        if isinstance(v, list):
+            return [Processor._jsonable_cfg_value(x) for x in v]
+        if isinstance(v, (np.floating, np.integer)):
+            return v.item()
+        return v
+
+    def _prescan_cache_root(self, cfg: SessionConfig) -> Path:
+        raw = str(getattr(cfg, "prescan_cache_dir", "prescan_cache") or "prescan_cache").strip()
+        root = Path(raw)
+        if not root.is_absolute():
+            root = _REPO_ROOT / root
+        return root
+
+    def _prescan_cache_meta(self, cfg: SessionConfig, fps: float, total_frames: int) -> dict:
+        # Only include knobs that can change pre-scan spans/ref-bank output. Do not
+        # include HDR export/preview settings, crop scoring, curation, or output paths.
+        prescan_keys = (
+            "prescan_stride",
+            "prescan_max_width",
+            "prescan_decode_max_w",
+            "prescan_face_conf",
+            "prescan_fd_enter",
+            "prescan_fd_add",
+            "prescan_fd_exit",
+            "prescan_add_cooldown_samples",
+            "prescan_rot_probe_period",
+            "prescan_probe_imgsz",
+            "prescan_probe_conf",
+            "prescan_heavy_90",
+            "prescan_heavy_180",
+            "prescan_min_segment_sec",
+            "prescan_pad_sec",
+            "prescan_bridge_gap_sec",
+            "prescan_exit_cooldown_sec",
+            "prescan_boundary_refine_sec",
+            "prescan_refine_stride_min",
+            "prescan_trim_pad",
+            "prescan_skip_trailing_refine",
+            "prescan_refine_budget_sec",
+            "prescan_bank_max",
+            "prescan_diversity_dedup_cos",
+            "prescan_replace_margin",
+            "prescan_fd9_skip",
+            "prescan_fd9_grace",
+            "prescan_fd9_probe_period",
+            "prescan_weights",
+            "face_model",
+            "clip_face_backbone",
+            "clip_face_pretrained",
+            "use_arcface",
+        )
+        settings = {
+            k: self._jsonable_cfg_value(getattr(cfg, k, None))
+            for k in prescan_keys
+        }
+        refs = [part.strip() for part in str(getattr(cfg, "ref", "") or "").split(";") if part.strip()]
+        meta = {
+            "version": 1,
+            "video": self._cache_file_identity(getattr(cfg, "video", "")),
+            "refs": [self._cache_file_identity(p) for p in refs],
+            "fps": round(float(fps or 0.0), 6),
+            "total_frames": int(total_frames or 0),
+            "settings": settings,
+        }
+        key_json = json.dumps(meta, sort_keys=True, separators=(",", ":"))
+        meta["key"] = hashlib.sha256(key_json.encode("utf-8")).hexdigest()
+        return meta
+
+    def _prescan_cache_path(self, cfg: SessionConfig, meta: dict) -> Path:
+        key = str(meta.get("key") or "")
+        return self._prescan_cache_root(cfg) / f"{key}.npz"
+
+    def _load_prescan_cache(
+        self,
+        cfg: SessionConfig,
+        fps: float,
+        total_frames: int,
+    ) -> tuple[bool, list[tuple[int, int]], Optional[np.ndarray], Optional[dict]]:
+        mode = str(getattr(cfg, "prescan_cache_mode", "auto") or "auto").lower()
+        if mode not in ("auto", "reuse"):
+            return False, [], None, None
+        meta = self._prescan_cache_meta(cfg, fps, total_frames)
+        path = self._prescan_cache_path(cfg, meta)
+        if not path.is_file():
+            return False, [], None, meta
+        try:
+            with np.load(str(path), allow_pickle=False) as data:
+                stored_meta = json.loads(str(data["meta"].item()))
+                if stored_meta.get("key") != meta.get("key") or stored_meta.get("version") != meta.get("version"):
+                    return False, [], None, meta
+                spans_arr = np.asarray(data["spans"], dtype=np.int64).reshape(-1, 2)
+                spans = [(int(s), int(e)) for s, e in spans_arr.tolist() if int(e) >= int(s)]
+                has_ref_arr = data["has_ref"] if "has_ref" in data.files else np.array([0], dtype=np.uint8)
+                has_ref = bool(int(np.asarray(has_ref_arr).reshape(-1)[0]))
+                ref_feat = None
+                if has_ref and "ref_face_feat" in data:
+                    arr = np.asarray(data["ref_face_feat"], dtype=np.float32)
+                    if arr.size > 0:
+                        ref_feat = arr.reshape(arr.shape[0], -1) if arr.ndim >= 2 else arr.reshape(1, -1)
+                self._status(
+                    f"Pre-scan cache hit • segments={len(spans)}",
+                    key="prescan_cache",
+                    interval=0.0,
+                )
+                return True, spans, ref_feat, meta
+        except Exception as exc:
+            self._status(f"Pre-scan cache ignored: {exc}", key="prescan_cache", interval=5.0)
+            return False, [], None, meta
+
+    def _save_prescan_cache(
+        self,
+        cfg: SessionConfig,
+        fps: float,
+        total_frames: int,
+        spans: list[tuple[int, int]],
+        ref_face_feat: Optional[np.ndarray],
+    ) -> None:
+        mode = str(getattr(cfg, "prescan_cache_mode", "auto") or "auto").lower()
+        if mode not in ("auto", "refresh", "reuse") or self._abort:
+            return
+        try:
+            meta = self._prescan_cache_meta(cfg, fps, total_frames)
+            path = self._prescan_cache_path(cfg, meta)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            spans_arr = np.asarray(spans or [], dtype=np.int64).reshape(-1, 2)
+            if ref_face_feat is None:
+                feat_arr = np.zeros((0, 0), dtype=np.float32)
+                has_ref = np.array([0], dtype=np.uint8)
+            else:
+                feat_arr = np.asarray(ref_face_feat, dtype=np.float32)
+                if feat_arr.ndim == 1:
+                    feat_arr = feat_arr.reshape(1, -1)
+                has_ref = np.array([1], dtype=np.uint8)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp, "wb") as f:
+                np.savez_compressed(
+                    f,
+                    meta=np.array(json.dumps(meta, sort_keys=True), dtype=np.str_),
+                    spans=spans_arr,
+                    ref_face_feat=feat_arr,
+                    has_ref=has_ref,
+                )
+            os.replace(tmp, path)
+            self._status(f"Pre-scan cache saved • segments={len(spans_arr)}", key="prescan_cache", interval=0.0)
+        except Exception as exc:
+            self._status(f"Pre-scan cache save failed: {exc}", key="prescan_cache", interval=5.0)
 
     def _stream_ref_bank_update(
         self,
@@ -791,11 +978,13 @@ class Processor(QtCore.QObject):
                             elif cmd == "play":
                                 self._paused = False
                             elif cmd == "seek":
+                                self._prescan_cache_dirty = True
                                 try:
                                     last_seek = int(arg)
                                 except Exception:
                                     pass
                             elif cmd == "step":
+                                self._prescan_cache_dirty = True
                                 try:
                                     step_accum += int(arg) if arg is not None else 1
                                 except Exception:
@@ -811,6 +1000,7 @@ class Processor(QtCore.QObject):
                                     ch = dict(arg or {})
                                     for k, v in ch.items():
                                         if k.startswith("prescan_"):
+                                            self._prescan_cache_dirty = True
                                             setattr(cfg, k, v)
                                     stride = max(1, int(cfg.prescan_stride))
                                     enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
@@ -880,11 +1070,13 @@ class Processor(QtCore.QObject):
                         while True:
                             cmd, arg = self._cmd_q.get_nowait()
                             if cmd == "seek":
+                                self._prescan_cache_dirty = True
                                 try:
                                     last_seek = int(arg)
                                 except Exception:
                                     pass
                             elif cmd == "step":
+                                self._prescan_cache_dirty = True
                                 try:
                                     step_accum += int(arg) if arg is not None else 1
                                 except Exception:
@@ -899,6 +1091,7 @@ class Processor(QtCore.QObject):
                                     ch = dict(arg or {})
                                     for k, v in ch.items():
                                         if k.startswith("prescan_"):
+                                            self._prescan_cache_dirty = True
                                             setattr(cfg, k, v)
                                     stride = max(1, int(cfg.prescan_stride))
                                     enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
@@ -2563,7 +2756,9 @@ class Processor(QtCore.QObject):
 
     @QtCore.Slot()
     def run(self):
-        cap = save_q = saver_thread = csv_f = dbg_f = hit_q = None
+        cap = save_q = saver_thread = archive_q = archive_thread = csv_f = dbg_f = hit_q = None
+        finished_ok = False
+        finished_msg = "Unknown termination"
         try:
             # Apply TRT/ORT env from cfg early
             def _env_set(k, v):
@@ -2637,15 +2832,9 @@ class Processor(QtCore.QObject):
 
             ensure_dir(cfg.out_dir)
             crops_dir = os.path.join(cfg.out_dir, "crops")
-            hdr_crops_dir = (
-                os.path.join(cfg.out_dir, "hdr_crops")
-                if bool(getattr(cfg, "hdr_passthrough", False))
-                else None
-            )
+            hdr_crops_dir = os.path.join(cfg.out_dir, "hdr_crops")
             ann_dir = os.path.join(cfg.out_dir, "annot") if cfg.save_annot else None
             ensure_dir(crops_dir)
-            if hdr_crops_dir:
-                ensure_dir(hdr_crops_dir)
             if ann_dir:
                 ensure_dir(ann_dir)
             # Debug I/O
@@ -3219,10 +3408,31 @@ class Processor(QtCore.QObject):
                 return cap_obj, hdr_is_active, fps_val, total_val
 
             if bool(getattr(cfg, "prescan_enable", True)) and total_frames > 0:
-                self._status("Pre-scan.", key="phase", interval=2.0)
-                keep_spans, ref_face_feat = self._prescan(
-                    cap, int(round(fps)), total_frames, face, ref_face_feat, cfg
-                )
+                prescan_loaded = False
+                keep_spans = []
+                cached_ref_face_feat = None
+                if str(getattr(cfg, "prescan_cache_mode", "auto") or "auto").lower() != "refresh":
+                    prescan_loaded, keep_spans, cached_ref_face_feat, _cache_meta = self._load_prescan_cache(
+                        cfg, float(fps), int(total_frames)
+                    )
+                    if prescan_loaded:
+                        ref_face_feat = cached_ref_face_feat
+                if not prescan_loaded:
+                    mode = str(getattr(cfg, "prescan_cache_mode", "auto") or "auto").lower()
+                    suffix = " (refresh cache)" if mode == "refresh" else ""
+                    self._status(f"Pre-scan.{suffix}", key="phase", interval=2.0)
+                    self._prescan_cache_dirty = False
+                    keep_spans, ref_face_feat = self._prescan(
+                        cap, int(round(fps)), total_frames, face, ref_face_feat, cfg
+                    )
+                    if not getattr(self, "_prescan_cache_dirty", False):
+                        self._save_prescan_cache(cfg, float(fps), int(total_frames), keep_spans, ref_face_feat)
+                    else:
+                        self._status(
+                            "Pre-scan cache not saved: run was interactively modified",
+                            key="prescan_cache",
+                            interval=0.0,
+                        )
                 if defer_reader_probe:
                     cap, hdr_active, fps, total_frames = _run_deferred_probe_after_prescan(
                         cap, fps, total_frames, hdr_active
@@ -3320,6 +3530,7 @@ class Processor(QtCore.QObject):
 
             # Async saver
             save_q: Optional[queue.Queue] = None
+            archive_q: Optional[queue.Queue] = None
             hit_q: Optional[queue.Queue] = None
             jpg_q = int(getattr(cfg, "jpg_quality", 85))
 
@@ -3363,6 +3574,7 @@ class Processor(QtCore.QObject):
                     pass
                 writer = None
                 save_q = queue.Queue(maxsize=512)
+                archive_q = queue.Queue(maxsize=256)
                 hit_q = queue.Queue(maxsize=512)
 
                 def _saver():
@@ -3375,8 +3587,48 @@ class Processor(QtCore.QObject):
                             save_q.task_done()
                             break
 
-                        img_path, img, row = item
-                        ok, why = _atomic_jpeg_write(img, img_path, jpg_q)
+                        ack_q = None
+                        ok = False
+                        why = "save_not_attempted"
+                        img_path = ""
+                        row = None
+                        if isinstance(item, dict):
+                            ack_q = item.get("ack_q")
+                            kind = str(item.get("type") or "")
+                            if kind == "hdr_sdr":
+                                img_path = str(item.get("path") or "")
+                                row = item.get("row")
+                                frame_pts_sec = item.get("frame_pts_sec")
+                                if frame_pts_sec is not None:
+                                    try:
+                                        frame_pts_sec = float(frame_pts_sec)
+                                    except Exception:
+                                        frame_pts_sec = None
+                                ok, why = self._save_hdr_sdr_screencap(
+                                    int(item.get("frame_idx", 0)),
+                                    frame_pts_sec,
+                                    tuple(item.get("crop_xyxy") or (0, 0, 1, 1)),
+                                    img_path,
+                                )
+                            elif kind == "jpeg":
+                                img_path = str(item.get("path") or "")
+                                row = item.get("row")
+                                img = item.get("img")
+                                if isinstance(img, np.ndarray):
+                                    ok, why = _atomic_jpeg_write(img, img_path, jpg_q)
+                                else:
+                                    ok, why = False, "invalid_jpeg_payload"
+                            else:
+                                ok, why = False, f"unknown_save_item_type:{kind or 'none'}"
+                        else:
+                            img_path, img, row = item
+                            ok, why = _atomic_jpeg_write(img, img_path, jpg_q)
+
+                        if ack_q is not None:
+                            try:
+                                ack_q.put_nowait((bool(ok), str(why or "")))
+                            except Exception:
+                                pass
 
                         if ok:
                             # hand off to worker thread for emitting
@@ -3405,14 +3657,39 @@ class Processor(QtCore.QObject):
 
                     f.close()
 
+                def _archive_saver():
+                    while True:
+                        item = archive_q.get()
+                        if item is None:
+                            archive_q.task_done()
+                            break
+                        try:
+                            frame_pts_sec = item.get("frame_pts_sec")
+                            if frame_pts_sec is not None:
+                                try:
+                                    frame_pts_sec = float(frame_pts_sec)
+                                except (TypeError, ValueError):
+                                    frame_pts_sec = None
+                            self._save_hdr_crop_p010(
+                                int(item.get("frame_idx", 0)),
+                                frame_pts_sec,
+                                tuple(item.get("crop_xyxy") or (0, 0, 2, 2)),
+                                str(item.get("path") or ""),
+                            )
+                        finally:
+                            archive_q.task_done()
+
                 saver_thread = threading.Thread(target=_saver, name="pc.saver", daemon=True)
                 saver_thread.start()
+                archive_thread = threading.Thread(target=_archive_saver, name="pc.archive_saver", daemon=True)
+                archive_thread.start()
 
             hit_count = 0
             lock_hits = 0
             locked_face = None
             locked_reid = None
             prev_box = None
+            source_size_cached: Optional[tuple[int, int]] = None
             frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
             if keep_spans:
                 span_i = self._span_index_for(frame_idx, keep_spans)
@@ -3521,6 +3798,15 @@ class Processor(QtCore.QObject):
                             "w_cowboy",
                             "w_body",
                             "overlay_scores",
+                            "hdr_screencap_fullres",
+                            "hdr_archive_crops",
+                            "hdr_crop_format",
+                            "hdr_sdr_quality",
+                            "hdr_sdr_tonemap",
+                            "hdr_sdr_gamut_mapping",
+                            "hdr_sdr_contrast_recovery",
+                            "hdr_sdr_peak_detect",
+                            "hdr_sdr_allow_inaccurate_fallback",
                         }
                         rot_keys = {
                             "rot_adaptive",
@@ -3731,6 +4017,7 @@ class Processor(QtCore.QObject):
                 self._pump_hdr_preview()
 
                 H, W = frame.shape[:2]
+                frame_pts_sec = self._capture_frame_pts_sec(cap, current_idx, fps)
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
 
@@ -4231,10 +4518,17 @@ class Processor(QtCore.QObject):
 
                 # Choose best and save with cadence + lock + margin + IoU gate
                 def save_hit(c, idx):
-                    nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box, ref_face_feat, ref_bank_list
+                    nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box, ref_face_feat, ref_bank_list, source_size_cached
                     crop_img_path = os.path.join(crops_dir, f"f{idx:08d}.jpg")
+                    hdr_primary_fullres = bool(
+                        hdr_active and bool(getattr(self.cfg, "hdr_screencap_fullres", True))
+                    )
                     hdr_out_path = None
-                    if self._hdr_passthrough_active and hdr_crops_dir:
+                    if hdr_active and bool(getattr(self.cfg, "hdr_archive_crops", False)):
+                        try:
+                            ensure_dir(hdr_crops_dir)
+                        except Exception:
+                            pass
                         hdr_fmt = str(getattr(self.cfg, "hdr_crop_format", "mkv") or "mkv").lower()
                         hdr_ext = ".avif" if hdr_fmt == "avif" else ".mkv"
                         hdr_out_path = os.path.join(hdr_crops_dir, f"f{idx:08d}{hdr_ext}")
@@ -4592,32 +4886,96 @@ class Processor(QtCore.QObject):
                         f"crop@{idx}: face_box={c.get('face_box')}", key="cropface", interval=2.0
                     )
 
+                    processed_crop_xyxy = (int(cx1), int(cy1), int(cx2), int(cy2))
+                    source_size = (int(W), int(H))
+                    source_crop_xyxy = processed_crop_xyxy
+                    needs_source_space = bool(hdr_primary_fullres or hdr_out_path)
+                    if needs_source_space:
+                        if source_size_cached is None:
+                            source_size_cached = self._capture_source_size(cap, frame.shape[:2])
+                        source_size = source_size_cached
+                        source_crop_xyxy = self._scale_crop_xyxy_to_source(
+                            processed_crop_xyxy,
+                            (int(W), int(H)),
+                            source_size,
+                        )
+                    primary_row_crop = source_crop_xyxy if hdr_primary_fullres else processed_crop_xyxy
                     crop_img2 = frame[cy1:cy2, cx1:cx2]
                     row = [
                         idx,
-                        idx / float(fps),
+                        frame_pts_sec if frame_pts_sec is not None else (idx / float(fps) if fps > 0 else 0.0),
                         c.get("score"),
                         c.get("fd"),
                         c.get("rd"),
-                        cx1,
-                        cy1,
-                        cx2,
-                        cy2,
+                        primary_row_crop[0],
+                        primary_row_crop[1],
+                        primary_row_crop[2],
+                        primary_row_crop[3],
                         crop_img_path,
                         c.get("sharp"),
                         str(ratio_str),
                     ]
+                    primary_saved_or_enqueued = False
                     if save_q is not None:
+                        ack_q: queue.Queue = queue.Queue(maxsize=1)
                         try:
-                            # enqueue a contiguous copy; slices are views into `frame`
-                            buf = np.ascontiguousarray(crop_img2)
-                            if not buf.flags.owndata:
-                                buf = buf.copy()
-                            save_q.put_nowait((crop_img_path, buf, row))
+                            if hdr_primary_fullres:
+                                save_q.put_nowait({
+                                    "type": "hdr_sdr",
+                                    "path": crop_img_path,
+                                    "row": row,
+                                    "frame_idx": int(idx),
+                                    "frame_pts_sec": frame_pts_sec,
+                                    "crop_xyxy": source_crop_xyxy,
+                                    "ack_q": ack_q,
+                                })
+                            else:
+                                # enqueue a contiguous copy; slices are views into `frame`
+                                buf = np.ascontiguousarray(crop_img2)
+                                if not buf.flags.owndata:
+                                    buf = buf.copy()
+                                save_q.put_nowait({
+                                    "type": "jpeg",
+                                    "path": crop_img_path,
+                                    "row": row,
+                                    "img": buf,
+                                    "ack_q": ack_q,
+                                })
                         except queue.Full:
-                            pass  # drop if saver is behind
+                            self._status(
+                                f"Save queue full: {crop_img_path}",
+                                key="save_backpressure",
+                                interval=0.5,
+                            )
+                            return False
+                        save_timeout_sec = max(5, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
+                        try:
+                            ok, why = ack_q.get(timeout=float(save_timeout_sec))
+                        except queue.Empty:
+                            self._status(
+                                f"Save ack timeout after {save_timeout_sec}s: {crop_img_path}",
+                                key="save_timeout",
+                                interval=0.5,
+                            )
+                            return False
+                        if not ok:
+                            self._status(
+                                f"Save failed ({why}): {crop_img_path}",
+                                key="save_err",
+                                interval=0.5,
+                            )
+                            return False
+                        primary_saved_or_enqueued = True
                     else:
-                        ok, why = _atomic_jpeg_write(crop_img2, crop_img_path, jpg_q)
+                        if hdr_primary_fullres:
+                            ok, why = self._save_hdr_sdr_screencap(
+                                int(idx),
+                                frame_pts_sec,
+                                source_crop_xyxy,
+                                crop_img_path,
+                            )
+                        else:
+                            ok, why = _atomic_jpeg_write(crop_img2, crop_img_path, jpg_q)
                         if ok:
                             # emit on worker thread directly
                             self.hit.emit(crop_img_path)
@@ -4635,10 +4993,27 @@ class Processor(QtCore.QObject):
                                 key="save_err",
                                 interval=0.5,
                             )
-                            # skip this hit, keep processing
-                            pass
-                    if hdr_out_path:
-                        self._save_hdr_crop_p010(idx, (cx1, cy1, cx2, cy2), hdr_out_path)
+                            return False
+                        primary_saved_or_enqueued = True
+                    if primary_saved_or_enqueued and hdr_out_path:
+                        hdr_crop_xyxy = self._even_hdr_crop_xyxy(source_crop_xyxy, source_size)
+                        if archive_q is not None:
+                            try:
+                                archive_q.put_nowait({
+                                    "type": "hdr_archive",
+                                    "path": hdr_out_path,
+                                    "frame_idx": int(idx),
+                                    "frame_pts_sec": frame_pts_sec,
+                                    "crop_xyxy": hdr_crop_xyxy,
+                                })
+                            except queue.Full:
+                                self._status(
+                                    f"HDR archive queue full: {hdr_out_path}",
+                                    key="save_backpressure",
+                                    interval=0.5,
+                                )
+                        else:
+                            self._save_hdr_crop_p010(idx, frame_pts_sec, hdr_crop_xyxy, hdr_out_path)
                     reasons_list = c.get("reasons") or []
                     reasons = "|".join(reasons_list)
                     bx1, by1, bx2, by2 = c["box"]
@@ -5200,12 +5575,12 @@ class Processor(QtCore.QObject):
                         }
                     )
             if self._abort:
-                self.finished.emit(False, "Aborted")
+                finished_ok, finished_msg = False, "Aborted"
             else:
-                self.finished.emit(True, f"Done. Hits: {hit_count}. Index: {csv_path}")
+                finished_ok, finished_msg = True, f"Done. Hits: {hit_count}. Index: {csv_path}"
         except Exception as e:
             err = f"Error: {e}\n{traceback.format_exc()}"
-            self.finished.emit(False, err)
+            finished_ok, finished_msg = False, err
         finally:
             if hit_q is not None:
                 try:
@@ -5220,6 +5595,20 @@ class Processor(QtCore.QObject):
                 save_q.join()
             if saver_thread is not None:
                 saver_thread.join()
+            # Saver acks can arrive before hit enqueue; drain once more after saver exit.
+            if hit_q is not None:
+                try:
+                    while True:
+                        _p = hit_q.get_nowait()
+                        self._emit_hit(_p)
+                        hit_q.task_done()
+                except queue.Empty:
+                    pass
+            if archive_q is not None:
+                archive_q.put(None)
+                archive_q.join()
+            if archive_thread is not None:
+                archive_thread.join()
             if cap is not None:
                 try:
                     cap.release()
@@ -5236,6 +5625,7 @@ class Processor(QtCore.QObject):
                     dbg_f.close()
                 except Exception:
                     pass
+            self.finished.emit(bool(finished_ok), str(finished_msg))
 
     def _init_status(self):
         # Per-key throttle timestamps and last texts
@@ -5389,13 +5779,363 @@ class Processor(QtCore.QObject):
                 pass
         return None
 
+    def _capture_source_size(self, cap, frame_shape: tuple[int, int]) -> tuple[int, int]:
+        """Return original source dimensions, not the possibly downscaled reader size."""
+        try:
+            if cap is not None:
+                source_size = getattr(cap, "_source_size", None)
+                if callable(source_size):
+                    sw, sh = source_size()
+                    if int(sw) > 0 and int(sh) > 0:
+                        return int(sw), int(sh)
+                sw = int(getattr(cap, "_source_w", 0) or 0)
+                sh = int(getattr(cap, "_source_h", 0) or 0)
+                if sw > 0 and sh > 0:
+                    return sw, sh
+        except Exception:
+            pass
+        try:
+            ffmpeg_probe = None
+            try:
+                from .video_io import _ffprobe_json as ffmpeg_probe  # type: ignore
+            except Exception:
+                from video_io import _ffprobe_json as ffmpeg_probe  # type: ignore
+            meta = ffmpeg_probe(self.cfg.video) if ffmpeg_probe is not None else {}
+            stream = (meta.get("streams") or [{}])[0]
+            sw = int(stream.get("width") or 0)
+            sh = int(stream.get("height") or 0)
+            if sw > 0 and sh > 0:
+                return sw, sh
+        except Exception:
+            pass
+        fh, fw = int(frame_shape[0]), int(frame_shape[1])
+        return max(1, fw), max(1, fh)
+
+    @staticmethod
+    def _capture_frame_pts_sec(cap, frame_idx: int, fps: float) -> Optional[float]:
+        """Return frame timestamp seconds, preferring capture-reported time over frame_idx/fps."""
+        try:
+            if cap is not None and hasattr(cap, "get"):
+                pos_msec = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
+                if math.isfinite(pos_msec) and (pos_msec > 0.0 or int(frame_idx) == 0):
+                    return pos_msec / 1000.0
+        except Exception:
+            pass
+        if fps > 0.0 and math.isfinite(fps):
+            return max(0.0, float(frame_idx) / float(fps))
+        return None
+
+    @staticmethod
+    def _scale_crop_xyxy_to_source(
+        crop_xyxy: tuple[int, int, int, int],
+        frame_size: tuple[int, int],
+        source_size: tuple[int, int],
+    ) -> tuple[int, int, int, int]:
+        """Map processed-frame crop coordinates back to original source pixels."""
+        fw, fh = max(1, int(frame_size[0])), max(1, int(frame_size[1]))
+        sw, sh = max(1, int(source_size[0])), max(1, int(source_size[1]))
+        sx = float(sw) / float(fw)
+        sy = float(sh) / float(fh)
+        x1, y1, x2, y2 = crop_xyxy
+        ox1 = int(round(float(x1) * sx))
+        oy1 = int(round(float(y1) * sy))
+        ox2 = int(round(float(x2) * sx))
+        oy2 = int(round(float(y2) * sy))
+        ox1 = max(0, min(sw - 1, ox1))
+        oy1 = max(0, min(sh - 1, oy1))
+        ox2 = max(ox1 + 1, min(sw, ox2))
+        oy2 = max(oy1 + 1, min(sh, oy2))
+        return ox1, oy1, ox2, oy2
+
+    @staticmethod
+    def _even_hdr_crop_xyxy(crop_xyxy: tuple[int, int, int, int], source_size: tuple[int, int]) -> tuple[int, int, int, int]:
+        """Make 4:2:0 HDR still/video crops legal without moving far from the chosen box."""
+        def _legalize_axis(a1: int, a2: int, limit: int) -> tuple[int, int]:
+            # 4:2:0-safe crop: even origin, even extent, in-bounds, size >= 2.
+            a1 = max(0, min(limit - 2, a1 & ~1))
+            a2 = max(a1 + 2, min(limit, a2))
+            if (a2 - a1) & 1:
+                if a2 < limit:
+                    a2 += 1
+                elif a2 > a1 + 2:
+                    a2 -= 1
+                elif a1 >= 2:
+                    a1 -= 2
+                else:
+                    a2 = min(limit, a1 + 2)
+            if a1 & 1:
+                if a1 + 1 <= limit - 2:
+                    a1 += 1
+                    a2 = max(a1 + 2, min(limit, a2 + 1))
+                else:
+                    a1 -= 1
+            a1 = max(0, min(limit - 2, a1 & ~1))
+            a2 = max(a1 + 2, min(limit, a2))
+            if (a2 - a1) & 1:
+                a2 = max(a1 + 2, min(limit, a2 - 1))
+            return a1, a2
+
+        sw, sh = max(2, int(source_size[0])), max(2, int(source_size[1]))
+        x1, y1, x2, y2 = [int(v) for v in crop_xyxy]
+        x1, x2 = _legalize_axis(x1, x2, sw)
+        y1, y2 = _legalize_axis(y1, y2, sh)
+        return x1, y1, x2, y2
+
+    def _ffmpeg_libplacebo_options(self, ffmpeg_bin: str) -> set[str]:
+        """Return supported ffmpeg libplacebo option names for this binary."""
+        cache = getattr(self, "_ffmpeg_lp_opts_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._ffmpeg_lp_opts_cache = cache
+        cached = cache.get(ffmpeg_bin)
+        if isinstance(cached, set):
+            return cached
+        opts: set[str] = set()
+        try:
+            cp = subprocess.run(
+                [ffmpeg_bin, "-hide_banner", "-h", "filter=libplacebo"],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            text = (cp.stdout or "") + "\n" + (cp.stderr or "")
+            for line in text.splitlines():
+                parts = line.strip().split()
+                if not parts:
+                    continue
+                name = parts[0].strip()
+                if name and all((ch.isalnum() or ch == "_") for ch in name):
+                    opts.add(name)
+        except Exception as exc:
+            self._status(
+                f"HDR libplacebo option probe failed: {exc}",
+                key="hdr_lp_probe",
+                interval=30.0,
+            )
+        cache[ffmpeg_bin] = opts
+        return opts
+
+    @staticmethod
+    def _add_lp_opt(opts: list[str], supported: set[str], name: str, value: str) -> bool:
+        if supported and name not in supported:
+            return False
+        opts.append(f"{name}={value}")
+        return True
+
+    def _hdr_tonemap_filter_cmds(
+        self,
+        ffmpeg_bin: str,
+        frame_idx: int,
+        frame_pts_sec: Optional[float],
+        crop_xyxy: tuple[int, int, int, int],
+        out_path: str,
+    ) -> list[list[str]]:
+        """Build preferred-to-fallback full-res HDR→SDR still export commands."""
+        x1, y1, x2, y2 = [int(v) for v in crop_xyxy]
+        w = max(1, int(x2 - x1))
+        h = max(1, int(y2 - y1))
+        seek_sec: Optional[float] = None
+        try:
+            if frame_pts_sec is not None and math.isfinite(float(frame_pts_sec)):
+                seek_sec = max(0.0, float(frame_pts_sec))
+        except Exception:
+            seek_sec = None
+        if seek_sec is None:
+            fps = float(getattr(self, "_fps", 0.0) or 0.0)
+            if fps > 0 and math.isfinite(fps):
+                seek_sec = max(0.0, float(frame_idx) / fps)
+        base = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
+        if seek_sec is not None:
+            base += ["-ss", f"{seek_sec:.6f}"]
+        base += ["-i", self.cfg.video, "-map", "0:v:0", "-frames:v", "1"]
+        q = max(2, min(31, int(round((100 - int(getattr(self.cfg, "jpg_quality", 90))) / 3.5 + 2))))
+        enc = ["-an", "-sn", "-dn", "-q:v", str(q), "-update", "1", out_path]
+        crop = f"crop={w}:{h}:{x1}:{y1}"
+        src = "setparams=color_trc=smpte2084:color_primaries=bt2020:colorspace=bt2020nc:range=limited"
+        desat = float(getattr(self.cfg, "tm_desat", 0.25))
+        param = float(getattr(self.cfg, "tm_param", 0.40))
+        nits = float(getattr(self.cfg, "sdr_nits", 125.0))
+        pref = str(getattr(self.cfg, "hdr_tonemap_pref", "auto") or "auto").lower()
+        quality = str(getattr(self.cfg, "hdr_sdr_quality", "resolve_like") or "resolve_like").lower()
+        algo = str(getattr(self.cfg, "hdr_sdr_tonemap", "spline") or "spline").lower()
+        if algo not in {"spline", "bt.2390", "st2094-40", "mobius", "hable", "reinhard", "clip"}:
+            algo = "spline"
+        gamut = str(getattr(self.cfg, "hdr_sdr_gamut_mapping", "perceptual") or "perceptual").lower()
+        if gamut not in {"perceptual", "relative", "saturation", "clip"}:
+            gamut = "perceptual"
+        try:
+            contrast_recovery = max(0.0, min(2.0, float(getattr(self.cfg, "hdr_sdr_contrast_recovery", 0.30))))
+        except Exception:
+            contrast_recovery = 0.30
+        peak_detect = bool(getattr(self.cfg, "hdr_sdr_peak_detect", True))
+        allow_inaccurate = bool(getattr(self.cfg, "hdr_sdr_allow_inaccurate_fallback", False))
+
+        filters = ffmpeg_has_hdr_filters(ffmpeg_bin)
+        cmds: list[list[str]] = []
+        if filters.get("libplacebo") and pref in ("auto", "libplacebo"):
+            supported = self._ffmpeg_libplacebo_options(ffmpeg_bin)
+            base_lp_opts = [
+                f"tonemapping='{algo}'",
+                "colorspace=bt709",
+                "color_primaries=bt709",
+                "color_trc=bt709",
+                "range=full",
+                "format=bgra",
+            ]
+            self._add_lp_opt(base_lp_opts, supported, "peak_detect", "true" if peak_detect else "false")
+            if quality in ("resolve_like", "madvr_like"):
+                self._add_lp_opt(base_lp_opts, supported, "peak_detection_preset", "high_quality")
+                self._add_lp_opt(base_lp_opts, supported, "color_map_preset", "high_quality")
+                self._add_lp_opt(base_lp_opts, supported, "gamut_mapping", gamut)
+                self._add_lp_opt(base_lp_opts, supported, "contrast_recovery", f"{contrast_recovery:.6g}")
+                self._add_lp_opt(base_lp_opts, supported, "contrast_smoothness", "3.5")
+                if not self._add_lp_opt(base_lp_opts, supported, "tonemapping_lut_size", "1024"):
+                    self._add_lp_opt(base_lp_opts, supported, "tone_lut_size", "1024")
+                if not self._add_lp_opt(base_lp_opts, supported, "dithering", "blue"):
+                    self._add_lp_opt(base_lp_opts, supported, "dither_method", "blue")
+            elif quality == "balanced":
+                self._add_lp_opt(base_lp_opts, supported, "gamut_mapping", gamut)
+                self._add_lp_opt(base_lp_opts, supported, "contrast_recovery", f"{min(contrast_recovery, 0.20):.6g}")
+                self._add_lp_opt(base_lp_opts, supported, "tonemapping_lut_size", "512")
+
+            lp_variants: list[list[str]] = [base_lp_opts]
+            if quality in ("resolve_like", "madvr_like", "balanced"):
+                alt = [opt for opt in base_lp_opts if not opt.startswith("gamut_mapping=")]
+                if supported and "gamut_mode" in supported:
+                    alt.append(f"gamut_mode={gamut}")
+                    lp_variants.append(alt)
+            lp_variants.append([
+                f"tonemapping='{algo}'",
+                "colorspace=bt709",
+                "color_primaries=bt709",
+                "color_trc=bt709",
+                "range=full",
+                "format=bgra",
+            ])
+
+            seen_lp: set[str] = set()
+            for opts in lp_variants:
+                opt_str = ":".join(opts)
+                if opt_str in seen_lp:
+                    continue
+                seen_lp.add(opt_str)
+                lp = f"{crop},format=p010le,{src},hwupload=extra_hw_frames=1,libplacebo={opt_str},format=bgr24"
+                cmds.append(
+                    base[:1]
+                    + ["-init_hw_device", "vulkan=vk:0", "-filter_hw_device", "vk"]
+                    + base[1:]
+                    + ["-vf", lp]
+                    + enc
+                )
+        if filters.get("zscale") and filters.get("tonemap") and pref in ("auto", "zscale"):
+            # CPU fallback. It is slower, but it only runs on accepted captures and
+            # preserves the main invariant: full-resolution source crop, not preview crop.
+            z_algo_map = {
+                "mobius": "mobius",
+                "hable": "hable",
+                "reinhard": "reinhard",
+                "clip": "clip",
+                "bt.2390": "reinhard",
+                "spline": "mobius",
+                "st2094-40": "hable",
+            }
+            z_algo = z_algo_map.get(algo, "mobius")
+            z_peak = nits if peak_detect else max(100.0, nits)
+            z_param = param
+            z_desat = desat
+            z_dither = "error_diffusion"
+            if quality in ("resolve_like", "madvr_like"):
+                z_dither = "error_diffusion"
+                z_param = min(1.0, z_param + 0.30 * contrast_recovery)
+            elif quality == "balanced":
+                z_dither = "ordered"
+                z_param = min(1.0, z_param + 0.15 * contrast_recovery)
+                z_desat = min(1.0, z_desat + 0.05)
+            elif quality == "fast":
+                z_dither = "none"
+                z_param = min(1.0, z_param + 0.05 * contrast_recovery)
+                z_desat = min(1.0, z_desat + 0.10)
+            if gamut == "clip":
+                z_desat = min(1.0, z_desat + 0.15)
+            elif gamut == "saturation":
+                z_desat = max(0.0, z_desat - 0.10)
+            elif gamut == "relative":
+                z_desat = max(0.0, z_desat - 0.05)
+            zf = (
+                f"{crop},{src},"
+                "zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc,"
+                "zscale=transfer=linear:npl=1000,format=gbrpf32le,"
+                f"tonemap=tonemap={z_algo}:param={z_param:.6g}:desat={z_desat:.6g}:peak={z_peak:.6g},"
+                f"zscale=transfer=bt709:primaries=bt709:matrix=bt709:dither={z_dither},"
+                "zscale=rangein=pc:range=pc,format=bgr24"
+            )
+            cmds.append(base + ["-vf", zf] + enc)
+        if allow_inaccurate and pref in ("auto", "scale"):
+            # Last-resort full-res export. This is not correct HDR tone mapping,
+            # but it is still original-resolution and only used if the HDR filters fail.
+            # Disabled by default because the goal is faithful HDR->SDR rendering,
+            # not silently saving a washed-out fallback frame.
+            sf = f"{crop},scale=in_range=limited:out_range=full,format=bgr24"
+            cmds.append(base + ["-vf", sf] + enc)
+        return cmds
+
+    def _save_hdr_sdr_screencap(
+        self,
+        frame_idx: int,
+        frame_pts_sec: Optional[float],
+        crop_xyxy: tuple[int, int, int, int],
+        out_path: str,
+    ) -> tuple[bool, str]:
+        """Export the primary crop as full-resolution HDR→SDR from the original source."""
+        ffmpeg_bin = self._resolve_ffmpeg_bin()
+        if not ffmpeg_bin:
+            return False, "ffmpeg_unavailable"
+        tmp = out_path + ".tmp.jpg"
+        try:
+            ensure_dir(os.path.dirname(out_path))
+        except Exception:
+            pass
+        timeout_sec = max(5, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
+        for cmd in self._hdr_tonemap_filter_cmds(ffmpeg_bin, frame_idx, frame_pts_sec, crop_xyxy, tmp):
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            try:
+                cp = subprocess.run(cmd, text=True, capture_output=True, check=False, timeout=timeout_sec)
+                if cp.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) >= 1024:
+                    os.replace(tmp, out_path)
+                    return True, ""
+                tail = (cp.stderr or cp.stdout or "").splitlines()[-4:]
+                why = " | ".join(tail) if tail else f"ffmpeg_rc={cp.returncode}"
+                self._status(f"HDR full-res export fallback: {why}", key="hdr_sdr_export", interval=10.0)
+            except subprocess.TimeoutExpired as exc:
+                self._status(
+                    f"HDR full-res export timeout after {timeout_sec}s: {exc}",
+                    key="hdr_sdr_export",
+                    interval=10.0,
+                )
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+                return False, f"ffmpeg_timeout_{timeout_sec}s"
+            except Exception as exc:
+                self._status(f"HDR full-res export fallback: {exc}", key="hdr_sdr_export", interval=10.0)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False, "all_hdr_export_filters_failed"
+
     def _save_hdr_crop_p010(
-        self, frame_idx: int, crop_xyxy: tuple[int, int, int, int], out_path: str
+        self, frame_idx: int, frame_pts_sec: Optional[float], crop_xyxy: tuple[int, int, int, int], out_path: str
     ) -> None:
         """Use ffmpeg directly to export an HDR crop from the original source."""
-
-        if not getattr(self, "_hdr_passthrough_active", False):
-            return
 
         ffmpeg_bin = self._resolve_ffmpeg_bin()
         if not ffmpeg_bin:
@@ -5415,14 +6155,20 @@ class Processor(QtCore.QObject):
             pass
 
         vf = f"crop={w}:{h}:{int(x1)}:{int(y1)}"
-        fps = float(getattr(self, "_fps", 0.0) or 0.0)
         seek_sec: Optional[float] = None
-        if fps > 0:
-            seek_sec = max(0.0, float(frame_idx) / fps)
+        try:
+            if frame_pts_sec is not None and math.isfinite(float(frame_pts_sec)):
+                seek_sec = max(0.0, float(frame_pts_sec))
+        except Exception:
+            seek_sec = None
+        if seek_sec is None:
+            fps = float(getattr(self, "_fps", 0.0) or 0.0)
+            if fps > 0 and math.isfinite(fps):
+                seek_sec = max(0.0, float(frame_idx) / fps)
 
         is_avif = out_path.lower().endswith(".avif")
 
-        cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error"]
+        cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
         if seek_sec is not None:
             cmd += ["-ss", f"{seek_sec:.6f}"]
         cmd += [
@@ -5485,12 +6231,64 @@ class Processor(QtCore.QObject):
                 "-color_primaries", "bt2020",
                 "-color_trc", "smpte2084",
             ]
-        cmd.append(out_path)
-
+        out_ext = Path(out_path).suffix or ".mkv"
+        tmp_out = out_path + f".tmp{out_ext}"
         try:
-            subprocess.run(cmd, check=True)
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+        except Exception:
+            pass
+        cmd.append(tmp_out)
+
+        timeout_sec = max(5, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
+        try:
+            cp = subprocess.run(
+                cmd,
+                check=False,
+                timeout=timeout_sec,
+                capture_output=True,
+                text=True,
+            )
+            if cp.returncode == 0 and os.path.exists(tmp_out) and os.path.getsize(tmp_out) > 0:
+                os.replace(tmp_out, out_path)
+                return
+            try:
+                if os.path.exists(tmp_out):
+                    os.remove(tmp_out)
+            except Exception:
+                pass
+            if cp.returncode != 0:
+                tail = (cp.stderr or cp.stdout or "").splitlines()[-4:]
+                why = " | ".join(tail) if tail else f"ffmpeg_rc={cp.returncode}"
+                self._status(
+                    f"HDR crop export failed: {why}",
+                    key="hdr_crop_export",
+                    interval=10.0,
+                )
+            else:
+                self._status(
+                    f"HDR crop export failed: invalid output file ({out_path})",
+                    key="hdr_crop_export",
+                    interval=10.0,
+                )
+        except subprocess.TimeoutExpired as exc:
+            self._status(
+                f"HDR crop export timeout after {timeout_sec}s: {exc}",
+                key="hdr_crop_export",
+                interval=10.0,
+            )
+            try:
+                if os.path.exists(tmp_out):
+                    os.remove(tmp_out)
+            except Exception:
+                pass
         except Exception as exc:
-            self.status(
+            try:
+                if os.path.exists(tmp_out):
+                    os.remove(tmp_out)
+            except Exception:
+                pass
+            self._status(
                 f"HDR crop export failed: {exc}",
                 key="hdr_crop_export",
                 interval=10.0,
@@ -5825,6 +6623,23 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         file_layout.addWidget(self.chk_hdr_passthrough, 5, 0, 1, 3)
 
+        self.chk_hdr_screencap_fullres = QtWidgets.QCheckBox("HDR source-res screencaps")
+        self.chk_hdr_screencap_fullres.setChecked(bool(getattr(self.cfg, "hdr_screencap_fullres", True)))
+        self.chk_hdr_screencap_fullres.setToolTip(
+            "For HDR input, save the primary crops/f*.jpg by cropping the original source frame "
+            "and tone-mapping it with FFmpeg/libplacebo/zscale. This is independent of Vulkan preview."
+        )
+        self.chk_hdr_screencap_fullres.toggled.connect(self._on_ui_change)
+        file_layout.addWidget(self.chk_hdr_screencap_fullres, 6, 0, 1, 3)
+
+        self.chk_hdr_archive_crops = QtWidgets.QCheckBox("Also save source HDR crops")
+        self.chk_hdr_archive_crops.setChecked(bool(getattr(self.cfg, "hdr_archive_crops", False)))
+        self.chk_hdr_archive_crops.setToolTip(
+            "Additionally write original-source HDR crops to hdr_crops/ in the selected HDR crop format."
+        )
+        self.chk_hdr_archive_crops.toggled.connect(self._on_ui_change)
+        file_layout.addWidget(self.chk_hdr_archive_crops, 7, 0, 1, 3)
+
         # Params
         param_group = QtWidgets.QGroupBox("Parameters")
         grid = QtWidgets.QGridLayout(param_group)
@@ -5859,6 +6674,66 @@ class MainWindow(QtWidgets.QMainWindow):
         pref_idx = self.tonemap_pref_combo.findData(self.cfg.hdr_tonemap_pref)
         self.tonemap_pref_combo.setCurrentIndex(pref_idx if pref_idx >= 0 else 0)
         self.tonemap_pref_combo.currentIndexChanged.connect(self._on_ui_change)
+
+        self.hdr_sdr_quality_combo = QtWidgets.QComboBox()
+        self.hdr_sdr_quality_combo.addItem("Resolve-like high quality", "resolve_like")
+        self.hdr_sdr_quality_combo.addItem("MadVR-like high quality", "madvr_like")
+        self.hdr_sdr_quality_combo.addItem("Balanced", "balanced")
+        self.hdr_sdr_quality_combo.addItem("Fast", "fast")
+        _hdrq = str(getattr(self.cfg, "hdr_sdr_quality", "resolve_like") or "resolve_like")
+        _hdrq_idx = self.hdr_sdr_quality_combo.findData(_hdrq)
+        self.hdr_sdr_quality_combo.setCurrentIndex(_hdrq_idx if _hdrq_idx >= 0 else 0)
+        self.hdr_sdr_quality_combo.setToolTip(
+            "Quality preset for full-res HDR->SDR screencap export. Does not affect pre-scan."
+        )
+        self.hdr_sdr_quality_combo.currentIndexChanged.connect(self._on_ui_change)
+
+        self.hdr_sdr_tonemap_combo = QtWidgets.QComboBox()
+        for _label, _data in (
+            ("Spline", "spline"),
+            ("BT.2390", "bt.2390"),
+            ("ST 2094-40", "st2094-40"),
+            ("Mobius", "mobius"),
+            ("Hable", "hable"),
+        ):
+            self.hdr_sdr_tonemap_combo.addItem(_label, _data)
+        _hdrtm = str(getattr(self.cfg, "hdr_sdr_tonemap", "spline") or "spline")
+        _hdrtm_idx = self.hdr_sdr_tonemap_combo.findData(_hdrtm)
+        self.hdr_sdr_tonemap_combo.setCurrentIndex(_hdrtm_idx if _hdrtm_idx >= 0 else 0)
+        self.hdr_sdr_tonemap_combo.setToolTip("Tone mapping curve for full-res HDR->SDR screencap export.")
+        self.hdr_sdr_tonemap_combo.currentIndexChanged.connect(self._on_ui_change)
+
+        self.hdr_sdr_gamut_combo = QtWidgets.QComboBox()
+        for _label, _data in (("Perceptual", "perceptual"), ("Relative", "relative"), ("Saturation", "saturation"), ("Clip", "clip")):
+            self.hdr_sdr_gamut_combo.addItem(_label, _data)
+        _hdrgm = str(getattr(self.cfg, "hdr_sdr_gamut_mapping", "perceptual") or "perceptual")
+        _hdrgm_idx = self.hdr_sdr_gamut_combo.findData(_hdrgm)
+        self.hdr_sdr_gamut_combo.setCurrentIndex(_hdrgm_idx if _hdrgm_idx >= 0 else 0)
+        self.hdr_sdr_gamut_combo.setToolTip("Gamut mapping for full-res HDR->SDR screencap export.")
+        self.hdr_sdr_gamut_combo.currentIndexChanged.connect(self._on_ui_change)
+
+        def _mk_fspin(minv: float, maxv: float, step: float, decimals: int, tooltip: str) -> QtWidgets.QDoubleSpinBox:
+            sb = QtWidgets.QDoubleSpinBox()
+            sb.setRange(minv, maxv)
+            sb.setSingleStep(step)
+            sb.setDecimals(decimals)
+            sb.setToolTip(tooltip)
+            sb.setKeyboardTracking(False)
+            return sb
+
+        self.hdr_sdr_contrast_spin = _mk_fspin(0.0, 2.0, 0.05, 2, "float: hdr_sdr_contrast_recovery")
+        self.hdr_sdr_contrast_spin.setValue(float(getattr(self.cfg, "hdr_sdr_contrast_recovery", 0.30)))
+        self.hdr_sdr_contrast_spin.valueChanged.connect(self._on_ui_change)
+        self.hdr_sdr_peak_check = QtWidgets.QCheckBox()
+        self.hdr_sdr_peak_check.setChecked(bool(getattr(self.cfg, "hdr_sdr_peak_detect", True)))
+        self.hdr_sdr_peak_check.setToolTip("bool: hdr_sdr_peak_detect (dynamic libplacebo peak detection)")
+        self.hdr_sdr_peak_check.stateChanged.connect(self._on_ui_change)
+        self.hdr_sdr_bad_fallback_check = QtWidgets.QCheckBox()
+        self.hdr_sdr_bad_fallback_check.setChecked(bool(getattr(self.cfg, "hdr_sdr_allow_inaccurate_fallback", False)))
+        self.hdr_sdr_bad_fallback_check.setToolTip(
+            "Allow inaccurate full-res scale fallback if HDR tone-map filters fail. Off preserves fidelity by failing instead of saving washed-out crops."
+        )
+        self.hdr_sdr_bad_fallback_check.stateChanged.connect(self._on_ui_change)
         self.hwaccel_combo = QtWidgets.QComboBox()
         self.hwaccel_combo.addItem("CPU decode (no hwaccel)", "off")
         self.hwaccel_combo.addItem("CUDA / NVDEC (GPU decode)", "cuda")
@@ -5938,6 +6813,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_prescan_decode_max_w.setValue(int(getattr(self.cfg, "prescan_decode_max_w", 384)))
         self.spin_prescan_decode_max_w.setToolTip("int: prescan_decode_max_w (decoder downscale; 0=disable)")
         self.spin_prescan_decode_max_w.valueChanged.connect(self._on_ui_change)
+        self.prescan_cache_combo = QtWidgets.QComboBox()
+        self.prescan_cache_combo.addItem("Auto reuse matching cache", "auto")
+        self.prescan_cache_combo.addItem("Refresh/rebuild cache", "refresh")
+        self.prescan_cache_combo.addItem("Disabled", "off")
+        _pc_mode = str(getattr(self.cfg, "prescan_cache_mode", "auto") or "auto")
+        _pc_idx = self.prescan_cache_combo.findData(_pc_mode)
+        self.prescan_cache_combo.setCurrentIndex(_pc_idx if _pc_idx >= 0 else 0)
+        self.prescan_cache_combo.setToolTip(
+            "Persistent pre-scan cache. Auto reuses matching video/ref/pre-scan settings; "
+            "HDR/export-only setting changes do not invalidate it."
+        )
+        self.prescan_cache_combo.currentIndexChanged.connect(self._on_ui_change)
+        self.prescan_cache_clear_btn = QtWidgets.QPushButton("Clear")
+        self.prescan_cache_clear_btn.setToolTip("Delete all persisted pre-scan cache files.")
+        self.prescan_cache_clear_btn.clicked.connect(self._clear_prescan_cache)
+        self.prescan_cache_widget = QtWidgets.QWidget()
+        _pc_lay = QtWidgets.QHBoxLayout(self.prescan_cache_widget)
+        _pc_lay.setContentsMargins(0, 0, 0, 0)
+        _pc_lay.setSpacing(6)
+        _pc_lay.addWidget(self.prescan_cache_combo, 1)
+        _pc_lay.addWidget(self.prescan_cache_clear_btn, 0)
         self.spin_prescan_face_conf = QtWidgets.QDoubleSpinBox()
         self.spin_prescan_face_conf.setDecimals(3)
         self.spin_prescan_face_conf.setRange(0.0, 1.0)
@@ -6170,15 +7066,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.jpg_quality_spin.setToolTip("int: jpg_quality")
         self.jpg_quality_spin.valueChanged.connect(self._on_ui_change)
 
-        def _mk_fspin(minv: float, maxv: float, step: float, decimals: int, tooltip: str) -> QtWidgets.QDoubleSpinBox:
-            sb = QtWidgets.QDoubleSpinBox()
-            sb.setRange(minv, maxv)
-            sb.setSingleStep(step)
-            sb.setDecimals(decimals)
-            sb.setToolTip(tooltip)
-            sb.setKeyboardTracking(False)
-            return sb
-
         self.faceless_allow_check = QtWidgets.QCheckBox()
         self.faceless_allow_check.setChecked(bool(self.cfg.allow_faceless_when_locked))
         self.faceless_allow_check.setToolTip("bool: allow_faceless_when_locked")
@@ -6297,8 +7184,14 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Tonemap desat", self.tm_desat_spin),
             ("Tonemap Mobius param", self.tm_param_spin),
             ("Tonemap backend", self.tonemap_pref_combo),
+            ("HDR SDR quality", self.hdr_sdr_quality_combo),
+            ("HDR SDR tone curve", self.hdr_sdr_tonemap_combo),
+            ("HDR SDR gamut", self.hdr_sdr_gamut_combo),
+            ("HDR contrast recovery", self.hdr_sdr_contrast_spin),
+            ("HDR peak detect", self.hdr_sdr_peak_check),
+            ("Allow inaccurate HDR fallback", self.hdr_sdr_bad_fallback_check),
             ("FFmpeg hardware decode", self.hwaccel_combo),
-            ("HDR crop format", self.hdr_crop_format_combo),
+            ("HDR archive format", self.hdr_crop_format_combo),
             ("Frame stride", self.stride_spin),
             ("YOLO min conf", self.det_conf_spin),
             ("Face max dist", self.face_thr_spin),
@@ -6322,6 +7215,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Pre-scan bank add dist ≤", self.spin_prescan_fd_add),
             ("Pre-scan max width (px)", self.spin_prescan_max_width),
             ("Pre-scan decode max width (px)", self.spin_prescan_decode_max_w),
+            ("Pre-scan cache", self.prescan_cache_widget),
             ("Pre-scan face det conf", self.spin_prescan_face_conf),
             ("Pre-scan ENTER dist ≤", self.spin_prescan_fd_enter),
             ("Pre-scan EXIT dist ≥", self.spin_prescan_fd_exit),
@@ -7271,6 +8165,38 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             self._in_ui_change = False
 
+    def _clear_prescan_cache(self) -> None:
+        root = _REPO_ROOT / "prescan_cache"
+        try:
+            # Respect a custom relative/absolute cache dir from the current config.
+            raw = str(getattr(self.cfg, "prescan_cache_dir", "prescan_cache") or "prescan_cache").strip()
+            root = Path(raw)
+            if not root.is_absolute():
+                root = _REPO_ROOT / root
+        except Exception:
+            root = _REPO_ROOT / "prescan_cache"
+        try:
+            root = root.resolve()
+            repo_root = _REPO_ROOT.resolve()
+            home = Path.home().resolve()
+            fs_root = Path(root.anchor)
+            if root in {fs_root, home, repo_root}:
+                raise ValueError(f"Refusing to clear unsafe cache path: {root}")
+            try:
+                root.relative_to(repo_root)
+            except ValueError as exc:
+                raise ValueError(f"Refusing to clear non-repo cache path: {root}") from exc
+            if root.exists():
+                shutil.rmtree(root)
+            root.mkdir(parents=True, exist_ok=True)
+            self.statusBar().showMessage(f"Cleared pre-scan cache: {root}", 5000)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Clear pre-scan cache failed",
+                f"Could not clear pre-scan cache:\n{root}\n\n{exc}",
+            )
+
     # ------------- Actions -------------
 
     def _pick_file(self, line: QtWidgets.QLineEdit, filt: str):
@@ -7484,6 +8410,15 @@ class MainWindow(QtWidgets.QMainWindow):
             "rot_every_n",
             "rot_after_hit_frames",
             "fast_no_face_imgsz",
+            "hdr_screencap_fullres",
+            "hdr_archive_crops",
+            "hdr_crop_format",
+            "hdr_sdr_quality",
+            "hdr_sdr_tonemap",
+            "hdr_sdr_gamut_mapping",
+            "hdr_sdr_contrast_recovery",
+            "hdr_sdr_peak_detect",
+            "hdr_sdr_allow_inaccurate_fallback",
         }
         live |= {
             "lambda_facefrac",
@@ -7543,6 +8478,12 @@ class MainWindow(QtWidgets.QMainWindow):
             prescan_fd_add=float(self.spin_prescan_fd_add.value()) if hasattr(self, "spin_prescan_fd_add") else 0.22,
             prescan_max_width=int(self.spin_prescan_max_width.value()) if hasattr(self, "spin_prescan_max_width") else 416,
             prescan_decode_max_w=int(self.spin_prescan_decode_max_w.value()) if hasattr(self, "spin_prescan_decode_max_w") else int(getattr(self.cfg, "prescan_decode_max_w", 384)),
+            prescan_cache_mode=(self.prescan_cache_combo.currentData() if hasattr(self, "prescan_cache_combo") else getattr(self.cfg, "prescan_cache_mode", "auto")) or "auto",
+            prescan_cache_dir=(
+                self.edit_prescan_cache_dir.text().strip()
+                if hasattr(self, "edit_prescan_cache_dir")
+                else str(getattr(self.cfg, "prescan_cache_dir", "prescan_cache") or "prescan_cache")
+            ),
             prescan_face_conf=float(self.spin_prescan_face_conf.value()) if hasattr(self, "spin_prescan_face_conf") else 0.5,
             prescan_fd_enter=float(self.spin_prescan_fd_enter.value()) if hasattr(self, "spin_prescan_fd_enter") else 0.45,
             prescan_fd_exit=float(self.spin_prescan_fd_exit.value()) if hasattr(self, "spin_prescan_fd_exit") else 0.52,
@@ -7647,16 +8588,40 @@ class MainWindow(QtWidgets.QMainWindow):
             face_max_frac_in_crop=float(self.face_max_frac_spin.value()) if hasattr(self, "face_max_frac_spin") else 0.42,
             face_min_frac_in_crop=float(self.face_min_frac_spin.value()) if hasattr(self, "face_min_frac_spin") else 0.18,
             crop_min_height_frac=float(self.crop_min_height_frac_spin.value()) if hasattr(self, "crop_min_height_frac_spin") else 0.28,
+            hdr_export_timeout_sec=int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300),
         )
         cfg.hdr_passthrough = (
             getattr(self, "chk_hdr_passthrough", None) is not None
             and self.chk_hdr_passthrough.isEnabled()
             and self.chk_hdr_passthrough.isChecked()
         )
+        cfg.hdr_screencap_fullres = (
+            getattr(self, "chk_hdr_screencap_fullres", None) is None
+            or self.chk_hdr_screencap_fullres.isChecked()
+        )
+        cfg.hdr_archive_crops = (
+            getattr(self, "chk_hdr_archive_crops", None) is not None
+            and self.chk_hdr_archive_crops.isChecked()
+        )
         try:
             cfg.hdr_crop_format = self.hdr_crop_format_combo.currentText().lower()
         except Exception:
             cfg.hdr_crop_format = "mkv"
+        try:
+            cfg.hdr_sdr_quality = self.hdr_sdr_quality_combo.currentData() or "resolve_like"
+        except Exception:
+            cfg.hdr_sdr_quality = "resolve_like"
+        try:
+            cfg.hdr_sdr_tonemap = self.hdr_sdr_tonemap_combo.currentData() or "spline"
+        except Exception:
+            cfg.hdr_sdr_tonemap = "spline"
+        try:
+            cfg.hdr_sdr_gamut_mapping = self.hdr_sdr_gamut_combo.currentData() or "perceptual"
+        except Exception:
+            cfg.hdr_sdr_gamut_mapping = "perceptual"
+        cfg.hdr_sdr_contrast_recovery = float(self.hdr_sdr_contrast_spin.value()) if hasattr(self, "hdr_sdr_contrast_spin") else 0.30
+        cfg.hdr_sdr_peak_detect = bool(self.hdr_sdr_peak_check.isChecked()) if hasattr(self, "hdr_sdr_peak_check") else True
+        cfg.hdr_sdr_allow_inaccurate_fallback = bool(self.hdr_sdr_bad_fallback_check.isChecked()) if hasattr(self, "hdr_sdr_bad_fallback_check") else False
         return cfg
 
     def _apply_cfg(self, cfg: SessionConfig):
@@ -7686,12 +8651,42 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.prescan_decode_max_w = int(getattr(cfg, "prescan_decode_max_w", 384))
         except Exception:
             self.cfg.prescan_decode_max_w = 384
+        self.cfg.prescan_cache_dir = str(getattr(cfg, "prescan_cache_dir", "prescan_cache") or "prescan_cache")
+        try:
+            self.cfg.hdr_export_timeout_sec = max(5, int(getattr(cfg, "hdr_export_timeout_sec", 300) or 300))
+        except Exception:
+            self.cfg.hdr_export_timeout_sec = 300
         self.video_edit.setText(cfg.video)
         paths = [part.strip() for part in (cfg.ref or "").split(';') if part.strip()]
         self._set_ref_paths(paths)
         self.out_edit.setText(cfg.out_dir)
         if hasattr(self, "chk_hdr_passthrough"):
             self.chk_hdr_passthrough.setChecked(bool(getattr(cfg, "hdr_passthrough", False)))
+        if hasattr(self, "chk_hdr_screencap_fullres"):
+            self.chk_hdr_screencap_fullres.setChecked(bool(getattr(cfg, "hdr_screencap_fullres", True)))
+        if hasattr(self, "chk_hdr_archive_crops"):
+            self.chk_hdr_archive_crops.setChecked(bool(getattr(cfg, "hdr_archive_crops", False)))
+        if hasattr(self, "hdr_sdr_quality_combo"):
+            val = str(getattr(cfg, "hdr_sdr_quality", "resolve_like") or "resolve_like")
+            idx = self.hdr_sdr_quality_combo.findData(val)
+            self.hdr_sdr_quality_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        if hasattr(self, "hdr_sdr_tonemap_combo"):
+            val = str(getattr(cfg, "hdr_sdr_tonemap", "spline") or "spline")
+            idx = self.hdr_sdr_tonemap_combo.findData(val)
+            self.hdr_sdr_tonemap_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        if hasattr(self, "hdr_sdr_gamut_combo"):
+            val = str(getattr(cfg, "hdr_sdr_gamut_mapping", "perceptual") or "perceptual")
+            idx = self.hdr_sdr_gamut_combo.findData(val)
+            self.hdr_sdr_gamut_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        if hasattr(self, "hdr_sdr_contrast_spin"):
+            try:
+                self.hdr_sdr_contrast_spin.setValue(float(getattr(cfg, "hdr_sdr_contrast_recovery", 0.30)))
+            except Exception:
+                self.hdr_sdr_contrast_spin.setValue(0.30)
+        if hasattr(self, "hdr_sdr_peak_check"):
+            self.hdr_sdr_peak_check.setChecked(bool(getattr(cfg, "hdr_sdr_peak_detect", True)))
+        if hasattr(self, "hdr_sdr_bad_fallback_check"):
+            self.hdr_sdr_bad_fallback_check.setChecked(bool(getattr(cfg, "hdr_sdr_allow_inaccurate_fallback", False)))
         self.ratio_edit.setText(cfg.ratio)
         try:
             self.sdr_nits_spin.setValue(float(getattr(cfg, "sdr_nits", 125.0)))
@@ -7768,6 +8763,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spin_prescan_max_width.setValue(int(cfg.prescan_max_width))
         if hasattr(self, 'spin_prescan_decode_max_w'):
             self.spin_prescan_decode_max_w.setValue(int(getattr(cfg, 'prescan_decode_max_w', 384)))
+        if hasattr(self, "prescan_cache_combo"):
+            mode = str(getattr(cfg, "prescan_cache_mode", "auto") or "auto")
+            idx = self.prescan_cache_combo.findData(mode)
+            self.prescan_cache_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        if hasattr(self, "edit_prescan_cache_dir"):
+            self.edit_prescan_cache_dir.setText(str(getattr(cfg, "prescan_cache_dir", "prescan_cache") or "prescan_cache"))
         if hasattr(self, 'spin_prescan_face_conf'):
             self.spin_prescan_face_conf.setValue(float(cfg.prescan_face_conf))
         if hasattr(self, 'spin_prescan_fd_enter'):
@@ -8472,6 +9473,54 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.hdr_crop_format_combo.setCurrentIndex(0)
         self.cfg.hdr_crop_format = self.hdr_crop_format_combo.currentText().lower()
+        if hasattr(self, "chk_hdr_screencap_fullres"):
+            self.chk_hdr_screencap_fullres.setChecked(
+                s.value("hdr_screencap_fullres", self.cfg.hdr_screencap_fullres, type=bool)
+            )
+            self.cfg.hdr_screencap_fullres = bool(self.chk_hdr_screencap_fullres.isChecked())
+        if hasattr(self, "chk_hdr_archive_crops"):
+            self.chk_hdr_archive_crops.setChecked(
+                s.value("hdr_archive_crops", self.cfg.hdr_archive_crops, type=bool)
+            )
+            self.cfg.hdr_archive_crops = bool(self.chk_hdr_archive_crops.isChecked())
+        if hasattr(self, "hdr_sdr_quality_combo"):
+            val = str(s.value("hdr_sdr_quality", getattr(self.cfg, "hdr_sdr_quality", "resolve_like")) or "resolve_like")
+            idx = self.hdr_sdr_quality_combo.findData(val)
+            self.hdr_sdr_quality_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self.cfg.hdr_sdr_quality = self.hdr_sdr_quality_combo.currentData() or "resolve_like"
+        if hasattr(self, "hdr_sdr_tonemap_combo"):
+            val = str(s.value("hdr_sdr_tonemap", getattr(self.cfg, "hdr_sdr_tonemap", "spline")) or "spline")
+            idx = self.hdr_sdr_tonemap_combo.findData(val)
+            self.hdr_sdr_tonemap_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self.cfg.hdr_sdr_tonemap = self.hdr_sdr_tonemap_combo.currentData() or "spline"
+        if hasattr(self, "hdr_sdr_gamut_combo"):
+            val = str(s.value("hdr_sdr_gamut_mapping", getattr(self.cfg, "hdr_sdr_gamut_mapping", "perceptual")) or "perceptual")
+            idx = self.hdr_sdr_gamut_combo.findData(val)
+            self.hdr_sdr_gamut_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self.cfg.hdr_sdr_gamut_mapping = self.hdr_sdr_gamut_combo.currentData() or "perceptual"
+        if hasattr(self, "hdr_sdr_contrast_spin"):
+            try:
+                self.hdr_sdr_contrast_spin.setValue(float(s.value("hdr_sdr_contrast_recovery", getattr(self.cfg, "hdr_sdr_contrast_recovery", 0.30))))
+            except Exception:
+                self.hdr_sdr_contrast_spin.setValue(0.30)
+            self.cfg.hdr_sdr_contrast_recovery = float(self.hdr_sdr_contrast_spin.value())
+        if hasattr(self, "hdr_sdr_peak_check"):
+            self.hdr_sdr_peak_check.setChecked(
+                s.value("hdr_sdr_peak_detect", getattr(self.cfg, "hdr_sdr_peak_detect", True), type=bool)
+            )
+            self.cfg.hdr_sdr_peak_detect = bool(self.hdr_sdr_peak_check.isChecked())
+        if hasattr(self, "hdr_sdr_bad_fallback_check"):
+            self.hdr_sdr_bad_fallback_check.setChecked(
+                s.value("hdr_sdr_allow_inaccurate_fallback", getattr(self.cfg, "hdr_sdr_allow_inaccurate_fallback", False), type=bool)
+            )
+            self.cfg.hdr_sdr_allow_inaccurate_fallback = bool(self.hdr_sdr_bad_fallback_check.isChecked())
+        try:
+            self.cfg.hdr_export_timeout_sec = max(
+                5,
+                int(s.value("hdr_export_timeout_sec", getattr(self.cfg, "hdr_export_timeout_sec", 300)) or 300),
+            )
+        except Exception:
+            self.cfg.hdr_export_timeout_sec = 300
         self.cfg.seek_fast = s.value("seek_fast", True, type=bool)
         try:
             self.cfg.seek_max_grabs = int(s.value("seek_max_grabs", 12))
@@ -8533,6 +9582,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spin_prescan_max_width.setValue(int(s.value("prescan_max_width", self.cfg.prescan_max_width)))
         if hasattr(self, 'spin_prescan_decode_max_w'):
             self.spin_prescan_decode_max_w.setValue(int(s.value("prescan_decode_max_w", getattr(self.cfg, "prescan_decode_max_w", 384))))
+        if hasattr(self, "prescan_cache_combo"):
+            mode = str(s.value("prescan_cache_mode", getattr(self.cfg, "prescan_cache_mode", "auto")) or "auto")
+            idx = self.prescan_cache_combo.findData(mode)
+            self.prescan_cache_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self.cfg.prescan_cache_mode = self.prescan_cache_combo.currentData() or "auto"
+        self.cfg.prescan_cache_dir = str(
+            s.value("prescan_cache_dir", getattr(self.cfg, "prescan_cache_dir", "prescan_cache"))
+            or "prescan_cache"
+        )
+        if hasattr(self, "edit_prescan_cache_dir"):
+            self.edit_prescan_cache_dir.setText(self.cfg.prescan_cache_dir)
         if hasattr(self, 'spin_prescan_face_conf'):
             self.spin_prescan_face_conf.setValue(float(s.value("prescan_face_conf", self.cfg.prescan_face_conf)))
         if hasattr(self, 'spin_prescan_fd_enter'):
