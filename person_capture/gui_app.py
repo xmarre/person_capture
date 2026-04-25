@@ -3381,6 +3381,24 @@ class Processor(QtCore.QObject):
                             save_q.task_done()
                             break
 
+                        if isinstance(item, dict) and item.get("type") == "hdr_archive":
+                            try:
+                                frame_pts_sec = item.get("frame_pts_sec")
+                                if frame_pts_sec is not None:
+                                    try:
+                                        frame_pts_sec = float(frame_pts_sec)
+                                    except Exception:
+                                        frame_pts_sec = None
+                                self._save_hdr_crop_p010(
+                                    int(item.get("frame_idx", 0)),
+                                    frame_pts_sec,
+                                    tuple(item.get("crop_xyxy") or (0, 0, 2, 2)),
+                                    str(item.get("path") or ""),
+                                )
+                            finally:
+                                save_q.task_done()
+                            continue
+
                         if isinstance(item, dict) and item.get("type") == "hdr_sdr":
                             img_path = str(item.get("path") or "")
                             row = item.get("row")
@@ -4661,6 +4679,7 @@ class Processor(QtCore.QObject):
                         c.get("sharp"),
                         str(ratio_str),
                     ]
+                    primary_saved_or_enqueued = False
                     if save_q is not None:
                         try:
                             if hdr_primary_fullres:
@@ -4678,8 +4697,14 @@ class Processor(QtCore.QObject):
                                 if not buf.flags.owndata:
                                     buf = buf.copy()
                                 save_q.put_nowait((crop_img_path, buf, row))
+                            primary_saved_or_enqueued = True
                         except queue.Full:
-                            pass  # drop if saver is behind
+                            self._status(
+                                f"Save queue full: {crop_img_path}",
+                                key="save_backpressure",
+                                interval=0.5,
+                            )
+                            return False
                     else:
                         if hdr_primary_fullres:
                             ok, why = self._save_hdr_sdr_screencap(
@@ -4707,11 +4732,27 @@ class Processor(QtCore.QObject):
                                 key="save_err",
                                 interval=0.5,
                             )
-                            # skip this hit, keep processing
-                            pass
-                    if hdr_out_path:
+                            return False
+                        primary_saved_or_enqueued = True
+                    if primary_saved_or_enqueued and hdr_out_path:
                         hdr_crop_xyxy = self._even_hdr_crop_xyxy(source_crop_xyxy, source_size)
-                        self._save_hdr_crop_p010(idx, frame_pts_sec, hdr_crop_xyxy, hdr_out_path)
+                        if save_q is not None:
+                            try:
+                                save_q.put_nowait({
+                                    "type": "hdr_archive",
+                                    "path": hdr_out_path,
+                                    "frame_idx": int(idx),
+                                    "frame_pts_sec": frame_pts_sec,
+                                    "crop_xyxy": hdr_crop_xyxy,
+                                })
+                            except queue.Full:
+                                self._status(
+                                    f"HDR archive queue full: {hdr_out_path}",
+                                    key="save_backpressure",
+                                    interval=0.5,
+                                )
+                        else:
+                            self._save_hdr_crop_p010(idx, frame_pts_sec, hdr_crop_xyxy, hdr_out_path)
                     reasons_list = c.get("reasons") or []
                     reasons = "|".join(reasons_list)
                     bx1, by1, bx2, by2 = c["box"]
@@ -5701,12 +5742,43 @@ class Processor(QtCore.QObject):
         if filters.get("zscale") and filters.get("tonemap") and pref in ("auto", "zscale", "libplacebo"):
             # CPU fallback. It is slower, but it only runs on accepted captures and
             # preserves the main invariant: full-resolution source crop, not preview crop.
+            z_algo_map = {
+                "mobius": "mobius",
+                "hable": "hable",
+                "reinhard": "reinhard",
+                "clip": "clip",
+                "bt.2390": "reinhard",
+                "spline": "mobius",
+                "st2094-40": "hable",
+            }
+            z_algo = z_algo_map.get(algo, "mobius")
+            z_peak = nits if peak_detect else max(100.0, nits)
+            z_param = param
+            z_desat = desat
+            z_dither = "error_diffusion"
+            if quality in ("resolve_like", "madvr_like"):
+                z_dither = "error_diffusion"
+                z_param = min(1.0, z_param + 0.30 * contrast_recovery)
+            elif quality == "balanced":
+                z_dither = "ordered"
+                z_param = min(1.0, z_param + 0.15 * contrast_recovery)
+                z_desat = min(1.0, z_desat + 0.05)
+            elif quality == "fast":
+                z_dither = "none"
+                z_param = min(1.0, z_param + 0.05 * contrast_recovery)
+                z_desat = min(1.0, z_desat + 0.10)
+            if gamut == "clip":
+                z_desat = min(1.0, z_desat + 0.15)
+            elif gamut == "saturation":
+                z_desat = max(0.0, z_desat - 0.10)
+            elif gamut == "relative":
+                z_desat = max(0.0, z_desat - 0.05)
             zf = (
                 f"{crop},{src},"
                 "zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc,"
                 "zscale=transfer=linear:npl=1000,format=gbrpf32le,"
-                f"tonemap=tonemap=mobius:param={param:.6g}:desat={desat:.6g}:peak={nits:.6g},"
-                "zscale=transfer=bt709:primaries=bt709:matrix=bt709:dither=error_diffusion,"
+                f"tonemap=tonemap={z_algo}:param={z_param:.6g}:desat={z_desat:.6g}:peak={z_peak:.6g},"
+                f"zscale=transfer=bt709:primaries=bt709:matrix=bt709:dither={z_dither},"
                 "zscale=rangein=pc:range=pc,format=bgr24"
             )
             cmds.append(base + ["-vf", zf] + enc)
@@ -6346,6 +6418,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hdr_sdr_gamut_combo.setToolTip("Gamut mapping for full-res HDR->SDR screencap export.")
         self.hdr_sdr_gamut_combo.currentIndexChanged.connect(self._on_ui_change)
 
+        def _mk_fspin(minv: float, maxv: float, step: float, decimals: int, tooltip: str) -> QtWidgets.QDoubleSpinBox:
+            sb = QtWidgets.QDoubleSpinBox()
+            sb.setRange(minv, maxv)
+            sb.setSingleStep(step)
+            sb.setDecimals(decimals)
+            sb.setToolTip(tooltip)
+            sb.setKeyboardTracking(False)
+            return sb
+
         self.hdr_sdr_contrast_spin = _mk_fspin(0.0, 2.0, 0.05, 2, "float: hdr_sdr_contrast_recovery")
         self.hdr_sdr_contrast_spin.setValue(float(getattr(self.cfg, "hdr_sdr_contrast_recovery", 0.30)))
         self.hdr_sdr_contrast_spin.valueChanged.connect(self._on_ui_change)
@@ -6669,15 +6750,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.jpg_quality_spin.setValue(85)
         self.jpg_quality_spin.setToolTip("int: jpg_quality")
         self.jpg_quality_spin.valueChanged.connect(self._on_ui_change)
-
-        def _mk_fspin(minv: float, maxv: float, step: float, decimals: int, tooltip: str) -> QtWidgets.QDoubleSpinBox:
-            sb = QtWidgets.QDoubleSpinBox()
-            sb.setRange(minv, maxv)
-            sb.setSingleStep(step)
-            sb.setDecimals(decimals)
-            sb.setToolTip(tooltip)
-            sb.setKeyboardTracking(False)
-            return sb
 
         self.faceless_allow_check = QtWidgets.QCheckBox()
         self.faceless_allow_check.setChecked(bool(self.cfg.allow_faceless_when_locked))
