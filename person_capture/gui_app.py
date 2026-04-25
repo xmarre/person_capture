@@ -2728,11 +2728,18 @@ class Processor(QtCore.QObject):
                     return cv2.VideoCapture(video_path)
                 pos0 = int(reader.get(cv2.CAP_PROP_POS_FRAMES) or 0)
                 ok = bool(reader.grab())
-                try:
-                    reader.set(cv2.CAP_PROP_POS_FRAMES, pos0)
-                except Exception:
-                    pass
+                rewound = False
                 if ok:
+                    for _ in range(2):
+                        try:
+                            reader.set(cv2.CAP_PROP_POS_FRAMES, pos0)
+                            cur = int(reader.get(cv2.CAP_PROP_POS_FRAMES) or -1)
+                            if cur == pos0:
+                                rewound = True
+                                break
+                        except Exception:
+                            break
+                if ok and rewound:
                     return reader
                 reader.release()
                 reader = cv2.VideoCapture(video_path)
