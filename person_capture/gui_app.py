@@ -624,8 +624,7 @@ class Processor(QtCore.QObject):
             if self._abort:
                 break
             try:
-                if not cap.grab():
-                    break
+                grabbed = cap.grab()
             except Exception as exc:
                 self._status(
                     f"Pre-scan skip failed: {exc}",
@@ -633,6 +632,16 @@ class Processor(QtCore.QObject):
                     interval=0.5,
                 )
                 raise
+            if not grabbed:
+                startup_exc = getattr(cap, "_last_startup_error", None)
+                if startup_exc is not None:
+                    self._status(
+                        f"Pre-scan skip failed: {startup_exc}",
+                        key="prescan_skip_error",
+                        interval=0.5,
+                    )
+                    raise RuntimeError("Pre-scan reader failed during grab") from startup_exc
+                break
             advanced += 1
         return advanced
 
