@@ -2798,7 +2798,12 @@ class FfmpegPipeReader:
         if prop == CV_CAP_PROP_POS_FRAMES:
             target = max(0, int(value))
             try:
-                if self._proc is not None and self._next_frame_index() == target:
+                proc = self._proc
+                if (
+                    proc is not None
+                    and getattr(proc, "poll", lambda: 1)() is None
+                    and self._next_frame_index() == target
+                ):
                     self._drop_until = None
                     return True
             except Exception:
