@@ -306,8 +306,12 @@ class SessionConfig:
     min_gap_sec: float = 1.5
     min_box_pixels: int = 8000
     auto_crop_borders: bool = True
-    hdr_passthrough: bool = False  # Vulkan HDR path + no tone-map reader
-    hdr_crop_format: str = "mkv"   # mkv (FFV1 lossless) | avif (AV1 lossless)
+    # HDR preview is optional. Final screencaps must not depend on this flag.
+    hdr_passthrough: bool = False  # Vulkan HDR preview path
+    # HDR output/export controls.
+    hdr_screencap_fullres: bool = True   # write primary crops from original-resolution source frames
+    hdr_archive_crops: bool = False      # additionally write source HDR crops to hdr_crops/
+    hdr_crop_format: str = "mkv"        # mkv (FFV1 lossless) | avif (AV1 lossless)
     log_interval_sec: float = 1.0
     lock_after_hits: int = 1
     lock_face_thresh: float = 0.28
@@ -2639,7 +2643,7 @@ class Processor(QtCore.QObject):
             crops_dir = os.path.join(cfg.out_dir, "crops")
             hdr_crops_dir = (
                 os.path.join(cfg.out_dir, "hdr_crops")
-                if bool(getattr(cfg, "hdr_passthrough", False))
+                if bool(getattr(cfg, "hdr_archive_crops", False))
                 else None
             )
             ann_dir = os.path.join(cfg.out_dir, "annot") if cfg.save_annot else None
@@ -3375,8 +3379,17 @@ class Processor(QtCore.QObject):
                             save_q.task_done()
                             break
 
-                        img_path, img, row = item
-                        ok, why = _atomic_jpeg_write(img, img_path, jpg_q)
+                        if isinstance(item, dict) and item.get("type") == "hdr_sdr":
+                            img_path = str(item.get("path") or "")
+                            row = item.get("row")
+                            ok, why = self._save_hdr_sdr_screencap(
+                                int(item.get("frame_idx", 0)),
+                                tuple(item.get("crop_xyxy") or (0, 0, 1, 1)),
+                                img_path,
+                            )
+                        else:
+                            img_path, img, row = item
+                            ok, why = _atomic_jpeg_write(img, img_path, jpg_q)
 
                         if ok:
                             # hand off to worker thread for emitting
@@ -4233,8 +4246,11 @@ class Processor(QtCore.QObject):
                 def save_hit(c, idx):
                     nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box, ref_face_feat, ref_bank_list
                     crop_img_path = os.path.join(crops_dir, f"f{idx:08d}.jpg")
+                    hdr_primary_fullres = bool(
+                        hdr_active and bool(getattr(self.cfg, "hdr_screencap_fullres", True))
+                    )
                     hdr_out_path = None
-                    if self._hdr_passthrough_active and hdr_crops_dir:
+                    if hdr_active and hdr_crops_dir:
                         hdr_fmt = str(getattr(self.cfg, "hdr_crop_format", "mkv") or "mkv").lower()
                         hdr_ext = ".avif" if hdr_fmt == "avif" else ".mkv"
                         hdr_out_path = os.path.join(hdr_crops_dir, f"f{idx:08d}{hdr_ext}")
@@ -4592,6 +4608,14 @@ class Processor(QtCore.QObject):
                         f"crop@{idx}: face_box={c.get('face_box')}", key="cropface", interval=2.0
                     )
 
+                    processed_crop_xyxy = (int(cx1), int(cy1), int(cx2), int(cy2))
+                    source_size = self._capture_source_size(cap, frame.shape[:2])
+                    source_crop_xyxy = self._scale_crop_xyxy_to_source(
+                        processed_crop_xyxy,
+                        (int(W), int(H)),
+                        source_size,
+                    )
+                    primary_row_crop = source_crop_xyxy if hdr_primary_fullres else processed_crop_xyxy
                     crop_img2 = frame[cy1:cy2, cx1:cx2]
                     row = [
                         idx,
@@ -4599,25 +4623,37 @@ class Processor(QtCore.QObject):
                         c.get("score"),
                         c.get("fd"),
                         c.get("rd"),
-                        cx1,
-                        cy1,
-                        cx2,
-                        cy2,
+                        primary_row_crop[0],
+                        primary_row_crop[1],
+                        primary_row_crop[2],
+                        primary_row_crop[3],
                         crop_img_path,
                         c.get("sharp"),
                         str(ratio_str),
                     ]
                     if save_q is not None:
                         try:
-                            # enqueue a contiguous copy; slices are views into `frame`
-                            buf = np.ascontiguousarray(crop_img2)
-                            if not buf.flags.owndata:
-                                buf = buf.copy()
-                            save_q.put_nowait((crop_img_path, buf, row))
+                            if hdr_primary_fullres:
+                                save_q.put_nowait({
+                                    "type": "hdr_sdr",
+                                    "path": crop_img_path,
+                                    "row": row,
+                                    "frame_idx": int(idx),
+                                    "crop_xyxy": source_crop_xyxy,
+                                })
+                            else:
+                                # enqueue a contiguous copy; slices are views into `frame`
+                                buf = np.ascontiguousarray(crop_img2)
+                                if not buf.flags.owndata:
+                                    buf = buf.copy()
+                                save_q.put_nowait((crop_img_path, buf, row))
                         except queue.Full:
                             pass  # drop if saver is behind
                     else:
-                        ok, why = _atomic_jpeg_write(crop_img2, crop_img_path, jpg_q)
+                        if hdr_primary_fullres:
+                            ok, why = self._save_hdr_sdr_screencap(int(idx), source_crop_xyxy, crop_img_path)
+                        else:
+                            ok, why = _atomic_jpeg_write(crop_img2, crop_img_path, jpg_q)
                         if ok:
                             # emit on worker thread directly
                             self.hit.emit(crop_img_path)
@@ -4638,7 +4674,8 @@ class Processor(QtCore.QObject):
                             # skip this hit, keep processing
                             pass
                     if hdr_out_path:
-                        self._save_hdr_crop_p010(idx, (cx1, cy1, cx2, cy2), hdr_out_path)
+                        hdr_crop_xyxy = self._even_hdr_crop_xyxy(source_crop_xyxy, source_size)
+                        self._save_hdr_crop_p010(idx, hdr_crop_xyxy, hdr_out_path)
                     reasons_list = c.get("reasons") or []
                     reasons = "|".join(reasons_list)
                     bx1, by1, bx2, by2 = c["box"]
@@ -5389,13 +5426,185 @@ class Processor(QtCore.QObject):
                 pass
         return None
 
+    def _capture_source_size(self, cap, frame_shape: tuple[int, int]) -> tuple[int, int]:
+        """Return original source dimensions, not the possibly downscaled reader size."""
+        try:
+            if cap is not None:
+                source_size = getattr(cap, "_source_size", None)
+                if callable(source_size):
+                    sw, sh = source_size()
+                    if int(sw) > 0 and int(sh) > 0:
+                        return int(sw), int(sh)
+                sw = int(getattr(cap, "_source_w", 0) or 0)
+                sh = int(getattr(cap, "_source_h", 0) or 0)
+                if sw > 0 and sh > 0:
+                    return sw, sh
+        except Exception:
+            pass
+        try:
+            ffmpeg_probe = None
+            try:
+                from .video_io import _ffprobe_json as ffmpeg_probe  # type: ignore
+            except Exception:
+                from video_io import _ffprobe_json as ffmpeg_probe  # type: ignore
+            meta = ffmpeg_probe(self.cfg.video) if ffmpeg_probe is not None else {}
+            stream = (meta.get("streams") or [{}])[0]
+            sw = int(stream.get("width") or 0)
+            sh = int(stream.get("height") or 0)
+            if sw > 0 and sh > 0:
+                return sw, sh
+        except Exception:
+            pass
+        fh, fw = int(frame_shape[0]), int(frame_shape[1])
+        return max(1, fw), max(1, fh)
+
+    @staticmethod
+    def _scale_crop_xyxy_to_source(
+        crop_xyxy: tuple[int, int, int, int],
+        frame_size: tuple[int, int],
+        source_size: tuple[int, int],
+    ) -> tuple[int, int, int, int]:
+        """Map processed-frame crop coordinates back to original source pixels."""
+        fw, fh = max(1, int(frame_size[0])), max(1, int(frame_size[1]))
+        sw, sh = max(1, int(source_size[0])), max(1, int(source_size[1]))
+        sx = float(sw) / float(fw)
+        sy = float(sh) / float(fh)
+        x1, y1, x2, y2 = crop_xyxy
+        ox1 = int(round(float(x1) * sx))
+        oy1 = int(round(float(y1) * sy))
+        ox2 = int(round(float(x2) * sx))
+        oy2 = int(round(float(y2) * sy))
+        ox1 = max(0, min(sw - 1, ox1))
+        oy1 = max(0, min(sh - 1, oy1))
+        ox2 = max(ox1 + 1, min(sw, ox2))
+        oy2 = max(oy1 + 1, min(sh, oy2))
+        return ox1, oy1, ox2, oy2
+
+    @staticmethod
+    def _even_hdr_crop_xyxy(crop_xyxy: tuple[int, int, int, int], source_size: tuple[int, int]) -> tuple[int, int, int, int]:
+        """Make 4:2:0 HDR still/video crops legal without moving far from the chosen box."""
+        sw, sh = max(2, int(source_size[0])), max(2, int(source_size[1]))
+        x1, y1, x2, y2 = [int(v) for v in crop_xyxy]
+        x1 = max(0, min(sw - 2, x1 & ~1))
+        y1 = max(0, min(sh - 2, y1 & ~1))
+        x2 = max(x1 + 2, min(sw, x2))
+        y2 = max(y1 + 2, min(sh, y2))
+        if (x2 - x1) & 1:
+            if x2 < sw:
+                x2 += 1
+            elif x1 > 0:
+                x1 -= 1
+        if (y2 - y1) & 1:
+            if y2 < sh:
+                y2 += 1
+            elif y1 > 0:
+                y1 -= 1
+        return x1, y1, x2, y2
+
+    def _hdr_tonemap_filter_cmds(
+        self,
+        ffmpeg_bin: str,
+        frame_idx: int,
+        crop_xyxy: tuple[int, int, int, int],
+        out_path: str,
+    ) -> list[list[str]]:
+        """Build preferred-to-fallback full-res HDR→SDR still export commands."""
+        x1, y1, x2, y2 = [int(v) for v in crop_xyxy]
+        w = max(1, int(x2 - x1))
+        h = max(1, int(y2 - y1))
+        fps = float(getattr(self, "_fps", 0.0) or 0.0)
+        seek_sec = max(0.0, float(frame_idx) / fps) if fps > 0 else None
+        base = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
+        if seek_sec is not None:
+            base += ["-ss", f"{seek_sec:.6f}"]
+        base += ["-i", self.cfg.video, "-map", "0:v:0", "-frames:v", "1"]
+        q = max(2, min(31, int(round((100 - int(getattr(self.cfg, "jpg_quality", 90))) / 3.5 + 2))))
+        enc = ["-an", "-sn", "-dn", "-q:v", str(q), "-update", "1", out_path]
+        crop = f"crop={w}:{h}:{x1}:{y1}"
+        src = "setparams=color_trc=smpte2084:color_primaries=bt2020:colorspace=bt2020nc:range=limited"
+        desat = float(getattr(self.cfg, "tm_desat", 0.25))
+        param = float(getattr(self.cfg, "tm_param", 0.40))
+        nits = float(getattr(self.cfg, "sdr_nits", 125.0))
+        pref = str(getattr(self.cfg, "hdr_tonemap_pref", "auto") or "auto").lower()
+
+        filters = ffmpeg_has_hdr_filters(ffmpeg_bin)
+        cmds: list[list[str]] = []
+        if filters.get("libplacebo") and pref in ("auto", "libplacebo"):
+            lp = (
+                f"{crop},format=p010le,{src},"
+                "hwupload=extra_hw_frames=1,"
+                "libplacebo=tonemapping='bt.2390':"
+                "colorspace=bt709:color_primaries=bt709:color_trc=bt709:"
+                "range=full:format=bgra,format=bgr24"
+            )
+            cmds.append(
+                base[:1]
+                + ["-init_hw_device", "vulkan=vk:0", "-filter_hw_device", "vk"]
+                + base[1:]
+                + ["-vf", lp]
+                + enc
+            )
+        if filters.get("zscale") and filters.get("tonemap") and pref in ("auto", "zscale", "libplacebo"):
+            # CPU fallback. It is slower, but it only runs on accepted captures and
+            # preserves the main invariant: full-resolution source crop, not preview crop.
+            zf = (
+                f"{crop},{src},"
+                "zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc,"
+                "zscale=transfer=linear:npl=1000,format=gbrpf32le,"
+                f"tonemap=tonemap=mobius:param={param:.6g}:desat={desat:.6g}:peak={nits:.6g},"
+                "zscale=transfer=bt709:primaries=bt709:matrix=bt709:dither=error_diffusion,"
+                "zscale=rangein=pc:range=pc,format=bgr24"
+            )
+            cmds.append(base + ["-vf", zf] + enc)
+        if pref in ("auto", "scale", "zscale", "libplacebo"):
+            # Last-resort full-res export. This is not correct HDR tone mapping,
+            # but it is still original-resolution and only used if the HDR filters fail.
+            sf = f"{crop},scale=in_range=limited:out_range=full,format=bgr24"
+            cmds.append(base + ["-vf", sf] + enc)
+        return cmds
+
+    def _save_hdr_sdr_screencap(
+        self,
+        frame_idx: int,
+        crop_xyxy: tuple[int, int, int, int],
+        out_path: str,
+    ) -> tuple[bool, str]:
+        """Export the primary crop as full-resolution HDR→SDR from the original source."""
+        ffmpeg_bin = self._resolve_ffmpeg_bin()
+        if not ffmpeg_bin:
+            return False, "ffmpeg_unavailable"
+        tmp = out_path + ".tmp.jpg"
+        try:
+            ensure_dir(os.path.dirname(out_path))
+        except Exception:
+            pass
+        for cmd in self._hdr_tonemap_filter_cmds(ffmpeg_bin, frame_idx, crop_xyxy, tmp):
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            try:
+                cp = subprocess.run(cmd, text=True, capture_output=True, check=False)
+                if cp.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) >= 1024:
+                    os.replace(tmp, out_path)
+                    return True, ""
+                tail = (cp.stderr or cp.stdout or "").splitlines()[-4:]
+                why = " | ".join(tail) if tail else f"ffmpeg_rc={cp.returncode}"
+                self._status(f"HDR full-res export fallback: {why}", key="hdr_sdr_export", interval=10.0)
+            except Exception as exc:
+                self._status(f"HDR full-res export fallback: {exc}", key="hdr_sdr_export", interval=10.0)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False, "all_hdr_export_filters_failed"
+
     def _save_hdr_crop_p010(
         self, frame_idx: int, crop_xyxy: tuple[int, int, int, int], out_path: str
     ) -> None:
         """Use ffmpeg directly to export an HDR crop from the original source."""
-
-        if not getattr(self, "_hdr_passthrough_active", False):
-            return
 
         ffmpeg_bin = self._resolve_ffmpeg_bin()
         if not ffmpeg_bin:
@@ -5824,6 +6033,23 @@ class MainWindow(QtWidgets.QMainWindow):
             "Use Vulkan HDR swapchain preview for HDR videos and disable the HDR tone-map reader."
         )
         file_layout.addWidget(self.chk_hdr_passthrough, 5, 0, 1, 3)
+
+        self.chk_hdr_screencap_fullres = QtWidgets.QCheckBox("HDR source-res screencaps")
+        self.chk_hdr_screencap_fullres.setChecked(bool(getattr(self.cfg, "hdr_screencap_fullres", True)))
+        self.chk_hdr_screencap_fullres.setToolTip(
+            "For HDR input, save the primary crops/f*.jpg by cropping the original source frame "
+            "and tone-mapping it with FFmpeg/libplacebo/zscale. This is independent of Vulkan preview."
+        )
+        self.chk_hdr_screencap_fullres.toggled.connect(self._on_ui_change)
+        file_layout.addWidget(self.chk_hdr_screencap_fullres, 6, 0, 1, 3)
+
+        self.chk_hdr_archive_crops = QtWidgets.QCheckBox("Also save source HDR crops")
+        self.chk_hdr_archive_crops.setChecked(bool(getattr(self.cfg, "hdr_archive_crops", False)))
+        self.chk_hdr_archive_crops.setToolTip(
+            "Additionally write original-source HDR crops to hdr_crops/ in the selected HDR crop format."
+        )
+        self.chk_hdr_archive_crops.toggled.connect(self._on_ui_change)
+        file_layout.addWidget(self.chk_hdr_archive_crops, 7, 0, 1, 3)
 
         # Params
         param_group = QtWidgets.QGroupBox("Parameters")
@@ -6298,7 +6524,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Tonemap Mobius param", self.tm_param_spin),
             ("Tonemap backend", self.tonemap_pref_combo),
             ("FFmpeg hardware decode", self.hwaccel_combo),
-            ("HDR crop format", self.hdr_crop_format_combo),
+            ("HDR archive format", self.hdr_crop_format_combo),
             ("Frame stride", self.stride_spin),
             ("YOLO min conf", self.det_conf_spin),
             ("Face max dist", self.face_thr_spin),
@@ -7653,6 +7879,14 @@ class MainWindow(QtWidgets.QMainWindow):
             and self.chk_hdr_passthrough.isEnabled()
             and self.chk_hdr_passthrough.isChecked()
         )
+        cfg.hdr_screencap_fullres = (
+            getattr(self, "chk_hdr_screencap_fullres", None) is None
+            or self.chk_hdr_screencap_fullres.isChecked()
+        )
+        cfg.hdr_archive_crops = (
+            getattr(self, "chk_hdr_archive_crops", None) is not None
+            and self.chk_hdr_archive_crops.isChecked()
+        )
         try:
             cfg.hdr_crop_format = self.hdr_crop_format_combo.currentText().lower()
         except Exception:
@@ -7692,6 +7926,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.out_edit.setText(cfg.out_dir)
         if hasattr(self, "chk_hdr_passthrough"):
             self.chk_hdr_passthrough.setChecked(bool(getattr(cfg, "hdr_passthrough", False)))
+        if hasattr(self, "chk_hdr_screencap_fullres"):
+            self.chk_hdr_screencap_fullres.setChecked(bool(getattr(cfg, "hdr_screencap_fullres", True)))
+        if hasattr(self, "chk_hdr_archive_crops"):
+            self.chk_hdr_archive_crops.setChecked(bool(getattr(cfg, "hdr_archive_crops", False)))
         self.ratio_edit.setText(cfg.ratio)
         try:
             self.sdr_nits_spin.setValue(float(getattr(cfg, "sdr_nits", 125.0)))
@@ -8472,6 +8710,16 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.hdr_crop_format_combo.setCurrentIndex(0)
         self.cfg.hdr_crop_format = self.hdr_crop_format_combo.currentText().lower()
+        if hasattr(self, "chk_hdr_screencap_fullres"):
+            self.chk_hdr_screencap_fullres.setChecked(
+                s.value("hdr_screencap_fullres", self.cfg.hdr_screencap_fullres, type=bool)
+            )
+            self.cfg.hdr_screencap_fullres = bool(self.chk_hdr_screencap_fullres.isChecked())
+        if hasattr(self, "chk_hdr_archive_crops"):
+            self.chk_hdr_archive_crops.setChecked(
+                s.value("hdr_archive_crops", self.cfg.hdr_archive_crops, type=bool)
+            )
+            self.cfg.hdr_archive_crops = bool(self.chk_hdr_archive_crops.isChecked())
         self.cfg.seek_fast = s.value("seek_fast", True, type=bool)
         try:
             self.cfg.seek_max_grabs = int(s.value("seek_max_grabs", 12))

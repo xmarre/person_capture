@@ -1153,6 +1153,8 @@ class FfmpegPipeReader:
         s = (meta.get("streams") or [{}])[0]
         self._w = int(s.get("width") or 0)
         self._h = int(s.get("height") or 0)
+        self._source_w = int(self._w)
+        self._source_h = int(self._h)
         self._fps = _safe_fps(s.get("avg_frame_rate") or "0/1")
         self._nb = int(s.get("nb_frames") or 0)
         self._total_is_exact = self._nb > 0
@@ -1300,8 +1302,10 @@ class FfmpegPipeReader:
             if w_pyav and h_pyav:
                 if self._w <= 0:
                     self._w = int(w_pyav)
+                    self._source_w = int(self._w)
                 if self._h <= 0:
                     self._h = int(h_pyav)
+                    self._source_h = int(self._h)
             if _fmt:
                 self._src_pixfmt = _str_lower_nonempty(_fmt)
             f_pyav, n_pyav = _probe_fps_total_pyav(path)
@@ -1315,8 +1319,10 @@ class FfmpegPipeReader:
                 try:
                     if self._w <= 0:
                         self._w = int(cap.get(CV_CAP_PROP_FRAME_WIDTH) or 0)
+                        self._source_w = int(self._w)
                     if self._h <= 0:
                         self._h = int(cap.get(CV_CAP_PROP_FRAME_HEIGHT) or 0)
+                        self._source_h = int(self._h)
                     if self._fps <= 0:
                         self._fps = float(cap.get(CV_CAP_PROP_FPS) or 0.0)
                     if self._nb <= 0:
@@ -1593,7 +1599,16 @@ class FfmpegPipeReader:
             if dev or m.get("force_dev", False) or not getattr(self, "_vk_device", ""):
                 self._vk_device = dev or ""
 
+    def _source_size(self) -> tuple[int, int]:
+        return int(getattr(self, "_source_w", self._w) or self._w), int(getattr(self, "_source_h", self._h) or self._h)
+
     def _apply_cap_dims(self) -> None:
+        # Preserve original source dimensions before mutating the pipe readback
+        # size. Capture/export paths must map processed-frame crop coordinates
+        # back to this source size instead of treating the decode cap as real
+        # video resolution.
+        self._source_w = int(getattr(self, "_source_w", self._w) or self._w)
+        self._source_h = int(getattr(self, "_source_h", self._h) or self._h)
         maxw = int(getattr(self, "_maxw", 0))
         if maxw > 0 and self._w > maxw:
             ratio = float(maxw) / float(self._w or 1)

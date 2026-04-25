@@ -169,5 +169,7 @@
     0.25,
     0.25
   ],
-  "curate_use_yaw_quota": true
+  "curate_use_yaw_quota": true,
+  "hdr_screencap_fullres": true,
+  "hdr_archive_crops": true
 }
