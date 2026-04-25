@@ -1,9 +1,8 @@
-name: Apply PR 303 review fixes
+name: PR303 fix
 
 on:
   push:
-    branches:
-      - tmp-pr303-review-fixes
+    branches: [tmp-pr303-review-fixes]
   workflow_dispatch:
 
 permissions:
@@ -11,24 +10,21 @@ permissions:
 
 jobs:
   apply:
-    if: ${{ !contains(github.event.head_commit.message, 'Address PR 303 review comments') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: video-hdr-prescan-fast-path
+          ref: tmp-pr303-review-fixes
           fetch-depth: 0
-      - name: Apply review fixes
-        shell: bash
-        run: |
-          set -euxo pipefail
-          git apply --check .github/patches/pr303_review_fixes.patch || true
-          cp "$GITHUB_WORKSPACE/.github/patches/pr303_review_fixes.patch" /tmp/pr303_review_fixes.patch
-          git apply --check /tmp/pr303_review_fixes.patch
-          git apply /tmp/pr303_review_fixes.patch
+      - run: |
+          cp .github/patches/pr303_review_fixes.patch /tmp/fix.patch
+          git fetch origin video-hdr-prescan-fast-path
+          git checkout -B video-hdr-prescan-fast-path origin/video-hdr-prescan-fast-path
+          git apply --check /tmp/fix.patch
+          git apply /tmp/fix.patch
           python -S -m py_compile person_capture/gui_app.py person_capture/video_io.py
           git config user.name github-actions
           git config user.email actions@github.com
           git add person_capture/gui_app.py person_capture/video_io.py
-          git commit -m "Address PR 303 review comments"
+          git commit -m review-fixes-pr303
           git push origin HEAD:video-hdr-prescan-fast-path
