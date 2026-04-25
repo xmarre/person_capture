@@ -620,6 +620,12 @@ class Processor(QtCore.QObject):
         """Discard up to ``count`` decoded frames without restarting the reader."""
 
         def _at_known_eof() -> bool:
+            reader_eof = getattr(cap, "_at_known_eof", None)
+            if callable(reader_eof):
+                try:
+                    return bool(reader_eof())
+                except Exception:
+                    pass
             try:
                 total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
             except Exception:
@@ -631,6 +637,8 @@ class Processor(QtCore.QObject):
             except Exception:
                 pos = 0
             if bool(getattr(cap, "_is_hdr_pipe", False)):
+                if not bool(getattr(cap, "_total_is_exact", False)):
+                    return False
                 # FfmpegPipeReader reports the last emitted frame index.
                 return pos >= total - 1
             # OpenCV usually reports the next frame index.
