@@ -1340,6 +1340,11 @@ class FfmpegPipeReader:
         self._proc = None
         self._arr: Optional[np.ndarray] = None
         self._pipe_buf: Optional[bytes] = None
+        self._drop_until: Optional[int] = None
+        try:
+            self._seek_preroll_frames = max(0, int(os.getenv("PC_FF_SEEK_PREROLL_FRAMES", "12")))
+        except Exception:
+            self._seek_preroll_frames = 12
         self._stderr_thread = None
         self._stderr_tail: list[str] = []
         self._lp_opts: dict[str, bool] = {}
@@ -1504,14 +1509,17 @@ class FfmpegPipeReader:
             return
         self._start(0)
 
-    def _known_total_frames(self) -> int:
-        if not bool(getattr(self, "_total_is_exact", False)):
-            return 0
+    def _stream_total_frames(self) -> int:
         try:
             total = int(getattr(self, "_nb", 0) or getattr(self, "_total", 0) or 0)
         except (TypeError, ValueError):
             total = 0
         return max(0, total)
+
+    def _known_total_frames(self) -> int:
+        if not bool(getattr(self, "_total_is_exact", False)):
+            return 0
+        return self._stream_total_frames()
 
     def _next_frame_index(self) -> int:
         try:
@@ -1520,12 +1528,18 @@ class FfmpegPipeReader:
             return 0
 
     def _at_known_eof(self, next_idx: Optional[int] = None) -> bool:
-        total = self._known_total_frames()
-        if total <= 0:
-            return False
         if next_idx is None:
             next_idx = self._next_frame_index()
-        return int(next_idx) >= total
+        next_i = int(next_idx)
+        total = self._known_total_frames()
+        if total > 0:
+            return next_i >= total
+        # MKV/remux streams often lack nb_frames, so _nb may be duration-derived.
+        # Treat only the final estimated frame as soft EOF. This prevents strict
+        # libplacebo fallback from turning normal late-seek EOF into a fatal
+        # "produced no frames" error while preserving real mid-stream failures.
+        total = self._stream_total_frames()
+        return total > 0 and next_i >= max(0, total - 1)
 
     def _ensure_started(self) -> bool:
         proc = self._proc
@@ -1604,16 +1618,18 @@ class FfmpegPipeReader:
         manual NV12→BGR converter (which assumes TV/limited) sees the expected
         16–235/16–240 range. For RGB-family pipes we prefer full range.
         """
-        # Single modern umbrella first if present
+        # Set every target color component this build exposes. The umbrella
+        # colorspace option is not enough on all ffmpeg/libplacebo builds; if
+        # color_trc remains inherited from a PQ source, BGR screenshots can look
+        # washed out even though tonemapping ran.
         if self._lp_supports_any("colorspace"):
             lp_args.append("colorspace=bt709")
-        else:
-            p = self._lp_supports_any("target_primaries", "color_primaries")
-            t = self._lp_supports_any("target_trc", "color_trc")
-            if p:
-                lp_args.append(f"{p}=bt709")
-            if t:
-                lp_args.append(f"{t}=bt709")
+        p = self._lp_supports_any("target_primaries", "color_primaries")
+        t = self._lp_supports_any("target_trc", "color_trc")
+        if p:
+            lp_args.append(f"{p}=bt709")
+        if t:
+            lp_args.append(f"{t}=bt709")
         if self._lp_supports_any("range"):
             tail = (getattr(self, "_pipe_pixfmt", "") or "").lower()
             rng = "limited" if tail == "nv12" else "full"
@@ -2436,11 +2452,11 @@ class FfmpegPipeReader:
         s += ",format=gbrpf32le,setsar=1"
         return s
 
-    def _start(self, idx: int):
+    def _start(self, idx: int, *, drop_until: Optional[int] = None):
         if self._proc:
             self._stop()
         if self._mode == "p010_passthrough":
-            self._start_p010(idx)
+            self._start_p010(idx, drop_until=drop_until)
             return
         # Apply the very first probe mode before constructing the command.
         if self._mode == "libplacebo" and self._use_libplacebo and self._has_vulkan:
@@ -2555,6 +2571,7 @@ class FfmpegPipeReader:
             creationflags=flags,
         )
         self._stderr_tail = []
+        self._drop_until = int(drop_until) if drop_until is not None else None
 
         def _drain() -> None:
             try:
@@ -2578,7 +2595,7 @@ class FfmpegPipeReader:
         self._pipe_buf = None
         self._pix_fmt = pix_fmt
 
-    def _start_p010(self, idx: int) -> None:
+    def _start_p010(self, idx: int, *, drop_until: Optional[int] = None) -> None:
         if self._proc:
             self._stop()
         t = 0.0 if self._fps <= 0 else max(0.0, idx / float(self._fps))
@@ -2666,6 +2683,7 @@ class FfmpegPipeReader:
             creationflags=flags,
         )
         self._stderr_tail = []
+        self._drop_until = int(drop_until) if drop_until is not None else None
 
         def _drain() -> None:
             try:
@@ -2738,6 +2756,7 @@ class FfmpegPipeReader:
         self._proc = None
         self._arr = None
         self._pipe_buf = None
+        self._drop_until = None
 
     # OpenCV-like API
     def get(self, prop: int) -> float:
@@ -2756,7 +2775,19 @@ class FfmpegPipeReader:
 
     def set(self, prop: int, value: float) -> bool:
         if prop == CV_CAP_PROP_POS_FRAMES:
-            self._start(max(0, int(value)))
+            target = max(0, int(value))
+            total = self._stream_total_frames()
+            if total > 0:
+                target = min(target, total - 1)
+            try:
+                if self._proc is not None and self._next_frame_index() == target:
+                    self._drop_until = None
+                    return True
+            except Exception:
+                pass
+            preroll = int(getattr(self, "_seek_preroll_frames", 12) or 0)
+            base = max(0, target - preroll) if target > 0 and preroll > 0 else target
+            self._start(base, drop_until=(target if base < target else None))
             return True
         return False
 
@@ -2866,9 +2897,15 @@ class FfmpegPipeReader:
                         if self.try_fallback_chain():
                             continue
                     return False
+                next_pos = int(self._pos) + 1
+                drop_until = getattr(self, "_drop_until", None)
+                if drop_until is not None and next_pos < int(drop_until):
+                    self._pos = next_pos
+                    continue
+                self._drop_until = None
                 self._pipe_buf = buf
                 self._arr = None
-                self._pos += 1
+                self._pos = next_pos
                 return True
 
             # Linear+python-tonemap path: read float32 RGB (planar G,B,R)
@@ -2885,9 +2922,15 @@ class FfmpegPipeReader:
                 rgb_linear = _eotf_hlg(rgb)
             else:
                 rgb_linear = _eotf_pq(rgb)
+            next_pos = int(self._pos) + 1
+            drop_until = getattr(self, "_drop_until", None)
+            if drop_until is not None and next_pos < int(drop_until):
+                self._pos = next_pos
+                continue
+            self._drop_until = None
             self._arr = rgb_linear
             self._pipe_buf = None
-            self._pos += 1
+            self._pos = next_pos
             return True
 
     def retrieve(self):

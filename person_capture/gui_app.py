@@ -2255,9 +2255,24 @@ class Processor(QtCore.QObject):
                     f = float(self._fps or 30.0)
                     mg = max(15, min(240, int(round(f))))
                 base = max(0, tgt_idx - int(mg))
-        if base != cur_idx:
-            # time-based reposition is often faster on some backends; fall back if it fails
-            if fast and self._fps:
+        # For OpenCV readers, cur_idx is the caller's processing cursor. For
+        # HDR ffmpeg pipes, some pre-scan callers pass the desired index as
+        # cur_idx even after the pipe has advanced to EOF. Compare against the
+        # pipe's real next index so a requested seek cannot be skipped.
+        cur_for_seek = cur_idx
+        if direct_pipe_seek:
+            try:
+                cur_for_seek = int(cap._next_frame_index())
+            except Exception:
+                try:
+                    cur_for_seek = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                except Exception:
+                    cur_for_seek = -1
+        if base != cur_for_seek:
+            # time-based reposition is often faster on some backends; fall back if it fails.
+            # HDR ffmpeg pipes implement only frame-based seeking and add their own small
+            # preroll internally, so do not route those seeks through POS_MSEC.
+            if fast and self._fps and not direct_pipe_seek:
                 ok = cap.set(cv2.CAP_PROP_POS_MSEC, (base / float(self._fps)) * 1000.0)
                 if not ok:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, base)
