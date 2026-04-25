@@ -944,6 +944,14 @@ class Processor(QtCore.QObject):
                             pass
                         continue
                     if not cap.grab():
+                        startup_exc = getattr(cap, "_last_startup_error", None)
+                        if startup_exc is not None:
+                            self._status(
+                                f"Pre-scan read failed: {startup_exc}",
+                                key="prescan_skip_error",
+                                interval=0.5,
+                            )
+                            raise RuntimeError("Pre-scan reader failed during grab") from startup_exc
                         break
                     ok, frame = cap.retrieve()
                     if not ok or frame is None:
