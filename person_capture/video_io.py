@@ -1530,16 +1530,21 @@ class FfmpegPipeReader:
     def _at_known_eof(self, next_idx: Optional[int] = None) -> bool:
         if next_idx is None:
             next_idx = self._next_frame_index()
-        next_i = int(next_idx)
         total = self._known_total_frames()
-        if total > 0:
-            return next_i >= total
-        # MKV/remux streams often lack nb_frames, so _nb may be duration-derived.
-        # Treat only the final estimated frame as soft EOF. This prevents strict
-        # libplacebo fallback from turning normal late-seek EOF into a fatal
-        # "produced no frames" error while preserving real mid-stream failures.
+        return total > 0 and int(next_idx) >= total
+
+    def _at_soft_eof(self, next_idx: Optional[int] = None) -> bool:
+        """
+        Best-effort EOF for post-failure handling only.
+        Uses estimated totals when exact frame counts are unavailable so late
+        tail short-reads do not trigger expensive fallback ladders.
+        """
+        if next_idx is None:
+            next_idx = self._next_frame_index()
+        if self._at_known_eof(next_idx):
+            return True
         total = self._stream_total_frames()
-        return total > 0 and next_i >= max(0, total - 1)
+        return total > 0 and int(next_idx) >= max(0, total - 1)
 
     def _ensure_started(self) -> bool:
         proc = self._proc
@@ -1719,7 +1724,7 @@ class FfmpegPipeReader:
         # not evidence that the active filter chain failed. This matters for
         # late pre-scan skips and deferred probes: strict LP must not turn EOF
         # into a fatal "produced no frames" error.
-        if self._at_known_eof():
+        if self._at_soft_eof():
             return False
         if self._fallback_hops >= getattr(self, "_fallback_hops_max", 12):
             self._log.error("LP fallback exhausted after %s hops.", self._fallback_hops)
@@ -2453,10 +2458,11 @@ class FfmpegPipeReader:
         return s
 
     def _start(self, idx: int, *, drop_until: Optional[int] = None):
+        pending_drop_until = self._drop_until if drop_until is None else int(drop_until)
         if self._proc:
             self._stop()
         if self._mode == "p010_passthrough":
-            self._start_p010(idx, drop_until=drop_until)
+            self._start_p010(idx, drop_until=pending_drop_until)
             return
         # Apply the very first probe mode before constructing the command.
         if self._mode == "libplacebo" and self._use_libplacebo and self._has_vulkan:
@@ -2571,7 +2577,7 @@ class FfmpegPipeReader:
             creationflags=flags,
         )
         self._stderr_tail = []
-        self._drop_until = int(drop_until) if drop_until is not None else None
+        self._drop_until = pending_drop_until
 
         def _drain() -> None:
             try:
@@ -2596,6 +2602,7 @@ class FfmpegPipeReader:
         self._pix_fmt = pix_fmt
 
     def _start_p010(self, idx: int, *, drop_until: Optional[int] = None) -> None:
+        pending_drop_until = self._drop_until if drop_until is None else int(drop_until)
         if self._proc:
             self._stop()
         t = 0.0 if self._fps <= 0 else max(0.0, idx / float(self._fps))
@@ -2683,7 +2690,7 @@ class FfmpegPipeReader:
             creationflags=flags,
         )
         self._stderr_tail = []
-        self._drop_until = int(drop_until) if drop_until is not None else None
+        self._drop_until = pending_drop_until
 
         def _drain() -> None:
             try:
@@ -2776,9 +2783,6 @@ class FfmpegPipeReader:
     def set(self, prop: int, value: float) -> bool:
         if prop == CV_CAP_PROP_POS_FRAMES:
             target = max(0, int(value))
-            total = self._stream_total_frames()
-            if total > 0:
-                target = min(target, total - 1)
             try:
                 if self._proc is not None and self._next_frame_index() == target:
                     self._drop_until = None
@@ -2867,7 +2871,7 @@ class FfmpegPipeReader:
                 self._last_startup_error = None
             except Exception as exc:
                 self._last_startup_error = exc
-                if self._mode != "p010_passthrough" and not self._at_known_eof():
+                if self._mode != "p010_passthrough" and not self._at_soft_eof():
                     self._log.warning(
                         "HDR pipe startup failed during grab; trying fallback: %s",
                         exc,
@@ -2880,7 +2884,7 @@ class FfmpegPipeReader:
             if not started or not self._proc or not self._proc.stdout:
                 if (
                     self._mode != "p010_passthrough"
-                    and not self._at_known_eof()
+                    and not self._at_soft_eof()
                     and self.try_fallback_chain()
                 ):
                     continue
@@ -2893,7 +2897,7 @@ class FfmpegPipeReader:
                     # EOF/late-seek-empty is a normal false return. Only run
                     # the expensive LP fallback ladder when the short read
                     # occurs before the known end of the stream.
-                    if self._mode != "p010_passthrough" and not self._at_known_eof():
+                    if self._mode != "p010_passthrough" and not self._at_soft_eof():
                         if self.try_fallback_chain():
                             continue
                     return False
@@ -2991,7 +2995,7 @@ class FfmpegPipeReader:
         # If the process died prematurely (e.g., libplacebo failed to init),
         # attempt a one-time filter-chain fallback before giving up.
         if self._proc is not None and self._proc.poll() is not None:
-            if self._at_known_eof():
+            if self._at_soft_eof():
                 self._last_startup_error = None
                 return False, None
             if not self.try_fallback_chain():
@@ -3002,7 +3006,7 @@ class FfmpegPipeReader:
             # switch to a safer chain once.
             if (
                 self._mode != "p010_passthrough"
-                and not self._at_known_eof()
+                and not self._at_soft_eof()
                 and self.try_fallback_chain()
             ):
                 if not self.grab():
