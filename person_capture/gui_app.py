@@ -2641,15 +2641,9 @@ class Processor(QtCore.QObject):
 
             ensure_dir(cfg.out_dir)
             crops_dir = os.path.join(cfg.out_dir, "crops")
-            hdr_crops_dir = (
-                os.path.join(cfg.out_dir, "hdr_crops")
-                if bool(getattr(cfg, "hdr_archive_crops", False))
-                else None
-            )
+            hdr_crops_dir = os.path.join(cfg.out_dir, "hdr_crops")
             ann_dir = os.path.join(cfg.out_dir, "annot") if cfg.save_annot else None
             ensure_dir(crops_dir)
-            if hdr_crops_dir:
-                ensure_dir(hdr_crops_dir)
             if ann_dir:
                 ensure_dir(ann_dir)
             # Debug I/O
@@ -4262,7 +4256,11 @@ class Processor(QtCore.QObject):
                         hdr_active and bool(getattr(self.cfg, "hdr_screencap_fullres", True))
                     )
                     hdr_out_path = None
-                    if hdr_active and hdr_crops_dir:
+                    if hdr_active and bool(getattr(self.cfg, "hdr_archive_crops", False)):
+                        try:
+                            ensure_dir(hdr_crops_dir)
+                        except Exception:
+                            pass
                         hdr_fmt = str(getattr(self.cfg, "hdr_crop_format", "mkv") or "mkv").lower()
                         hdr_ext = ".avif" if hdr_fmt == "avif" else ".mkv"
                         hdr_out_path = os.path.join(hdr_crops_dir, f"f{idx:08d}{hdr_ext}")
@@ -5761,7 +5759,9 @@ class Processor(QtCore.QObject):
                 "-color_primaries", "bt2020",
                 "-color_trc", "smpte2084",
             ]
-        cmd.append(out_path)
+        out_ext = Path(out_path).suffix or ".mkv"
+        tmp_out = out_path + f".tmp{out_ext}"
+        cmd.append(tmp_out)
 
         timeout_sec = max(5, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
         try:
@@ -5772,11 +5772,25 @@ class Processor(QtCore.QObject):
                 capture_output=True,
                 text=True,
             )
+            if cp.returncode == 0 and os.path.exists(tmp_out) and os.path.getsize(tmp_out) > 0:
+                os.replace(tmp_out, out_path)
+                return
+            try:
+                if os.path.exists(tmp_out):
+                    os.remove(tmp_out)
+            except Exception:
+                pass
             if cp.returncode != 0:
                 tail = (cp.stderr or cp.stdout or "").splitlines()[-4:]
                 why = " | ".join(tail) if tail else f"ffmpeg_rc={cp.returncode}"
                 self._status(
                     f"HDR crop export failed: {why}",
+                    key="hdr_crop_export",
+                    interval=10.0,
+                )
+            else:
+                self._status(
+                    f"HDR crop export failed: invalid output file ({out_path})",
                     key="hdr_crop_export",
                     interval=10.0,
                 )
@@ -5786,7 +5800,17 @@ class Processor(QtCore.QObject):
                 key="hdr_crop_export",
                 interval=10.0,
             )
+            try:
+                if os.path.exists(tmp_out):
+                    os.remove(tmp_out)
+            except Exception:
+                pass
         except Exception as exc:
+            try:
+                if os.path.exists(tmp_out):
+                    os.remove(tmp_out)
+            except Exception:
+                pass
             self._status(
                 f"HDR crop export failed: {exc}",
                 key="hdr_crop_export",
