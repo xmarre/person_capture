@@ -626,8 +626,13 @@ class Processor(QtCore.QObject):
             try:
                 if not cap.grab():
                     break
-            except Exception:
-                break
+            except Exception as exc:
+                self._status(
+                    f"Pre-scan skip failed: {exc}",
+                    key="prescan_skip_error",
+                    interval=0.5,
+                )
+                raise
             advanced += 1
         return advanced
 
@@ -3004,6 +3009,49 @@ class Processor(QtCore.QObject):
                 keep_spans, ref_face_feat = self._prescan(
                     cap, int(round(fps)), total_frames, face, ref_face_feat, cfg
                 )
+                if defer_reader_probe:
+                    self._status(
+                        "HDR reader first-frame probe running after pre-scan",
+                        key="hdr_probe_deferred",
+                        interval=60.0,
+                    )
+                    ok = _probe_reader(cap, float(fps or 24.0))
+                    strict = bool(getattr(cap, "_strict_lp", False))
+                    if (not ok) and hasattr(cap, "try_fallback_chain") and not strict:
+                        try:
+                            if cap.try_fallback_chain():
+                                logger.warning("HDR reader fallback after pre-scan")
+                                ok = _probe_reader(cap, float(fps or 24.0))
+                        except Exception:
+                            pass
+                    if (not ok) and strict:
+                        raise RuntimeError("libplacebo(Vulkan) produced no frames in strict mode")
+                    if not ok:
+                        self._status(
+                            "HDR reader delivered no frames after pre-scan; falling back to OpenCV reader",
+                            key="hdr_probe_fail",
+                            interval=60.0,
+                        )
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        self._hdr_preview_close()
+                        os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
+                        cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
+                        try:
+                            cap.set(cv2.CAP_PROP_HW_ACCELERATION, 1)
+                        except Exception:
+                            pass
+                        if not cap.isOpened():
+                            cap.release()
+                            cap = cv2.VideoCapture(cfg.video)
+                        if not cap.isOpened():
+                            raise RuntimeError(f"Cannot open video after deferred HDR fallback: {cfg.video}")
+                        hdr_active = False
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+                        fps = float(cap.get(cv2.CAP_PROP_FPS) or fps or 30.0)
+                        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or total_frames or 0)
                 if keep_spans:
                     s0 = keep_spans[0][0]
                     #

@@ -1372,7 +1372,7 @@ class FfmpegPipeReader:
                 self._w,
                 self._h,
             )
-            self._maybe_start_initial_pipe()
+            self._maybe_start_initial_pipe(force_eager=True)
             return
         self._filters = self._list_filters()
         self._use_libplacebo = ("libplacebo" in self._filters)
@@ -1490,24 +1490,29 @@ class FfmpegPipeReader:
     def _lazy_start_enabled(self) -> bool:
         return os.getenv("PC_FF_LAZY_START", "1").lower() not in ("0", "false", "no")
 
-    def _maybe_start_initial_pipe(self) -> None:
-        if self._lazy_start_enabled():
+    def _maybe_start_initial_pipe(self, *, force_eager: bool = False) -> None:
+        if self._lazy_start_enabled() and not force_eager:
             self._log.info("HDR pipe start deferred until first frame request")
             return
         self._start(0)
 
     def _ensure_started(self) -> bool:
-        if self._proc is not None:
+        proc = self._proc
+        if proc is not None and getattr(proc, "poll", lambda: 1)() is None:
             return True
+        if proc is not None:
+            self._stop()
         try:
             next_idx = max(0, int(getattr(self, "_pos", -1)) + 1)
-        except Exception:
+        except (TypeError, ValueError):
             next_idx = 0
         try:
             self._start(next_idx)
-        except Exception:
-            return False
-        return self._proc is not None
+        except Exception as exc:
+            self._log.warning("HDR pipe lazy start failed at frame %d: %s", next_idx, exc)
+            raise
+        proc = self._proc
+        return proc is not None and getattr(proc, "poll", lambda: 1)() is None
 
     def _calc_fallback_budget(self) -> int:
         n = len(getattr(self, "_vk_probe_modes", []))         # Vulkan probe modes
