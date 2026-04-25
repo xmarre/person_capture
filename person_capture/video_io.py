@@ -2790,8 +2790,23 @@ class FfmpegPipeReader:
         return w, h, y_plane, uv_plane, stride_y, stride_uv
 
     def grab(self) -> bool:
-        if not self._ensure_started() or not self._proc or not self._proc.stdout:
+        try:
+            started = self._ensure_started()
+        except Exception as exc:
+            if self._mode != "p010_passthrough":
+                self._log.warning(
+                    "HDR pipe startup failed during grab; trying fallback: %s",
+                    exc,
+                )
+                if self.try_fallback_chain():
+                    return self.grab()
+            raise
+
+        if not started or not self._proc or not self._proc.stdout:
+            if self._mode != "p010_passthrough" and self.try_fallback_chain():
+                return self.grab()
             return False
+
         if self._pix_fmt in {"bgr24", "nv12", "p010le"}:
             need = self._pipe_frame_bytes
             buf = self._proc.stdout.read(need)
