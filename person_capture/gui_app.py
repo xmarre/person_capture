@@ -3382,8 +3382,15 @@ class Processor(QtCore.QObject):
                         if isinstance(item, dict) and item.get("type") == "hdr_sdr":
                             img_path = str(item.get("path") or "")
                             row = item.get("row")
+                            frame_pts_sec = item.get("frame_pts_sec")
+                            if frame_pts_sec is not None:
+                                try:
+                                    frame_pts_sec = float(frame_pts_sec)
+                                except Exception:
+                                    frame_pts_sec = None
                             ok, why = self._save_hdr_sdr_screencap(
                                 int(item.get("frame_idx", 0)),
+                                frame_pts_sec,
                                 tuple(item.get("crop_xyxy") or (0, 0, 1, 1)),
                                 img_path,
                             )
@@ -3534,6 +3541,9 @@ class Processor(QtCore.QObject):
                             "w_cowboy",
                             "w_body",
                             "overlay_scores",
+                            "hdr_screencap_fullres",
+                            "hdr_archive_crops",
+                            "hdr_crop_format",
                         }
                         rot_keys = {
                             "rot_adaptive",
@@ -3744,6 +3754,7 @@ class Processor(QtCore.QObject):
                 self._pump_hdr_preview()
 
                 H, W = frame.shape[:2]
+                frame_pts_sec = self._capture_frame_pts_sec(cap, current_idx, fps)
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
 
@@ -4619,7 +4630,7 @@ class Processor(QtCore.QObject):
                     crop_img2 = frame[cy1:cy2, cx1:cx2]
                     row = [
                         idx,
-                        idx / float(fps),
+                        frame_pts_sec if frame_pts_sec is not None else (idx / float(fps) if fps > 0 else 0.0),
                         c.get("score"),
                         c.get("fd"),
                         c.get("rd"),
@@ -4639,6 +4650,7 @@ class Processor(QtCore.QObject):
                                     "path": crop_img_path,
                                     "row": row,
                                     "frame_idx": int(idx),
+                                    "frame_pts_sec": frame_pts_sec,
                                     "crop_xyxy": source_crop_xyxy,
                                 })
                             else:
@@ -4651,7 +4663,12 @@ class Processor(QtCore.QObject):
                             pass  # drop if saver is behind
                     else:
                         if hdr_primary_fullres:
-                            ok, why = self._save_hdr_sdr_screencap(int(idx), source_crop_xyxy, crop_img_path)
+                            ok, why = self._save_hdr_sdr_screencap(
+                                int(idx),
+                                frame_pts_sec,
+                                source_crop_xyxy,
+                                crop_img_path,
+                            )
                         else:
                             ok, why = _atomic_jpeg_write(crop_img2, crop_img_path, jpg_q)
                         if ok:
@@ -4675,7 +4692,7 @@ class Processor(QtCore.QObject):
                             pass
                     if hdr_out_path:
                         hdr_crop_xyxy = self._even_hdr_crop_xyxy(source_crop_xyxy, source_size)
-                        self._save_hdr_crop_p010(idx, hdr_crop_xyxy, hdr_out_path)
+                        self._save_hdr_crop_p010(idx, frame_pts_sec, hdr_crop_xyxy, hdr_out_path)
                     reasons_list = c.get("reasons") or []
                     reasons = "|".join(reasons_list)
                     bx1, by1, bx2, by2 = c["box"]
@@ -5459,6 +5476,20 @@ class Processor(QtCore.QObject):
         return max(1, fw), max(1, fh)
 
     @staticmethod
+    def _capture_frame_pts_sec(cap, frame_idx: int, fps: float) -> Optional[float]:
+        """Return frame timestamp seconds, preferring capture-reported time over frame_idx/fps."""
+        try:
+            if cap is not None and hasattr(cap, "get"):
+                pos_msec = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
+                if math.isfinite(pos_msec) and pos_msec >= 0.0:
+                    return pos_msec / 1000.0
+        except Exception:
+            pass
+        if fps > 0.0 and math.isfinite(fps):
+            return max(0.0, float(frame_idx) / float(fps))
+        return None
+
+    @staticmethod
     def _scale_crop_xyxy_to_source(
         crop_xyxy: tuple[int, int, int, int],
         frame_size: tuple[int, int],
@@ -5505,6 +5536,7 @@ class Processor(QtCore.QObject):
         self,
         ffmpeg_bin: str,
         frame_idx: int,
+        frame_pts_sec: Optional[float],
         crop_xyxy: tuple[int, int, int, int],
         out_path: str,
     ) -> list[list[str]]:
@@ -5512,8 +5544,16 @@ class Processor(QtCore.QObject):
         x1, y1, x2, y2 = [int(v) for v in crop_xyxy]
         w = max(1, int(x2 - x1))
         h = max(1, int(y2 - y1))
-        fps = float(getattr(self, "_fps", 0.0) or 0.0)
-        seek_sec = max(0.0, float(frame_idx) / fps) if fps > 0 else None
+        seek_sec: Optional[float] = None
+        try:
+            if frame_pts_sec is not None and math.isfinite(float(frame_pts_sec)):
+                seek_sec = max(0.0, float(frame_pts_sec))
+        except Exception:
+            seek_sec = None
+        if seek_sec is None:
+            fps = float(getattr(self, "_fps", 0.0) or 0.0)
+            if fps > 0 and math.isfinite(fps):
+                seek_sec = max(0.0, float(frame_idx) / fps)
         base = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
         if seek_sec is not None:
             base += ["-ss", f"{seek_sec:.6f}"]
@@ -5566,6 +5606,7 @@ class Processor(QtCore.QObject):
     def _save_hdr_sdr_screencap(
         self,
         frame_idx: int,
+        frame_pts_sec: Optional[float],
         crop_xyxy: tuple[int, int, int, int],
         out_path: str,
     ) -> tuple[bool, str]:
@@ -5578,20 +5619,33 @@ class Processor(QtCore.QObject):
             ensure_dir(os.path.dirname(out_path))
         except Exception:
             pass
-        for cmd in self._hdr_tonemap_filter_cmds(ffmpeg_bin, frame_idx, crop_xyxy, tmp):
+        timeout_sec = max(5, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
+        for cmd in self._hdr_tonemap_filter_cmds(ffmpeg_bin, frame_idx, frame_pts_sec, crop_xyxy, tmp):
             try:
                 if os.path.exists(tmp):
                     os.remove(tmp)
             except Exception:
                 pass
             try:
-                cp = subprocess.run(cmd, text=True, capture_output=True, check=False)
+                cp = subprocess.run(cmd, text=True, capture_output=True, check=False, timeout=timeout_sec)
                 if cp.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) >= 1024:
                     os.replace(tmp, out_path)
                     return True, ""
                 tail = (cp.stderr or cp.stdout or "").splitlines()[-4:]
                 why = " | ".join(tail) if tail else f"ffmpeg_rc={cp.returncode}"
                 self._status(f"HDR full-res export fallback: {why}", key="hdr_sdr_export", interval=10.0)
+            except subprocess.TimeoutExpired as exc:
+                self._status(
+                    f"HDR full-res export timeout after {timeout_sec}s: {exc}",
+                    key="hdr_sdr_export",
+                    interval=10.0,
+                )
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+                return False, f"ffmpeg_timeout_{timeout_sec}s"
             except Exception as exc:
                 self._status(f"HDR full-res export fallback: {exc}", key="hdr_sdr_export", interval=10.0)
         try:
@@ -5602,7 +5656,7 @@ class Processor(QtCore.QObject):
         return False, "all_hdr_export_filters_failed"
 
     def _save_hdr_crop_p010(
-        self, frame_idx: int, crop_xyxy: tuple[int, int, int, int], out_path: str
+        self, frame_idx: int, frame_pts_sec: Optional[float], crop_xyxy: tuple[int, int, int, int], out_path: str
     ) -> None:
         """Use ffmpeg directly to export an HDR crop from the original source."""
 
@@ -5624,10 +5678,16 @@ class Processor(QtCore.QObject):
             pass
 
         vf = f"crop={w}:{h}:{int(x1)}:{int(y1)}"
-        fps = float(getattr(self, "_fps", 0.0) or 0.0)
         seek_sec: Optional[float] = None
-        if fps > 0:
-            seek_sec = max(0.0, float(frame_idx) / fps)
+        try:
+            if frame_pts_sec is not None and math.isfinite(float(frame_pts_sec)):
+                seek_sec = max(0.0, float(frame_pts_sec))
+        except Exception:
+            seek_sec = None
+        if seek_sec is None:
+            fps = float(getattr(self, "_fps", 0.0) or 0.0)
+            if fps > 0 and math.isfinite(fps):
+                seek_sec = max(0.0, float(frame_idx) / fps)
 
         is_avif = out_path.lower().endswith(".avif")
 
@@ -7710,6 +7770,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "rot_every_n",
             "rot_after_hit_frames",
             "fast_no_face_imgsz",
+            "hdr_screencap_fullres",
+            "hdr_archive_crops",
+            "hdr_crop_format",
         }
         live |= {
             "lambda_facefrac",

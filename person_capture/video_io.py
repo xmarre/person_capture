@@ -24,12 +24,14 @@ try:
     except Exception:
         pass
     CV_CAP_PROP_POS_FRAMES = int(cv2.CAP_PROP_POS_FRAMES)
+    CV_CAP_PROP_POS_MSEC = int(cv2.CAP_PROP_POS_MSEC)
     CV_CAP_PROP_FPS = int(cv2.CAP_PROP_FPS)
     CV_CAP_PROP_FRAME_COUNT = int(cv2.CAP_PROP_FRAME_COUNT)
     CV_CAP_PROP_FRAME_WIDTH = int(cv2.CAP_PROP_FRAME_WIDTH)
     CV_CAP_PROP_FRAME_HEIGHT = int(cv2.CAP_PROP_FRAME_HEIGHT)
 except Exception:
     CV_CAP_PROP_POS_FRAMES = 1
+    CV_CAP_PROP_POS_MSEC = 0
     CV_CAP_PROP_FPS = 5
     CV_CAP_PROP_FRAME_COUNT = 7
     CV_CAP_PROP_FRAME_WIDTH = 3
@@ -682,6 +684,19 @@ def _index_from_pts(vs, pts: Optional[int], fps: float) -> Optional[int]:
     return int(round((pts * tb) * fps))
 
 
+def _seconds_from_pts(vs, pts: Optional[int]) -> Optional[float]:
+    if pts is None:
+        return None
+    try:
+        tb = vs.time_base
+        sec = float(pts * tb)
+        if math.isfinite(sec):
+            return sec
+    except Exception:
+        pass
+    return None
+
+
 @dataclass
 class _FrameBuf:
     arr: Optional[np.ndarray] = None
@@ -696,6 +711,7 @@ class _BaseAvReader:
         self._total = _nb_frames_guess(self._ct, self._vs)
         self._buf = _FrameBuf()
         self._pos = 0
+        self._pos_sec: Optional[float] = None
         self._graph = None
         self._src = None
         self._sink = None
@@ -723,6 +739,12 @@ class _BaseAvReader:
             return float(total)
         if prop_id == CV_CAP_PROP_POS_FRAMES:
             return float(self._pos)
+        if prop_id == CV_CAP_PROP_POS_MSEC:
+            if self._pos_sec is not None and math.isfinite(self._pos_sec):
+                return float(self._pos_sec * 1000.0)
+            if self._fps and self._fps > 0:
+                return float(max(0.0, float(self._pos) / float(self._fps)) * 1000.0)
+            return 0.0
         return 0.0
 
     def set(self, prop_id: int, value: float) -> bool:
@@ -749,6 +771,7 @@ class _BaseAvReader:
                 pass
         self._drop_until = index
         self._pos = max(0, index - 1)
+        self._pos_sec = None
         try:
             if self._graph:
                 self._configure_graph(reset=True)
@@ -771,6 +794,7 @@ class _BaseAvReader:
                         if idx < self._drop_until:
                             # Keep the counter in sync while skipping frames with no timestamps.
                             self._pos = idx
+                            self._pos_sec = _seconds_from_pts(self._vs, getattr(frame, "pts", None))
                             continue
                         self._drop_until = None
                     if self._graph is None or self._src is None:
@@ -782,6 +806,9 @@ class _BaseAvReader:
                         if idx is None:
                             idx = self._pos + 1  # sequential fallback for filters without PTS
                         self._pos = idx
+                        self._pos_sec = _seconds_from_pts(self._vs, getattr(of, "pts", None))
+                        if self._pos_sec is None and self._fps and self._fps > 0:
+                            self._pos_sec = float(self._pos) / float(self._fps)
                         self._buf.arr = arr
                         return True
             return False
@@ -823,9 +850,13 @@ class AvP010PreviewReader(_BaseAvReader):
                         idx = self._pos + 1
                     if self._drop_until is not None and idx < self._drop_until:
                         self._pos = idx
+                        self._pos_sec = _seconds_from_pts(self._vs, getattr(frame, "pts", None))
                         continue
                     self._drop_until = None
                     self._pos = idx
+                    self._pos_sec = _seconds_from_pts(self._vs, getattr(frame, "pts", None))
+                    if self._pos_sec is None and self._fps and self._fps > 0:
+                        self._pos_sec = float(self._pos) / float(self._fps)
                     return frame
         except Exception:
             self._log.debug("P010 preview demux failed", exc_info=True)
@@ -2805,6 +2836,11 @@ class FfmpegPipeReader:
             return float(total)
         if prop == CV_CAP_PROP_POS_FRAMES:
             return float(max(self._pos, 0))
+        if prop == CV_CAP_PROP_POS_MSEC:
+            fps = float(getattr(self, "_fps", 0.0) or 0.0)
+            if fps > 0.0 and math.isfinite(fps):
+                return float(max(0.0, float(max(self._pos, 0)) / fps) * 1000.0)
+            return 0.0
         if prop == CV_CAP_PROP_FRAME_WIDTH:
             return float(self._w)
         if prop == CV_CAP_PROP_FRAME_HEIGHT:
