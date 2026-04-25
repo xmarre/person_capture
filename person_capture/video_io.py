@@ -1562,6 +1562,7 @@ class FfmpegPipeReader:
         try:
             self._start(next_idx, drop_until=pending_drop_until)
         except Exception as exc:
+            self._drop_until = pending_drop_until
             self._log.warning("HDR pipe lazy start failed at frame %d: %s", next_idx, exc)
             raise
         proc = self._proc
@@ -2810,7 +2811,12 @@ class FfmpegPipeReader:
                     self._drop_until = None
                     return True
             except Exception:
-                pass
+                self._log.debug(
+                    "HDR seek fast-path probe failed (target=%s, proc_present=%s)",
+                    target,
+                    self._proc is not None,
+                    exc_info=True,
+                )
             preroll = int(getattr(self, "_seek_preroll_frames", 12) or 0)
             base = max(0, target - preroll) if target > 0 and preroll > 0 else target
             self._start(base, drop_until=(target if base < target else None))
