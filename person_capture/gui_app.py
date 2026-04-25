@@ -3421,10 +3421,18 @@ class Processor(QtCore.QObject):
                     mode = str(getattr(cfg, "prescan_cache_mode", "auto") or "auto").lower()
                     suffix = " (refresh cache)" if mode == "refresh" else ""
                     self._status(f"Pre-scan.{suffix}", key="phase", interval=2.0)
+                    self._prescan_cache_dirty = False
                     keep_spans, ref_face_feat = self._prescan(
                         cap, int(round(fps)), total_frames, face, ref_face_feat, cfg
                     )
-                    self._save_prescan_cache(cfg, float(fps), int(total_frames), keep_spans, ref_face_feat)
+                    if not getattr(self, "_prescan_cache_dirty", False):
+                        self._save_prescan_cache(cfg, float(fps), int(total_frames), keep_spans, ref_face_feat)
+                    else:
+                        self._status(
+                            "Pre-scan cache not saved: run was interactively modified",
+                            key="prescan_cache",
+                            interval=0.0,
+                        )
                 if defer_reader_probe:
                     cap, hdr_active, fps, total_frames = _run_deferred_probe_after_prescan(
                         cap, fps, total_frames, hdr_active
