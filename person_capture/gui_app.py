@@ -320,6 +320,7 @@ class SessionConfig:
     hdr_sdr_contrast_recovery: float = 0.30
     hdr_sdr_peak_detect: bool = True
     hdr_sdr_allow_inaccurate_fallback: bool = False
+    hdr_export_timeout_sec: int = 300
     log_interval_sec: float = 1.0
     lock_after_hits: int = 1
     lock_face_thresh: float = 0.28
@@ -8234,6 +8235,7 @@ class MainWindow(QtWidgets.QMainWindow):
             face_max_frac_in_crop=float(self.face_max_frac_spin.value()) if hasattr(self, "face_max_frac_spin") else 0.42,
             face_min_frac_in_crop=float(self.face_min_frac_spin.value()) if hasattr(self, "face_min_frac_spin") else 0.18,
             crop_min_height_frac=float(self.crop_min_height_frac_spin.value()) if hasattr(self, "crop_min_height_frac_spin") else 0.28,
+            hdr_export_timeout_sec=int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300),
         )
         cfg.hdr_passthrough = (
             getattr(self, "chk_hdr_passthrough", None) is not None
@@ -8296,6 +8298,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.prescan_decode_max_w = int(getattr(cfg, "prescan_decode_max_w", 384))
         except Exception:
             self.cfg.prescan_decode_max_w = 384
+        try:
+            self.cfg.hdr_export_timeout_sec = max(5, int(getattr(cfg, "hdr_export_timeout_sec", 300) or 300))
+        except Exception:
+            self.cfg.hdr_export_timeout_sec = 300
         self.video_edit.setText(cfg.video)
         paths = [part.strip() for part in (cfg.ref or "").split(';') if part.strip()]
         self._set_ref_paths(paths)
@@ -9148,6 +9154,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 s.value("hdr_sdr_allow_inaccurate_fallback", getattr(self.cfg, "hdr_sdr_allow_inaccurate_fallback", False), type=bool)
             )
             self.cfg.hdr_sdr_allow_inaccurate_fallback = bool(self.hdr_sdr_bad_fallback_check.isChecked())
+        try:
+            self.cfg.hdr_export_timeout_sec = max(
+                5,
+                int(s.value("hdr_export_timeout_sec", getattr(self.cfg, "hdr_export_timeout_sec", 300)) or 300),
+            )
+        except Exception:
+            self.cfg.hdr_export_timeout_sec = 300
         self.cfg.seek_fast = s.value("seek_fast", True, type=bool)
         try:
             self.cfg.seek_max_grabs = int(s.value("seek_max_grabs", 12))
