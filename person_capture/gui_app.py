@@ -7026,6 +7026,55 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    def eventFilter(self, watched, event):
+        try:
+            if (
+                event.type() == QtCore.QEvent.Type.Wheel
+                and bool(watched.property("_pc_no_wheel_value_edit"))
+            ):
+                self._scroll_parent_area(watched, event)
+                return True
+        except Exception:
+            pass
+        return super().eventFilter(watched, event)
+
+    def _mark_no_wheel_value_edit(self, widget: QtWidgets.QWidget):
+        watched = []
+        value_types = (
+            QtWidgets.QAbstractSpinBox,
+            QtWidgets.QComboBox,
+            QtWidgets.QAbstractSlider,
+        )
+        if isinstance(widget, value_types):
+            watched.append(widget)
+        for widget_type in value_types:
+            watched.extend(widget.findChildren(widget_type))
+
+        seen = set()
+        for child in watched:
+            ident = id(child)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            child.setProperty("_pc_no_wheel_value_edit", True)
+            child.installEventFilter(self)
+
+    def _scroll_parent_area(self, widget: QtWidgets.QWidget, event: QtGui.QWheelEvent):
+        parent = widget.parent()
+        while parent is not None and not isinstance(parent, QtWidgets.QScrollArea):
+            parent = parent.parent()
+        if parent is None:
+            return
+
+        bar = parent.verticalScrollBar()
+        pixel_delta = event.pixelDelta().y()
+        if pixel_delta:
+            delta = -pixel_delta
+        else:
+            delta = -int(event.angleDelta().y() / 120.0 * max(1, bar.singleStep() * 3))
+        if delta:
+            bar.setValue(bar.value() + delta)
+
     def _install_filter(self):
         # Build label->row index for settings filtering
         try:
@@ -7045,6 +7094,8 @@ class MainWindow(QtWidgets.QMainWindow):
                             fi = layout.itemAtPosition(i, 1)
                             if li and fi and li.widget() and fi.widget():
                                 self._param_rows.append((li.widget(), fi.widget()))
+            for _, field in getattr(self, "_param_rows", []):
+                self._mark_no_wheel_value_edit(field)
             if hasattr(self, "search_edit"):
                 self.search_edit.textChanged.connect(self._apply_filter)
         except Exception:
