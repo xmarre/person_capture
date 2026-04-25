@@ -1,4 +1,3 @@
-@'
 # Visual Studio
 .vs/
 [Bb]in/
@@ -39,7 +38,6 @@ out/**
 # OS/editor
 Thumbs.db
 .DS_Store
-'@ | Set-Content -Encoding utf8 .gitignore
 /preset.json
 /yolov8n.pt
 /output
@@ -58,3 +56,5 @@ Thumbs.db
 /.ultralytics
 /person_capture/output/index.csv
 /person_capture/pc_hdr_pipelines.cache
+
+.codex

@@ -615,6 +615,36 @@ class Processor(QtCore.QObject):
                 return i
             if f < s:
                 return i
+
+    def _prescan_skip_forward(self, cap, count: int) -> int:
+        """Discard up to ``count`` decoded frames without restarting the reader."""
+        advanced = 0
+        remaining = max(0, int(count))
+        for _ in range(remaining):
+            if self._abort:
+                break
+            try:
+                grabbed = cap.grab()
+            except Exception as exc:
+                self._status(
+                    f"Pre-scan skip failed: {exc}",
+                    key="prescan_skip_error",
+                    interval=0.5,
+                )
+                raise
+            if not grabbed:
+                startup_exc = getattr(cap, "_last_startup_error", None)
+                if startup_exc is not None:
+                    self._status(
+                        f"Pre-scan skip failed: {startup_exc}",
+                        key="prescan_skip_error",
+                        interval=0.5,
+                    )
+                    raise RuntimeError("Pre-scan reader failed during grab") from startup_exc
+                break
+            advanced += 1
+        return advanced
+
     def _prescan(self, cap, fps, total_frames, face: "FaceEmbedder", ref_feat, cfg):
         """
         Fast pass to find keep-spans. Now:
@@ -811,17 +841,10 @@ class Processor(QtCore.QObject):
                         next_i = ((i // stride) + 1) * stride
                         if next_i >= total_frames:
                             break
-                        old_i = i
-                        i2 = self._seek_to(
-                            cap,
-                            i,
-                            next_i,
-                            fast=bool(getattr(cfg, "seek_fast", True)),
-                            max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
-                            hdr_reader=self._hdr_preview_reader,
-                        )
-                        # if capped seek didn't reach next_i, still advance one stride to avoid stalls
-                        i = i2 if i2 > old_i else old_i + stride
+                        skipped = self._prescan_skip_forward(cap, next_i - i)
+                        if skipped < (next_i - i):
+                            break
+                        i = next_i
                         continue
                     # Preempt before IO to honor newly queued seeks/steps
                     try:
@@ -904,9 +927,14 @@ class Processor(QtCore.QObject):
                         break
                     ok, frame = cap.retrieve()
                     if not ok or frame is None:
-                        i += 1
+                        skipped = self._prescan_skip_forward(cap, max(0, stride - 1))
+                        if skipped < max(0, stride - 1):
+                            break
+                        i += stride
                         continue
-                    self._pump_hdr_preview()
+                    if self._hdr_preview_enabled():
+                        self._hdr_preview_seek(i)
+                        self._pump_hdr_preview()
                     idx = i
                     sample_idx = processed_samples
                     processed_samples += 1
@@ -1082,7 +1110,10 @@ class Processor(QtCore.QObject):
                             self._emit_preview_bgr(vis)
                         except Exception:
                             pass
-                    i += 1
+                    skipped = self._prescan_skip_forward(cap, max(0, stride - 1))
+                    if skipped < max(0, stride - 1):
+                        break
+                    i += stride
                 if active:
                     s = max(0, start - pad)
                     e = total_frames - 1
@@ -1301,7 +1332,7 @@ class Processor(QtCore.QObject):
                 pass
             # Final prescan progress: do not claim 100% coverage if we bailed early.
             try:
-                samples = int(i)
+                samples = int(processed_samples)
             except Exception:
                 samples = 0
             msg = (
@@ -2687,6 +2718,53 @@ class Processor(QtCore.QObject):
             # Processing/cropping path: always HDR→SDR tone-mapped BGR (or OpenCV fallback).
             cap = None
 
+            def _open_opencv_reader(video_path: str):
+                def _probe_and_rewind(candidate) -> bool:
+                    if hasattr(candidate, "isOpened") and not candidate.isOpened():
+                        return False
+                    pos0 = int(candidate.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+                    ok = bool(candidate.grab())
+                    if not ok:
+                        return False
+                    for _ in range(2):
+                        try:
+                            candidate.set(cv2.CAP_PROP_POS_FRAMES, pos0)
+                            cur = int(candidate.get(cv2.CAP_PROP_POS_FRAMES) or -1)
+                            if cur == pos0:
+                                return True
+                        except Exception:
+                            break
+                    return False
+
+                hwmode = str(getattr(cfg, "ff_hwaccel", "off") or "off").strip().lower()
+                prev_ffmpeg_opts = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+                try:
+                    if hwmode != "off":
+                        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"hwaccel;{hwmode}"
+                    else:
+                        os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
+                    reader = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+                finally:
+                    if prev_ffmpeg_opts is None:
+                        os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
+                    else:
+                        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = prev_ffmpeg_opts
+                if hasattr(reader, "isOpened") and not reader.isOpened():
+                    reader.release()
+                    fallback = cv2.VideoCapture(video_path)
+                    if _probe_and_rewind(fallback):
+                        return fallback
+                    fallback.release()
+                    raise RuntimeError(f"OpenCV reader produced no frames: {video_path}")
+                if _probe_and_rewind(reader):
+                    return reader
+                reader.release()
+                fallback = cv2.VideoCapture(video_path)
+                if _probe_and_rewind(fallback):
+                    return fallback
+                fallback.release()
+                raise RuntimeError(f"OpenCV reader produced no frames: {video_path}")
+
             try:
                 cap = open_video_with_tonemap(cfg.video)
                 if cap is not None:
@@ -2717,15 +2795,7 @@ class Processor(QtCore.QObject):
                         interval=60.0,
                     )
                     hdr_active = False
-                    os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
-                    cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
-                    try:
-                        cap.set(cv2.CAP_PROP_HW_ACCELERATION, 1)
-                    except Exception:
-                        pass
-                    if hasattr(cap, "isOpened") and not cap.isOpened():
-                        cap.release()
-                        cap = cv2.VideoCapture(cfg.video)
+                    cap = _open_opencv_reader(cfg.video)
             except Exception:
                 cap = cv2.VideoCapture(cfg.video)
 
@@ -2741,7 +2811,7 @@ class Processor(QtCore.QObject):
                 pass
 
             # Default: HDR passthrough ON when available unless explicitly disabled in cfg.
-            cfg_hdr_passthrough = bool(getattr(cfg, "hdrpassthrough", True))
+            cfg_hdr_passthrough = bool(getattr(cfg, "hdr_passthrough", True))
             want_hdr_passthrough = (
                 hdr_active
                 and cfg_hdr_passthrough
@@ -2757,12 +2827,13 @@ class Processor(QtCore.QObject):
             if want_hdr_passthrough:
                 if self._hdr_preview_reader is None:
                     try:
-                        hwmode = (getattr(cfg, "ffhwaccel", "off") or "off").strip().lower()
+                        hwmode = (getattr(cfg, "ff_hwaccel", "off") or "off").strip().lower()
                         if hwmode != "off":
                             os.environ["PC_HWACCEL"] = hwmode
-                            os.environ["PCHWACCELOUTFMT"] = hwmode
+                            os.environ["PC_HWACCEL_OUT_FMT"] = "cuda" if hwmode == "cuda" else hwmode
                         else:
                             os.environ.pop("PC_HWACCEL", None)
+                            os.environ.pop("PC_HWACCEL_OUT_FMT", None)
                             os.environ.pop("PCHWACCELOUTFMT", None)
 
                         logger.info(
@@ -2856,7 +2927,21 @@ class Processor(QtCore.QObject):
             fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-            ok = _probe_reader(cap, float(fps or 24.0))
+            defer_reader_probe = (
+                hdr_active
+                and bool(getattr(cfg, "prescan_enable", True))
+                and int(getattr(cfg, "prescan_decode_max_w", 0) or 0) > 0
+                and bool(getattr(cap, "_is_hdr_pipe", False))
+            )
+            if defer_reader_probe:
+                ok = True
+                self._status(
+                    "HDR reader first-frame probe deferred until after pre-scan",
+                    key="hdr_probe_deferred",
+                    interval=60.0,
+                )
+            else:
+                ok = _probe_reader(cap, float(fps or 24.0))
             # No CPU/zscale fallbacks when strict LP is active.
             strict = bool(getattr(cap, "_strict_lp", False))
             if (not ok) and hasattr(cap, "try_fallback_chain") and not strict:
@@ -2900,15 +2985,7 @@ class Processor(QtCore.QObject):
                 except Exception:
                     pass
                 self._hdr_preview_close()
-                os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda")
-                cap = cv2.VideoCapture(cfg.video, cv2.CAP_FFMPEG)
-                try:
-                    cap.set(cv2.CAP_PROP_HW_ACCELERATION, 1)
-                except Exception:
-                    pass
-                if not cap.isOpened():
-                    cap.release()
-                    cap = cv2.VideoCapture(cfg.video)
+                cap = _open_opencv_reader(cfg.video)
                 if not cap.isOpened():
                     raise RuntimeError(f"Cannot open video after HDR fallback: {cfg.video}")
                 try:
@@ -2967,11 +3044,72 @@ class Processor(QtCore.QObject):
                 self.progress.emit(0)
             except Exception:
                 pass
+
+            def _run_deferred_probe_after_prescan(cap_obj, fps_val, total_val, hdr_is_active):
+                self._status(
+                    "HDR reader first-frame probe running after pre-scan",
+                    key="hdr_probe_deferred",
+                    interval=60.0,
+                )
+                ok = _probe_reader(cap_obj, float(fps_val or 24.0))
+                strict = bool(getattr(cap_obj, "_strict_lp", False))
+                if (not ok) and hasattr(cap_obj, "try_fallback_chain") and not strict:
+                    try:
+                        if cap_obj.try_fallback_chain():
+                            logger.warning("HDR reader fallback after pre-scan")
+                            ok = _probe_reader(cap_obj, float(fps_val or 24.0))
+                    except Exception:
+                        pass
+                if (not ok) and strict:
+                    raise RuntimeError("libplacebo(Vulkan) produced no frames in strict mode")
+                if not ok:
+                    self._status(
+                        "HDR reader delivered no frames after pre-scan; falling back to OpenCV reader",
+                        key="hdr_probe_fail",
+                        interval=60.0,
+                    )
+                    try:
+                        cap_obj.release()
+                    except Exception:
+                        pass
+                    self._hdr_preview_close()
+                    cap_obj = _open_opencv_reader(cfg.video)
+                    if not cap_obj.isOpened():
+                        raise RuntimeError(
+                            f"Cannot open video after deferred HDR fallback: {cfg.video}"
+                        )
+                    hdr_is_active = False
+                    cap_obj.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+                    fps_val = float(cap_obj.get(cv2.CAP_PROP_FPS) or fps_val or 30.0)
+                    total_val = int(cap_obj.get(cv2.CAP_PROP_FRAME_COUNT) or total_val or 0)
+                    self._fps = fps_val
+                    self._total_frames = total_val
+                    try:
+                        self._keyframes = self._read_keyframes_worker(cfg.video, fps_val, total_val)
+                    except Exception:
+                        self._keyframes = []
+                    try:
+                        self.keyframes.emit(list(self._keyframes))
+                    except Exception:
+                        pass
+                    self.setup.emit(total_val, fps_val)
+                    try:
+                        self.status.emit(
+                            f"KFs={len(self._keyframes)} fps={float(fps_val):.3f} total={total_val}"
+                        )
+                    except Exception:
+                        pass
+                return cap_obj, hdr_is_active, fps_val, total_val
+
             if bool(getattr(cfg, "prescan_enable", True)) and total_frames > 0:
                 self._status("Pre-scan.", key="phase", interval=2.0)
                 keep_spans, ref_face_feat = self._prescan(
                     cap, int(round(fps)), total_frames, face, ref_face_feat, cfg
                 )
+                if defer_reader_probe:
+                    cap, hdr_active, fps, total_frames = _run_deferred_probe_after_prescan(
+                        cap, fps, total_frames, hdr_active
+                    )
                 if keep_spans:
                     s0 = keep_spans[0][0]
                     #
@@ -3041,6 +3179,10 @@ class Processor(QtCore.QObject):
                     self._status(f"Pre-scan segments: {len(keep_spans)}", key="prescan", interval=30.0)
                 else:
                     self._status("Pre-scan found no matches; full scan", key="prescan", interval=30.0)
+            elif defer_reader_probe:
+                cap, hdr_active, fps, total_frames = _run_deferred_probe_after_prescan(
+                    cap, fps, total_frames, hdr_active
+                )
             else:
                 keep_spans = []
                 span_i = 0

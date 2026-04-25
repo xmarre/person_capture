@@ -1216,6 +1216,7 @@ class FfmpegPipeReader:
         )
         # Guard so we only log frame shape/dtype once per reader.
         self._debug_logged_frame = False
+        self._last_startup_error = None
         # Optional override if a chosen out_format fails; toggled by fallback logic.
         self._sw_fmt_override: Optional[str] = None
 
@@ -1372,7 +1373,7 @@ class FfmpegPipeReader:
                 self._w,
                 self._h,
             )
-            self._start(0)
+            self._maybe_start_initial_pipe(force_eager=True)
             return
         self._filters = self._list_filters()
         self._use_libplacebo = ("libplacebo" in self._filters)
@@ -1479,13 +1480,40 @@ class FfmpegPipeReader:
         # Stage-specific fallback flags so we can attempt zscale, then scale (non-strict mode).
         self._tried_zscale = False
         self._tried_scale = False
-        self._start(0)
+        self._maybe_start_initial_pipe()
         mode = (
             "libplacebo"
             if self._mode == "libplacebo"
             else ("zscale+tonemap" if self._mode == "zscale" else "linear+python-tonemap")
         )
         self._log.info("HDR preview path: bundled ffmpeg pipe (%s)", mode)
+
+    def _lazy_start_enabled(self) -> bool:
+        return os.getenv("PC_FF_LAZY_START", "1").lower() not in ("0", "false", "no")
+
+    def _maybe_start_initial_pipe(self, *, force_eager: bool = False) -> None:
+        if self._lazy_start_enabled() and not force_eager:
+            self._log.info("HDR pipe start deferred until first frame request")
+            return
+        self._start(0)
+
+    def _ensure_started(self) -> bool:
+        proc = self._proc
+        if proc is not None and getattr(proc, "poll", lambda: 1)() is None:
+            return True
+        if proc is not None:
+            self._stop()
+        try:
+            next_idx = max(0, int(getattr(self, "_pos", -1)) + 1)
+        except (TypeError, ValueError):
+            next_idx = 0
+        try:
+            self._start(next_idx)
+        except Exception as exc:
+            self._log.warning("HDR pipe lazy start failed at frame %d: %s", next_idx, exc)
+            raise
+        proc = self._proc
+        return proc is not None and getattr(proc, "poll", lambda: 1)() is None
 
     def _calc_fallback_budget(self) -> int:
         n = len(getattr(self, "_vk_probe_modes", []))         # Vulkan probe modes
@@ -2541,8 +2569,8 @@ class FfmpegPipeReader:
 
         # Optional decoder hwaccel for HDR P010 passthrough (e.g. PC_HWACCEL=cuda).
         # This offloads 4K decode to NVDEC (or other hwaccel) while keeping a raw P010 pipe.
-        hwaccel = getattr(self, "hwaccel", "") or ""
-        hwaccel_out = getattr(self, "hwacceloutputformat", "") or ""
+        hwaccel = getattr(self, "_hwaccel", "") or ""
+        hwaccel_out = getattr(self, "_hwaccel_output_format", "") or ""
         hwaccel = hwaccel.strip().lower()
         hwaccel_out = hwaccel_out.strip().lower()
         if hwaccel and hwaccel != "off":
@@ -2763,8 +2791,28 @@ class FfmpegPipeReader:
         return w, h, y_plane, uv_plane, stride_y, stride_uv
 
     def grab(self) -> bool:
-        if not self._proc or not self._proc.stdout:
-            return False
+        while True:
+            try:
+                started = self._ensure_started()
+                self._last_startup_error = None
+            except Exception as exc:
+                self._last_startup_error = exc
+                if self._mode != "p010_passthrough":
+                    self._log.warning(
+                        "HDR pipe startup failed during grab; trying fallback: %s",
+                        exc,
+                    )
+                    if self.try_fallback_chain():
+                        continue
+                self._log.error("HDR pipe startup failed during grab", exc_info=True)
+                return False
+
+            if not started or not self._proc or not self._proc.stdout:
+                if self._mode != "p010_passthrough" and self.try_fallback_chain():
+                    continue
+                return False
+            break
+
         if self._pix_fmt in {"bgr24", "nv12", "p010le"}:
             need = self._pipe_frame_bytes
             buf = self._proc.stdout.read(need)
