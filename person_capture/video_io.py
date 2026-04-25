@@ -35,6 +35,8 @@ except Exception:
     CV_CAP_PROP_FRAME_WIDTH = 3
     CV_CAP_PROP_FRAME_HEIGHT = 4
 
+_PRESERVE_DROP_UNTIL = object()
+
 
 def _ffprobe_path() -> Optional[str]:
     """
@@ -1550,13 +1552,14 @@ class FfmpegPipeReader:
         proc = self._proc
         if proc is not None and getattr(proc, "poll", lambda: 1)() is None:
             return True
+        pending_drop_until = self._drop_until
         if proc is not None:
             self._stop()
         next_idx = self._next_frame_index()
         if self._at_known_eof(next_idx):
             return False
         try:
-            self._start(next_idx)
+            self._start(next_idx, drop_until=pending_drop_until)
         except Exception as exc:
             self._log.warning("HDR pipe lazy start failed at frame %d: %s", next_idx, exc)
             raise
@@ -2457,8 +2460,13 @@ class FfmpegPipeReader:
         s += ",format=gbrpf32le,setsar=1"
         return s
 
-    def _start(self, idx: int, *, drop_until: Optional[int] = None):
-        pending_drop_until = self._drop_until if drop_until is None else int(drop_until)
+    def _start(self, idx: int, *, drop_until: object = _PRESERVE_DROP_UNTIL):
+        if drop_until is _PRESERVE_DROP_UNTIL:
+            pending_drop_until = self._drop_until
+        elif drop_until is None:
+            pending_drop_until = None
+        else:
+            pending_drop_until = int(drop_until)
         if self._proc:
             self._stop()
         if self._mode == "p010_passthrough":
@@ -2601,8 +2609,13 @@ class FfmpegPipeReader:
         self._pipe_buf = None
         self._pix_fmt = pix_fmt
 
-    def _start_p010(self, idx: int, *, drop_until: Optional[int] = None) -> None:
-        pending_drop_until = self._drop_until if drop_until is None else int(drop_until)
+    def _start_p010(self, idx: int, *, drop_until: object = _PRESERVE_DROP_UNTIL) -> None:
+        if drop_until is _PRESERVE_DROP_UNTIL:
+            pending_drop_until = self._drop_until
+        elif drop_until is None:
+            pending_drop_until = None
+        else:
+            pending_drop_until = int(drop_until)
         if self._proc:
             self._stop()
         t = 0.0 if self._fps <= 0 else max(0.0, idx / float(self._fps))
