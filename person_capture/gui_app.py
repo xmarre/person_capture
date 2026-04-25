@@ -2576,7 +2576,7 @@ class Processor(QtCore.QObject):
 
     @QtCore.Slot()
     def run(self):
-        cap = save_q = saver_thread = csv_f = dbg_f = hit_q = None
+        cap = save_q = saver_thread = archive_q = archive_thread = csv_f = dbg_f = hit_q = None
         try:
             # Apply TRT/ORT env from cfg early
             def _env_set(k, v):
@@ -3327,6 +3327,7 @@ class Processor(QtCore.QObject):
 
             # Async saver
             save_q: Optional[queue.Queue] = None
+            archive_q: Optional[queue.Queue] = None
             hit_q: Optional[queue.Queue] = None
             jpg_q = int(getattr(cfg, "jpg_quality", 85))
 
@@ -3370,6 +3371,7 @@ class Processor(QtCore.QObject):
                     pass
                 writer = None
                 save_q = queue.Queue(maxsize=512)
+                archive_q = queue.Queue(maxsize=256)
                 hit_q = queue.Queue(maxsize=512)
 
                 def _saver():
@@ -3381,24 +3383,6 @@ class Processor(QtCore.QObject):
                         if item is None:
                             save_q.task_done()
                             break
-
-                        if isinstance(item, dict) and item.get("type") == "hdr_archive":
-                            try:
-                                frame_pts_sec = item.get("frame_pts_sec")
-                                if frame_pts_sec is not None:
-                                    try:
-                                        frame_pts_sec = float(frame_pts_sec)
-                                    except Exception:
-                                        frame_pts_sec = None
-                                self._save_hdr_crop_p010(
-                                    int(item.get("frame_idx", 0)),
-                                    frame_pts_sec,
-                                    tuple(item.get("crop_xyxy") or (0, 0, 2, 2)),
-                                    str(item.get("path") or ""),
-                                )
-                            finally:
-                                save_q.task_done()
-                            continue
 
                         ack_q = None
                         ok = False
@@ -3470,8 +3454,32 @@ class Processor(QtCore.QObject):
 
                     f.close()
 
+                def _archive_saver():
+                    while True:
+                        item = archive_q.get()
+                        if item is None:
+                            archive_q.task_done()
+                            break
+                        try:
+                            frame_pts_sec = item.get("frame_pts_sec")
+                            if frame_pts_sec is not None:
+                                try:
+                                    frame_pts_sec = float(frame_pts_sec)
+                                except (TypeError, ValueError):
+                                    frame_pts_sec = None
+                            self._save_hdr_crop_p010(
+                                int(item.get("frame_idx", 0)),
+                                frame_pts_sec,
+                                tuple(item.get("crop_xyxy") or (0, 0, 2, 2)),
+                                str(item.get("path") or ""),
+                            )
+                        finally:
+                            archive_q.task_done()
+
                 saver_thread = threading.Thread(target=_saver, name="pc.saver", daemon=True)
                 saver_thread.start()
+                archive_thread = threading.Thread(target=_archive_saver, name="pc.archive_saver", daemon=True)
+                archive_thread.start()
 
             hit_count = 0
             lock_hits = 0
@@ -4786,9 +4794,9 @@ class Processor(QtCore.QObject):
                         primary_saved_or_enqueued = True
                     if primary_saved_or_enqueued and hdr_out_path:
                         hdr_crop_xyxy = self._even_hdr_crop_xyxy(source_crop_xyxy, source_size)
-                        if save_q is not None:
+                        if archive_q is not None:
                             try:
-                                save_q.put_nowait({
+                                archive_q.put_nowait({
                                     "type": "hdr_archive",
                                     "path": hdr_out_path,
                                     "frame_idx": int(idx),
@@ -5384,6 +5392,11 @@ class Processor(QtCore.QObject):
                 save_q.join()
             if saver_thread is not None:
                 saver_thread.join()
+            if archive_q is not None:
+                archive_q.put(None)
+                archive_q.join()
+            if archive_thread is not None:
+                archive_thread.join()
             if cap is not None:
                 try:
                     cap.release()
