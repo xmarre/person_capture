@@ -618,14 +618,42 @@ class Processor(QtCore.QObject):
 
     def _prescan_skip_forward(self, cap, count: int) -> int:
         """Discard up to ``count`` decoded frames without restarting the reader."""
+
+        def _at_known_eof() -> bool:
+            reader_eof = getattr(cap, "_at_known_eof", None)
+            if callable(reader_eof):
+                try:
+                    return bool(reader_eof())
+                except Exception:
+                    pass
+            try:
+                total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            except Exception:
+                total = 0
+            if total <= 0:
+                return False
+            try:
+                pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+            except Exception:
+                pos = 0
+            if bool(getattr(cap, "_is_hdr_pipe", False)):
+                if not bool(getattr(cap, "_total_is_exact", False)):
+                    return False
+                # FfmpegPipeReader reports the last emitted frame index.
+                return pos >= total - 1
+            # OpenCV usually reports the next frame index.
+            return pos >= total
+
         advanced = 0
         remaining = max(0, int(count))
         for _ in range(remaining):
-            if self._abort:
+            if self._abort or _at_known_eof():
                 break
             try:
                 grabbed = cap.grab()
             except Exception as exc:
+                if _at_known_eof():
+                    break
                 self._status(
                     f"Pre-scan skip failed: {exc}",
                     key="prescan_skip_error",
@@ -923,14 +951,54 @@ class Processor(QtCore.QObject):
                         except Exception:
                             pass
                         continue
-                    if not cap.grab():
+                    try:
+                        grabbed = cap.grab()
+                    except Exception as exc:
+                        at_known_eof = False
+                        reader_eof = getattr(cap, "_at_known_eof", None)
+                        if callable(reader_eof):
+                            try:
+                                at_known_eof = bool(reader_eof())
+                            except Exception:
+                                at_known_eof = False
+                        if at_known_eof:
+                            break
+                        startup_exc = getattr(cap, "_last_startup_error", None)
+                        detail = startup_exc if startup_exc is not None else exc
+                        self._status(
+                            f"Pre-scan read failed: {detail}",
+                            key="prescan_skip_error",
+                            interval=0.5,
+                        )
+                        raise RuntimeError("Pre-scan reader failed during grab") from exc
+                    if not grabbed:
+                        startup_exc = getattr(cap, "_last_startup_error", None)
+                        if startup_exc is not None:
+                            self._status(
+                                f"Pre-scan read failed: {startup_exc}",
+                                key="prescan_skip_error",
+                                interval=0.5,
+                            )
+                            raise RuntimeError("Pre-scan reader failed during grab") from startup_exc
                         break
                     ok, frame = cap.retrieve()
                     if not ok or frame is None:
-                        skipped = self._prescan_skip_forward(cap, max(0, stride - 1))
-                        if skipped < max(0, stride - 1):
+                        startup_exc = getattr(cap, "_last_startup_error", None)
+                        if startup_exc is not None:
+                            self._status(
+                                f"Pre-scan read failed: {startup_exc}",
+                                key="prescan_skip_error",
+                                interval=0.5,
+                            )
+                            raise RuntimeError("Pre-scan reader failed during retrieve") from startup_exc
+                        target_skip = min(
+                            max(0, stride - 1),
+                            max(0, total_frames - i - 1),
+                        )
+                        skipped = self._prescan_skip_forward(cap, target_skip)
+                        if skipped < target_skip:
                             break
-                        i += stride
+                        i = i + 1 + skipped
                         continue
                     if self._hdr_preview_enabled():
                         self._hdr_preview_seek(i)
@@ -1110,10 +1178,14 @@ class Processor(QtCore.QObject):
                             self._emit_preview_bgr(vis)
                         except Exception:
                             pass
-                    skipped = self._prescan_skip_forward(cap, max(0, stride - 1))
-                    if skipped < max(0, stride - 1):
+                    target_skip = min(
+                        max(0, stride - 1),
+                        max(0, total_frames - idx - 1),
+                    )
+                    skipped = self._prescan_skip_forward(cap, target_skip)
+                    if skipped < target_skip:
                         break
-                    i += stride
+                    i = idx + 1 + skipped
                 if active:
                     s = max(0, start - pad)
                     e = total_frames - 1
@@ -6954,6 +7026,55 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    def eventFilter(self, watched, event):
+        try:
+            if (
+                event.type() == QtCore.QEvent.Type.Wheel
+                and bool(watched.property("_pc_no_wheel_value_edit"))
+            ):
+                self._scroll_parent_area(watched, event)
+                return True
+        except Exception:
+            pass
+        return super().eventFilter(watched, event)
+
+    def _mark_no_wheel_value_edit(self, widget: QtWidgets.QWidget):
+        watched = []
+        value_types = (
+            QtWidgets.QAbstractSpinBox,
+            QtWidgets.QComboBox,
+            QtWidgets.QAbstractSlider,
+        )
+        if isinstance(widget, value_types):
+            watched.append(widget)
+        for widget_type in value_types:
+            watched.extend(widget.findChildren(widget_type))
+
+        seen = set()
+        for child in watched:
+            ident = id(child)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            child.setProperty("_pc_no_wheel_value_edit", True)
+            child.installEventFilter(self)
+
+    def _scroll_parent_area(self, widget: QtWidgets.QWidget, event: QtGui.QWheelEvent):
+        parent = widget.parent()
+        while parent is not None and not isinstance(parent, QtWidgets.QScrollArea):
+            parent = parent.parent()
+        if parent is None:
+            return
+
+        bar = parent.verticalScrollBar()
+        pixel_delta = event.pixelDelta().y()
+        if pixel_delta:
+            delta = -pixel_delta
+        else:
+            delta = -int(event.angleDelta().y() / 120.0 * max(1, bar.singleStep() * 3))
+        if delta:
+            bar.setValue(bar.value() + delta)
+
     def _install_filter(self):
         # Build label->row index for settings filtering
         try:
@@ -6973,6 +7094,8 @@ class MainWindow(QtWidgets.QMainWindow):
                             fi = layout.itemAtPosition(i, 1)
                             if li and fi and li.widget() and fi.widget():
                                 self._param_rows.append((li.widget(), fi.widget()))
+            for _, field in getattr(self, "_param_rows", []):
+                self._mark_no_wheel_value_edit(field)
             if hasattr(self, "search_edit"):
                 self.search_edit.textChanged.connect(self._apply_filter)
         except Exception:
