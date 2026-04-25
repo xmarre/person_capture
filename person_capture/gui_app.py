@@ -951,7 +951,27 @@ class Processor(QtCore.QObject):
                         except Exception:
                             pass
                         continue
-                    if not cap.grab():
+                    try:
+                        grabbed = cap.grab()
+                    except Exception as exc:
+                        at_known_eof = False
+                        reader_eof = getattr(cap, "_at_known_eof", None)
+                        if callable(reader_eof):
+                            try:
+                                at_known_eof = bool(reader_eof())
+                            except Exception:
+                                at_known_eof = False
+                        if at_known_eof:
+                            break
+                        startup_exc = getattr(cap, "_last_startup_error", None)
+                        detail = startup_exc if startup_exc is not None else exc
+                        self._status(
+                            f"Pre-scan read failed: {detail}",
+                            key="prescan_skip_error",
+                            interval=0.5,
+                        )
+                        raise RuntimeError("Pre-scan reader failed during grab") from exc
+                    if not grabbed:
                         startup_exc = getattr(cap, "_last_startup_error", None)
                         if startup_exc is not None:
                             self._status(
