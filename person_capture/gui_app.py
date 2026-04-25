@@ -2577,6 +2577,8 @@ class Processor(QtCore.QObject):
     @QtCore.Slot()
     def run(self):
         cap = save_q = saver_thread = archive_q = archive_thread = csv_f = dbg_f = hit_q = None
+        finished_ok = False
+        finished_msg = "Unknown termination"
         try:
             # Apply TRT/ORT env from cfg early
             def _env_set(k, v):
@@ -5372,12 +5374,12 @@ class Processor(QtCore.QObject):
                         }
                     )
             if self._abort:
-                self.finished.emit(False, "Aborted")
+                finished_ok, finished_msg = False, "Aborted"
             else:
-                self.finished.emit(True, f"Done. Hits: {hit_count}. Index: {csv_path}")
+                finished_ok, finished_msg = True, f"Done. Hits: {hit_count}. Index: {csv_path}"
         except Exception as e:
             err = f"Error: {e}\n{traceback.format_exc()}"
-            self.finished.emit(False, err)
+            finished_ok, finished_msg = False, err
         finally:
             if hit_q is not None:
                 try:
@@ -5413,6 +5415,7 @@ class Processor(QtCore.QObject):
                     dbg_f.close()
                 except Exception:
                     pass
+            self.finished.emit(bool(finished_ok), str(finished_msg))
 
     def _init_status(self):
         # Per-key throttle timestamps and last texts
