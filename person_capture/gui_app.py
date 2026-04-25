@@ -13,7 +13,7 @@ Run:
 from __future__ import annotations
 import time
 
-import os, sys, subprocess, shutil, threading, struct
+import os, sys, subprocess, shutil, threading, struct, hashlib
 import json, csv, traceback
 import logging
 
@@ -463,6 +463,10 @@ class SessionConfig:
     prescan_fd9_grace: int = 1                  # start skipping after this many consecutive fd≈9 samples
     prescan_fd9_probe_period: int = 3           # while skipping, run a real probe every Nth sample
     prescan_weights: Tuple[float, float, float] = (0.70, 0.25, 0.05)  # (anchor, diversity, quality)
+    # Persistent pre-scan reuse. Keyed only by video/ref identity and pre-scan-affecting settings,
+    # so HDR/export-only changes do not invalidate it.
+    prescan_cache_mode: str = "auto"  # auto | refresh | off
+    prescan_cache_dir: str = "prescan_cache"
     # --- runtime paths ---
     trt_lib_dir: str = ""                  # preferred TensorRT lib directory
     # --- TensorRT / ORT (advanced) ---
@@ -554,6 +558,176 @@ class Processor(QtCore.QObject):
         except Exception:
             return 0.70, 0.25, 0.05
         return wa, wd, wq
+
+    @staticmethod
+    def _cache_file_identity(path: str) -> dict:
+        p = str(path or "").strip()
+        if not p:
+            return {"path": "", "missing": True}
+        try:
+            ap = os.path.abspath(p)
+        except Exception:
+            ap = p
+        try:
+            st = os.stat(ap)
+            return {
+                "path": ap,
+                "size": int(getattr(st, "st_size", 0) or 0),
+                "mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))),
+            }
+        except Exception:
+            return {"path": ap, "missing": True}
+
+    @staticmethod
+    def _jsonable_cfg_value(v):
+        if isinstance(v, tuple):
+            return [Processor._jsonable_cfg_value(x) for x in v]
+        if isinstance(v, list):
+            return [Processor._jsonable_cfg_value(x) for x in v]
+        if isinstance(v, (np.floating, np.integer)):
+            return v.item()
+        return v
+
+    def _prescan_cache_root(self, cfg: SessionConfig) -> Path:
+        raw = str(getattr(cfg, "prescan_cache_dir", "prescan_cache") or "prescan_cache").strip()
+        root = Path(raw)
+        if not root.is_absolute():
+            root = _REPO_ROOT / root
+        return root
+
+    def _prescan_cache_meta(self, cfg: SessionConfig, fps: float, total_frames: int) -> dict:
+        # Only include knobs that can change pre-scan spans/ref-bank output. Do not
+        # include HDR export/preview settings, crop scoring, curation, or output paths.
+        prescan_keys = (
+            "prescan_stride",
+            "prescan_max_width",
+            "prescan_decode_max_w",
+            "prescan_face_conf",
+            "prescan_fd_enter",
+            "prescan_fd_add",
+            "prescan_fd_exit",
+            "prescan_add_cooldown_samples",
+            "prescan_rot_probe_period",
+            "prescan_probe_imgsz",
+            "prescan_probe_conf",
+            "prescan_heavy_90",
+            "prescan_heavy_180",
+            "prescan_min_segment_sec",
+            "prescan_pad_sec",
+            "prescan_bridge_gap_sec",
+            "prescan_exit_cooldown_sec",
+            "prescan_boundary_refine_sec",
+            "prescan_refine_stride_min",
+            "prescan_trim_pad",
+            "prescan_skip_trailing_refine",
+            "prescan_refine_budget_sec",
+            "prescan_bank_max",
+            "prescan_diversity_dedup_cos",
+            "prescan_replace_margin",
+            "prescan_fd9_skip",
+            "prescan_fd9_grace",
+            "prescan_fd9_probe_period",
+            "prescan_weights",
+            "face_model",
+            "clip_face_backbone",
+            "clip_face_pretrained",
+            "use_arcface",
+        )
+        settings = {
+            k: self._jsonable_cfg_value(getattr(cfg, k, None))
+            for k in prescan_keys
+        }
+        refs = [part.strip() for part in str(getattr(cfg, "ref", "") or "").split(";") if part.strip()]
+        meta = {
+            "version": 1,
+            "video": self._cache_file_identity(getattr(cfg, "video", "")),
+            "refs": [self._cache_file_identity(p) for p in refs],
+            "fps": round(float(fps or 0.0), 6),
+            "total_frames": int(total_frames or 0),
+            "settings": settings,
+        }
+        key_json = json.dumps(meta, sort_keys=True, separators=(",", ":"))
+        meta["key"] = hashlib.sha256(key_json.encode("utf-8")).hexdigest()
+        return meta
+
+    def _prescan_cache_path(self, cfg: SessionConfig, meta: dict) -> Path:
+        key = str(meta.get("key") or "")
+        return self._prescan_cache_root(cfg) / f"{key}.npz"
+
+    def _load_prescan_cache(
+        self,
+        cfg: SessionConfig,
+        fps: float,
+        total_frames: int,
+    ) -> tuple[bool, list[tuple[int, int]], Optional[np.ndarray], Optional[dict]]:
+        mode = str(getattr(cfg, "prescan_cache_mode", "auto") or "auto").lower()
+        if mode not in ("auto", "reuse"):
+            return False, [], None, None
+        meta = self._prescan_cache_meta(cfg, fps, total_frames)
+        path = self._prescan_cache_path(cfg, meta)
+        if not path.is_file():
+            return False, [], None, meta
+        try:
+            with np.load(str(path), allow_pickle=False) as data:
+                stored_meta = json.loads(str(data["meta"].item()))
+                if stored_meta.get("key") != meta.get("key") or stored_meta.get("version") != meta.get("version"):
+                    return False, [], None, meta
+                spans_arr = np.asarray(data["spans"], dtype=np.int64).reshape(-1, 2)
+                spans = [(int(s), int(e)) for s, e in spans_arr.tolist() if int(e) >= int(s)]
+                has_ref_arr = data["has_ref"] if "has_ref" in data.files else np.array([0], dtype=np.uint8)
+                has_ref = bool(int(np.asarray(has_ref_arr).reshape(-1)[0]))
+                ref_feat = None
+                if has_ref and "ref_face_feat" in data:
+                    arr = np.asarray(data["ref_face_feat"], dtype=np.float32)
+                    if arr.size > 0:
+                        ref_feat = arr.reshape(arr.shape[0], -1) if arr.ndim >= 2 else arr.reshape(1, -1)
+                self._status(
+                    f"Pre-scan cache hit • segments={len(spans)}",
+                    key="prescan_cache",
+                    interval=0.0,
+                )
+                return True, spans, ref_feat, meta
+        except Exception as exc:
+            self._status(f"Pre-scan cache ignored: {exc}", key="prescan_cache", interval=5.0)
+            return False, [], None, meta
+
+    def _save_prescan_cache(
+        self,
+        cfg: SessionConfig,
+        fps: float,
+        total_frames: int,
+        spans: list[tuple[int, int]],
+        ref_face_feat: Optional[np.ndarray],
+    ) -> None:
+        mode = str(getattr(cfg, "prescan_cache_mode", "auto") or "auto").lower()
+        if mode not in ("auto", "refresh", "reuse") or self._abort:
+            return
+        try:
+            meta = self._prescan_cache_meta(cfg, fps, total_frames)
+            path = self._prescan_cache_path(cfg, meta)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            spans_arr = np.asarray(spans or [], dtype=np.int64).reshape(-1, 2)
+            if ref_face_feat is None:
+                feat_arr = np.zeros((0, 0), dtype=np.float32)
+                has_ref = np.array([0], dtype=np.uint8)
+            else:
+                feat_arr = np.asarray(ref_face_feat, dtype=np.float32)
+                if feat_arr.ndim == 1:
+                    feat_arr = feat_arr.reshape(1, -1)
+                has_ref = np.array([1], dtype=np.uint8)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp, "wb") as f:
+                np.savez_compressed(
+                    f,
+                    meta=np.array(json.dumps(meta, sort_keys=True), dtype=np.str_),
+                    spans=spans_arr,
+                    ref_face_feat=feat_arr,
+                    has_ref=has_ref,
+                )
+            os.replace(tmp, path)
+            self._status(f"Pre-scan cache saved • segments={len(spans_arr)}", key="prescan_cache", interval=0.0)
+        except Exception as exc:
+            self._status(f"Pre-scan cache save failed: {exc}", key="prescan_cache", interval=5.0)
 
     def _stream_ref_bank_update(
         self,
@@ -804,11 +978,13 @@ class Processor(QtCore.QObject):
                             elif cmd == "play":
                                 self._paused = False
                             elif cmd == "seek":
+                                self._prescan_cache_dirty = True
                                 try:
                                     last_seek = int(arg)
                                 except Exception:
                                     pass
                             elif cmd == "step":
+                                self._prescan_cache_dirty = True
                                 try:
                                     step_accum += int(arg) if arg is not None else 1
                                 except Exception:
@@ -824,6 +1000,7 @@ class Processor(QtCore.QObject):
                                     ch = dict(arg or {})
                                     for k, v in ch.items():
                                         if k.startswith("prescan_"):
+                                            self._prescan_cache_dirty = True
                                             setattr(cfg, k, v)
                                     stride = max(1, int(cfg.prescan_stride))
                                     enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
@@ -893,11 +1070,13 @@ class Processor(QtCore.QObject):
                         while True:
                             cmd, arg = self._cmd_q.get_nowait()
                             if cmd == "seek":
+                                self._prescan_cache_dirty = True
                                 try:
                                     last_seek = int(arg)
                                 except Exception:
                                     pass
                             elif cmd == "step":
+                                self._prescan_cache_dirty = True
                                 try:
                                     step_accum += int(arg) if arg is not None else 1
                                 except Exception:
@@ -912,6 +1091,7 @@ class Processor(QtCore.QObject):
                                     ch = dict(arg or {})
                                     for k, v in ch.items():
                                         if k.startswith("prescan_"):
+                                            self._prescan_cache_dirty = True
                                             setattr(cfg, k, v)
                                     stride = max(1, int(cfg.prescan_stride))
                                     enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
@@ -3228,10 +3408,23 @@ class Processor(QtCore.QObject):
                 return cap_obj, hdr_is_active, fps_val, total_val
 
             if bool(getattr(cfg, "prescan_enable", True)) and total_frames > 0:
-                self._status("Pre-scan.", key="phase", interval=2.0)
-                keep_spans, ref_face_feat = self._prescan(
-                    cap, int(round(fps)), total_frames, face, ref_face_feat, cfg
-                )
+                prescan_loaded = False
+                keep_spans = []
+                cached_ref_face_feat = None
+                if str(getattr(cfg, "prescan_cache_mode", "auto") or "auto").lower() != "refresh":
+                    prescan_loaded, keep_spans, cached_ref_face_feat, _cache_meta = self._load_prescan_cache(
+                        cfg, float(fps), int(total_frames)
+                    )
+                    if prescan_loaded:
+                        ref_face_feat = cached_ref_face_feat
+                if not prescan_loaded:
+                    mode = str(getattr(cfg, "prescan_cache_mode", "auto") or "auto").lower()
+                    suffix = " (refresh cache)" if mode == "refresh" else ""
+                    self._status(f"Pre-scan.{suffix}", key="phase", interval=2.0)
+                    keep_spans, ref_face_feat = self._prescan(
+                        cap, int(round(fps)), total_frames, face, ref_face_feat, cfg
+                    )
+                    self._save_prescan_cache(cfg, float(fps), int(total_frames), keep_spans, ref_face_feat)
                 if defer_reader_probe:
                     cap, hdr_active, fps, total_frames = _run_deferred_probe_after_prescan(
                         cap, fps, total_frames, hdr_active
@@ -6603,6 +6796,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_prescan_decode_max_w.setValue(int(getattr(self.cfg, "prescan_decode_max_w", 384)))
         self.spin_prescan_decode_max_w.setToolTip("int: prescan_decode_max_w (decoder downscale; 0=disable)")
         self.spin_prescan_decode_max_w.valueChanged.connect(self._on_ui_change)
+        self.prescan_cache_combo = QtWidgets.QComboBox()
+        self.prescan_cache_combo.addItem("Auto reuse matching cache", "auto")
+        self.prescan_cache_combo.addItem("Refresh/rebuild cache", "refresh")
+        self.prescan_cache_combo.addItem("Disabled", "off")
+        _pc_mode = str(getattr(self.cfg, "prescan_cache_mode", "auto") or "auto")
+        _pc_idx = self.prescan_cache_combo.findData(_pc_mode)
+        self.prescan_cache_combo.setCurrentIndex(_pc_idx if _pc_idx >= 0 else 0)
+        self.prescan_cache_combo.setToolTip(
+            "Persistent pre-scan cache. Auto reuses matching video/ref/pre-scan settings; "
+            "HDR/export-only setting changes do not invalidate it."
+        )
+        self.prescan_cache_combo.currentIndexChanged.connect(self._on_ui_change)
+        self.prescan_cache_clear_btn = QtWidgets.QPushButton("Clear")
+        self.prescan_cache_clear_btn.setToolTip("Delete all persisted pre-scan cache files.")
+        self.prescan_cache_clear_btn.clicked.connect(self._clear_prescan_cache)
+        self.prescan_cache_widget = QtWidgets.QWidget()
+        _pc_lay = QtWidgets.QHBoxLayout(self.prescan_cache_widget)
+        _pc_lay.setContentsMargins(0, 0, 0, 0)
+        _pc_lay.setSpacing(6)
+        _pc_lay.addWidget(self.prescan_cache_combo, 1)
+        _pc_lay.addWidget(self.prescan_cache_clear_btn, 0)
         self.spin_prescan_face_conf = QtWidgets.QDoubleSpinBox()
         self.spin_prescan_face_conf.setDecimals(3)
         self.spin_prescan_face_conf.setRange(0.0, 1.0)
@@ -6984,6 +7198,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Pre-scan bank add dist ≤", self.spin_prescan_fd_add),
             ("Pre-scan max width (px)", self.spin_prescan_max_width),
             ("Pre-scan decode max width (px)", self.spin_prescan_decode_max_w),
+            ("Pre-scan cache", self.prescan_cache_widget),
             ("Pre-scan face det conf", self.spin_prescan_face_conf),
             ("Pre-scan ENTER dist ≤", self.spin_prescan_fd_enter),
             ("Pre-scan EXIT dist ≥", self.spin_prescan_fd_exit),
@@ -7933,6 +8148,28 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             self._in_ui_change = False
 
+    def _clear_prescan_cache(self) -> None:
+        root = _REPO_ROOT / "prescan_cache"
+        try:
+            # Respect a custom relative/absolute cache dir from the current config.
+            raw = str(getattr(self.cfg, "prescan_cache_dir", "prescan_cache") or "prescan_cache").strip()
+            root = Path(raw)
+            if not root.is_absolute():
+                root = _REPO_ROOT / root
+        except Exception:
+            root = _REPO_ROOT / "prescan_cache"
+        try:
+            if root.exists():
+                shutil.rmtree(root)
+            root.mkdir(parents=True, exist_ok=True)
+            self.statusBar().showMessage(f"Cleared pre-scan cache: {root}", 5000)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Clear pre-scan cache failed",
+                f"Could not clear pre-scan cache:\n{root}\n\n{exc}",
+            )
+
     # ------------- Actions -------------
 
     def _pick_file(self, line: QtWidgets.QLineEdit, filt: str):
@@ -8214,6 +8451,7 @@ class MainWindow(QtWidgets.QMainWindow):
             prescan_fd_add=float(self.spin_prescan_fd_add.value()) if hasattr(self, "spin_prescan_fd_add") else 0.22,
             prescan_max_width=int(self.spin_prescan_max_width.value()) if hasattr(self, "spin_prescan_max_width") else 416,
             prescan_decode_max_w=int(self.spin_prescan_decode_max_w.value()) if hasattr(self, "spin_prescan_decode_max_w") else int(getattr(self.cfg, "prescan_decode_max_w", 384)),
+            prescan_cache_mode=(self.prescan_cache_combo.currentData() if hasattr(self, "prescan_cache_combo") else getattr(self.cfg, "prescan_cache_mode", "auto")) or "auto",
             prescan_face_conf=float(self.spin_prescan_face_conf.value()) if hasattr(self, "spin_prescan_face_conf") else 0.5,
             prescan_fd_enter=float(self.spin_prescan_fd_enter.value()) if hasattr(self, "spin_prescan_fd_enter") else 0.45,
             prescan_fd_exit=float(self.spin_prescan_fd_exit.value()) if hasattr(self, "spin_prescan_fd_exit") else 0.52,
@@ -8492,6 +8730,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spin_prescan_max_width.setValue(int(cfg.prescan_max_width))
         if hasattr(self, 'spin_prescan_decode_max_w'):
             self.spin_prescan_decode_max_w.setValue(int(getattr(cfg, 'prescan_decode_max_w', 384)))
+        if hasattr(self, "prescan_cache_combo"):
+            mode = str(getattr(cfg, "prescan_cache_mode", "auto") or "auto")
+            idx = self.prescan_cache_combo.findData(mode)
+            self.prescan_cache_combo.setCurrentIndex(idx if idx >= 0 else 0)
         if hasattr(self, 'spin_prescan_face_conf'):
             self.spin_prescan_face_conf.setValue(float(cfg.prescan_face_conf))
         if hasattr(self, 'spin_prescan_fd_enter'):
@@ -9305,6 +9547,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spin_prescan_max_width.setValue(int(s.value("prescan_max_width", self.cfg.prescan_max_width)))
         if hasattr(self, 'spin_prescan_decode_max_w'):
             self.spin_prescan_decode_max_w.setValue(int(s.value("prescan_decode_max_w", getattr(self.cfg, "prescan_decode_max_w", 384))))
+        if hasattr(self, "prescan_cache_combo"):
+            mode = str(s.value("prescan_cache_mode", getattr(self.cfg, "prescan_cache_mode", "auto")) or "auto")
+            idx = self.prescan_cache_combo.findData(mode)
+            self.prescan_cache_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self.cfg.prescan_cache_mode = self.prescan_cache_combo.currentData() or "auto"
         if hasattr(self, 'spin_prescan_face_conf'):
             self.spin_prescan_face_conf.setValue(float(s.value("prescan_face_conf", self.cfg.prescan_face_conf)))
         if hasattr(self, 'spin_prescan_fd_enter'):

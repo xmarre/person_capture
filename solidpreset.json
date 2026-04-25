@@ -177,5 +177,6 @@
   "hdr_sdr_gamut_mapping": "perceptual",
   "hdr_sdr_contrast_recovery": 0.3,
   "hdr_sdr_peak_detect": true,
-  "hdr_sdr_allow_inaccurate_fallback": false
+  "hdr_sdr_allow_inaccurate_fallback": false,
+  "prescan_cache_mode": "auto"
 }
