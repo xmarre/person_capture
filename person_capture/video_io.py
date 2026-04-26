@@ -1499,7 +1499,7 @@ class FfmpegPipeReader:
         # Tunables (env overrides). Defaults align with MPC VR feel.
         # Strict LP mode = no CPU/zscale fallback. We'll try one minimal LP chain retry, then error.
         self._lp_minimal = False
-        self._sdr_nits = float(os.getenv("PC_SDR_NITS", "125.0"))     # 80–200 typical
+        self._sdr_nits = float(os.getenv("PC_SDR_NITS", "100.0"))     # 80-200 typical
         self._tm_desat = float(os.getenv("PC_TM_DESAT", "0.25"))      # 0=keep chroma, 1=desaturate more
         self._tm_param = float(os.getenv("PC_TM_PARAM", "0.40"))      # Mobius curve softness
         # Canonical backend override from GUI / CLI.

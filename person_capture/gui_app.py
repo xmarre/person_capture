@@ -283,6 +283,7 @@ APP_ORG = "PersonCapture"
 APP_NAME = "PersonCapture GUI"
 
 _SETTINGS_KEY_FFMPEG_DIR = "paths/ffmpeg_dir"
+_SETTINGS_KEY_SDR_NITS_MIGRATED = "migrations/sdr_nits_default_100_v1"
 
 # ---------------------- Data & Settings ----------------------
 
@@ -336,7 +337,7 @@ class SessionConfig:
     score_margin: float = 0.03
     iou_gate: float = 0.05
     # --- HDR tonemap tuning ---
-    sdr_nits: float = 125.0          # target SDR display brightness
+    sdr_nits: float = 100.0          # target SDR display brightness
     tm_desat: float = 0.25           # 0..1 chroma desaturation in highlights
     tm_param: float = 0.40           # Mobius shoulder softness
     hdr_tonemap_pref: str = "auto"   # auto | libplacebo | zscale | scale
@@ -2034,21 +2035,35 @@ class Processor(QtCore.QObject):
                 "body": ["2:3", "3:4", "1:1", "3:2"],
                 "base": ["1:1", "2:3"],
             }.get(profile, ["1:1", "2:3"])
-            if validated_user_ratios:
-                return list(validated_user_ratios)
+
+            # User ratios are an availability list, not a command to use the same
+            # geometry for every crop profile. Close/upper portraits must never
+            # become landscape crops merely because 3:2 exists in the UI list.
+            # Keep 3:2 available only for body/context profiles after the scorer
+            # confirms the current frame is actually suited to it.
             allow_landscape = profile == "body"
+            available = validated_user_ratios if validated_user_ratios else preferred
             out: list[str] = []
-            for rs in preferred:
+
+            def _add_ratio(rs: str) -> None:
                 try:
                     rw, rh = parse_ratio(rs)
                     aspect = float(rw) / max(1e-6, float(rh))
                 except Exception:
-                    continue
-                if not allow_landscape and aspect > 1.05:
-                    continue
+                    return
+                if aspect > 1.05 and not allow_landscape:
+                    return
                 if rs not in out:
                     out.append(rs)
-            return out or preferred
+
+            for rs in preferred:
+                if rs in available:
+                    _add_ratio(rs)
+            for rs in available:
+                _add_ratio(rs)
+            if out:
+                return out
+            return [] if validated_user_ratios else ["1:1", "2:3"]
 
         base = self._coerce_box_xyxy(base_crop_xyxy, bounds)
         subj = self._coerce_box_xyxy(subject_box, bounds)
@@ -2150,8 +2165,17 @@ class Processor(QtCore.QObject):
                 except Exception:
                     continue
                 is_landscape = aspect > 1.05
-                if not validated_user_ratios and profile in {"close", "upper"} and is_landscape:
+                if profile in {"close", "upper", "base"} and is_landscape:
                     continue
+                if profile == "body" and is_landscape:
+                    # A landscape body crop is only useful when the frame is truly
+                    # body/context dominated. If the matched face is already
+                    # prominent, a 3:2 crop is the wrong dataset sample and is more
+                    # likely to cut facial context near the edge.
+                    if face is not None and face_frame_frac >= 0.12:
+                        continue
+                    if subj_h_frac < 0.60:
+                        continue
 
                 crop = self._ratio_crop_containing_box(
                     protect,
@@ -2190,6 +2214,10 @@ class Processor(QtCore.QObject):
                     profile_prior = 0.78
                     if body_cadence or face_frame_frac < 0.10 or subj_h_frac > 0.62:
                         profile_prior -= 0.076 * landscape_penalty
+                    if face is not None and face_frame_frac >= 0.12:
+                        profile_prior += 0.55
+                    if is_landscape:
+                        profile_prior += 0.35
                     if rs == "2:3":
                         ratio_prior += 0.00
                     elif rs == "3:4":
@@ -2238,9 +2266,28 @@ class Processor(QtCore.QObject):
             return crop, rs, profile
 
         fallback_protect = face_protect or subj or base or (bx1, by1, bx2, by2)
-        fallback_ratio = validated_user_ratios[0] if validated_user_ratios else ("1:1" if face_protect is not None else "2:3")
+        fallback_ratio = None
+        fallback_profile = "fallback"
+        for rs in validated_user_ratios:
+            try:
+                rw, rh = parse_ratio(rs)
+                aspect = float(rw) / max(1e-6, float(rh))
+            except Exception:
+                continue
+            is_landscape = aspect > 1.05
+            if is_landscape:
+                if face is not None and face_frame_frac >= 0.12:
+                    continue
+                if subj_h_frac < 0.60:
+                    continue
+                fallback_profile = "body"
+            fallback_ratio = rs
+            break
+        if fallback_ratio is None:
+            fallback_ratio = "1:1" if face_protect is not None else "2:3"
+            fallback_profile = "fallback"
         crop = self._ratio_crop_containing_box(fallback_protect, fallback_ratio, bounds)
-        return crop, fallback_ratio, "fallback"
+        return crop, fallback_ratio, fallback_profile
 
     def _enforce_scale_and_margins(
         self,
@@ -3627,7 +3674,7 @@ class Processor(QtCore.QObject):
             # --- Video / HDR setup ---
             # Apply HDR tonemap env overrides from cfg (GUI always supplies defaults)
             try:
-                os.environ["PC_SDR_NITS"] = str(float(getattr(cfg, "sdr_nits", 125.0)))
+                os.environ["PC_SDR_NITS"] = str(float(getattr(cfg, "sdr_nits", SessionConfig.sdr_nits)))
                 os.environ["PC_TM_DESAT"] = str(float(getattr(cfg, "tm_desat", 0.25)))
                 os.environ["PC_TM_PARAM"] = str(float(getattr(cfg, "tm_param", 0.40)))
                 for key in ("PC_FORCE_ZSCALE", "PC_FORCE_SCALE", "PC_FORCE_TONEMAP"):
@@ -5429,6 +5476,168 @@ class Processor(QtCore.QObject):
                         except Exception:
                             pass
 
+                    # Final face containment / shape repair. Identity boxes identify the
+                    # target, but the final dataset crop must still satisfy the hard
+                    # invariant that the detected face is inside the saved crop. Also
+                    # prefer square/portrait crops when the face is already prominent;
+                    # landscape is only acceptable for body/context shots.
+                    hard_face_box = c.get("face_box")
+                    if hard_face_box is not None:
+                        try:
+                            hf = self._coerce_box_xyxy(hard_face_box, (repair_bx1, repair_by1, repair_bx2, repair_by2))
+                            if hf is not None:
+                                hfx1, hfy1, hfx2, hfy2 = hf
+                                hfw = max(1.0, hfx2 - hfx1)
+                                hfh = max(1.0, hfy2 - hfy1)
+                                hard_face_padded = self._pad_box_xyxy(
+                                    hf,
+                                    pad_x=0.06 * hfw,
+                                    pad_y_top=0.10 * hfh,
+                                    pad_y_bottom=0.16 * hfh,
+                                    bounds_xyxy=(repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                ) or hf
+                                cur_crop = (float(cx1), float(cy1), float(cx2), float(cy2))
+                                cur_w = max(1.0, float(cx2 - cx1))
+                                cur_h = max(1.0, float(cy2 - cy1))
+                                cur_face_h_frac = hfh / cur_h
+                                try:
+                                    rrw, rrh = parse_ratio(ratio_str)
+                                    cur_aspect = float(rrw) / max(1e-6, float(rrh))
+                                except Exception:
+                                    cur_aspect = cur_w / cur_h
+                                was_landscape = cur_aspect > 1.05
+                                hard_def = self._containment_deficit_xyxy(cur_crop, hard_face_padded, margin_px=1.0)
+                                prominent_face = cur_face_h_frac >= 0.16 or float(c.get("face_frac") or 0.0) >= 0.12
+                                force_portrait = was_landscape and (crop_profile_for_guard != "body" or prominent_face)
+                                if hard_def > 0.01 or force_portrait:
+                                    identity_guard = self._coerce_box_xyxy(
+                                        self._union_boxes_xyxy(
+                                            c.get("subject_box") or c.get("show_box"),
+                                            c.get("head_box"),
+                                            c.get("face_box"),
+                                        ),
+                                        (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                    )
+                                    protect_box_clamped = (
+                                        self._coerce_box_xyxy(protect_box, (repair_bx1, repair_by1, repair_bx2, repair_by2))
+                                        if protect_box is not None
+                                        else None
+                                    )
+                                    full_guard_box = self._union_boxes_xyxy(
+                                        hard_face_padded,
+                                        identity_guard,
+                                        protect_box_clamped,
+                                    ) or hard_face_padded
+                                    best_fix = None
+                                    for fix_ratio in ("1:1", "2:3", "3:4"):
+                                        try:
+                                            fixed = self._ratio_crop_containing_box(
+                                                full_guard_box,
+                                                fix_ratio,
+                                                (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                                anchor=((hfx1 + hfx2) * 0.5, (hfy1 + hfy2) * 0.5 + 0.18 * hfh),
+                                                min_size_xy=(max(hfw * 1.18, 2.0), max(hfh * 1.22, 2.0)),
+                                            )
+                                            guard_def = self._containment_deficit_xyxy(fixed, full_guard_box, margin_px=1.0)
+                                            if guard_def > 0.01:
+                                                continue
+                                            fw2 = max(1.0, float(fixed[2] - fixed[0]))
+                                            fh2 = max(1.0, float(fixed[3] - fixed[1]))
+                                            face_h_frac2 = hfh / fh2
+                                            target_frac = 0.34 if fix_ratio == "1:1" else 0.24
+                                            score = abs(face_h_frac2 - target_frac)
+                                            score += 0.02 if fix_ratio == "2:3" else (0.04 if fix_ratio == "3:4" else 0.0)
+                                            score += 0.04 * ((fw2 * fh2) / max(1.0, float((repair_bx2 - repair_bx1) * (repair_by2 - repair_by1))))
+                                            if best_fix is None or score < best_fix[0]:
+                                                best_fix = (score, fixed, fix_ratio)
+                                        except Exception:
+                                            continue
+                                    if best_fix is not None:
+                                        _, fixed, fixed_ratio = best_fix
+                                        cx1, cy1, cx2, cy2 = fixed
+                                        ratio_str = fixed_ratio
+                                        c["ratio"] = fixed_ratio
+                                        if crop_profile_for_guard == "body" and was_landscape and fixed_ratio in {"1:1", "2:3", "3:4"}:
+                                            c["crop_profile"] = "upper"
+                                            crop_profile_for_guard = "upper"
+                                    elif hard_def > 0.01 or force_portrait:
+                                        fallback_ratio = "2:3" if force_portrait else ratio_str
+                                        fallback_done = False
+                                        try:
+                                            fixed = self._ratio_crop_containing_box(
+                                                full_guard_box,
+                                                fallback_ratio,
+                                                (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                                anchor=((hfx1 + hfx2) * 0.5, (hfy1 + hfy2) * 0.5 + 0.18 * hfh),
+                                                min_size_xy=(max(cur_w, hfw * 1.18), max(cur_h, hfh * 1.22)),
+                                            )
+                                            guard_def = self._containment_deficit_xyxy(fixed, full_guard_box, margin_px=1.0)
+                                            if guard_def <= 0.01:
+                                                cx1, cy1, cx2, cy2 = fixed
+                                                ratio_str = fallback_ratio
+                                                c["ratio"] = fallback_ratio
+                                                fallback_done = True
+                                        except Exception:
+                                            fallback_done = False
+                                        if not fallback_done:
+                                            try:
+                                                fixed = self._ratio_crop_containing_box(
+                                                    hard_face_padded,
+                                                    fallback_ratio,
+                                                    (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                                    anchor=((hfx1 + hfx2) * 0.5, (hfy1 + hfy2) * 0.5 + 0.18 * hfh),
+                                                    min_size_xy=(max(cur_w, hfw * 1.18), max(cur_h, hfh * 1.22)),
+                                                )
+                                                cx1, cy1, cx2, cy2 = fixed
+                                                ratio_str = fallback_ratio
+                                                c["ratio"] = fallback_ratio
+                                                fallback_done = True
+                                            except Exception:
+                                                pass
+                                        if (not fallback_done) and (hard_def > 0.01 or force_portrait):
+                                            if force_portrait:
+                                                ratio_str = fallback_ratio
+                                                c["ratio"] = fallback_ratio
+                                            try:
+                                                shift_seed = cur_crop
+                                                if force_portrait:
+                                                    shift_seed = self._ratio_crop_containing_box(
+                                                        hard_face_padded,
+                                                        fallback_ratio,
+                                                        (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                                        anchor=((hfx1 + hfx2) * 0.5, (hfy1 + hfy2) * 0.5 + 0.18 * hfh),
+                                                        min_size_xy=(max(cur_w, hfw * 1.18), max(cur_h, hfh * 1.22)),
+                                                    )
+                                                cx1, cy1, cx2, cy2 = self._shift_crop_to_include_box(
+                                                    shift_seed,
+                                                    hard_face_padded,
+                                                    (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                                    margin_px=1.0,
+                                                )
+                                            except Exception:
+                                                if force_portrait:
+                                                    try:
+                                                        cx1, cy1, cx2, cy2 = self._ratio_crop_containing_box(
+                                                            hard_face_padded,
+                                                            fallback_ratio,
+                                                            (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                                            anchor=((hfx1 + hfx2) * 0.5, (hfy1 + hfy2) * 0.5 + 0.18 * hfh),
+                                                            min_size_xy=(max(hfw * 1.18, 2.0), max(hfh * 1.22, 2.0)),
+                                                        )
+                                                    except Exception:
+                                                        pass
+                                        if crop_profile_for_guard == "body" and was_landscape and c.get("ratio") in {"1:1", "2:3", "3:4"}:
+                                            c["crop_profile"] = "upper"
+                                            crop_profile_for_guard = "upper"
+                        except Exception:
+                            logger.exception(
+                                "Final face containment repair failed idx=%s face=%s bounds=%s crop=%s",
+                                idx,
+                                hard_face_box,
+                                (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                (cx1, cy1, cx2, cy2),
+                            )
+
                     # Final clamp inside de-barred content window (prevents 1px bar re-entry)
                     cx1 = max(repair_bx1, min(repair_bx2 - 1, cx1))
                     cy1 = max(repair_by1, min(repair_by2 - 1, cy1))
@@ -6671,7 +6880,7 @@ class Processor(QtCore.QObject):
         src = "setparams=color_trc=smpte2084:color_primaries=bt2020:colorspace=bt2020nc:range=limited"
         desat = float(getattr(self.cfg, "tm_desat", 0.25))
         param = float(getattr(self.cfg, "tm_param", 0.40))
-        nits = float(getattr(self.cfg, "sdr_nits", 125.0))
+        nits = float(getattr(self.cfg, "sdr_nits", SessionConfig.sdr_nits))
         pref = str(getattr(self.cfg, "hdr_tonemap_pref", "auto") or "auto").lower()
         quality = str(getattr(self.cfg, "hdr_sdr_quality", "madvr_like") or "madvr_like").lower()
         algo = str(getattr(self.cfg, "hdr_sdr_tonemap", "auto") or "auto").lower()
@@ -6722,6 +6931,10 @@ class Processor(QtCore.QObject):
                 _add_first_lp_opt(opts, ("target_primaries", "color_primaries"), "bt709")
                 _add_first_lp_opt(opts, ("target_trc", "color_trc"), "bt709")
                 self._add_lp_opt(opts, supported, "range", "full")
+                _add_first_lp_opt(opts, ("sdr_peak", "target_peak", "dst_peak", "peak"), f"{nits:.6g}")
+                if not _add_first_lp_opt(opts, ("desaturation", "desat"), f"{desat:.6g}"):
+                    sat = max(0.0, 1.0 - desat)
+                    _add_first_lp_opt(opts, ("saturation", "sat"), f"{sat:.6g}")
                 _add_first_lp_opt(opts, ("gamut_mode", "gamut_mapping"), gamut)
 
             base_lp_opts = [f"tonemapping='{algo}'"]
@@ -9587,9 +9800,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.hdr_sdr_bad_fallback_check.setChecked(bool(getattr(cfg, "hdr_sdr_allow_inaccurate_fallback", False)))
         self.ratio_edit.setText(cfg.ratio)
         try:
-            self.sdr_nits_spin.setValue(float(getattr(cfg, "sdr_nits", 125.0)))
+            self.sdr_nits_spin.setValue(float(getattr(cfg, "sdr_nits", SessionConfig.sdr_nits)))
         except Exception:
-            self.sdr_nits_spin.setValue(125.0)
+            self.sdr_nits_spin.setValue(float(SessionConfig.sdr_nits))
         try:
             self.tm_desat_spin.setValue(float(getattr(cfg, "tm_desat", 0.25)))
         except Exception:
@@ -10424,7 +10637,16 @@ class MainWindow(QtWidgets.QMainWindow):
             _stored_ratio = "1:1,2:3,3:2"
         self.ratio_edit.setText(_stored_ratio)
         try:
-            self.sdr_nits_spin.setValue(float(s.value("sdr_nits", self.cfg.sdr_nits)))
+            _sdr_nits = float(s.value("sdr_nits", self.cfg.sdr_nits))
+            # One-time migration away from the old 125-nits default. Use a
+            # sentinel so users who intentionally keep 125 are not reset on
+            # every startup.
+            if not bool(s.value(_SETTINGS_KEY_SDR_NITS_MIGRATED, False, type=bool)):
+                if abs(_sdr_nits - 125.0) < 0.001:
+                    _sdr_nits = float(self.cfg.sdr_nits)
+                    s.setValue("sdr_nits", _sdr_nits)
+                s.setValue(_SETTINGS_KEY_SDR_NITS_MIGRATED, True)
+            self.sdr_nits_spin.setValue(_sdr_nits)
         except Exception:
             self.sdr_nits_spin.setValue(float(self.cfg.sdr_nits))
         try:
