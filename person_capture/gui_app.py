@@ -298,7 +298,7 @@ class SessionConfig:
     # ≤0 uses fps-derived auto cap (~1s of decoding) to avoid long stalls.
     seek_max_grabs: int = 12
     out_dir: str = "output"
-    ratio: str = "2:3,1:1,3:2"
+    ratio: str = "1:1,2:3,3:2"
     frame_stride: int = 2
     min_det_conf: float = 0.35
     face_thresh: float = 0.45
@@ -322,9 +322,9 @@ class SessionConfig:
     hdr_crop_format: str = "mkv"        # mkv (FFV1 lossless) | avif (AV1 lossless)
     # Full-resolution HDR->SDR still-render quality controls. These affect only
     # primary crops/f*.jpg source export, not pre-scan/detection preview.
-    hdr_sdr_quality: str = "resolve_like"  # resolve_like | madvr_like | balanced | fast
-    hdr_sdr_tonemap: str = "spline"        # spline | bt.2390 | st2094-40 | mobius | hable
-    hdr_sdr_gamut_mapping: str = "perceptual"  # perceptual | relative | saturation | clip
+    hdr_sdr_quality: str = "madvr_like"  # madvr_like | resolve_like | balanced | fast
+    hdr_sdr_tonemap: str = "auto"        # auto | bt.2390 | spline | st2094-40 | mobius | hable
+    hdr_sdr_gamut_mapping: str = "clip"  # clip | perceptual | relative | saturation
     hdr_sdr_contrast_recovery: float = 0.30
     hdr_sdr_peak_detect: bool = True
     hdr_sdr_allow_inaccurate_fallback: bool = False
@@ -361,8 +361,8 @@ class SessionConfig:
     # area vs. composition
     area_gamma: float = 0.60                 # <1 softens area growth
     area_face_scale_weight: float = 0.70     # down-weight area when face is large
-    square_pull_face_min: float = 0.45       # activate square pull when fh/frame_h > this; 0..1
-    square_pull_weight: float = 0.25         # strength of square pull
+    square_pull_face_min: float = 0.16       # activate square pull when fh/frame_h > this; 0..1
+    square_pull_weight: float = 1.10         # strength of square pull
     tight_face_relax_thresh: float = 0.48    # if face_h / crop_h ≥ thresh, relax bottom
     tight_face_relax_scale: float = 0.5      # scale want_bottom by this when tight
     device: str = "cuda"            # cuda | cpu
@@ -389,6 +389,12 @@ class SessionConfig:
     crop_top_headroom_max_frac: float = 0.15     # max(top margin / crop_h)
     crop_bottom_min_face_heights: float = 1.5    # min bottom margin in face-heights
     crop_penalty_weight: float = 3.0             # weight for placement penalties vs area growth
+    crop_head_side_pad_frac: float = 0.70        # protect hair/head around detected face width
+    crop_head_top_pad_frac: float = 0.85         # protect hair/forehead above detected face height
+    crop_head_bottom_pad_frac: float = 0.30      # protect chin/neck below detected face height
+    wide_face_aspect_penalty_weight: float = 10.0# penalize landscape crops when face is prominent
+    wide_face_min_frame_frac: float = 0.12       # prominent-face threshold for landscape penalty
+    wide_face_aspect_limit: float = 1.05         # aspects above this are considered landscape
     # Final safety guards (post-trim)
     side_guard_drop_enable: bool = True          # drop frames that still violate side margin after all steps
     side_guard_drop_factor: float = 0.66         # require at least this * desired margin on both sides before saving
@@ -1662,6 +1668,87 @@ class Processor(QtCore.QObject):
         iy2 = max(iy1 + 1, min(frame_h, int(round(y2))))
         return ix1, iy1, ix2, iy2
 
+    def _face_head_proxy_box(
+        self,
+        face_box: Optional[Tuple[float, float, float, float]],
+        frame_w: int,
+        frame_h: int,
+    ) -> Optional[Tuple[float, float, float, float]]:
+        """Conservative head/hair protection box derived from a face detector box.
+
+        SCRFD-style face boxes usually cover the facial region, not hair, forehead,
+        ears, or jaw/neck context.  Using the raw face box as the crop safety
+        invariant lets the cropper legally cut the visible head while still
+        keeping the detected face rectangle inside the crop.
+        """
+        if face_box is None:
+            return None
+        try:
+            fx1, fy1, fx2, fy2 = [float(v) for v in face_box]
+        except Exception:
+            return None
+        fw = max(1.0, fx2 - fx1)
+        fh = max(1.0, fy2 - fy1)
+        cfg = self.cfg
+        side = max(0.0, float(getattr(cfg, "crop_head_side_pad_frac", 0.70))) * fw
+        top = max(0.0, float(getattr(cfg, "crop_head_top_pad_frac", 0.85))) * fh
+        bottom = max(0.0, float(getattr(cfg, "crop_head_bottom_pad_frac", 0.30))) * fh
+        hx1 = max(0.0, fx1 - side)
+        hy1 = max(0.0, fy1 - top)
+        hx2 = min(float(frame_w), fx2 + side)
+        hy2 = min(float(frame_h), fy2 + bottom)
+        if hx2 <= hx1 + 1.0 or hy2 <= hy1 + 1.0:
+            return None
+        return hx1, hy1, hx2, hy2
+
+    @staticmethod
+    def _shift_crop_to_include_box(
+        crop_xyxy: Tuple[float, float, float, float],
+        protect_xyxy: Optional[Tuple[float, float, float, float]],
+        bounds_xyxy: Tuple[int, int, int, int],
+        margin_px: float = 0.0,
+    ) -> Tuple[int, int, int, int]:
+        """Shift a fixed-size crop so the protected box remains visible.
+
+        This preserves the selected aspect ratio and crop size.  It is a final
+        correction pass, not a crop rescorer.
+        """
+        cx1, cy1, cx2, cy2 = [float(v) for v in crop_xyxy]
+        bx1, by1, bx2, by2 = [int(v) for v in bounds_xyxy]
+        if protect_xyxy is None:
+            return int(round(cx1)), int(round(cy1)), int(round(cx2)), int(round(cy2))
+        try:
+            px1, py1, px2, py2 = [float(v) for v in protect_xyxy]
+        except Exception:
+            return int(round(cx1)), int(round(cy1)), int(round(cx2)), int(round(cy2))
+        m = max(0.0, float(margin_px))
+        w = max(1.0, cx2 - cx1)
+        h = max(1.0, cy2 - cy1)
+
+        # Horizontal correction. Positive dx moves the crop right.
+        dx = 0.0
+        if px1 - m < cx1:
+            dx = (px1 - m) - cx1
+        if px2 + m > cx2 + dx:
+            dx = (px2 + m) - cx2
+        nx1 = max(float(bx1), min(float(bx2) - w, cx1 + dx))
+        nx2 = nx1 + w
+
+        # Vertical correction. Positive dy moves the crop down.
+        dy = 0.0
+        if py1 - m < cy1:
+            dy = (py1 - m) - cy1
+        if py2 + m > cy2 + dy:
+            dy = (py2 + m) - cy2
+        ny1 = max(float(by1), min(float(by2) - h, cy1 + dy))
+        ny2 = ny1 + h
+
+        ix1 = max(bx1, min(bx2 - 1, int(round(nx1))))
+        iy1 = max(by1, min(by2 - 1, int(round(ny1))))
+        ix2 = max(ix1 + 1, min(bx2, int(round(nx2))))
+        iy2 = max(iy1 + 1, min(by2, int(round(ny2))))
+        return ix1, iy1, ix2, iy2
+
     def _enforce_scale_and_margins(
         self,
         crop_xyxy: Tuple[int, int, int, int],
@@ -1746,6 +1833,7 @@ class Processor(QtCore.QObject):
         best_score = 1e9
         best_template_loss = 0.0
         cfg = self.cfg
+        head_box = self._face_head_proxy_box(face_box, frame_w, frame_h)
 
         def _penalty(crop_xyxy, face_xyxy):
             if face_xyxy is None:
@@ -1782,6 +1870,18 @@ class Processor(QtCore.QObject):
             ax = abs(x)
             return 0.5 * ax * ax if ax <= delta else delta * (ax - 0.5 * delta)
 
+        def _containment_deficit(crop_xyxy, protect_xyxy, margin_px=0.0):
+            if protect_xyxy is None:
+                return 0.0
+            cx1, cy1, cx2, cy2 = crop_xyxy
+            px1, py1, px2, py2 = protect_xyxy
+            pw = max(1.0, px2 - px1)
+            ph = max(1.0, py2 - py1)
+            m = max(0.0, float(margin_px))
+            dx = max(0.0, (cx1 + m) - px1) + max(0.0, px2 - (cx2 - m))
+            dy = max(0.0, (cy1 + m) - py1) + max(0.0, py2 - (cy2 - m))
+            return (dx / pw) + (dy / ph)
+
         for rs in ratios:
             try:
                 rw, rh = parse_ratio(rs)
@@ -1803,8 +1903,15 @@ class Processor(QtCore.QObject):
             # soften pure-area dominance
             area_term = pow(area_raw, float(cfg.area_gamma))
 
-            pen = _penalty((ex1, ey1, ex2, ey2), face_box)
+            crop_xyxy = (ex1, ey1, ex2, ey2)
+            pen = _penalty(crop_xyxy, face_box)
             total = area_term + float(cfg.crop_penalty_weight) * pen
+            if head_box is not None:
+                # This is the invariant the previous scorer violated: the crop may
+                # not cut the visible head/hair merely because the detector's face
+                # rectangle still fits.  Use a very large but graded penalty so if
+                # no candidate can fully satisfy it, the least-bad candidate wins.
+                total += 1.0e6 * _containment_deficit(crop_xyxy, head_box, margin_px=1.0)
             tmpl_loss = 0.0
 
             if face_box is not None:
@@ -1847,6 +1954,17 @@ class Processor(QtCore.QObject):
                 if (fh / max(1.0, frame_h)) > float(cfg.square_pull_face_min):
                     pull = (fh / float(frame_h)) - float(cfg.square_pull_face_min)
                     total += float(cfg.square_pull_weight) * pull * abs(asp - 1.0)
+
+                # Landscape crops are usually wrong for a prominent face unless the
+                # subject/body box truly requires them.  Previously the area term
+                # could choose 3:2 because it was the smallest crop, even when that
+                # produced a face/head cut.
+                face_scale = max(fw / max(1.0, frame_w), fh / max(1.0, frame_h))
+                wide_min = max(1e-6, float(getattr(cfg, "wide_face_min_frame_frac", 0.12)))
+                wide_limit = max(1.0, float(getattr(cfg, "wide_face_aspect_limit", 1.05)))
+                if face_scale >= wide_min and asp > wide_limit:
+                    strength = min(4.0, face_scale / wide_min)
+                    total += float(getattr(cfg, "wide_face_aspect_penalty_weight", 10.0)) * strength * (asp - wide_limit)
 
             if total < best_score:
                 best_score = total
@@ -3775,6 +3893,12 @@ class Processor(QtCore.QObject):
                             "crop_top_headroom_max_frac",
                             "crop_bottom_min_face_heights",
                             "crop_penalty_weight",
+                            "crop_head_side_pad_frac",
+                            "crop_head_top_pad_frac",
+                            "crop_head_bottom_pad_frac",
+                            "wide_face_aspect_penalty_weight",
+                            "wide_face_min_frame_frac",
+                            "wide_face_aspect_limit",
                             "face_anchor_down_frac",
                             "face_max_frac_in_crop",
                             "face_min_frac_in_crop",
@@ -4175,6 +4299,16 @@ class Processor(QtCore.QObject):
                                     fx2i = int(round(float(np.clip(fx2 + off_x, 0, W - 1))))
                                     fy2i = int(round(float(np.clip(fy2 + off_y, 0, H - 1))))
                                     face_box_global = (fx1i, fy1i, fx2i, fy2i)
+                                    head_box_global = None
+                                    head_box_roi = self._face_head_proxy_box(face_box_abs, W2, H2)
+                                    if head_box_roi is not None:
+                                        hx1, hy1, hx2, hy2 = head_box_roi
+                                        head_box_global = (
+                                            max(0, min(W, hx1 + off_x)),
+                                            max(0, min(H, hy1 + off_y)),
+                                            max(0, min(W, hx2 + off_x)),
+                                            max(0, min(H, hy2 + off_y)),
+                                        )
                                     short_circuit_candidate = dict(
                                         score=fd_val,
                                         fd=fd_val,
@@ -4184,6 +4318,7 @@ class Processor(QtCore.QObject):
                                         area=(ox2 - ox1) * (oy2 - oy1),
                                         show_box=face_box_global,
                                         face_box=face_box_global,
+                                        head_box=head_box_global,
                                         face_feat=gbest["feat"],
                                         reid_feat=None,
                                         ratio=chosen_ratio,
@@ -4486,6 +4621,7 @@ class Processor(QtCore.QObject):
                     ox1, oy1, ox2, oy2 = ex1+off_x, ey1+off_y, ex2+off_x, ey2+off_y
                     area = (ox2-ox1)*(oy2-oy1)
                     face_box_global = None
+                    head_box_global = None
                     face_frac = 0.0
                     if face_box_abs is not None:
                         fx1, fy1, fx2, fy2 = face_box_abs
@@ -4498,6 +4634,15 @@ class Processor(QtCore.QObject):
                             max(0, min(W, fx2 + off_x)),
                             max(0, min(H, fy2 + off_y)),
                         )
+                        head_box_roi = self._face_head_proxy_box(face_box_abs, W2, H2)
+                        if head_box_roi is not None:
+                            hx1, hy1, hx2, hy2 = head_box_roi
+                            head_box_global = (
+                                max(0, min(W, hx1 + off_x)),
+                                max(0, min(H, hy1 + off_y)),
+                                max(0, min(W, hx2 + off_x)),
+                                max(0, min(H, hy2 + off_y)),
+                            )
                     candidates.append(
                         dict(
                             score=score,
@@ -4513,6 +4658,7 @@ class Processor(QtCore.QObject):
                                 int(y2 + off_y),
                             ),
                             face_box=face_box_global,
+                            head_box=head_box_global,
                             face_feat=(bf["feat"] if bf is not None else None),
                             reid_feat=(reid_feats[i] if i < len(reid_feats) else None),
                             ratio=chosen_ratio,
@@ -4766,6 +4912,32 @@ class Processor(QtCore.QObject):
                     except Exception:
                         pass
 
+                    protect_box = c.get("head_box") or c.get("face_box")
+                    if protect_box is not None:
+                        cx1, cy1, cx2, cy2 = self._shift_crop_to_include_box(
+                            (cx1, cy1, cx2, cy2),
+                            protect_box,
+                            (bx1, by1, bx2, by2),
+                            margin_px=1.0,
+                        )
+
+                    hb = c.get("head_box")
+                    if hb is not None:
+                        inner_px_head = float(getattr(cfg, "face_edge_inner_px", 1.0))
+                        head_cut = (
+                            float(hb[0]) < float(cx1) + inner_px_head
+                            or float(hb[2]) > float(cx2) - inner_px_head
+                            or float(hb[1]) < float(cy1) + inner_px_head
+                            or float(hb[3]) > float(cy2) - inner_px_head
+                        )
+                        if head_cut:
+                            self._status(
+                                "skip: head_guard_drop (visible head would be cut)",
+                                key="cap",
+                                interval=1.5,
+                            )
+                            return False
+
                     # Edge-aware side-margin safety: avoid saving half-face crops pinned to an edge.
                     fb = c.get("face_box")
                     if fb is not None and bool(getattr(cfg, "side_guard_drop_enable", True)):
@@ -4857,6 +5029,24 @@ class Processor(QtCore.QObject):
                                     key="side_guard_dbg2",
                                     interval=0.8,
                                 )
+                        # Re-check head containment after side-guard salvage: salvage may
+                        # shift or shrink the crop relative to the earlier head guard.
+                        hb = c.get("head_box")
+                        if hb is not None:
+                            head_inner_px = inner_px
+                            head_cut = (
+                                float(hb[0]) < float(cx1) + head_inner_px
+                                or float(hb[2]) > float(cx2) - head_inner_px
+                                or float(hb[1]) < float(cy1) + head_inner_px
+                                or float(hb[3]) > float(cy2) - head_inner_px
+                            )
+                            if head_cut:
+                                self._status(
+                                    "skip: head_guard_drop (visible head would be cut)",
+                                    key="cap",
+                                    interval=1.5,
+                                )
+                                return False
                         # final guard (also catches actual face cuts)
                         edge_cut = (float(fb[0]) < float(cx1) + inner_px) or (float(fb[2]) > float(cx2) - inner_px)
                         if min(left_margin, right_margin) < required or edge_cut:
@@ -4895,6 +5085,14 @@ class Processor(QtCore.QObject):
                     )
 
                     processed_crop_xyxy = (int(cx1), int(cy1), int(cx2), int(cy2))
+                    # Keep the annotated preview in sync with the actual saved crop.
+                    # Earlier preview boxes were drawn from the pre-final candidate box,
+                    # while save_hit later changed the crop via smart-crop, border trim,
+                    # ratio correction, and face/head guards.  That made the UI show a
+                    # different box from the file that was actually written.
+                    c["box"] = processed_crop_xyxy
+                    c["saved_box"] = processed_crop_xyxy
+                    c["selected"] = True
                     source_size = (int(W), int(H))
                     source_crop_xyxy = processed_crop_xyxy
                     needs_source_space = bool(hdr_primary_fullres or hdr_out_path)
@@ -5168,6 +5366,16 @@ class Processor(QtCore.QObject):
                                     sfy1 = max(0, min(H - 1, int(round(fy1 + off_y))))
                                     sfx2 = max(sfx1 + 1, min(W, int(round(fx2 + off_x))))
                                     sfy2 = max(sfy1 + 1, min(H, int(round(fy2 + off_y))))
+                                    head_box_global = None
+                                    head_box_roi = self._face_head_proxy_box(face_box_abs, W2, H2)
+                                    if head_box_roi is not None:
+                                        hx1, hy1, hx2, hy2 = head_box_roi
+                                        head_box_global = (
+                                            max(0, min(W, hx1 + off_x)),
+                                            max(0, min(H, hy1 + off_y)),
+                                            max(0, min(W, hx2 + off_x)),
+                                            max(0, min(H, hy2 + off_y)),
+                                        )
                                     carea = max(1.0, float((ex2 - ex1) * (ey2 - ey1)))
                                     farea = max(1.0, (fx2 - fx1) * (fy2 - fy1))
                                     face_frac = float(farea) / carea
@@ -5180,6 +5388,7 @@ class Processor(QtCore.QObject):
                                         area=(ox2 - ox1) * (oy2 - oy1),
                                         show_box=(sfx1, sfy1, sfx2, sfy2),
                                         face_box=(sfx1, sfy1, sfx2, sfy2),
+                                        head_box=head_box_global,
                                         face_feat=gbest["feat"],
                                         reid_feat=None,
                                         ratio=chosen_ratio,
@@ -5475,7 +5684,8 @@ class Processor(QtCore.QObject):
                                     cv2.LINE_AA,
                                 )
                     if candidates:
-                        bvals = np.asarray(candidates[0]["box"], dtype=float)
+                        selected_preview = next((cc for cc in candidates if cc.get("selected")), candidates[0])
+                        bvals = np.asarray(selected_preview.get("saved_box") or selected_preview.get("box"), dtype=float)
                         if np.isfinite(bvals).all():
                             bx1, by1, bx2, by2 = [int(round(v)) for v in bvals]
                             bx1 = max(0, min(W - 1, bx1))
@@ -5484,7 +5694,7 @@ class Processor(QtCore.QObject):
                             by2 = max(0, min(H - 1, by2))
                             if bx2 > bx1 and by2 > by1:
                                 cv2.rectangle(show, (bx1, by1), (bx2, by2), (255,0,0), 2)
-                                rs = candidates[0].get("reasons")
+                                rs = selected_preview.get("reasons")
                                 if rs:
                                     cv2.putText(
                                         show,
@@ -6015,13 +6225,13 @@ class Processor(QtCore.QObject):
         param = float(getattr(self.cfg, "tm_param", 0.40))
         nits = float(getattr(self.cfg, "sdr_nits", 125.0))
         pref = str(getattr(self.cfg, "hdr_tonemap_pref", "auto") or "auto").lower()
-        quality = str(getattr(self.cfg, "hdr_sdr_quality", "resolve_like") or "resolve_like").lower()
-        algo = str(getattr(self.cfg, "hdr_sdr_tonemap", "spline") or "spline").lower()
-        if algo not in {"spline", "bt.2390", "st2094-40", "mobius", "hable", "reinhard", "clip"}:
-            algo = "spline"
-        gamut = str(getattr(self.cfg, "hdr_sdr_gamut_mapping", "perceptual") or "perceptual").lower()
+        quality = str(getattr(self.cfg, "hdr_sdr_quality", "madvr_like") or "madvr_like").lower()
+        algo = str(getattr(self.cfg, "hdr_sdr_tonemap", "auto") or "auto").lower()
+        if algo not in {"auto", "spline", "bt.2390", "st2094-40", "mobius", "hable", "reinhard", "clip"}:
+            algo = "auto"
+        gamut = str(getattr(self.cfg, "hdr_sdr_gamut_mapping", "clip") or "clip").lower()
         if gamut not in {"perceptual", "relative", "saturation", "clip"}:
-            gamut = "perceptual"
+            gamut = "clip"
         try:
             contrast_recovery = max(0.0, min(2.0, float(getattr(self.cfg, "hdr_sdr_contrast_recovery", 0.30))))
         except Exception:
@@ -6038,6 +6248,10 @@ class Processor(QtCore.QObject):
             "-c:v", "mjpeg",
             "-q:v", str(q),
             "-pix_fmt", "yuvj444p",
+            "-color_range", "pc",
+            "-colorspace", "bt709",
+            "-color_primaries", "bt709",
+            "-color_trc", "bt709",
             "-update", "1",
             out_path,
         ]
@@ -6053,44 +6267,45 @@ class Processor(QtCore.QObject):
                         return True
                 return False
 
+            def _add_output_color_opts(opts: list[str]) -> None:
+                self._add_lp_opt(opts, supported, "colorspace", "bt709")
+                # Prefer target_* names when available: color_* is accepted by older
+                # ffmpeg builds but can be interpreted as the working frame metadata.
+                _add_first_lp_opt(opts, ("target_primaries", "color_primaries"), "bt709")
+                _add_first_lp_opt(opts, ("target_trc", "color_trc"), "bt709")
+                self._add_lp_opt(opts, supported, "range", "full")
+                _add_first_lp_opt(opts, ("gamut_mode", "gamut_mapping"), gamut)
+
             base_lp_opts = [f"tonemapping='{algo}'"]
-            self._add_lp_opt(base_lp_opts, supported, "colorspace", "bt709")
-            _add_first_lp_opt(base_lp_opts, ("color_primaries", "target_primaries"), "bt709")
-            _add_first_lp_opt(base_lp_opts, ("color_trc", "target_trc"), "bt709")
-            self._add_lp_opt(base_lp_opts, supported, "range", "full")
-            lp_readback_in_filter = _add_first_lp_opt(
-                base_lp_opts,
-                ("format", "out_format", "out_pfmt"),
-                "bgra",
-            )
+            _add_output_color_opts(base_lp_opts)
+            _add_first_lp_opt(base_lp_opts, ("format", "out_format", "out_pfmt"), "bgra")
             self._add_lp_opt(base_lp_opts, supported, "peak_detect", "true" if peak_detect else "false")
+            if algo in {"mobius", "hable", "reinhard", "gamma"}:
+                self._add_lp_opt(base_lp_opts, supported, "tonemapping_param", f"{param:.6g}")
             if quality in ("resolve_like", "madvr_like"):
                 self._add_lp_opt(base_lp_opts, supported, "peak_detection_preset", "high_quality")
                 self._add_lp_opt(base_lp_opts, supported, "color_map_preset", "high_quality")
-                self._add_lp_opt(base_lp_opts, supported, "gamut_mapping", gamut)
                 self._add_lp_opt(base_lp_opts, supported, "contrast_recovery", f"{contrast_recovery:.6g}")
                 self._add_lp_opt(base_lp_opts, supported, "contrast_smoothness", "3.5")
+                self._add_lp_opt(base_lp_opts, supported, "deband", "true")
                 if not self._add_lp_opt(base_lp_opts, supported, "tonemapping_lut_size", "1024"):
                     self._add_lp_opt(base_lp_opts, supported, "tone_lut_size", "1024")
-                if not self._add_lp_opt(base_lp_opts, supported, "dithering", "blue"):
-                    self._add_lp_opt(base_lp_opts, supported, "dither_method", "blue")
+                # Match the live preview renderer path: ordered dithering, not a
+                # separate still-export blue-noise path that changes dark gradients.
+                if not self._add_lp_opt(base_lp_opts, supported, "dithering", "ordered"):
+                    self._add_lp_opt(base_lp_opts, supported, "dither_method", "ordered")
             elif quality == "balanced":
-                self._add_lp_opt(base_lp_opts, supported, "gamut_mapping", gamut)
                 self._add_lp_opt(base_lp_opts, supported, "contrast_recovery", f"{min(contrast_recovery, 0.20):.6g}")
                 self._add_lp_opt(base_lp_opts, supported, "tonemapping_lut_size", "512")
+                if not self._add_lp_opt(base_lp_opts, supported, "dithering", "ordered"):
+                    self._add_lp_opt(base_lp_opts, supported, "dither_method", "ordered")
 
             lp_variants: list[list[str]] = [base_lp_opts]
-            if quality in ("resolve_like", "madvr_like", "balanced"):
-                alt = [opt for opt in base_lp_opts if not opt.startswith("gamut_mapping=")]
-                if supported and "gamut_mode" in supported:
-                    alt.append(f"gamut_mode={gamut}")
-                    lp_variants.append(alt)
             minimal_lp_opts = [f"tonemapping='{algo}'"]
-            self._add_lp_opt(minimal_lp_opts, supported, "colorspace", "bt709")
-            _add_first_lp_opt(minimal_lp_opts, ("color_primaries", "target_primaries"), "bt709")
-            _add_first_lp_opt(minimal_lp_opts, ("color_trc", "target_trc"), "bt709")
-            self._add_lp_opt(minimal_lp_opts, supported, "range", "full")
+            _add_output_color_opts(minimal_lp_opts)
             _add_first_lp_opt(minimal_lp_opts, ("format", "out_format", "out_pfmt"), "bgra")
+            if not self._add_lp_opt(minimal_lp_opts, supported, "dithering", "ordered"):
+                self._add_lp_opt(minimal_lp_opts, supported, "dither_method", "ordered")
             lp_variants.append(minimal_lp_opts)
 
             seen_lp: set[str] = set()
@@ -6103,7 +6318,11 @@ class Processor(QtCore.QObject):
                 # then crop in SDR/RGB. Cropping before tone mapping changes the
                 # peak/gamut context and can misalign 4:2:0 chroma at arbitrary crop
                 # offsets, causing visible artifacts versus madVR/MPCVR-style output.
-                readback = "" if lp_readback_in_filter else ",hwdownload,format=bgra"
+                has_readback_fmt = any(
+                    opt.startswith(("format=", "out_format=", "out_pfmt="))
+                    for opt in opts
+                )
+                readback = "" if has_readback_fmt else ",hwdownload,format=bgra"
                 lp = f"format=p010le,{src},hwupload=extra_hw_frames=1,libplacebo={opt_str}{readback},format=bgr24,{crop}"
                 cmds.append(
                     base[:1]
@@ -6116,6 +6335,7 @@ class Processor(QtCore.QObject):
             # CPU fallback. It is slower, but it only runs on accepted captures and
             # preserves the main invariant: full-resolution source crop, not preview crop.
             z_algo_map = {
+                "auto": "mobius",
                 "mobius": "mobius",
                 "hable": "hable",
                 "reinhard": "reinhard",
@@ -6753,7 +6973,7 @@ class MainWindow(QtWidgets.QMainWindow):
         param_group = QtWidgets.QGroupBox("Parameters")
         grid = QtWidgets.QGridLayout(param_group)
 
-        self.ratio_edit = QtWidgets.QLineEdit("2:3")
+        self.ratio_edit = QtWidgets.QLineEdit("1:1,2:3,3:2")
         self.sdr_nits_spin = QtWidgets.QDoubleSpinBox()
         self.sdr_nits_spin.setRange(50.0, 400.0)
         self.sdr_nits_spin.setDecimals(0)
@@ -6785,11 +7005,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tonemap_pref_combo.currentIndexChanged.connect(self._on_ui_change)
 
         self.hdr_sdr_quality_combo = QtWidgets.QComboBox()
-        self.hdr_sdr_quality_combo.addItem("Resolve-like high quality", "resolve_like")
-        self.hdr_sdr_quality_combo.addItem("MadVR-like high quality", "madvr_like")
+        self.hdr_sdr_quality_combo.addItem("MadVR/MPCVR-style high quality", "madvr_like")
+        self.hdr_sdr_quality_combo.addItem("Resolve-style high quality", "resolve_like")
         self.hdr_sdr_quality_combo.addItem("Balanced", "balanced")
         self.hdr_sdr_quality_combo.addItem("Fast", "fast")
-        _hdrq = str(getattr(self.cfg, "hdr_sdr_quality", "resolve_like") or "resolve_like")
+        _hdrq = str(getattr(self.cfg, "hdr_sdr_quality", "madvr_like") or "madvr_like")
         _hdrq_idx = self.hdr_sdr_quality_combo.findData(_hdrq)
         self.hdr_sdr_quality_combo.setCurrentIndex(_hdrq_idx if _hdrq_idx >= 0 else 0)
         self.hdr_sdr_quality_combo.setToolTip(
@@ -6799,23 +7019,24 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.hdr_sdr_tonemap_combo = QtWidgets.QComboBox()
         for _label, _data in (
-            ("Spline", "spline"),
+            ("Auto / renderer default", "auto"),
             ("BT.2390", "bt.2390"),
+            ("Spline", "spline"),
             ("ST 2094-40", "st2094-40"),
             ("Mobius", "mobius"),
             ("Hable", "hable"),
         ):
             self.hdr_sdr_tonemap_combo.addItem(_label, _data)
-        _hdrtm = str(getattr(self.cfg, "hdr_sdr_tonemap", "spline") or "spline")
+        _hdrtm = str(getattr(self.cfg, "hdr_sdr_tonemap", "auto") or "auto")
         _hdrtm_idx = self.hdr_sdr_tonemap_combo.findData(_hdrtm)
         self.hdr_sdr_tonemap_combo.setCurrentIndex(_hdrtm_idx if _hdrtm_idx >= 0 else 0)
         self.hdr_sdr_tonemap_combo.setToolTip("Tone mapping curve for full-res HDR->SDR screencap export.")
         self.hdr_sdr_tonemap_combo.currentIndexChanged.connect(self._on_ui_change)
 
         self.hdr_sdr_gamut_combo = QtWidgets.QComboBox()
-        for _label, _data in (("Perceptual", "perceptual"), ("Relative", "relative"), ("Saturation", "saturation"), ("Clip", "clip")):
+        for _label, _data in (("Clip", "clip"), ("Perceptual", "perceptual"), ("Relative", "relative"), ("Saturation", "saturation")):
             self.hdr_sdr_gamut_combo.addItem(_label, _data)
-        _hdrgm = str(getattr(self.cfg, "hdr_sdr_gamut_mapping", "perceptual") or "perceptual")
+        _hdrgm = str(getattr(self.cfg, "hdr_sdr_gamut_mapping", "clip") or "clip")
         _hdrgm_idx = self.hdr_sdr_gamut_combo.findData(_hdrgm)
         self.hdr_sdr_gamut_combo.setCurrentIndex(_hdrgm_idx if _hdrgm_idx >= 0 else 0)
         self.hdr_sdr_gamut_combo.setToolTip("Gamut mapping for full-res HDR->SDR screencap export.")
@@ -8524,6 +8745,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "crop_top_headroom_max_frac",
             "crop_bottom_min_face_heights",
             "crop_penalty_weight",
+            "crop_head_side_pad_frac",
+            "crop_head_top_pad_frac",
+            "crop_head_bottom_pad_frac",
+            "wide_face_aspect_penalty_weight",
+            "wide_face_min_frame_frac",
+            "wide_face_aspect_limit",
             "face_anchor_down_frac",
             "smart_crop_enable",
             "smart_crop_steps",
@@ -8586,7 +8813,7 @@ class MainWindow(QtWidgets.QMainWindow):
             video=self.video_edit.text().strip(),
             ref=ref_join,
             out_dir=self.out_edit.text().strip() or "output",
-            ratio=self.ratio_edit.text().strip() or "2:3",
+            ratio=self.ratio_edit.text().strip() or "1:1,2:3,3:2",
             sdr_nits=float(self.sdr_nits_spin.value()),
             tm_desat=float(self.tm_desat_spin.value()),
             tm_param=float(self.tm_param_spin.value()),
@@ -8694,6 +8921,12 @@ class MainWindow(QtWidgets.QMainWindow):
             crop_top_headroom_max_frac=float(self.crop_top_headroom_spin.value()) if hasattr(self, "crop_top_headroom_spin") else 0.15,
             crop_bottom_min_face_heights=float(self.crop_bottom_min_face_spin.value()) if hasattr(self, "crop_bottom_min_face_spin") else 1.5,
             crop_penalty_weight=float(self.crop_penalty_weight_spin.value()) if hasattr(self, "crop_penalty_weight_spin") else 3.0,
+            crop_head_side_pad_frac=float(getattr(self.cfg, "crop_head_side_pad_frac", 0.70)),
+            crop_head_top_pad_frac=float(getattr(self.cfg, "crop_head_top_pad_frac", 0.85)),
+            crop_head_bottom_pad_frac=float(getattr(self.cfg, "crop_head_bottom_pad_frac", 0.30)),
+            wide_face_aspect_penalty_weight=float(getattr(self.cfg, "wide_face_aspect_penalty_weight", 10.0)),
+            wide_face_min_frame_frac=float(getattr(self.cfg, "wide_face_min_frame_frac", 0.12)),
+            wide_face_aspect_limit=float(getattr(self.cfg, "wide_face_aspect_limit", 1.05)),
             face_anchor_down_frac=float(self.face_anchor_down_spin.value()) if hasattr(self, "face_anchor_down_spin") else 1.1,
             lambda_facefrac=float(self.lambda_facefrac_spin.value()),
             crop_center_weight=float(self.crop_center_weight_spin.value()),
@@ -8738,17 +8971,17 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             cfg.hdr_crop_format = "mkv"
         try:
-            cfg.hdr_sdr_quality = self.hdr_sdr_quality_combo.currentData() or "resolve_like"
+            cfg.hdr_sdr_quality = self.hdr_sdr_quality_combo.currentData() or "madvr_like"
         except Exception:
-            cfg.hdr_sdr_quality = "resolve_like"
+            cfg.hdr_sdr_quality = "madvr_like"
         try:
-            cfg.hdr_sdr_tonemap = self.hdr_sdr_tonemap_combo.currentData() or "spline"
+            cfg.hdr_sdr_tonemap = self.hdr_sdr_tonemap_combo.currentData() or "auto"
         except Exception:
-            cfg.hdr_sdr_tonemap = "spline"
+            cfg.hdr_sdr_tonemap = "auto"
         try:
-            cfg.hdr_sdr_gamut_mapping = self.hdr_sdr_gamut_combo.currentData() or "perceptual"
+            cfg.hdr_sdr_gamut_mapping = self.hdr_sdr_gamut_combo.currentData() or "clip"
         except Exception:
-            cfg.hdr_sdr_gamut_mapping = "perceptual"
+            cfg.hdr_sdr_gamut_mapping = "clip"
         cfg.hdr_sdr_contrast_recovery = float(self.hdr_sdr_contrast_spin.value()) if hasattr(self, "hdr_sdr_contrast_spin") else 0.30
         cfg.hdr_sdr_peak_detect = bool(self.hdr_sdr_peak_check.isChecked()) if hasattr(self, "hdr_sdr_peak_check") else True
         cfg.hdr_sdr_allow_inaccurate_fallback = bool(self.hdr_sdr_bad_fallback_check.isChecked()) if hasattr(self, "hdr_sdr_bad_fallback_check") else False
@@ -8797,15 +9030,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "chk_hdr_archive_crops"):
             self.chk_hdr_archive_crops.setChecked(bool(getattr(cfg, "hdr_archive_crops", False)))
         if hasattr(self, "hdr_sdr_quality_combo"):
-            val = str(getattr(cfg, "hdr_sdr_quality", "resolve_like") or "resolve_like")
+            val = str(getattr(cfg, "hdr_sdr_quality", "madvr_like") or "madvr_like")
             idx = self.hdr_sdr_quality_combo.findData(val)
             self.hdr_sdr_quality_combo.setCurrentIndex(idx if idx >= 0 else 0)
         if hasattr(self, "hdr_sdr_tonemap_combo"):
-            val = str(getattr(cfg, "hdr_sdr_tonemap", "spline") or "spline")
+            val = str(getattr(cfg, "hdr_sdr_tonemap", "auto") or "auto")
             idx = self.hdr_sdr_tonemap_combo.findData(val)
             self.hdr_sdr_tonemap_combo.setCurrentIndex(idx if idx >= 0 else 0)
         if hasattr(self, "hdr_sdr_gamut_combo"):
-            val = str(getattr(cfg, "hdr_sdr_gamut_mapping", "perceptual") or "perceptual")
+            val = str(getattr(cfg, "hdr_sdr_gamut_mapping", "clip") or "clip")
             idx = self.hdr_sdr_gamut_combo.findData(val)
             self.hdr_sdr_gamut_combo.setCurrentIndex(idx if idx >= 0 else 0)
         if hasattr(self, "hdr_sdr_contrast_spin"):
@@ -9021,6 +9254,32 @@ class MainWindow(QtWidgets.QMainWindow):
             self.crop_bottom_min_face_spin.setValue(cfg.crop_bottom_min_face_heights)
         if hasattr(self, 'crop_penalty_weight_spin'):
             self.crop_penalty_weight_spin.setValue(cfg.crop_penalty_weight)
+        try:
+            self.cfg.crop_head_side_pad_frac = float(getattr(cfg, "crop_head_side_pad_frac", 0.70))
+        except Exception:
+            self.cfg.crop_head_side_pad_frac = 0.70
+        try:
+            self.cfg.crop_head_top_pad_frac = float(getattr(cfg, "crop_head_top_pad_frac", 0.85))
+        except Exception:
+            self.cfg.crop_head_top_pad_frac = 0.85
+        try:
+            self.cfg.crop_head_bottom_pad_frac = float(getattr(cfg, "crop_head_bottom_pad_frac", 0.30))
+        except Exception:
+            self.cfg.crop_head_bottom_pad_frac = 0.30
+        try:
+            self.cfg.wide_face_aspect_penalty_weight = float(
+                getattr(cfg, "wide_face_aspect_penalty_weight", 10.0)
+            )
+        except Exception:
+            self.cfg.wide_face_aspect_penalty_weight = 10.0
+        try:
+            self.cfg.wide_face_min_frame_frac = float(getattr(cfg, "wide_face_min_frame_frac", 0.12))
+        except Exception:
+            self.cfg.wide_face_min_frame_frac = 0.12
+        try:
+            self.cfg.wide_face_aspect_limit = float(getattr(cfg, "wide_face_aspect_limit", 1.05))
+        except Exception:
+            self.cfg.wide_face_aspect_limit = 1.05
         if hasattr(self, 'face_anchor_down_spin'):
             self.face_anchor_down_spin.setValue(cfg.face_anchor_down_frac)
         if hasattr(self, 'lambda_facefrac_spin'):
@@ -9606,7 +9865,13 @@ class MainWindow(QtWidgets.QMainWindow):
         paths = self._filter_images([part.strip() for part in refs.split(';') if part.strip()])
         self._set_ref_paths(paths)
         self.out_edit.setText(s.value("out_dir", "output"))
-        self.ratio_edit.setText(s.value("ratio", "2:3"))
+        _stored_ratio = str(s.value("ratio", getattr(self.cfg, "ratio", "1:1,2:3,3:2")) or "1:1,2:3,3:2")
+        if _stored_ratio.strip() == "2:3":
+            # Migrate the old single portrait default to the new composition-safe
+            # candidate list.  A lone 2:3 default deprived the scorer of square
+            # alternatives for close/prominent faces.
+            _stored_ratio = "1:1,2:3,3:2"
+        self.ratio_edit.setText(_stored_ratio)
         try:
             self.sdr_nits_spin.setValue(float(s.value("sdr_nits", self.cfg.sdr_nits)))
         except Exception:
@@ -9651,20 +9916,41 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self.cfg.hdr_archive_crops = bool(self.chk_hdr_archive_crops.isChecked())
         if hasattr(self, "hdr_sdr_quality_combo"):
-            val = str(s.value("hdr_sdr_quality", getattr(self.cfg, "hdr_sdr_quality", "resolve_like")) or "resolve_like")
+            val = str(s.value("hdr_sdr_quality", getattr(self.cfg, "hdr_sdr_quality", "madvr_like")) or "madvr_like")
             idx = self.hdr_sdr_quality_combo.findData(val)
             self.hdr_sdr_quality_combo.setCurrentIndex(idx if idx >= 0 else 0)
-            self.cfg.hdr_sdr_quality = self.hdr_sdr_quality_combo.currentData() or "resolve_like"
+            self.cfg.hdr_sdr_quality = self.hdr_sdr_quality_combo.currentData() or "madvr_like"
         if hasattr(self, "hdr_sdr_tonemap_combo"):
-            val = str(s.value("hdr_sdr_tonemap", getattr(self.cfg, "hdr_sdr_tonemap", "spline")) or "spline")
+            val = str(s.value("hdr_sdr_tonemap", getattr(self.cfg, "hdr_sdr_tonemap", "auto")) or "auto")
             idx = self.hdr_sdr_tonemap_combo.findData(val)
             self.hdr_sdr_tonemap_combo.setCurrentIndex(idx if idx >= 0 else 0)
-            self.cfg.hdr_sdr_tonemap = self.hdr_sdr_tonemap_combo.currentData() or "spline"
+            self.cfg.hdr_sdr_tonemap = self.hdr_sdr_tonemap_combo.currentData() or "auto"
         if hasattr(self, "hdr_sdr_gamut_combo"):
-            val = str(s.value("hdr_sdr_gamut_mapping", getattr(self.cfg, "hdr_sdr_gamut_mapping", "perceptual")) or "perceptual")
+            val = str(s.value("hdr_sdr_gamut_mapping", getattr(self.cfg, "hdr_sdr_gamut_mapping", "clip")) or "clip")
             idx = self.hdr_sdr_gamut_combo.findData(val)
             self.hdr_sdr_gamut_combo.setCurrentIndex(idx if idx >= 0 else 0)
-            self.cfg.hdr_sdr_gamut_mapping = self.hdr_sdr_gamut_combo.currentData() or "perceptual"
+            self.cfg.hdr_sdr_gamut_mapping = self.hdr_sdr_gamut_combo.currentData() or "clip"
+        if all(hasattr(self, name) for name in ("hdr_sdr_quality_combo", "hdr_sdr_tonemap_combo", "hdr_sdr_gamut_combo")):
+            _old_hdr_defaults = (
+                self.hdr_sdr_quality_combo.currentData(),
+                self.hdr_sdr_tonemap_combo.currentData(),
+                self.hdr_sdr_gamut_combo.currentData(),
+            )
+            if _old_hdr_defaults == ("resolve_like", "spline", "perceptual"):
+                # Migrate the previous still-export defaults.  They were intentionally
+                # different from the live libplacebo renderer and are the common cause
+                # of saved crops looking brighter/flatter than the preview.
+                for _combo, _data in (
+                    (self.hdr_sdr_quality_combo, "madvr_like"),
+                    (self.hdr_sdr_tonemap_combo, "auto"),
+                    (self.hdr_sdr_gamut_combo, "clip"),
+                ):
+                    _idx = _combo.findData(_data)
+                    if _idx >= 0:
+                        _combo.setCurrentIndex(_idx)
+                self.cfg.hdr_sdr_quality = self.hdr_sdr_quality_combo.currentData() or "madvr_like"
+                self.cfg.hdr_sdr_tonemap = self.hdr_sdr_tonemap_combo.currentData() or "auto"
+                self.cfg.hdr_sdr_gamut_mapping = self.hdr_sdr_gamut_combo.currentData() or "clip"
         if hasattr(self, "hdr_sdr_contrast_spin"):
             try:
                 self.hdr_sdr_contrast_spin.setValue(float(s.value("hdr_sdr_contrast_recovery", getattr(self.cfg, "hdr_sdr_contrast_recovery", 0.30))))
@@ -9888,6 +10174,45 @@ class MainWindow(QtWidgets.QMainWindow):
             self.crop_penalty_weight_spin.setValue(
                 float(s.value("crop_penalty_weight", self.cfg.crop_penalty_weight))
             )
+        try:
+            self.cfg.crop_head_side_pad_frac = float(
+                s.value("crop_head_side_pad_frac", getattr(self.cfg, "crop_head_side_pad_frac", 0.70))
+            )
+        except Exception:
+            self.cfg.crop_head_side_pad_frac = 0.70
+        try:
+            self.cfg.crop_head_top_pad_frac = float(
+                s.value("crop_head_top_pad_frac", getattr(self.cfg, "crop_head_top_pad_frac", 0.85))
+            )
+        except Exception:
+            self.cfg.crop_head_top_pad_frac = 0.85
+        try:
+            self.cfg.crop_head_bottom_pad_frac = float(
+                s.value("crop_head_bottom_pad_frac", getattr(self.cfg, "crop_head_bottom_pad_frac", 0.30))
+            )
+        except Exception:
+            self.cfg.crop_head_bottom_pad_frac = 0.30
+        try:
+            self.cfg.wide_face_aspect_penalty_weight = float(
+                s.value(
+                    "wide_face_aspect_penalty_weight",
+                    getattr(self.cfg, "wide_face_aspect_penalty_weight", 10.0),
+                )
+            )
+        except Exception:
+            self.cfg.wide_face_aspect_penalty_weight = 10.0
+        try:
+            self.cfg.wide_face_min_frame_frac = float(
+                s.value("wide_face_min_frame_frac", getattr(self.cfg, "wide_face_min_frame_frac", 0.12))
+            )
+        except Exception:
+            self.cfg.wide_face_min_frame_frac = 0.12
+        try:
+            self.cfg.wide_face_aspect_limit = float(
+                s.value("wide_face_aspect_limit", getattr(self.cfg, "wide_face_aspect_limit", 1.05))
+            )
+        except Exception:
+            self.cfg.wide_face_aspect_limit = 1.05
         if hasattr(self, 'face_anchor_down_spin'):
             self.face_anchor_down_spin.setValue(
                 float(s.value("face_anchor_down_frac", self.cfg.face_anchor_down_frac))
