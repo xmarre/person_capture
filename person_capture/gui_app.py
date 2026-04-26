@@ -5134,7 +5134,18 @@ class Processor(QtCore.QObject):
                     )
 
                 # Choose best and save with cadence + lock + margin + IoU gate
-                def save_hit(c, idx):
+                def save_hit(
+                    c,
+                    idx,
+                    *,
+                    frame_w,
+                    frame_h,
+                    det_off_x,
+                    det_off_y,
+                    det_w,
+                    det_h,
+                    ratio_list,
+                ):
                     nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box, ref_face_feat, ref_bank_list, source_size_cached
                     crop_img_path = os.path.join(crops_dir, f"f{idx:08d}.jpg")
                     hdr_primary_fullres = bool(
@@ -5154,8 +5165,8 @@ class Processor(QtCore.QObject):
                     ratio_str = str(
                         c.get("ratio")
                         or (
-                            ratios[0]
-                            if 'ratios' in locals() and ratios
+                            ratio_list[0]
+                            if ratio_list
                             else (self.cfg.ratio.split(',')[0] if self.cfg.ratio else '2:3')
                         )
                     )
@@ -5167,18 +5178,18 @@ class Processor(QtCore.QObject):
                     # the target face/head or person is not cut off when a feasible
                     # in-bounds ratio crop exists.
                     if bool(getattr(cfg, "auto_crop_borders", False)):
-                        bx1 = int(locals().get("off_x", 0))
-                        by1 = int(locals().get("off_y", 0))
-                        bx2 = int(bx1 + locals().get("W2", W))
-                        by2 = int(by1 + locals().get("H2", H))
+                        bx1 = int(det_off_x)
+                        by1 = int(det_off_y)
+                        bx2 = int(bx1 + det_w)
+                        by2 = int(by1 + det_h)
                     else:
-                        bx1, by1, bx2, by2 = 0, 0, W, H
-                    bx1 = max(0, min(W - 1, bx1))
-                    by1 = max(0, min(H - 1, by1))
-                    bx2 = max(bx1 + 1, min(W, bx2))
-                    by2 = max(by1 + 1, min(H, by2))
+                        bx1, by1, bx2, by2 = 0, 0, frame_w, frame_h
+                    bx1 = max(0, min(frame_w - 1, bx1))
+                    by1 = max(0, min(frame_h - 1, by1))
+                    bx2 = max(bx1 + 1, min(frame_w, bx2))
+                    by2 = max(by1 + 1, min(frame_h, by2))
 
-                    ratio_candidates = list(ratios) if 'ratios' in locals() and ratios else [ratio_str]
+                    ratio_candidates = list(ratio_list) if ratio_list else [ratio_str]
                     if bool(getattr(cfg, "compose_crop_enable", True)):
                         (cx1, cy1, cx2, cy2), ratio_str, crop_profile = self._compose_dataset_crop(
                             (gx1, gy1, gx2, gy2),
@@ -5256,18 +5267,18 @@ class Processor(QtCore.QObject):
                     except Exception:
                         pass
 
-                    cx1 = max(0, min(W - 1, int(round(cx1))))
-                    cy1 = max(0, min(H - 1, int(round(cy1))))
-                    cx2 = max(cx1 + 1, min(W, int(round(cx2))))
-                    cy2 = max(cy1 + 1, min(H, int(round(cy2))))
+                    cx1 = max(0, min(frame_w - 1, int(round(cx1))))
+                    cy1 = max(0, min(frame_h - 1, int(round(cy1))))
+                    cx2 = max(cx1 + 1, min(frame_w, int(round(cx2))))
+                    cy2 = max(cy1 + 1, min(frame_h, int(round(cy2))))
 
                     if bool(getattr(cfg, "auto_crop_borders", False)):
-                        bx1 = int(locals().get("off_x", 0))
-                        by1 = int(locals().get("off_y", 0))
-                        bx2 = int(bx1 + locals().get("W2", W))
-                        by2 = int(by1 + locals().get("H2", H))
+                        bx1 = int(det_off_x)
+                        by1 = int(det_off_y)
+                        bx2 = int(bx1 + det_w)
+                        by2 = int(by1 + det_h)
                     else:
-                        bx1, by1, bx2, by2 = 0, 0, W, H
+                        bx1, by1, bx2, by2 = 0, 0, frame_w, frame_h
 
                     # Ensure ratio terms exist before using them in corrections
                     try:
@@ -5935,7 +5946,17 @@ class Processor(QtCore.QObject):
                         chosen is not None
                         and now_t - self._last_hit_t >= float(cfg.min_gap_sec)
                     ):
-                        if save_hit(chosen, current_idx):
+                        if save_hit(
+                            chosen,
+                            current_idx,
+                            frame_w=W,
+                            frame_h=H,
+                            det_off_x=off_x,
+                            det_off_y=off_y,
+                            det_w=W2,
+                            det_h=H2,
+                            ratio_list=ratios,
+                        ):
                             hit_count += 1
                             self._last_hit_t = now_t
 
