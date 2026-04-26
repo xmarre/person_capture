@@ -1060,7 +1060,11 @@ class Processor(QtCore.QObject):
                             fast=bool(getattr(cfg, "seek_fast", True)),
                             max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
                             allow_partial=True,
-                            hdr_reader=self._hdr_preview_reader,
+                            hdr_reader=(
+                                self._hdr_preview_reader
+                                if (prescan_hdr_preview and self._hdr_preview_enabled())
+                                else None
+                            ),
                         )
                         # ensure forward progress even if seek advanced < stride
                         i_floor = (new_pos // stride) * stride
@@ -1157,7 +1161,11 @@ class Processor(QtCore.QObject):
                             fast=bool(getattr(cfg, "seek_fast", True)),
                             max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
                             allow_partial=True,
-                            hdr_reader=self._hdr_preview_reader,
+                            hdr_reader=(
+                                self._hdr_preview_reader
+                                if (prescan_hdr_preview and self._hdr_preview_enabled())
+                                else None
+                            ),
                         )
                         i_floor = (new_pos // stride) * stride
                         if i_floor <= i:
@@ -1494,7 +1502,11 @@ class Processor(QtCore.QObject):
                                 fast=bool(getattr(cfg, "seek_fast", True)),
                                 max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
                                 allow_partial=False,
-                                hdr_reader=self._hdr_preview_reader,
+                                hdr_reader=(
+                                    self._hdr_preview_reader
+                                    if (prescan_hdr_preview and self._hdr_preview_enabled())
+                                    else None
+                                ),
                             )
                             ret, frame = cap.read()
                             if not ret or frame is None:
@@ -1543,7 +1555,11 @@ class Processor(QtCore.QObject):
                                     fast=bool(getattr(cfg, "seek_fast", True)),
                                     max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
                                     allow_partial=False,
-                                    hdr_reader=self._hdr_preview_reader,
+                                    hdr_reader=(
+                                        self._hdr_preview_reader
+                                        if (prescan_hdr_preview and self._hdr_preview_enabled())
+                                        else None
+                                    ),
                                 )
                                 ret, frame = cap.read()
                                 if not ret or frame is None:
@@ -3930,11 +3946,11 @@ class Processor(QtCore.QObject):
                 and cfg_hdr_passthrough
                 and bool(self.ui_hdr_passthrough_enabled)
                 and _hdr_passthrough_available()
-                and ((not prescan_will_run) or allow_prescan_hdr_preview)
             )
             self._status(
                 f"HDR passthrough gate: hdr={hdr_active} cfg={cfg_hdr_passthrough} "
-                f"ui={self.ui_hdr_passthrough_enabled} prescan_preview={allow_prescan_hdr_preview} "
+                f"ui={self.ui_hdr_passthrough_enabled} prescan={prescan_will_run} "
+                f"prescan_preview={allow_prescan_hdr_preview} "
                 f"dll={_hdr_passthrough_available()}",
                 key="hdr_gate",
                 interval=10.0,
@@ -3970,11 +3986,12 @@ class Processor(QtCore.QObject):
                     # Drive preview from a dedicated P010 reader.
                     self._hdr_passthrough_active = True
                     self._hdr_preview_latest = None
-                    try:
-                        pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
-                        self._hdr_preview_seek(pos)
-                    except Exception:
-                        pass
+                    if (not prescan_will_run) or allow_prescan_hdr_preview:
+                        try:
+                            pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+                            self._hdr_preview_seek(pos)
+                        except Exception:
+                            pass
                     self._status(
                         "HDR passthrough preview: enabled (P010 preview reader)",
                         key="hdr_passthrough",
