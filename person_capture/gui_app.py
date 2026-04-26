@@ -5571,7 +5571,13 @@ class Processor(QtCore.QObject):
                                             c["crop_profile"] = "upper"
                                             crop_profile_for_guard = "upper"
                         except Exception:
-                            pass
+                            logger.exception(
+                                "Final face containment repair failed idx=%s face=%s bounds=%s crop=%s",
+                                idx,
+                                hard_face_box,
+                                (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                (cx1, cy1, cx2, cy2),
+                            )
 
                     # Final clamp inside de-barred content window (prevents 1px bar re-entry)
                     cx1 = max(repair_bx1, min(repair_bx2 - 1, cx1))
