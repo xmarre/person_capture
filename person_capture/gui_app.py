@@ -5293,7 +5293,7 @@ class Processor(QtCore.QObject):
                         pass
 
                     protect_box = self._union_boxes_xyxy(
-                        c.get("subject_box"),
+                        c.get("subject_box") or c.get("show_box"),
                         c.get("head_box"),
                         c.get("face_box"),
                     )
@@ -5380,6 +5380,12 @@ class Processor(QtCore.QObject):
                     )
 
                     processed_crop_xyxy = (int(cx1), int(cy1), int(cx2), int(cy2))
+                    try:
+                        final_crop_for_sharp = frame[int(cy1):int(cy2), int(cx1):int(cx2)]
+                        if final_crop_for_sharp.size > 0:
+                            c["sharp"] = self._calc_sharpness(final_crop_for_sharp)
+                    except Exception:
+                        pass
                     # Keep the annotated preview in sync with the actual saved crop.
                     # Earlier preview boxes were drawn from the pre-final candidate box,
                     # while save_hit later changed the crop via smart-crop, border trim,
