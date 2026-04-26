@@ -343,7 +343,31 @@ def _remove_path_for_update_replace(path: Path) -> None:
         pass
 
 
-def _merge_staged_item_preserving_user_data(src: Path, dst: Path) -> None:
+def _path_is_within(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+_PRESERVED_UPDATE_PATHS = {
+    ("person_capture", "output"),
+    ("person_capture", "out"),
+    ("output",),
+    ("out",),
+}
+
+
+def _is_preserved_update_path(path_parts: tuple[str, ...]) -> bool:
+    return any(path_parts[:len(prefix)] == prefix for prefix in _PRESERVED_UPDATE_PATHS)
+
+
+def _merge_staged_item_preserving_user_data(
+    src: Path,
+    dst: Path,
+    rel_parts: tuple[str, ...],
+) -> None:
     """
     Merge one staged update item into the install tree.
 
@@ -353,17 +377,30 @@ def _merge_staged_item_preserving_user_data(src: Path, dst: Path) -> None:
     install root, and sometimes under package subdirectories. Directory-level
     replacement can therefore delete output/crops while updating the code.
 
-    This replaces files that are present in the update payload, but never
-    deletes destination-only children inside existing directories. That
-    preserves user output and caches while still allowing shipped files to be
-    updated in place.
+    This replaces files that are present in the update payload. For destination
+    paths that are not explicit runtime-data roots, destination-only children
+    are removed so deleted shipped files do not linger after an update. We only
+    preserve destination-only content under known runtime-data roots.
     """
     if src.is_dir() and not src.is_symlink():
         if dst.exists() and (not dst.is_dir() or dst.is_symlink()):
             _remove_path_for_update_replace(dst)
         dst.mkdir(parents=True, exist_ok=True)
+        staged_names = set()
         for child in list(src.iterdir()):
-            _merge_staged_item_preserving_user_data(child, dst / child.name)
+            staged_names.add(child.name)
+            _merge_staged_item_preserving_user_data(
+                child,
+                dst / child.name,
+                rel_parts + (child.name,),
+            )
+        for existing in list(dst.iterdir()):
+            if existing.name in staged_names:
+                continue
+            rel_existing = rel_parts + (existing.name,)
+            if _is_preserved_update_path(rel_existing):
+                continue
+            _remove_path_for_update_replace(existing)
         try:
             src.rmdir()
         except OSError:
@@ -403,6 +440,16 @@ def apply_staged_update(repo: Path) -> Tuple[bool, str]:
             info = json.load(f)
         sha_applied = str(info.get("sha") or "")
         staged = Path(info.get("staged_dir") or (repo / "update_staged"))
+        repo_resolved = repo.resolve()
+        staged_base = (repo_resolved / "update_staged").resolve()
+        staged_resolved = staged.resolve(strict=False)
+        if not _path_is_within(staged_resolved, staged_base):
+            try:
+                flag.unlink()
+            except Exception:
+                pass
+            return False, "invalid staged dir"
+        staged = staged_resolved
         if not staged.exists():
             try:
                 flag.unlink()
@@ -416,13 +463,16 @@ def apply_staged_update(repo: Path) -> Tuple[bool, str]:
         repo_req = _select_req_file(repo_reqs)
         staged_bytes = staged_req.read_bytes() if staged_req and staged_req.exists() else b""
         repo_bytes = repo_req.read_bytes() if repo_req and repo_req.exists() else b""
-        # Move files/dirs from staged into repo without deleting destination-only
-        # children inside existing directories. The old implementation did
-        # `rmtree(dst)` for every staged directory, so replacing the shipped
-        # `person_capture/` package could also delete user-created
-        # `person_capture/output/crops/` data.
+        # Move files/dirs from staged into repo while preserving destination-only
+        # runtime data under explicit output roots. For non-preserved paths we
+        # still remove destination-only entries so deleted shipped files do not
+        # survive updates.
         for item in list(staged.iterdir()):
-            _merge_staged_item_preserving_user_data(item, repo / item.name)
+            _merge_staged_item_preserving_user_data(
+                item,
+                repo_resolved / item.name,
+                (item.name,),
+            )
         try:
             shutil.rmtree(staged, ignore_errors=True)
         except Exception:
