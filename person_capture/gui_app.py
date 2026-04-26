@@ -2006,13 +2006,7 @@ class Processor(QtCore.QObject):
                 continue
             if rs not in ratios:
                 ratios.append(rs)
-        # Keep the user list, but guarantee that portrait/square composition is
-        # available.  Existing saved settings may still contain only landscape.
-        for rs in ("1:1", "2:3"):
-            if rs not in ratios:
-                ratios.insert(0 if rs == "1:1" else min(1, len(ratios)), rs)
-        if not ratios:
-            ratios = ["1:1", "2:3"]
+        display_ratios = list(ratios) if ratios else ["1:1", "2:3"]
 
         base = self._coerce_box_xyxy(base_crop_xyxy, bounds)
         subj = self._coerce_box_xyxy(subject_box, bounds)
@@ -2104,7 +2098,7 @@ class Processor(QtCore.QObject):
                 elif profile == "body" and subj is not None:
                     anchor = ((subj[0] + subj[2]) * 0.5, (subj[1] + subj[3]) * 0.5)
 
-            for rs in ratios:
+            for rs in display_ratios:
                 try:
                     rw, rh = parse_ratio(rs)
                     aspect = float(rw) / float(rh)
@@ -2182,8 +2176,9 @@ class Processor(QtCore.QObject):
 
         # Last-resort: repair the existing crop to contain the best known identity box.
         fallback_protect = protect_face or subj or base
-        crop = self._ratio_crop_containing_box(fallback_protect, ratios[0], bounds)
-        return crop, ratios[0], "fallback"
+        fallback_ratio = ratios[0] if ratios else display_ratios[0]
+        crop = self._ratio_crop_containing_box(fallback_protect, fallback_ratio, bounds)
+        return crop, fallback_ratio, "fallback"
 
     def _enforce_scale_and_margins(
         self,
@@ -5291,7 +5286,11 @@ class Processor(QtCore.QObject):
                     except Exception:
                         pass
 
-                    protect_box = self._union_boxes_xyxy(c.get("head_box"), c.get("face_box"))
+                    protect_box = self._union_boxes_xyxy(
+                        c.get("subject_box"),
+                        c.get("head_box"),
+                        c.get("face_box"),
+                    )
                     if protect_box is not None:
                         try:
                             cur_w = max(1.0, float(cx2 - cx1))
@@ -9103,6 +9102,13 @@ class MainWindow(QtWidgets.QMainWindow):
             "w_upper",
             "w_cowboy",
             "w_body",
+            "compose_crop_enable",
+            "compose_detect_person_for_face",
+            "compose_close_face_h_frac",
+            "compose_upper_face_h_frac",
+            "compose_body_face_h_frac",
+            "compose_landscape_face_penalty",
+            "compose_body_every_n",
         }
         delta = {}
         for k in prescan_live | live:
@@ -9260,6 +9266,13 @@ class MainWindow(QtWidgets.QMainWindow):
             face_max_frac_in_crop=float(self.face_max_frac_spin.value()) if hasattr(self, "face_max_frac_spin") else 0.42,
             face_min_frac_in_crop=float(self.face_min_frac_spin.value()) if hasattr(self, "face_min_frac_spin") else 0.18,
             crop_min_height_frac=float(self.crop_min_height_frac_spin.value()) if hasattr(self, "crop_min_height_frac_spin") else 0.28,
+            compose_crop_enable=bool(getattr(self.cfg, "compose_crop_enable", True)),
+            compose_detect_person_for_face=bool(getattr(self.cfg, "compose_detect_person_for_face", True)),
+            compose_close_face_h_frac=float(getattr(self.cfg, "compose_close_face_h_frac", 0.34)),
+            compose_upper_face_h_frac=float(getattr(self.cfg, "compose_upper_face_h_frac", 0.22)),
+            compose_body_face_h_frac=float(getattr(self.cfg, "compose_body_face_h_frac", 0.085)),
+            compose_landscape_face_penalty=float(getattr(self.cfg, "compose_landscape_face_penalty", 5.0)),
+            compose_body_every_n=int(getattr(self.cfg, "compose_body_every_n", 6)),
             hdr_export_timeout_sec=int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300),
         )
         cfg.hdr_passthrough = (
@@ -9328,6 +9341,28 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.hdr_export_timeout_sec = max(5, int(getattr(cfg, "hdr_export_timeout_sec", 300) or 300))
         except Exception:
             self.cfg.hdr_export_timeout_sec = 300
+        self.cfg.compose_crop_enable = bool(getattr(cfg, "compose_crop_enable", True))
+        self.cfg.compose_detect_person_for_face = bool(getattr(cfg, "compose_detect_person_for_face", True))
+        try:
+            self.cfg.compose_close_face_h_frac = float(getattr(cfg, "compose_close_face_h_frac", 0.34))
+        except Exception:
+            self.cfg.compose_close_face_h_frac = 0.34
+        try:
+            self.cfg.compose_upper_face_h_frac = float(getattr(cfg, "compose_upper_face_h_frac", 0.22))
+        except Exception:
+            self.cfg.compose_upper_face_h_frac = 0.22
+        try:
+            self.cfg.compose_body_face_h_frac = float(getattr(cfg, "compose_body_face_h_frac", 0.085))
+        except Exception:
+            self.cfg.compose_body_face_h_frac = 0.085
+        try:
+            self.cfg.compose_landscape_face_penalty = float(getattr(cfg, "compose_landscape_face_penalty", 5.0))
+        except Exception:
+            self.cfg.compose_landscape_face_penalty = 5.0
+        try:
+            self.cfg.compose_body_every_n = int(getattr(cfg, "compose_body_every_n", 6))
+        except Exception:
+            self.cfg.compose_body_every_n = 6
         self.video_edit.setText(cfg.video)
         paths = [part.strip() for part in (cfg.ref or "").split(';') if part.strip()]
         self._set_ref_paths(paths)
@@ -10522,6 +10557,49 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         except Exception:
             self.cfg.wide_face_aspect_limit = 1.05
+        self.cfg.compose_crop_enable = s.value(
+            "compose_crop_enable",
+            getattr(self.cfg, "compose_crop_enable", True),
+            type=bool,
+        )
+        self.cfg.compose_detect_person_for_face = s.value(
+            "compose_detect_person_for_face",
+            getattr(self.cfg, "compose_detect_person_for_face", True),
+            type=bool,
+        )
+        try:
+            self.cfg.compose_close_face_h_frac = float(
+                s.value("compose_close_face_h_frac", getattr(self.cfg, "compose_close_face_h_frac", 0.34))
+            )
+        except Exception:
+            self.cfg.compose_close_face_h_frac = 0.34
+        try:
+            self.cfg.compose_upper_face_h_frac = float(
+                s.value("compose_upper_face_h_frac", getattr(self.cfg, "compose_upper_face_h_frac", 0.22))
+            )
+        except Exception:
+            self.cfg.compose_upper_face_h_frac = 0.22
+        try:
+            self.cfg.compose_body_face_h_frac = float(
+                s.value("compose_body_face_h_frac", getattr(self.cfg, "compose_body_face_h_frac", 0.085))
+            )
+        except Exception:
+            self.cfg.compose_body_face_h_frac = 0.085
+        try:
+            self.cfg.compose_landscape_face_penalty = float(
+                s.value(
+                    "compose_landscape_face_penalty",
+                    getattr(self.cfg, "compose_landscape_face_penalty", 5.0),
+                )
+            )
+        except Exception:
+            self.cfg.compose_landscape_face_penalty = 5.0
+        try:
+            self.cfg.compose_body_every_n = int(
+                s.value("compose_body_every_n", getattr(self.cfg, "compose_body_every_n", 6))
+            )
+        except Exception:
+            self.cfg.compose_body_every_n = 6
         if hasattr(self, 'face_anchor_down_spin'):
             self.face_anchor_down_spin.setValue(
                 float(s.value("face_anchor_down_frac", self.cfg.face_anchor_down_frac))
