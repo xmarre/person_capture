@@ -251,7 +251,7 @@ class Item:
     face_frac: float  # face height fraction in crop
     yaw: float  # degrees
     roll: float  # degrees
-    ratio: str  # e.g., "2:3","1:1","3:2"
+    ratio: str  # e.g., "2:3","3:4","1:1","3:2"
     phash: int  # 64-bit perceptual hash
     face_feat: Optional[np.ndarray]
     bg_clip: Optional[np.ndarray]  # CLIP embedding of full crop for diversity
@@ -588,7 +588,7 @@ class Curator:
         """Assign an item to one of the selection buckets."""
         f = it.face_frac
         ratio = it.ratio
-        if ratio == "2:3":
+        if ratio in ("2:3", "3:4"):
             if f >= 0.33:
                 return "closeup"
             if 0.22 <= f < 0.33:
@@ -731,6 +731,8 @@ class Curator:
             asp = W / float(H)
             if 0.60 <= asp <= 0.70:
                 return "2:3"
+            if 0.70 < asp <= 0.82:
+                return "3:4"
             if 0.95 <= asp <= 1.05:
                 return "1:1"
             if 1.40 <= asp <= 1.70:
