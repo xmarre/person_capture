@@ -2170,9 +2170,9 @@ class Processor(QtCore.QObject):
                     continue
                 if profile == "body" and is_landscape:
                     # Landscape is a rare context/body sample, not a normal face
-                    # framing choice. It is only allowed on the deterministic body
-                    # prior and a real associated person box, and only when the
-                    # matched face is small in the frame.
+                    # framing choice. Eligibility requires an associated subject
+                    # plus small-face/tall-subject gates; body_cadence influences
+                    # scoring later and is not an eligibility gate.
                     if subj is None:
                         continue
                     if face is not None and face_frame_frac >= 0.12:
@@ -10515,7 +10515,13 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 self.hit_label.setToolTip(f"{crop_path}\n{img.width()}x{img.height()}")
             except Exception:
-                pass
+                logging.getLogger(__name__).debug(
+                    "Failed to set hit preview tooltip for %s (%sx%s)",
+                    crop_path,
+                    img.width(),
+                    img.height(),
+                    exc_info=True,
+                )
             return True
 
         img = QtGui.QImage(crop_path)
