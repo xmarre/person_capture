@@ -286,6 +286,7 @@ _SETTINGS_KEY_FFMPEG_DIR = "paths/ffmpeg_dir"
 _SETTINGS_KEY_SDR_NITS_MIGRATED = "migrations/sdr_nits_default_100_v1"
 _SETTINGS_KEY_CROP_HEAD_PAD_MIGRATED = "migrations/crop_head_pad_defaults_088_095_v1"
 _SETTINGS_KEY_RATIO_DEFAULTS_MIGRATED = "migrations/ratio_defaults_334_v1"
+_HDR_READER_DEFAULT = object()
 
 # ---------------------- Data & Settings ----------------------
 
@@ -3224,9 +3225,10 @@ class Processor(QtCore.QObject):
         max_grabs: int = 0,
         peek_preview: bool = False,
         allow_partial: bool = False,
-        hdr_reader=None,
+        hdr_reader=_HDR_READER_DEFAULT,
     ) -> int:
         """Keyframe-aware seek. Fast UI seeks may return before target; internal jumps must not."""
+        hdr_reader_eff = self._hdr_preview_reader if hdr_reader is _HDR_READER_DEFAULT else hdr_reader
         if self._total_frames is not None:
             tgt_idx = max(0, min(self._total_frames - 1, int(tgt_idx)))
 
@@ -3289,7 +3291,8 @@ class Processor(QtCore.QObject):
                     cap.set(cv2.CAP_PROP_POS_FRAMES, base)
             else:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, base)
-            self._hdr_preview_seek(base, reader=hdr_reader)
+            if hdr_reader_eff is not None:
+                self._hdr_preview_seek(base, reader=hdr_reader_eff)
         idx = base
         limit = max(0, tgt_idx - base)
         # Cap forward grabs only for partial/UI fast seeks. Segment jumps in the
@@ -3323,14 +3326,17 @@ class Processor(QtCore.QObject):
                 ok, frame = cap.retrieve()
                 if ok:
                     try:
-                        self._pump_hdr_preview(reader=hdr_reader)
+                        if hdr_reader_eff is not None:
+                            self._pump_hdr_preview(reader=hdr_reader_eff)
                         self._emit_preview_bgr(frame)
                     except Exception:
                         pass
                 else:
-                    self._hdr_preview_skip(1, reader=hdr_reader)
+                    if hdr_reader_eff is not None:
+                        self._hdr_preview_skip(1, reader=hdr_reader_eff)
             else:
-                self._hdr_preview_skip(1, reader=hdr_reader)
+                if hdr_reader_eff is not None:
+                    self._hdr_preview_skip(1, reader=hdr_reader_eff)
             if fast and allow_partial and t0 is not None and (time.perf_counter() - t0) > budget:
                 try:
                     self._status(
@@ -10922,12 +10928,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.out_edit.setText(s.value("out_dir", "output"))
         _stored_ratio = str(s.value("ratio", getattr(self.cfg, "ratio", "1:1,2:3,3:4")) or "1:1,2:3,3:4")
         _ratio_defaults_migrated = bool(s.value(_SETTINGS_KEY_RATIO_DEFAULTS_MIGRATED, False, type=bool))
-        if (not _ratio_defaults_migrated) and _stored_ratio.strip() in {"1:1,3:2,2:3", "1:1,2:3,3:2"}:
-            # Migrate old defaults away from landscape availability. Landscape
-            # crops are still possible from explicit user settings, but the solid
-            # dataset preset should not let 3:2 leak into head/portrait decisions.
-            _stored_ratio = "1:1,2:3,3:4"
-            s.setValue("ratio", _stored_ratio)
+        if not _ratio_defaults_migrated:
+            _ratio_norm = ",".join(part.strip() for part in _stored_ratio.split(",") if part.strip())
+            if _ratio_norm in {"1:1,3:2,2:3", "1:1,2:3,3:2"}:
+                # Migrate old defaults away from landscape availability. Landscape
+                # crops are still possible from explicit user settings, but the solid
+                # dataset preset should not let 3:2 leak into head/portrait decisions.
+                _stored_ratio = "1:1,2:3,3:4"
+                s.setValue("ratio", _stored_ratio)
             s.setValue(_SETTINGS_KEY_RATIO_DEFAULTS_MIGRATED, True)
         self.ratio_edit.setText(_stored_ratio)
         try:
