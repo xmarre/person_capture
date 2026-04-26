@@ -2266,7 +2266,23 @@ class Processor(QtCore.QObject):
             return crop, rs, profile
 
         fallback_protect = face_protect or subj or base or (bx1, by1, bx2, by2)
-        fallback_ratio = validated_user_ratios[0] if validated_user_ratios else ("1:1" if face_protect is not None else "2:3")
+        fallback_ratio = None
+        for rs in validated_user_ratios:
+            try:
+                rw, rh = parse_ratio(rs)
+                aspect = float(rw) / max(1e-6, float(rh))
+            except Exception:
+                continue
+            is_landscape = aspect > 1.05
+            if is_landscape:
+                if face is not None and face_frame_frac >= 0.12:
+                    continue
+                if subj_h_frac < 0.60:
+                    continue
+            fallback_ratio = rs
+            break
+        if fallback_ratio is None:
+            fallback_ratio = "1:1" if face_protect is not None else "2:3"
         crop = self._ratio_crop_containing_box(fallback_protect, fallback_ratio, bounds)
         return crop, fallback_ratio, "fallback"
 
@@ -3655,7 +3671,7 @@ class Processor(QtCore.QObject):
             # --- Video / HDR setup ---
             # Apply HDR tonemap env overrides from cfg (GUI always supplies defaults)
             try:
-                os.environ["PC_SDR_NITS"] = str(float(getattr(cfg, "sdr_nits", 125.0)))
+                os.environ["PC_SDR_NITS"] = str(float(getattr(cfg, "sdr_nits", SessionConfig.sdr_nits)))
                 os.environ["PC_TM_DESAT"] = str(float(getattr(cfg, "tm_desat", 0.25)))
                 os.environ["PC_TM_PARAM"] = str(float(getattr(cfg, "tm_param", 0.40)))
                 for key in ("PC_FORCE_ZSCALE", "PC_FORCE_SCALE", "PC_FORCE_TONEMAP"):
@@ -6836,7 +6852,7 @@ class Processor(QtCore.QObject):
         src = "setparams=color_trc=smpte2084:color_primaries=bt2020:colorspace=bt2020nc:range=limited"
         desat = float(getattr(self.cfg, "tm_desat", 0.25))
         param = float(getattr(self.cfg, "tm_param", 0.40))
-        nits = float(getattr(self.cfg, "sdr_nits", 125.0))
+        nits = float(getattr(self.cfg, "sdr_nits", SessionConfig.sdr_nits))
         pref = str(getattr(self.cfg, "hdr_tonemap_pref", "auto") or "auto").lower()
         quality = str(getattr(self.cfg, "hdr_sdr_quality", "madvr_like") or "madvr_like").lower()
         algo = str(getattr(self.cfg, "hdr_sdr_tonemap", "auto") or "auto").lower()
@@ -9756,9 +9772,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.hdr_sdr_bad_fallback_check.setChecked(bool(getattr(cfg, "hdr_sdr_allow_inaccurate_fallback", False)))
         self.ratio_edit.setText(cfg.ratio)
         try:
-            self.sdr_nits_spin.setValue(float(getattr(cfg, "sdr_nits", 125.0)))
+            self.sdr_nits_spin.setValue(float(getattr(cfg, "sdr_nits", SessionConfig.sdr_nits)))
         except Exception:
-            self.sdr_nits_spin.setValue(125.0)
+            self.sdr_nits_spin.setValue(float(SessionConfig.sdr_nits))
         try:
             self.tm_desat_spin.setValue(float(getattr(cfg, "tm_desat", 0.25)))
         except Exception:
