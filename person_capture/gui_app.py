@@ -285,6 +285,7 @@ APP_NAME = "PersonCapture GUI"
 _SETTINGS_KEY_FFMPEG_DIR = "paths/ffmpeg_dir"
 _SETTINGS_KEY_SDR_NITS_MIGRATED = "migrations/sdr_nits_default_100_v1"
 _SETTINGS_KEY_CROP_HEAD_PAD_MIGRATED = "migrations/crop_head_pad_defaults_088_095_v1"
+_SETTINGS_KEY_RATIO_DEFAULTS_MIGRATED = "migrations/ratio_defaults_334_v1"
 
 # ---------------------- Data & Settings ----------------------
 
@@ -3804,6 +3805,9 @@ class Processor(QtCore.QObject):
             except Exception:
                 pass
 
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
             # Default: HDR passthrough ON when available unless explicitly disabled in cfg.
             cfg_hdr_passthrough = bool(getattr(cfg, "hdr_passthrough", True))
             prescan_will_run = bool(getattr(cfg, "prescan_enable", True)) and total_frames > 0
@@ -3921,9 +3925,6 @@ class Processor(QtCore.QObject):
                         pass
                 self._hdr_preview_seek(pos0)
                 return ok_any
-
-            fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
             defer_reader_probe = (
                 hdr_active
@@ -10767,11 +10768,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_ref_paths(paths)
         self.out_edit.setText(s.value("out_dir", "output"))
         _stored_ratio = str(s.value("ratio", getattr(self.cfg, "ratio", "1:1,2:3,3:4")) or "1:1,2:3,3:4")
-        if _stored_ratio.strip() in {"2:3", "1:1,3:2,2:3", "1:1,2:3,3:2"}:
+        _ratio_defaults_migrated = bool(s.value(_SETTINGS_KEY_RATIO_DEFAULTS_MIGRATED, False, type=bool))
+        if (not _ratio_defaults_migrated) and _stored_ratio.strip() in {"2:3", "1:1,3:2,2:3", "1:1,2:3,3:2"}:
             # Migrate old defaults away from landscape availability. Landscape
             # crops are still possible from explicit user settings, but the solid
             # dataset preset should not let 3:2 leak into head/portrait decisions.
             _stored_ratio = "1:1,2:3,3:4"
+            s.setValue("ratio", _stored_ratio)
+        if not _ratio_defaults_migrated:
+            s.setValue(_SETTINGS_KEY_RATIO_DEFAULTS_MIGRATED, True)
         self.ratio_edit.setText(_stored_ratio)
         try:
             _sdr_nits = float(s.value("sdr_nits", self.cfg.sdr_nits))
