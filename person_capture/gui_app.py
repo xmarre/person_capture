@@ -2020,6 +2020,15 @@ class Processor(QtCore.QObject):
         bound_h = max(1.0, float(by2 - by1))
         bound_area = max(1.0, bound_w * bound_h)
 
+        validated_user_ratios: list[str] = []
+        for rs in [str(r).strip() for r in (ratio_candidates or []) if str(r).strip()]:
+            try:
+                parse_ratio(rs)
+            except Exception:
+                continue
+            if rs not in validated_user_ratios:
+                validated_user_ratios.append(rs)
+
         def _ratio_list_for_profile(profile: str) -> list[str]:
             # Respect user-provided ratios as-is; only use profile defaults if the
             # user list is empty/invalid.
@@ -2029,16 +2038,8 @@ class Processor(QtCore.QObject):
                 "body": ["2:3", "1:1", "3:2"],
                 "base": ["1:1", "2:3"],
             }.get(profile, ["1:1", "2:3"])
-            user_ratios: list[str] = []
-            for rs in [str(r).strip() for r in (ratio_candidates or []) if str(r).strip()]:
-                try:
-                    parse_ratio(rs)
-                except Exception:
-                    continue
-                if rs not in user_ratios:
-                    user_ratios.append(rs)
-            if user_ratios:
-                return user_ratios
+            if validated_user_ratios:
+                return list(validated_user_ratios)
             out: list[str] = []
             for rs in preferred:
                 try:
@@ -2149,8 +2150,6 @@ class Processor(QtCore.QObject):
                 except Exception:
                     continue
                 is_landscape = aspect > 1.05
-                if is_landscape and profile != "body":
-                    continue
 
                 crop = self._ratio_crop_containing_box(
                     protect,
@@ -2224,7 +2223,7 @@ class Processor(QtCore.QObject):
             return crop, rs, profile
 
         fallback_protect = face_protect or subj or base or (bx1, by1, bx2, by2)
-        fallback_ratio = "1:1" if face_protect is not None else "2:3"
+        fallback_ratio = validated_user_ratios[0] if validated_user_ratios else ("1:1" if face_protect is not None else "2:3")
         crop = self._ratio_crop_containing_box(fallback_protect, fallback_ratio, bounds)
         return crop, fallback_ratio, "fallback"
 
@@ -5683,6 +5682,15 @@ class Processor(QtCore.QObject):
                             except Exception:
                                 logger.exception("CSV write failed for %s", crop_img_path)
                         else:
+                            if hdr_primary_fullres:
+                                hdr_sdr_failures += 1
+                                hdr_disable_after = max(0, int(getattr(self.cfg, "hdr_sdr_disable_after_failures", 1) or 0))
+                                if hdr_disable_after > 0 and hdr_sdr_failures >= hdr_disable_after:
+                                    self._status(
+                                        "HDR full-res still export disabled for this run after repeated failures; using decoded-frame JPEG fallback",
+                                        key="hdr_sdr_export_disable",
+                                        interval=30.0,
+                                    )
                             self._status(
                                 f"Save failed ({why}): {crop_img_path}",
                                 key="save_err",
