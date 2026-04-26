@@ -5523,11 +5523,19 @@ class Processor(QtCore.QObject):
                                 was_landscape = cur_aspect > 1.05
                                 hard_def = self._containment_deficit_xyxy(cur_crop, hard_face_padded, margin_px=1.0)
                                 frame_face_h_frac = hfh / max(1.0, float(repair_by2 - repair_by1))
-                                prominent_face = (
-                                    cur_face_h_frac >= 0.10
-                                    or frame_face_h_frac >= 0.075
-                                    or float(c.get("face_frac") or 0.0) >= 0.035
-                                )
+                                if crop_profile_for_guard == "body":
+                                    # Keep body-landscape portrait forcing aligned with the
+                                    # upstream body eligibility gate (face_h/frame_h >= 0.12).
+                                    prominent_face = (
+                                        cur_face_h_frac >= 0.12
+                                        or frame_face_h_frac >= 0.12
+                                    )
+                                else:
+                                    prominent_face = (
+                                        cur_face_h_frac >= 0.10
+                                        or frame_face_h_frac >= 0.075
+                                        or float(c.get("face_frac") or 0.0) >= 0.035
+                                    )
                                 force_portrait = was_landscape and (crop_profile_for_guard != "body" or prominent_face)
                                 if hard_def > 0.01 or force_portrait:
                                     if crop_profile_for_guard == "body" and not force_portrait:
@@ -7133,6 +7141,7 @@ class Processor(QtCore.QObject):
         except Exception:
             pass
         timeout_sec = max(5, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
+        deadline = time.monotonic() + float(timeout_sec)
         for cmd in self._hdr_tonemap_filter_cmds(ffmpeg_bin, frame_idx, frame_pts_sec, crop_xyxy, tmp):
             try:
                 if os.path.exists(tmp):
@@ -7140,7 +7149,10 @@ class Processor(QtCore.QObject):
             except Exception:
                 pass
             try:
-                cp = subprocess.run(cmd, text=True, capture_output=True, check=False, timeout=timeout_sec)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False, f"ffmpeg_timeout_{timeout_sec}s"
+                cp = subprocess.run(cmd, text=True, capture_output=True, check=False, timeout=remaining)
                 if cp.returncode == 0:
                     valid, invalid_why = self._validate_hdr_sdr_export_image(tmp, (int(crop_xyxy[2] - crop_xyxy[0]), int(crop_xyxy[3] - crop_xyxy[1])))
                     if valid:
@@ -7162,7 +7174,7 @@ class Processor(QtCore.QObject):
                 self._status(f"HDR full-res export fallback: {why}", key="hdr_sdr_export", interval=10.0)
             except subprocess.TimeoutExpired as exc:
                 self._status(
-                    f"HDR full-res export timeout after {timeout_sec}s: {exc}",
+                    f"HDR full-res export timeout after {timeout_sec}s total budget: {exc}",
                     key="hdr_sdr_export",
                     interval=10.0,
                 )
