@@ -4216,17 +4216,17 @@ class Processor(QtCore.QObject):
                             img_path, img, row = item
                             ok, why = _atomic_jpeg_write(img, img_path, jpg_q)
 
-                        if ack_q is not None:
-                            try:
-                                ack_q.put_nowait((bool(ok), str(why or "")))
-                            except Exception:
-                                pass
-
                         if ok:
                             if kind == "hdr_sdr" and isinstance(row, list) and len(row) > 10:
                                 saved_sharp = self._calc_saved_file_sharpness(img_path)
                                 if saved_sharp is not None:
                                     row[10] = float(saved_sharp)
+                        if ack_q is not None:
+                            try:
+                                ack_q.put_nowait((bool(ok), str(why or "")))
+                            except Exception:
+                                pass
+                        if ok:
                             # hand off to worker thread for emitting
                             try:
                                 hit_q.put_nowait(img_path)
@@ -5525,6 +5525,11 @@ class Processor(QtCore.QObject):
                                 interval=0.5,
                             )
                             return False
+                        if hdr_primary_fullres and isinstance(row, list) and len(row) > 10:
+                            try:
+                                c["sharp"] = float(row[10])
+                            except Exception:
+                                pass
                         primary_saved_or_enqueued = True
                     else:
                         if hdr_primary_fullres:
