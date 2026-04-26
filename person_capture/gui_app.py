@@ -926,7 +926,7 @@ class Processor(QtCore.QObject):
         prescan_hdr_preview = bool(getattr(cfg, "prescan_hdr_preview", False))
 
         def _run():
-            nonlocal cap
+            nonlocal cap, prescan_hdr_preview
             # seed bank
             if ref_feat is None:
                 ref_bank_list = []
@@ -1034,6 +1034,7 @@ class Processor(QtCore.QObject):
                                     enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
                                     fd_add = float(getattr(cfg, "prescan_fd_add", enter))
                                     Wmax = int(cfg.prescan_max_width)
+                                    prescan_hdr_preview = bool(getattr(cfg, "prescan_hdr_preview", False))
                                     face.conf = float(cfg.prescan_face_conf)
                                     add_cooldown_samples = int(
                                         getattr(
@@ -1125,6 +1126,7 @@ class Processor(QtCore.QObject):
                                     enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
                                     fd_add = float(getattr(cfg, "prescan_fd_add", enter))
                                     Wmax = int(cfg.prescan_max_width)
+                                    prescan_hdr_preview = bool(getattr(cfg, "prescan_hdr_preview", False))
                                     face.conf = float(cfg.prescan_face_conf)
                                     add_cooldown_samples = int(
                                         getattr(
@@ -2594,8 +2596,119 @@ class Processor(QtCore.QObject):
         h, w = frame.shape[:2]
         scan_frac = float(getattr(self.cfg, "border_scan_frac", 0.25))
         max_scan = int(round(min(h, w) * max(0.0, scan_frac))) if scan_frac > 0 else None
-        x1,y1,x2,y2 = detect_black_borders(frame, thr=int(thr), max_scan=max_scan)
-        return frame[y1:y2, x1:x2], (x1,y1)
+        x1, y1, x2, y2 = detect_black_borders(frame, thr=int(thr), max_scan=max_scan)
+        x1 = max(0, min(w - 1, int(x1)))
+        y1 = max(0, min(h - 1, int(y1)))
+        x2 = max(x1 + 1, min(w, int(x2)))
+        y2 = max(y1 + 1, min(h, int(y2)))
+        if (x1, y1, x2, y2) == (0, 0, w, h):
+            return frame, (0, 0)
+        if not self._is_real_letterbox_crop(frame, (x1, y1, x2, y2), int(thr)):
+            self._status(
+                f"Ignoring false border crop x={x1} y={y1} w={x2 - x1} h={y2 - y1}",
+                key="border_guard",
+                interval=2.0,
+            )
+            return frame, (0, 0)
+        return frame[y1:y2, x1:x2], (x1, y1)
+
+    def _is_real_letterbox_crop(
+        self,
+        frame,
+        crop_xyxy: Tuple[int, int, int, int],
+        thr: int,
+    ) -> bool:
+        """Validate that a detected border crop is really a video border.
+
+        The low-level detector uses edge-row/edge-column means. In candle-lit
+        HDR scenes that can mistake dark hair, clothing, or a dark wall for a
+        border and then all later crop repair is clamped to that false content
+        window. A real letterbox/pillarbox strip is nearly uniform black across
+        the full side and normally appears as a matched pair. Reject one-sided
+        or textured/detailed edge crops.
+        """
+        if frame is None or getattr(frame, "size", 0) == 0:
+            return False
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in crop_xyxy]
+        left = max(0, x1)
+        top = max(0, y1)
+        right = max(0, w - x2)
+        bottom = max(0, h - y2)
+        if left <= 0 and top <= 0 and right <= 0 and bottom <= 0:
+            return True
+
+        # One-sided trims are almost never valid cinema mattes. They are the
+        # failure mode that shifts the final crop's left edge into the subject's
+        # face/head in dark scenes.
+        tol = max(3, int(round(min(w, h) * 0.006)))
+        if (left > 0) != (right > 0):
+            return False
+        if (top > 0) != (bottom > 0):
+            return False
+        if left and right and abs(left - right) > max(tol, int(0.35 * max(left, right))):
+            return False
+        if top and bottom and abs(top - bottom) > max(tol, int(0.35 * max(top, bottom))):
+            return False
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        max_luma = max(float(thr) + 8.0, 18.0)
+        max_std = 3.5
+
+        def _strip_ok(region) -> bool:
+            if region is None or region.size == 0:
+                return True
+            vals = region.reshape(-1).astype(np.float32)
+            # Use high percentiles instead of mean so a bright rim light, face
+            # edge, subtitle, or background object rejects the border candidate.
+            p95 = float(np.percentile(vals, 95.0))
+            p99 = float(np.percentile(vals, 99.0))
+            std = float(np.std(vals))
+            return p95 <= max_luma and p99 <= (max_luma + 4.0) and std <= max_std
+
+        if left and not _strip_ok(gray[:, :left]):
+            return False
+        if right and not _strip_ok(gray[:, w - right :]):
+            return False
+        if top and not _strip_ok(gray[:top, :]):
+            return False
+        if bottom and not _strip_ok(gray[h - bottom :, :]):
+            return False
+        return True
+
+    def _repair_crop_bounds_from_identity(
+        self,
+        bounds_xyxy: Tuple[int, int, int, int],
+        frame_w: int,
+        frame_h: int,
+        *boxes,
+    ) -> Tuple[int, int, int, int]:
+        """Do not let a false border/content ROI clamp through identity evidence.
+
+        Border removal is only a content-window hint. If the already matched
+        face/head/subject box lies outside that window, the window is wrong for
+        final dataset composition and must expand back to the full frame.
+        """
+        bx1, by1, bx2, by2 = [int(v) for v in bounds_xyxy]
+        bx1 = max(0, min(frame_w - 1, bx1))
+        by1 = max(0, min(frame_h - 1, by1))
+        bx2 = max(bx1 + 1, min(frame_w, bx2))
+        by2 = max(by1 + 1, min(frame_h, by2))
+        pad = 2.0
+        for box in boxes:
+            if box is None or len(box) != 4:
+                continue
+            try:
+                x1, y1, x2, y2 = [float(v) for v in box]
+            except Exception:
+                continue
+            if not all(np.isfinite([x1, y1, x2, y2])):
+                continue
+            if x2 <= x1 or y2 <= y1:
+                continue
+            if x1 < bx1 - pad or y1 < by1 - pad or x2 > bx2 + pad or y2 > by2 + pad:
+                return (0, 0, int(frame_w), int(frame_h))
+        return (bx1, by1, bx2, by2)
 
     def _iou(self, a, b):
         ax1,ay1,ax2,ay2 = a; bx1,by1,bx2,by2 = b
@@ -5343,6 +5456,14 @@ class Processor(QtCore.QObject):
                     by1 = max(0, min(frame_h - 1, by1))
                     bx2 = max(bx1 + 1, min(frame_w, bx2))
                     by2 = max(by1 + 1, min(frame_h, by2))
+                    bx1, by1, bx2, by2 = self._repair_crop_bounds_from_identity(
+                        (bx1, by1, bx2, by2),
+                        frame_w,
+                        frame_h,
+                        c.get("face_box"),
+                        c.get("head_box"),
+                        c.get("subject_box"),
+                    )
 
                     ratio_candidates = list(ratio_list) if ratio_list else [ratio_str]
                     if bool(getattr(cfg, "compose_crop_enable", True)):
@@ -5375,7 +5496,14 @@ class Processor(QtCore.QObject):
                         by2 = int(by1 + det_h)
                     else:
                         bx1, by1, bx2, by2 = 0, 0, frame_w, frame_h
-                    repair_bx1, repair_by1, repair_bx2, repair_by2 = bx1, by1, bx2, by2
+                    repair_bx1, repair_by1, repair_bx2, repair_by2 = self._repair_crop_bounds_from_identity(
+                        (bx1, by1, bx2, by2),
+                        frame_w,
+                        frame_h,
+                        c.get("face_box"),
+                        c.get("head_box"),
+                        c.get("subject_box"),
+                    )
 
                     # Do not run border detection on the already-composed crop.
                     # In candle-lit/dark scenes the subject's hair, clothing, or a dark
@@ -10769,13 +10897,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.out_edit.setText(s.value("out_dir", "output"))
         _stored_ratio = str(s.value("ratio", getattr(self.cfg, "ratio", "1:1,2:3,3:4")) or "1:1,2:3,3:4")
         _ratio_defaults_migrated = bool(s.value(_SETTINGS_KEY_RATIO_DEFAULTS_MIGRATED, False, type=bool))
-        if (not _ratio_defaults_migrated) and _stored_ratio.strip() in {"2:3", "1:1,3:2,2:3", "1:1,2:3,3:2"}:
+        if (not _ratio_defaults_migrated) and _stored_ratio.strip() in {"1:1,3:2,2:3", "1:1,2:3,3:2"}:
             # Migrate old defaults away from landscape availability. Landscape
             # crops are still possible from explicit user settings, but the solid
             # dataset preset should not let 3:2 leak into head/portrait decisions.
             _stored_ratio = "1:1,2:3,3:4"
             s.setValue("ratio", _stored_ratio)
-        if not _ratio_defaults_migrated:
             s.setValue(_SETTINGS_KEY_RATIO_DEFAULTS_MIGRATED, True)
         self.ratio_edit.setText(_stored_ratio)
         try:
