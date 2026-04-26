@@ -2042,6 +2042,7 @@ class Processor(QtCore.QObject):
             # Keep 3:2 available only for body/context profiles after the scorer
             # confirms the current frame is actually suited to it.
             allow_landscape = profile == "body"
+            available = validated_user_ratios if validated_user_ratios else preferred
             out: list[str] = []
 
             def _add_ratio(rs: str) -> None:
@@ -2056,8 +2057,9 @@ class Processor(QtCore.QObject):
                     out.append(rs)
 
             for rs in preferred:
-                _add_ratio(rs)
-            for rs in validated_user_ratios:
+                if rs in available:
+                    _add_ratio(rs)
+            for rs in available:
                 _add_ratio(rs)
             return out or ["1:1", "2:3"]
 
