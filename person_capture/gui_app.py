@@ -5562,9 +5562,11 @@ class Processor(QtCore.QObject):
                                         if (protect_box is not None and crop_profile_for_guard == "body" and not force_portrait)
                                         else None
                                     )
-                                    # No show_box fallback here. show_box may be the stale
-                                    # candidate/preview box; using it as a guard resurrects
-                                    # bad wide crops and can still cut the head.
+                                    # Do not add any extra show_box-only guard here.
+                                    # identity_guard already carries subject_or_show in the
+                                    # non-body / forced-portrait branch; adding another
+                                    # standalone show_box guard can resurrect stale wide
+                                    # preview geometry.
                                     full_guard_box = self._union_boxes_xyxy(
                                         hard_face_padded,
                                         identity_guard,
