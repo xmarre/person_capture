@@ -283,6 +283,7 @@ APP_ORG = "PersonCapture"
 APP_NAME = "PersonCapture GUI"
 
 _SETTINGS_KEY_FFMPEG_DIR = "paths/ffmpeg_dir"
+_SETTINGS_KEY_SDR_NITS_MIGRATED = "migrations/sdr_nits_default_100_v1"
 
 # ---------------------- Data & Settings ----------------------
 
@@ -5485,18 +5486,24 @@ class Processor(QtCore.QObject):
                                 prominent_face = cur_face_h_frac >= 0.16 or float(c.get("face_frac") or 0.0) >= 0.12
                                 force_portrait = cur_aspect > 1.05 and (crop_profile_for_guard != "body" or prominent_face)
                                 if hard_def > 0.01 or force_portrait:
+                                    protect_box_clamped = (
+                                        self._coerce_box_xyxy(protect_box, (repair_bx1, repair_by1, repair_bx2, repair_by2))
+                                        if protect_box is not None
+                                        else None
+                                    )
+                                    full_guard_box = self._union_boxes_xyxy(hard_face_padded, protect_box_clamped) or hard_face_padded
                                     best_fix = None
                                     for fix_ratio in ("1:1", "2:3", "3:4"):
                                         try:
                                             fixed = self._ratio_crop_containing_box(
-                                                hard_face_padded,
+                                                full_guard_box,
                                                 fix_ratio,
                                                 (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                                 anchor=((hfx1 + hfx2) * 0.5, (hfy1 + hfy2) * 0.5 + 0.18 * hfh),
                                                 min_size_xy=(max(hfw * 1.18, 2.0), max(hfh * 1.22, 2.0)),
                                             )
-                                            fdef = self._containment_deficit_xyxy(fixed, hard_face_padded, margin_px=1.0)
-                                            if fdef > 0.01:
+                                            guard_def = self._containment_deficit_xyxy(fixed, full_guard_box, margin_px=1.0)
+                                            if guard_def > 0.01:
                                                 continue
                                             fw2 = max(1.0, float(fixed[2] - fixed[0]))
                                             fh2 = max(1.0, float(fixed[3] - fixed[1]))
@@ -6813,7 +6820,7 @@ class Processor(QtCore.QObject):
                 _add_first_lp_opt(opts, ("target_primaries", "color_primaries"), "bt709")
                 _add_first_lp_opt(opts, ("target_trc", "color_trc"), "bt709")
                 self._add_lp_opt(opts, supported, "range", "full")
-                _add_first_lp_opt(opts, ("target_peak", "dst_peak", "peak"), f"{nits:.6g}")
+                _add_first_lp_opt(opts, ("sdr_peak", "target_peak", "dst_peak", "peak"), f"{nits:.6g}")
                 self._add_lp_opt(opts, supported, "desaturation", f"{desat:.6g}")
                 _add_first_lp_opt(opts, ("gamut_mode", "gamut_mapping"), gamut)
 
@@ -10518,11 +10525,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ratio_edit.setText(_stored_ratio)
         try:
             _sdr_nits = float(s.value("sdr_nits", self.cfg.sdr_nits))
-            # Migrate the previous default. A stored 125 nits value was usually
-            # not user intent and made libplacebo still exports visibly brighter
-            # than the MPC-HC/madVR-style reference.
-            if abs(_sdr_nits - 125.0) < 0.001:
-                _sdr_nits = float(self.cfg.sdr_nits)
+            # One-time migration away from the old 125-nits default. Use a
+            # sentinel so users who intentionally keep 125 are not reset on
+            # every startup.
+            if not bool(s.value(_SETTINGS_KEY_SDR_NITS_MIGRATED, False, type=bool)):
+                if abs(_sdr_nits - 125.0) < 0.001:
+                    _sdr_nits = float(self.cfg.sdr_nits)
+                    s.setValue("sdr_nits", _sdr_nits)
+                s.setValue(_SETTINGS_KEY_SDR_NITS_MIGRATED, True)
             self.sdr_nits_spin.setValue(_sdr_nits)
         except Exception:
             self.sdr_nits_spin.setValue(float(self.cfg.sdr_nits))
