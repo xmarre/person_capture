@@ -2474,6 +2474,18 @@ class Processor(QtCore.QObject):
         mean_intensity = float(np.mean(g))
         return variance / (mean_intensity * mean_intensity + 1e-6)
 
+    def _calc_saved_file_sharpness(self, path: str):
+        try:
+            img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        except Exception:
+            return None
+        if img is None or getattr(img, "size", 0) == 0:
+            return None
+        try:
+            return self._calc_sharpness(img)
+        except Exception:
+            return None
+
     def _autocrop_borders(self, frame, thr):
         # Package-safe import (supports both module and flat execution)
         try:
@@ -4171,6 +4183,7 @@ class Processor(QtCore.QObject):
                         why = "save_not_attempted"
                         img_path = ""
                         row = None
+                        kind = ""
                         if isinstance(item, dict):
                             ack_q = item.get("ack_q")
                             kind = str(item.get("type") or "")
@@ -4210,6 +4223,10 @@ class Processor(QtCore.QObject):
                                 pass
 
                         if ok:
+                            if kind == "hdr_sdr" and isinstance(row, list) and len(row) > 10:
+                                saved_sharp = self._calc_saved_file_sharpness(img_path)
+                                if saved_sharp is not None:
+                                    row[10] = float(saved_sharp)
                             # hand off to worker thread for emitting
                             try:
                                 hit_q.put_nowait(img_path)
@@ -5413,12 +5430,13 @@ class Processor(QtCore.QObject):
                     )
 
                     processed_crop_xyxy = (int(cx1), int(cy1), int(cx2), int(cy2))
-                    try:
-                        final_crop_for_sharp = frame[int(cy1):int(cy2), int(cx1):int(cx2)]
-                        if final_crop_for_sharp.size > 0:
-                            c["sharp"] = self._calc_sharpness(final_crop_for_sharp)
-                    except Exception:
-                        pass
+                    if not hdr_primary_fullres:
+                        try:
+                            final_crop_for_sharp = frame[int(cy1):int(cy2), int(cx1):int(cx2)]
+                            if final_crop_for_sharp.size > 0:
+                                c["sharp"] = self._calc_sharpness(final_crop_for_sharp)
+                        except Exception:
+                            pass
                     # Keep the annotated preview in sync with the actual saved crop.
                     # Earlier preview boxes were drawn from the pre-final candidate box,
                     # while save_hit later changed the crop via smart-crop, border trim,
@@ -5517,6 +5535,11 @@ class Processor(QtCore.QObject):
                         else:
                             ok, why = _atomic_jpeg_write(crop_img2, crop_img_path, jpg_q)
                         if ok:
+                            if hdr_primary_fullres:
+                                saved_sharp = self._calc_saved_file_sharpness(crop_img_path)
+                                if saved_sharp is not None:
+                                    row[10] = float(saved_sharp)
+                                    c["sharp"] = float(saved_sharp)
                             # emit on worker thread directly
                             self.hit.emit(crop_img_path)
                             # CSV best-effort
