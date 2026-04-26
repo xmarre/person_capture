@@ -2175,9 +2175,9 @@ class Processor(QtCore.QObject):
                     # matched face is small in the frame.
                     if subj is None:
                         continue
-                    if face is not None and face_frame_frac >= 0.075:
+                    if face is not None and face_frame_frac >= 0.12:
                         continue
-                    if subj_h_frac < 0.68:
+                    if subj_h_frac < 0.60:
                         continue
 
                 crop = self._ratio_crop_containing_box(
@@ -2281,9 +2281,9 @@ class Processor(QtCore.QObject):
             if is_landscape:
                 if subj is None:
                     continue
-                if face is not None and face_frame_frac >= 0.075:
+                if face is not None and face_frame_frac >= 0.12:
                     continue
-                if subj_h_frac < 0.68:
+                if subj_h_frac < 0.60:
                     continue
                 fallback_profile = "body"
             fallback_ratio = rs
@@ -10066,17 +10066,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'crop_penalty_weight_spin'):
             self.crop_penalty_weight_spin.setValue(cfg.crop_penalty_weight)
         try:
-            self.cfg.crop_head_side_pad_frac = float(getattr(cfg, "crop_head_side_pad_frac", 0.70))
+            self.cfg.crop_head_side_pad_frac = float(
+                getattr(cfg, "crop_head_side_pad_frac", SessionConfig.crop_head_side_pad_frac)
+            )
         except Exception:
-            self.cfg.crop_head_side_pad_frac = 0.70
+            self.cfg.crop_head_side_pad_frac = float(SessionConfig.crop_head_side_pad_frac)
         try:
-            self.cfg.crop_head_top_pad_frac = float(getattr(cfg, "crop_head_top_pad_frac", 0.85))
+            self.cfg.crop_head_top_pad_frac = float(
+                getattr(cfg, "crop_head_top_pad_frac", SessionConfig.crop_head_top_pad_frac)
+            )
         except Exception:
-            self.cfg.crop_head_top_pad_frac = 0.85
+            self.cfg.crop_head_top_pad_frac = float(SessionConfig.crop_head_top_pad_frac)
         try:
-            self.cfg.crop_head_bottom_pad_frac = float(getattr(cfg, "crop_head_bottom_pad_frac", 0.30))
+            self.cfg.crop_head_bottom_pad_frac = float(
+                getattr(cfg, "crop_head_bottom_pad_frac", SessionConfig.crop_head_bottom_pad_frac)
+            )
         except Exception:
-            self.cfg.crop_head_bottom_pad_frac = 0.30
+            self.cfg.crop_head_bottom_pad_frac = float(SessionConfig.crop_head_bottom_pad_frac)
         try:
             self.cfg.wide_face_aspect_penalty_weight = float(
                 getattr(cfg, "wide_face_aspect_penalty_weight", 10.0)
@@ -11042,22 +11048,31 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         try:
             self.cfg.crop_head_side_pad_frac = float(
-                s.value("crop_head_side_pad_frac", getattr(self.cfg, "crop_head_side_pad_frac", 0.70))
+                s.value(
+                    "crop_head_side_pad_frac",
+                    getattr(self.cfg, "crop_head_side_pad_frac", SessionConfig.crop_head_side_pad_frac),
+                )
             )
         except Exception:
-            self.cfg.crop_head_side_pad_frac = 0.70
+            self.cfg.crop_head_side_pad_frac = float(SessionConfig.crop_head_side_pad_frac)
         try:
             self.cfg.crop_head_top_pad_frac = float(
-                s.value("crop_head_top_pad_frac", getattr(self.cfg, "crop_head_top_pad_frac", 0.85))
+                s.value(
+                    "crop_head_top_pad_frac",
+                    getattr(self.cfg, "crop_head_top_pad_frac", SessionConfig.crop_head_top_pad_frac),
+                )
             )
         except Exception:
-            self.cfg.crop_head_top_pad_frac = 0.85
+            self.cfg.crop_head_top_pad_frac = float(SessionConfig.crop_head_top_pad_frac)
         try:
             self.cfg.crop_head_bottom_pad_frac = float(
-                s.value("crop_head_bottom_pad_frac", getattr(self.cfg, "crop_head_bottom_pad_frac", 0.30))
+                s.value(
+                    "crop_head_bottom_pad_frac",
+                    getattr(self.cfg, "crop_head_bottom_pad_frac", SessionConfig.crop_head_bottom_pad_frac),
+                )
             )
         except Exception:
-            self.cfg.crop_head_bottom_pad_frac = 0.30
+            self.cfg.crop_head_bottom_pad_frac = float(SessionConfig.crop_head_bottom_pad_frac)
         try:
             self.cfg.wide_face_aspect_penalty_weight = float(
                 s.value(
