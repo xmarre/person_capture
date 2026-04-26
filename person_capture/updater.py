@@ -199,17 +199,17 @@ def git_update(repo: Path, autostash: bool = True) -> Tuple[bool, str]:
         prev = _call(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
         # prepare
         _call(["git", "fetch", "--tags", "--prune"], cwd=repo)
-        # stash if dirty (so update doesn't fail)
-        if autostash:
-            try:
-                status = _call(["git", "status", "--porcelain"], cwd=repo).stdout.strip()
-                if status:
-                    _call(["git", "stash", "push", "-u", "-m", "PersonCapture autostash"], cwd=repo)
-            except Exception:
-                pass
-        # Rebase onto upstream
+        # Rebase onto upstream. Do not run our own `git stash push -u` here:
+        # - `-u` includes untracked, non-ignored files and can make user output
+        #   directories appear to vanish during updates.
+        # - the old code never popped that manual stash.
+        # Git's `--autostash` is enough for tracked local edits and is restored by
+        # git itself at the end of the pull/rebase.
         upstream = _git_tracking_remote(repo) or "origin/main"
-        pull = _call(["git", "pull", "--rebase", "--autostash"], cwd=repo)
+        pull_args = ["git", "pull", "--rebase"]
+        if autostash:
+            pull_args.append("--autostash")
+        pull = _call(pull_args, cwd=repo)
         if pull.returncode != 0 and pull.stderr:
             # attempt a non-rebase pull
             _call(["git", "pull", upstream.split('/')[0], upstream.split('/')[1]], cwd=repo, check=True)
@@ -332,6 +332,50 @@ def stage_zip_update(repo: Path, branch: Optional[str] = None) -> Tuple[bool, st
     except Exception as e:
         return False, f"stage error: {e}", None
 
+def _remove_path_for_update_replace(path: Path) -> None:
+    """Remove a path that is about to be replaced by an update payload."""
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=False)
+        else:
+            path.unlink(missing_ok=True)
+    except FileNotFoundError:
+        pass
+
+
+def _merge_staged_item_preserving_user_data(src: Path, dst: Path) -> None:
+    """
+    Merge one staged update item into the install tree.
+
+    The previous zip updater removed a destination directory before moving the
+    staged directory into place. That is safe for pure source trees, but it is
+    wrong for this app because users commonly keep runtime data under the
+    install root, and sometimes under package subdirectories. Directory-level
+    replacement can therefore delete output/crops while updating the code.
+
+    This replaces files that are present in the update payload, but never
+    deletes destination-only children inside existing directories. That
+    preserves user output and caches while still allowing shipped files to be
+    updated in place.
+    """
+    if src.is_dir() and not src.is_symlink():
+        if dst.exists() and (not dst.is_dir() or dst.is_symlink()):
+            _remove_path_for_update_replace(dst)
+        dst.mkdir(parents=True, exist_ok=True)
+        for child in list(src.iterdir()):
+            _merge_staged_item_preserving_user_data(child, dst / child.name)
+        try:
+            src.rmdir()
+        except OSError:
+            shutil.rmtree(src, ignore_errors=True)
+        return
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() or dst.is_symlink():
+        _remove_path_for_update_replace(dst)
+    shutil.move(str(src), str(dst))
+
+
 def _pip_install_requirements(req_file: Path) -> str:
     try:
         if os.environ.get(PIP_ENV_SKIP, "").strip().lower() in ("1","true","yes","on"):
@@ -372,19 +416,13 @@ def apply_staged_update(repo: Path) -> Tuple[bool, str]:
         repo_req = _select_req_file(repo_reqs)
         staged_bytes = staged_req.read_bytes() if staged_req and staged_req.exists() else b""
         repo_bytes = repo_req.read_bytes() if repo_req and repo_req.exists() else b""
-        # Move all files/dirs from staged into repo (in-place overwrite)
-        for item in staged.iterdir():
-            dst = repo / item.name
-            # Remove existing dst first to avoid merge weirdness
-            if dst.exists():
-                if dst.is_dir():
-                    shutil.rmtree(dst, ignore_errors=True)
-                else:
-                    try:
-                        dst.unlink()
-                    except Exception:
-                        pass
-            shutil.move(str(item), str(dst))
+        # Move files/dirs from staged into repo without deleting destination-only
+        # children inside existing directories. The old implementation did
+        # `rmtree(dst)` for every staged directory, so replacing the shipped
+        # `person_capture/` package could also delete user-created
+        # `person_capture/output/crops/` data.
+        for item in list(staged.iterdir()):
+            _merge_staged_item_preserving_user_data(item, repo / item.name)
         try:
             shutil.rmtree(staged, ignore_errors=True)
         except Exception:
