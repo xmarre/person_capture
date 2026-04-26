@@ -5560,7 +5560,7 @@ class Processor(QtCore.QObject):
                                         if crop_profile_for_guard == "body" and was_landscape and fixed_ratio in {"1:1", "2:3", "3:4"}:
                                             c["crop_profile"] = "upper"
                                             crop_profile_for_guard = "upper"
-                                    elif hard_def > 0.01:
+                                    elif hard_def > 0.01 or force_portrait:
                                         fallback_ratio = "2:3" if force_portrait else ratio_str
                                         fallback_done = False
                                         try:
