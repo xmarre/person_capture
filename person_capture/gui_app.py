@@ -2174,7 +2174,7 @@ class Processor(QtCore.QObject):
                     # likely to cut facial context near the edge.
                     if face is not None and face_frame_frac >= 0.12:
                         continue
-                    if not body_cadence and subj_h_frac < 0.60:
+                    if subj_h_frac < 0.60:
                         continue
 
                 crop = self._ratio_crop_containing_box(
