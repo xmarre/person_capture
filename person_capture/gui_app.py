@@ -5610,6 +5610,13 @@ class Processor(QtCore.QObject):
                         if not ok:
                             if hdr_primary_fullres:
                                 hdr_sdr_failures += 1
+                                hdr_disable_after = max(0, int(getattr(self.cfg, "hdr_sdr_disable_after_failures", 1) or 0))
+                                if hdr_disable_after > 0 and hdr_sdr_failures >= hdr_disable_after:
+                                    self._status(
+                                        "HDR full-res still export disabled for this run after repeated failures; using decoded-frame JPEG fallback",
+                                        key="hdr_sdr_export_disable",
+                                        interval=30.0,
+                                    )
                             self._status(
                                 f"Save failed ({why}): {crop_img_path}",
                                 key="save_err",
