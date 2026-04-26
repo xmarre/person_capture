@@ -3939,7 +3939,8 @@ class Processor(QtCore.QObject):
 
             # Default: HDR passthrough ON when available unless explicitly disabled in cfg.
             cfg_hdr_passthrough = bool(getattr(cfg, "hdr_passthrough", True))
-            prescan_will_run = bool(getattr(cfg, "prescan_enable", True)) and total_frames > 0
+            prescan_enabled = bool(getattr(cfg, "prescan_enable", True))
+            prescan_will_run = prescan_enabled and total_frames > 0
             allow_prescan_hdr_preview = bool(getattr(cfg, "prescan_hdr_preview", False))
             want_hdr_passthrough = (
                 hdr_active
@@ -3986,12 +3987,14 @@ class Processor(QtCore.QObject):
                     # Drive preview from a dedicated P010 reader.
                     self._hdr_passthrough_active = True
                     self._hdr_preview_latest = None
-                    if (not prescan_will_run) or allow_prescan_hdr_preview:
+                    # Use prescan intent here instead of early total_frames because
+                    # total/fps may be repaired a few lines later.
+                    if (not prescan_enabled) or allow_prescan_hdr_preview:
                         try:
                             pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
                             self._hdr_preview_seek(pos)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.debug("Initial HDR preview seek skipped after failure: %s", exc)
                     self._status(
                         "HDR passthrough preview: enabled (P010 preview reader)",
                         key="hdr_passthrough",
