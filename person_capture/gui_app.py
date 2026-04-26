@@ -5491,12 +5491,24 @@ class Processor(QtCore.QObject):
                                 prominent_face = cur_face_h_frac >= 0.16 or float(c.get("face_frac") or 0.0) >= 0.12
                                 force_portrait = was_landscape and (crop_profile_for_guard != "body" or prominent_face)
                                 if hard_def > 0.01 or force_portrait:
+                                    identity_guard = self._coerce_box_xyxy(
+                                        self._union_boxes_xyxy(
+                                            c.get("subject_box") or c.get("show_box"),
+                                            c.get("head_box"),
+                                            c.get("face_box"),
+                                        ),
+                                        (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                    )
                                     protect_box_clamped = (
                                         self._coerce_box_xyxy(protect_box, (repair_bx1, repair_by1, repair_bx2, repair_by2))
                                         if protect_box is not None
                                         else None
                                     )
-                                    full_guard_box = self._union_boxes_xyxy(hard_face_padded, protect_box_clamped) or hard_face_padded
+                                    full_guard_box = self._union_boxes_xyxy(
+                                        hard_face_padded,
+                                        identity_guard,
+                                        protect_box_clamped,
+                                    ) or hard_face_padded
                                     best_fix = None
                                     for fix_ratio in ("1:1", "2:3", "3:4"):
                                         try:
