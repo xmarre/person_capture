@@ -1923,7 +1923,29 @@ class Processor(QtCore.QObject):
         y1 = max(by1, min(by2 - crop_h, y1))
         x2 = x1 + crop_w
         y2 = y1 + crop_h
-        return self._clip_to_frame(x1, y1, x2, y2, int(round(bx2)), int(round(by2)))
+
+        # Quantize content bounds first, then clip in local coordinates so
+        # rounding cannot re-enter trimmed regions when bounds are offset.
+        ibx1 = int(math.ceil(bx1))
+        iby1 = int(math.ceil(by1))
+        ibx2 = int(math.floor(bx2))
+        iby2 = int(math.floor(by2))
+        if ibx2 <= ibx1:
+            ibx1 = int(round(bx1))
+            ibx2 = max(ibx1 + 1, int(round(bx2)))
+        if iby2 <= iby1:
+            iby1 = int(round(by1))
+            iby2 = max(iby1 + 1, int(round(by2)))
+
+        lx1, ly1, lx2, ly2 = self._clip_to_frame(
+            x1 - float(ibx1),
+            y1 - float(iby1),
+            x2 - float(ibx1),
+            y2 - float(iby1),
+            ibx2 - ibx1,
+            iby2 - iby1,
+        )
+        return ibx1 + lx1, iby1 + ly1, ibx1 + lx2, iby1 + ly2
 
     @staticmethod
     def _find_person_box_for_face(
