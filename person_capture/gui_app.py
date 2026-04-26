@@ -6012,7 +6012,12 @@ class Processor(QtCore.QObject):
                             return False
                         primary_saved_or_enqueued = True
                     if primary_saved_or_enqueued and hdr_out_path:
-                        hdr_crop_xyxy = self._even_hdr_crop_xyxy(source_crop_xyxy, source_size)
+                        is_avif_archive = hdr_out_path.lower().endswith(".avif")
+                        hdr_crop_xyxy = (
+                            source_crop_xyxy
+                            if is_avif_archive
+                            else self._even_hdr_crop_xyxy(source_crop_xyxy, source_size)
+                        )
                         if archive_q is not None:
                             try:
                                 archive_q.put_nowait({
