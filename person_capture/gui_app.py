@@ -2028,19 +2028,17 @@ class Processor(QtCore.QObject):
                 validated_user_ratios.append(rs)
 
         def _ratio_list_for_profile(profile: str) -> list[str]:
-            # Final composition must not let a stale/global ratio list turn a
-            # face/head shot into a wide crop. User ratios are still honored, but
-            # only when they are compatible with the composition profile.
             preferred = {
                 "close": ["1:1", "2:3", "3:4"],
                 "upper": ["2:3", "3:4", "1:1"],
                 "body": ["2:3", "3:4", "1:1", "3:2"],
                 "base": ["1:1", "2:3"],
             }.get(profile, ["1:1", "2:3"])
+            if validated_user_ratios:
+                return list(validated_user_ratios)
             allow_landscape = profile == "body"
-            seed = list(validated_user_ratios) + preferred
             out: list[str] = []
-            for rs in seed:
+            for rs in preferred:
                 try:
                     rw, rh = parse_ratio(rs)
                     aspect = float(rw) / max(1e-6, float(rh))
@@ -2152,7 +2150,7 @@ class Processor(QtCore.QObject):
                 except Exception:
                     continue
                 is_landscape = aspect > 1.05
-                if profile in {"close", "upper"} and is_landscape:
+                if not validated_user_ratios and profile in {"close", "upper"} and is_landscape:
                     continue
 
                 crop = self._ratio_crop_containing_box(
@@ -4854,7 +4852,7 @@ class Processor(QtCore.QObject):
                                         sharp=sharp,
                                         box=(ox1, oy1, ox2, oy2),
                                         area=(ox2 - ox1) * (oy2 - oy1),
-                                        show_box=subject_box_global or face_box_global,
+                                        show_box=subject_box_global or (ox1, oy1, ox2, oy2),
                                         subject_box=subject_box_global,
                                         face_box=face_box_global,
                                         head_box=head_box_global,
