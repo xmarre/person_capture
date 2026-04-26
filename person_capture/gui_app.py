@@ -284,6 +284,7 @@ APP_NAME = "PersonCapture GUI"
 
 _SETTINGS_KEY_FFMPEG_DIR = "paths/ffmpeg_dir"
 _SETTINGS_KEY_SDR_NITS_MIGRATED = "migrations/sdr_nits_default_100_v1"
+_SETTINGS_KEY_CROP_HEAD_PAD_MIGRATED = "migrations/crop_head_pad_defaults_088_095_v1"
 
 # ---------------------- Data & Settings ----------------------
 
@@ -2170,9 +2171,9 @@ class Processor(QtCore.QObject):
                 if profile == "body" and is_landscape:
                     # Landscape is a rare context/body sample, not a normal face
                     # framing choice. It is only allowed on the deterministic body
-                    # cadence, with a real associated person box, and only when the
+                    # prior and a real associated person box, and only when the
                     # matched face is small in the frame.
-                    if subj is None or not body_cadence:
+                    if subj is None:
                         continue
                     if face is not None and face_frame_frac >= 0.075:
                         continue
@@ -2278,7 +2279,7 @@ class Processor(QtCore.QObject):
                 continue
             is_landscape = aspect > 1.05
             if is_landscape:
-                if subj is None or not body_cadence:
+                if subj is None:
                     continue
                 if face is not None and face_frame_frac >= 0.075:
                     continue
@@ -5411,10 +5412,12 @@ class Processor(QtCore.QObject):
                         )
                     else:
                         # Close/upper/portrait crops protect the detected head and
-                        # face only. show_box/candidate boxes are identity/debug
-                        # evidence and must not force the final crop shape. Including
-                        # them here made stale wide boxes survive portrait repair.
+                        # face plus the active associated person box. show_box is
+                        # a fallback only when subject_box is missing, because
+                        # show_box can be stale composed geometry.
+                        subject_or_show = c.get("subject_box") or c.get("show_box")
                         protect_box = self._union_boxes_xyxy(
+                            subject_or_show,
                             c.get("head_box"),
                             c.get("face_box"),
                         )
@@ -5537,8 +5540,10 @@ class Processor(QtCore.QObject):
                                             (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                         )
                                     else:
+                                        subject_or_show = c.get("subject_box") or c.get("show_box")
                                         identity_guard = self._coerce_box_xyxy(
                                             self._union_boxes_xyxy(
+                                                subject_or_show,
                                                 c.get("head_box"),
                                                 c.get("face_box"),
                                             ),
@@ -10687,6 +10692,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sdr_nits_spin.setValue(_sdr_nits)
         except Exception:
             self.sdr_nits_spin.setValue(float(self.cfg.sdr_nits))
+        try:
+            # One-time migration for the face/head protection defaults so
+            # persisted pre-change defaults pick up the final alignment fix.
+            if not bool(s.value(_SETTINGS_KEY_CROP_HEAD_PAD_MIGRATED, False, type=bool)):
+                def _migrate_crop_pad(key: str, old_default: float, new_default: float) -> None:
+                    raw = s.value(key, None)
+                    if raw is None:
+                        s.setValue(key, float(new_default))
+                        return
+                    try:
+                        current = float(raw)
+                    except Exception:
+                        return
+                    if abs(current - old_default) < 1e-6:
+                        s.setValue(key, float(new_default))
+
+                _migrate_crop_pad("crop_head_side_pad_frac", 0.70, 0.88)
+                _migrate_crop_pad("crop_head_top_pad_frac", 0.85, 0.95)
+                s.setValue(_SETTINGS_KEY_CROP_HEAD_PAD_MIGRATED, True)
+        except Exception:
+            pass
         try:
             self.tm_desat_spin.setValue(float(s.value("tm_desat", self.cfg.tm_desat)))
         except Exception:
