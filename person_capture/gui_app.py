@@ -2061,7 +2061,9 @@ class Processor(QtCore.QObject):
                     _add_ratio(rs)
             for rs in available:
                 _add_ratio(rs)
-            return out or ["1:1", "2:3"]
+            if out:
+                return out
+            return [] if validated_user_ratios else ["1:1", "2:3"]
 
         base = self._coerce_box_xyxy(base_crop_xyxy, bounds)
         subj = self._coerce_box_xyxy(subject_box, bounds)
@@ -6873,7 +6875,9 @@ class Processor(QtCore.QObject):
                 _add_first_lp_opt(opts, ("target_trc", "color_trc"), "bt709")
                 self._add_lp_opt(opts, supported, "range", "full")
                 _add_first_lp_opt(opts, ("sdr_peak", "target_peak", "dst_peak", "peak"), f"{nits:.6g}")
-                self._add_lp_opt(opts, supported, "desaturation", f"{desat:.6g}")
+                if not _add_first_lp_opt(opts, ("desaturation", "desat"), f"{desat:.6g}"):
+                    sat = max(0.0, 1.0 - desat)
+                    _add_first_lp_opt(opts, ("saturation", "sat"), f"{sat:.6g}")
                 _add_first_lp_opt(opts, ("gamut_mode", "gamut_mapping"), gamut)
 
             base_lp_opts = [f"tonemapping='{algo}'"]
