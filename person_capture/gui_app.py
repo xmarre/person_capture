@@ -13,8 +13,16 @@ Run:
 from __future__ import annotations
 import time
 
-import os, sys, subprocess, shutil, threading, struct, hashlib
-import json, csv, traceback
+import os
+import sys
+import subprocess
+import shutil
+import threading
+import struct
+import hashlib
+import json
+import csv
+import traceback
 import logging
 
 # Ensure logs also go to stdout (console), not only to the Qt log widget.
@@ -5923,6 +5931,56 @@ class Processor(QtCore.QObject):
         opts.append(f"{name}={value}")
         return True
 
+    def _ffmpeg_accurate_seek_input_args(self, seek_sec: Optional[float]) -> tuple[list[str], list[str]]:
+        """Return (pre-input args, post-input args) for accurate still export seeking."""
+        if seek_sec is None:
+            return [], []
+        try:
+            seek_f = max(0.0, float(seek_sec))
+        except Exception:
+            return [], []
+        try:
+            preroll_sec = max(0.0, float(os.getenv("PC_HDR_EXPORT_PREROLL_SEC", "2.0")))
+        except Exception:
+            preroll_sec = 2.0
+        preroll_sec = min(seek_f, preroll_sec)
+        if preroll_sec > 1e-6:
+            return ["-ss", f"{max(0.0, seek_f - preroll_sec):.6f}"], ["-ss", f"{preroll_sec:.6f}"]
+        return [], ["-ss", f"{seek_f:.6f}"]
+
+    @staticmethod
+    def _validated_jpeg_quality(cfg: object, default: int = 95) -> int:
+        try:
+            return max(1, min(100, int(getattr(cfg, "jpg_quality", default))))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _validate_hdr_sdr_export_image(path: str) -> tuple[bool, str]:
+        """Reject empty/corrupt/all-black HDR still exports before accepting them."""
+        try:
+            if not path or not os.path.exists(path):
+                return False, "missing_output"
+            if os.path.getsize(path) < 1024:
+                return False, "tiny_output"
+            data = np.fromfile(path, dtype=np.uint8)
+            if data.size < 1024:
+                return False, "tiny_output"
+            img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+            if img is None or img.ndim != 3 or img.size == 0:
+                return False, "decode_failed"
+            y = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            mean = float(np.mean(y))
+            p95 = float(np.percentile(y, 95.0))
+            p99 = float(np.percentile(y, 99.0))
+            # Real candle-lit scenes are often dark; failed seek/decode frames are
+            # effectively all black. Keep the rejection threshold deliberately low.
+            if mean < 1.0 and p95 < 3.0 and p99 < 8.0:
+                return False, f"near_black_output mean={mean:.3f} p95={p95:.3f} p99={p99:.3f}"
+            return True, ""
+        except Exception as exc:
+            return False, f"validate_failed:{exc}"
+
     def _hdr_tonemap_filter_cmds(
         self,
         ffmpeg_bin: str,
@@ -5945,12 +6003,12 @@ class Processor(QtCore.QObject):
             fps = float(getattr(self, "_fps", 0.0) or 0.0)
             if fps > 0 and math.isfinite(fps):
                 seek_sec = max(0.0, float(frame_idx) / fps)
+        pre_seek_args, post_seek_args = self._ffmpeg_accurate_seek_input_args(seek_sec)
         base = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
-        if seek_sec is not None:
-            base += ["-ss", f"{seek_sec:.6f}"]
-        base += ["-i", self.cfg.video, "-map", "0:v:0", "-frames:v", "1"]
-        q = max(2, min(31, int(round((100 - int(getattr(self.cfg, "jpg_quality", 90))) / 3.5 + 2))))
-        enc = ["-an", "-sn", "-dn", "-q:v", str(q), "-update", "1", out_path]
+        base += pre_seek_args
+        base += ["-i", self.cfg.video]
+        base += post_seek_args
+        base += ["-map", "0:v:0", "-frames:v", "1"]
         crop = f"crop={w}:{h}:{x1}:{y1}"
         src = "setparams=color_trc=smpte2084:color_primaries=bt2020:colorspace=bt2020nc:range=limited"
         desat = float(getattr(self.cfg, "tm_desat", 0.25))
@@ -5971,18 +6029,40 @@ class Processor(QtCore.QObject):
         peak_detect = bool(getattr(self.cfg, "hdr_sdr_peak_detect", True))
         allow_inaccurate = bool(getattr(self.cfg, "hdr_sdr_allow_inaccurate_fallback", False))
 
+        jpg_quality = self._validated_jpeg_quality(self.cfg, default=95)
+        q = max(1, min(31, int(round((100 - jpg_quality) / 5.0 + 1))))
+        if quality in ("resolve_like", "madvr_like"):
+            q = min(q, 2)
+        enc = [
+            "-an", "-sn", "-dn",
+            "-c:v", "mjpeg",
+            "-q:v", str(q),
+            "-pix_fmt", "yuvj444p",
+            "-update", "1",
+            out_path,
+        ]
+
         filters = ffmpeg_has_hdr_filters(ffmpeg_bin)
         cmds: list[list[str]] = []
         if filters.get("libplacebo") and pref in ("auto", "libplacebo"):
             supported = self._ffmpeg_libplacebo_options(ffmpeg_bin)
-            base_lp_opts = [
-                f"tonemapping='{algo}'",
-                "colorspace=bt709",
-                "color_primaries=bt709",
-                "color_trc=bt709",
-                "range=full",
-                "format=bgra",
-            ]
+
+            def _add_first_lp_opt(opts: list[str], names: tuple[str, ...], value: str) -> bool:
+                for name in names:
+                    if self._add_lp_opt(opts, supported, name, value):
+                        return True
+                return False
+
+            base_lp_opts = [f"tonemapping='{algo}'"]
+            self._add_lp_opt(base_lp_opts, supported, "colorspace", "bt709")
+            _add_first_lp_opt(base_lp_opts, ("color_primaries", "target_primaries"), "bt709")
+            _add_first_lp_opt(base_lp_opts, ("color_trc", "target_trc"), "bt709")
+            self._add_lp_opt(base_lp_opts, supported, "range", "full")
+            lp_readback_in_filter = _add_first_lp_opt(
+                base_lp_opts,
+                ("format", "out_format", "out_pfmt"),
+                "bgra",
+            )
             self._add_lp_opt(base_lp_opts, supported, "peak_detect", "true" if peak_detect else "false")
             if quality in ("resolve_like", "madvr_like"):
                 self._add_lp_opt(base_lp_opts, supported, "peak_detection_preset", "high_quality")
@@ -6005,14 +6085,13 @@ class Processor(QtCore.QObject):
                 if supported and "gamut_mode" in supported:
                     alt.append(f"gamut_mode={gamut}")
                     lp_variants.append(alt)
-            lp_variants.append([
-                f"tonemapping='{algo}'",
-                "colorspace=bt709",
-                "color_primaries=bt709",
-                "color_trc=bt709",
-                "range=full",
-                "format=bgra",
-            ])
+            minimal_lp_opts = [f"tonemapping='{algo}'"]
+            self._add_lp_opt(minimal_lp_opts, supported, "colorspace", "bt709")
+            _add_first_lp_opt(minimal_lp_opts, ("color_primaries", "target_primaries"), "bt709")
+            _add_first_lp_opt(minimal_lp_opts, ("color_trc", "target_trc"), "bt709")
+            self._add_lp_opt(minimal_lp_opts, supported, "range", "full")
+            _add_first_lp_opt(minimal_lp_opts, ("format", "out_format", "out_pfmt"), "bgra")
+            lp_variants.append(minimal_lp_opts)
 
             seen_lp: set[str] = set()
             for opts in lp_variants:
@@ -6020,7 +6099,12 @@ class Processor(QtCore.QObject):
                 if opt_str in seen_lp:
                     continue
                 seen_lp.add(opt_str)
-                lp = f"{crop},format=p010le,{src},hwupload=extra_hw_frames=1,libplacebo={opt_str},format=bgr24"
+                # Renderer-equivalent order: tone-map the full source frame first,
+                # then crop in SDR/RGB. Cropping before tone mapping changes the
+                # peak/gamut context and can misalign 4:2:0 chroma at arbitrary crop
+                # offsets, causing visible artifacts versus madVR/MPCVR-style output.
+                readback = "" if lp_readback_in_filter else ",hwdownload,format=bgra"
+                lp = f"format=p010le,{src},hwupload=extra_hw_frames=1,libplacebo={opt_str}{readback},format=bgr24,{crop}"
                 cmds.append(
                     base[:1]
                     + ["-init_hw_device", "vulkan=vk:0", "-filter_hw_device", "vk"]
@@ -6063,12 +6147,12 @@ class Processor(QtCore.QObject):
             elif gamut == "relative":
                 z_desat = max(0.0, z_desat - 0.05)
             zf = (
-                f"{crop},{src},"
+                f"{src},"
                 "zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc,"
                 "zscale=transfer=linear:npl=1000,format=gbrpf32le,"
                 f"tonemap=tonemap={z_algo}:param={z_param:.6g}:desat={z_desat:.6g}:peak={z_peak:.6g},"
                 f"zscale=transfer=bt709:primaries=bt709:matrix=bt709:dither={z_dither},"
-                "zscale=rangein=pc:range=pc,format=bgr24"
+                f"zscale=rangein=pc:range=pc,format=bgr24,{crop}"
             )
             cmds.append(base + ["-vf", zf] + enc)
         if allow_inaccurate and pref in ("auto", "scale"):
@@ -6076,7 +6160,7 @@ class Processor(QtCore.QObject):
             # but it is still original-resolution and only used if the HDR filters fail.
             # Disabled by default because the goal is faithful HDR->SDR rendering,
             # not silently saving a washed-out fallback frame.
-            sf = f"{crop},scale=in_range=limited:out_range=full,format=bgr24"
+            sf = f"scale=in_range=limited:out_range=full,format=bgr24,{crop}"
             cmds.append(base + ["-vf", sf] + enc)
         return cmds
 
@@ -6105,9 +6189,22 @@ class Processor(QtCore.QObject):
                 pass
             try:
                 cp = subprocess.run(cmd, text=True, capture_output=True, check=False, timeout=timeout_sec)
-                if cp.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) >= 1024:
-                    os.replace(tmp, out_path)
-                    return True, ""
+                if cp.returncode == 0:
+                    valid, invalid_why = self._validate_hdr_sdr_export_image(tmp)
+                    if valid:
+                        os.replace(tmp, out_path)
+                        return True, ""
+                    try:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    except Exception:
+                        pass
+                    self._status(
+                        f"HDR full-res export rejected: {invalid_why}",
+                        key="hdr_sdr_export",
+                        interval=10.0,
+                    )
+                    continue
                 tail = (cp.stderr or cp.stdout or "").splitlines()[-4:]
                 why = " | ".join(tail) if tail else f"ffmpeg_rc={cp.returncode}"
                 self._status(f"HDR full-res export fallback: {why}", key="hdr_sdr_export", interval=10.0)
@@ -6168,12 +6265,15 @@ class Processor(QtCore.QObject):
 
         is_avif = out_path.lower().endswith(".avif")
 
+        pre_seek_args, post_seek_args = self._ffmpeg_accurate_seek_input_args(seek_sec)
         cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
-        if seek_sec is not None:
-            cmd += ["-ss", f"{seek_sec:.6f}"]
+        cmd += pre_seek_args
         cmd += [
             "-i",
             self.cfg.video,
+        ]
+        cmd += post_seek_args
+        cmd += [
             "-vf",
             vf,
             "-map",
@@ -6311,6 +6411,13 @@ class Processor(QtCore.QObject):
         self._hdr_preview_reader = None
         self._hdr_preview_latest = None
         self._hdr_passthrough_active = False
+
+    @QtCore.Slot()
+    def disable_hdr_passthrough(self) -> None:
+        """Disable HDR passthrough and clean up resources.
+        Called from MainWindow when watchdog detects HDR preview is stale/dead.
+        """
+        self._hdr_preview_close()
 
     def _normalize_hdr_preview_payload(
         self,
@@ -6506,6 +6613,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # HDR preview UI state flag (mirrors cfg.hdr_passthrough_preview)
         self._hdr_passthrough_enabled: bool = False
+        self._last_hdr_preview_t: float = 0.0
+        self._hdr_preview_seen: bool = False
         self._curator_fallback: Optional[Processor] = None
         self._fps: Optional[float] = None
         self._total_frames: Optional[int] = None
@@ -8247,6 +8356,27 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             self._log(f"Curator dispatch failed: {exc}")
 
+    def _queue_worker_disable_hdr_passthrough(self) -> None:
+        worker = getattr(self, "_worker", None)
+        if worker is None:
+            return
+        try:
+            conn_type = (
+                QtCore.Qt.ConnectionType.QueuedConnection
+                if hasattr(QtCore.Qt, "ConnectionType")
+                else QtCore.Qt.QueuedConnection
+            )
+            QtCore.QMetaObject.invokeMethod(
+                worker,
+                "disable_hdr_passthrough",
+                conn_type,
+            )
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "Failed to queue HDR passthrough shutdown",
+                exc_info=True,
+            )
+
     def _on_speed_combo_changed(self, txt: str):
         if not self._worker:
             return
@@ -8959,6 +9089,8 @@ class MainWindow(QtWidgets.QMainWindow):
             cfg.hdr_passthrough and getattr(self, "_hdr_passthrough_supported", False)
         )
         self._hdr_passthrough_enabled = passthrough_active
+        self._last_hdr_preview_t = time.perf_counter()
+        self._hdr_preview_seen = False
 
         # basic validation
         if not os.path.isfile(cfg.video):
@@ -9094,8 +9226,30 @@ class MainWindow(QtWidgets.QMainWindow):
 
         _update_label(img)
 
+        hdr_passthrough_enabled = bool(getattr(self, "_hdr_passthrough_enabled", False))
+        if hdr_passthrough_enabled:
+            ctx_ok = False
+            try:
+                widget = getattr(self, "hdr_widget", None)
+                has_ctx = getattr(widget, "has_valid_ctx", None) if widget is not None else None
+                ctx_ok = bool(has_ctx()) if callable(has_ctx) else False
+            except Exception:
+                ctx_ok = False
+            hdr_seen = bool(getattr(self, "_hdr_preview_seen", False))
+            try:
+                last_hdr_t = float(getattr(self, "_last_hdr_preview_t", 0.0) or 0.0)
+                hdr_stale = hdr_seen and ((time.perf_counter() - last_hdr_t) > 2.0)
+            except Exception:
+                hdr_stale = False
+            if (hdr_seen and not ctx_ok) or hdr_stale:
+                log.debug("SDR preview taking over preview_stack (HDR passthrough stale/dead)")
+                self._hdr_passthrough_enabled = False
+                hdr_passthrough_enabled = False
+                # Propagate to worker: disable HDR passthrough and clean up reader
+                self._queue_worker_disable_hdr_passthrough()
+
         # If HDR passthrough is not active, SDR preview owns the stack.
-        if not getattr(self, "_hdr_passthrough_enabled", False):
+        if not hdr_passthrough_enabled:
             try:
                 if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
                     log.debug("SDR preview taking over preview_stack (index 0)")
@@ -9157,6 +9311,11 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         log = logging.getLogger(__name__)
 
+        # Early check: if the worker has disabled HDR passthrough, stop processing frames.
+        worker = getattr(self, "_worker", None)
+        if worker is not None and not getattr(worker, "_hdr_passthrough_active", False):
+            return
+
         widget = getattr(self, "hdr_widget", None)
         if widget is None:
             return
@@ -9175,6 +9334,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._hdr_passthrough_enabled:
                 log.info("HDR passthrough: disabling (init failed)")
             self._hdr_passthrough_enabled = False
+            # Propagate to worker: disable HDR passthrough and clean up reader
+            self._queue_worker_disable_hdr_passthrough()
             if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
                 log.debug("SDR preview taking over preview_stack (index 0)")
                 self.preview_stack.setCurrentIndex(0)
@@ -9203,10 +9364,14 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._hdr_passthrough_enabled:
                 log.info("HDR passthrough: disabling (upload failed)")
             self._hdr_passthrough_enabled = False
+            # Propagate to worker: disable HDR passthrough and clean up reader
+            self._queue_worker_disable_hdr_passthrough()
             if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
                 log.debug("SDR preview taking over preview_stack (index 0)")
                 self.preview_stack.setCurrentIndex(0)
             return
+        self._hdr_preview_seen = True
+        self._last_hdr_preview_t = time.perf_counter()
 
         try:
             has_ctx = getattr(widget, "has_valid_ctx", None)
@@ -9218,6 +9383,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._hdr_passthrough_enabled:
                 log.info("HDR passthrough: disabling (no valid context)")
             self._hdr_passthrough_enabled = False
+            # Propagate to worker: disable HDR passthrough and clean up reader
+            self._queue_worker_disable_hdr_passthrough()
             if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
                 log.debug("SDR preview taking over preview_stack (index 0)")
                 self.preview_stack.setCurrentIndex(0)
@@ -9979,10 +10146,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main():
     # Suppress noisy HF hub warnings in GUI
-    import os, logging
+    import os
+    import logging
     os.environ.setdefault('HF_HUB_DISABLE_TELEMETRY', '1')
     try:
-        import huggingface_hub
         logging.getLogger('huggingface_hub').setLevel(logging.ERROR)
         logging.getLogger('huggingface_hub.file_download').setLevel(logging.ERROR)
     except Exception:

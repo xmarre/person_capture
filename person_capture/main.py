@@ -104,7 +104,7 @@ def _calc_sharpness(bgr: np.ndarray) -> float:
 from .detectors import PersonDetector
 from .face_embedder import FaceEmbedder
 from .reid_embedder import ReIDEmbedder
-from .utils import ensure_dir, parse_ratio, expand_box_to_ratio, crop_img, cosine_distance
+from .utils import ensure_dir, parse_ratio, expand_box_to_ratio
 
 def load_image(path):
     img = cv2.imread(path, cv2.IMREAD_COLOR)
