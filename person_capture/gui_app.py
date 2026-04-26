@@ -6942,11 +6942,17 @@ class Processor(QtCore.QObject):
         jpg_quality = self._validated_jpeg_quality(self.cfg, default=95)
         q = max(1, min(31, int(round((100 - jpg_quality) / 5.0 + 1))))
         if quality in ("resolve_like", "madvr_like"):
-            q = min(q, 2)
+            # Full-res still export is the final dataset artifact, not a fast
+            # preview cache. Keep it at the visually lossless end of FFmpeg's
+            # MJPEG scale; q=2 is still visibly softer in very dark, low-texture
+            # faces once the UI or training tooling magnifies the crop.
+            q = 1
         enc = [
             "-an", "-sn", "-dn",
             "-c:v", "mjpeg",
             "-q:v", str(q),
+            "-qmin", "1",
+            "-qmax", str(q),
             "-pix_fmt", "yuvj444p",
             "-color_range", "pc",
             "-colorspace", "bt709",
@@ -6980,37 +6986,51 @@ class Processor(QtCore.QObject):
                     _add_first_lp_opt(opts, ("saturation", "sat"), f"{sat:.6g}")
                 _add_first_lp_opt(opts, ("gamut_mode", "gamut_mapping"), gamut)
 
-            base_lp_opts = [f"tonemapping='{algo}'"]
-            _add_output_color_opts(base_lp_opts)
-            _add_first_lp_opt(base_lp_opts, ("format", "out_format", "out_pfmt"), "bgra")
-            self._add_lp_opt(base_lp_opts, supported, "peak_detect", "true" if peak_detect else "false")
-            if algo in {"mobius", "hable", "reinhard", "gamma"}:
-                self._add_lp_opt(base_lp_opts, supported, "tonemapping_param", f"{param:.6g}")
-            if quality in ("resolve_like", "madvr_like"):
-                self._add_lp_opt(base_lp_opts, supported, "peak_detection_preset", "high_quality")
-                self._add_lp_opt(base_lp_opts, supported, "color_map_preset", "high_quality")
-                self._add_lp_opt(base_lp_opts, supported, "contrast_recovery", f"{contrast_recovery:.6g}")
-                self._add_lp_opt(base_lp_opts, supported, "contrast_smoothness", "3.5")
-                self._add_lp_opt(base_lp_opts, supported, "deband", "true")
-                if not self._add_lp_opt(base_lp_opts, supported, "tonemapping_lut_size", "1024"):
-                    self._add_lp_opt(base_lp_opts, supported, "tone_lut_size", "1024")
-                # Match the live preview renderer path: ordered dithering, not a
-                # separate still-export blue-noise path that changes dark gradients.
-                if not self._add_lp_opt(base_lp_opts, supported, "dithering", "ordered"):
-                    self._add_lp_opt(base_lp_opts, supported, "dither_method", "ordered")
-            elif quality == "balanced":
-                self._add_lp_opt(base_lp_opts, supported, "contrast_recovery", f"{min(contrast_recovery, 0.20):.6g}")
-                self._add_lp_opt(base_lp_opts, supported, "tonemapping_lut_size", "512")
-                if not self._add_lp_opt(base_lp_opts, supported, "dithering", "ordered"):
-                    self._add_lp_opt(base_lp_opts, supported, "dither_method", "ordered")
+            # Match the live HDR preview reader's libplacebo algorithm resolution:
+            # GUI/default "auto" does not mean pass literal auto to the still
+            # renderer. The live reader starts with BT.2390, then tries aliases if
+            # a build dislikes the dotted spelling. Passing literal auto here made
+            # saved crops use a different curve than the preview.
+            lp_algos = ["bt.2390" if algo == "auto" else algo]
+            if lp_algos[0] in {"bt.2390", "bt2390"}:
+                lp_algos.append("bt2390" if lp_algos[0] == "bt.2390" else "bt.2390")
 
-            lp_variants: list[list[str]] = [base_lp_opts]
-            minimal_lp_opts = [f"tonemapping='{algo}'"]
-            _add_output_color_opts(minimal_lp_opts)
-            _add_first_lp_opt(minimal_lp_opts, ("format", "out_format", "out_pfmt"), "bgra")
-            if not self._add_lp_opt(minimal_lp_opts, supported, "dithering", "ordered"):
-                self._add_lp_opt(minimal_lp_opts, supported, "dither_method", "ordered")
-            lp_variants.append(minimal_lp_opts)
+            lp_variants: list[list[str]] = []
+            for lp_algo in lp_algos:
+                base_lp_opts = [f"tonemapping='{lp_algo}'"]
+                _add_output_color_opts(base_lp_opts)
+                _add_first_lp_opt(base_lp_opts, ("format", "out_format", "out_pfmt"), "bgra")
+                self._add_lp_opt(base_lp_opts, supported, "peak_detect", "true" if peak_detect else "false")
+                if lp_algo in {"mobius", "hable", "reinhard", "gamma"}:
+                    self._add_lp_opt(base_lp_opts, supported, "tonemapping_param", f"{param:.6g}")
+                if quality in ("resolve_like", "madvr_like"):
+                    self._add_lp_opt(base_lp_opts, supported, "peak_detection_preset", "high_quality")
+                    self._add_lp_opt(base_lp_opts, supported, "color_map_preset", "high_quality")
+                    self._add_lp_opt(base_lp_opts, supported, "contrast_recovery", f"{contrast_recovery:.6g}")
+                    self._add_lp_opt(base_lp_opts, supported, "contrast_smoothness", "3.5")
+                    # Do not enable libplacebo debanding for dataset stills. It is
+                    # useful for playback gradients, but on close face crops it
+                    # smooths skin/eye detail and makes the saved crop look worse
+                    # than the live preview.
+                    if not self._add_lp_opt(base_lp_opts, supported, "tonemapping_lut_size", "1024"):
+                        self._add_lp_opt(base_lp_opts, supported, "tone_lut_size", "1024")
+                    # Match the live preview renderer path: ordered dithering, not a
+                    # separate still-export blue-noise path that changes dark gradients.
+                    if not self._add_lp_opt(base_lp_opts, supported, "dithering", "ordered"):
+                        self._add_lp_opt(base_lp_opts, supported, "dither_method", "ordered")
+                elif quality == "balanced":
+                    self._add_lp_opt(base_lp_opts, supported, "contrast_recovery", f"{min(contrast_recovery, 0.20):.6g}")
+                    self._add_lp_opt(base_lp_opts, supported, "tonemapping_lut_size", "512")
+                    if not self._add_lp_opt(base_lp_opts, supported, "dithering", "ordered"):
+                        self._add_lp_opt(base_lp_opts, supported, "dither_method", "ordered")
+                lp_variants.append(base_lp_opts)
+
+                minimal_lp_opts = [f"tonemapping='{lp_algo}'"]
+                _add_output_color_opts(minimal_lp_opts)
+                _add_first_lp_opt(minimal_lp_opts, ("format", "out_format", "out_pfmt"), "bgra")
+                if not self._add_lp_opt(minimal_lp_opts, supported, "dithering", "ordered"):
+                    self._add_lp_opt(minimal_lp_opts, supported, "dither_method", "ordered")
+                lp_variants.append(minimal_lp_opts)
 
             seen_lp: set[str] = set()
             for opts in lp_variants:
@@ -10469,13 +10489,22 @@ class MainWindow(QtWidgets.QMainWindow):
         def _set(img: QtGui.QImage) -> bool:
             if img.isNull():
                 return False
-            self.hit_label.setPixmap(
-                QtGui.QPixmap.fromImage(img).scaled(
-                    self.hit_label.size(),
+            label_size = self.hit_label.size()
+            pix = QtGui.QPixmap.fromImage(img)
+            # The saved-crop panel is a QC surface. Do not upscale the crop or
+            # smooth-filter it; that made the UI itself look softer than the live
+            # preview and hid whether the file was actually sharp.
+            if img.width() > label_size.width() or img.height() > label_size.height():
+                pix = pix.scaled(
+                    label_size,
                     QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-                    QtCore.Qt.TransformationMode.SmoothTransformation,
+                    QtCore.Qt.TransformationMode.FastTransformation,
                 )
-            )
+            self.hit_label.setPixmap(pix)
+            try:
+                self.hit_label.setToolTip(f"{crop_path}\n{img.width()}x{img.height()}")
+            except Exception:
+                pass
             return True
 
         img = QtGui.QImage(crop_path)
