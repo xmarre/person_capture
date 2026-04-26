@@ -2190,7 +2190,14 @@ class Processor(QtCore.QObject):
                     profile_prior = 0.78
                     if body_cadence or face_frame_frac < 0.10 or subj_h_frac > 0.62:
                         profile_prior -= 0.076 * landscape_penalty
-                    ratio_prior += 0.00 if rs == "2:3" else (0.12 if rs == "1:1" else 0.30)
+                    if rs == "2:3":
+                        ratio_prior += 0.00
+                    elif rs == "3:4":
+                        ratio_prior += 0.08
+                    elif rs == "1:1":
+                        ratio_prior += 0.12
+                    else:
+                        ratio_prior += 0.30
                     if is_landscape and subj is not None:
                         subj_aspect = (subj[2] - subj[0]) / max(1.0, subj[3] - subj[1])
                         if subj_aspect < 0.72:
@@ -4672,6 +4679,10 @@ class Processor(QtCore.QObject):
                     H2, W2 = frame_for_det.shape[:2]
                 else:
                     H2, W2 = H, W
+                # Keep the original border-aware content ROI for save/repair bounds
+                # even if person detection later falls back to full-frame inference.
+                base_det_off_x, base_det_off_y = off_x, off_y
+                base_det_w, base_det_h = W2, H2
 
                 candidates = []
                 faces_local = {}
@@ -5225,6 +5236,7 @@ class Processor(QtCore.QObject):
                     det_w,
                     det_h,
                     ratio_list,
+                    repair_bounds_xyxy=None,
                 ):
                     nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box, ref_face_feat, ref_bank_list, source_size_cached
                     crop_img_path = os.path.join(crops_dir, f"f{idx:08d}.jpg")
@@ -5292,7 +5304,9 @@ class Processor(QtCore.QObject):
                         except Exception:
                             pass
 
-                    if bool(getattr(cfg, "auto_crop_borders", False)):
+                    if repair_bounds_xyxy is not None and len(repair_bounds_xyxy) == 4:
+                        bx1, by1, bx2, by2 = [int(v) for v in repair_bounds_xyxy]
+                    elif bool(getattr(cfg, "auto_crop_borders", False)):
                         bx1 = int(det_off_x)
                         by1 = int(det_off_y)
                         bx2 = int(bx1 + det_w)
@@ -6020,6 +6034,12 @@ class Processor(QtCore.QObject):
                             det_off_y=off_y,
                             det_w=W2,
                             det_h=H2,
+                            repair_bounds_xyxy=(
+                                int(base_det_off_x),
+                                int(base_det_off_y),
+                                int(base_det_off_x + base_det_w),
+                                int(base_det_off_y + base_det_h),
+                            ),
                             ratio_list=ratios,
                         ):
                             hit_count += 1
