@@ -5486,9 +5486,10 @@ class Processor(QtCore.QObject):
                                     cur_aspect = float(rrw) / max(1e-6, float(rrh))
                                 except Exception:
                                     cur_aspect = cur_w / cur_h
+                                was_landscape = cur_aspect > 1.05
                                 hard_def = self._containment_deficit_xyxy(cur_crop, hard_face_padded, margin_px=1.0)
                                 prominent_face = cur_face_h_frac >= 0.16 or float(c.get("face_frac") or 0.0) >= 0.12
-                                force_portrait = cur_aspect > 1.05 and (crop_profile_for_guard != "body" or prominent_face)
+                                force_portrait = was_landscape and (crop_profile_for_guard != "body" or prominent_face)
                                 if hard_def > 0.01 or force_portrait:
                                     protect_box_clamped = (
                                         self._coerce_box_xyxy(protect_box, (repair_bx1, repair_by1, repair_bx2, repair_by2))
@@ -5525,7 +5526,7 @@ class Processor(QtCore.QObject):
                                         cx1, cy1, cx2, cy2 = fixed
                                         ratio_str = fixed_ratio
                                         c["ratio"] = fixed_ratio
-                                        if crop_profile_for_guard == "body" and force_portrait:
+                                        if crop_profile_for_guard == "body" and was_landscape and fixed_ratio in {"1:1", "2:3", "3:4"}:
                                             c["crop_profile"] = "upper"
                                             crop_profile_for_guard = "upper"
                                     elif hard_def > 0.01:
@@ -5569,7 +5570,7 @@ class Processor(QtCore.QObject):
                                                 (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                                 margin_px=1.0,
                                             )
-                                        if crop_profile_for_guard == "body" and force_portrait and c.get("ratio") in {"1:1", "2:3", "3:4"}:
+                                        if crop_profile_for_guard == "body" and was_landscape and c.get("ratio") in {"1:1", "2:3", "3:4"}:
                                             c["crop_profile"] = "upper"
                                             crop_profile_for_guard = "upper"
                         except Exception:
