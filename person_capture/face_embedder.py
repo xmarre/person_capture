@@ -1,5 +1,8 @@
 
-import os, io, sys, glob, site, math, re
+import os
+import sys
+import math
+import re
 import ctypes
 from pathlib import Path
 from pathlib import Path as _P
@@ -11,14 +14,12 @@ from socket import timeout as SocketTimeout
 import tempfile
 import shutil
 from typing import TYPE_CHECKING, List
-from typing import Optional, Tuple, Dict, Any, Callable
+from typing import Optional, Tuple, Dict, Callable
 
 from PIL import Image
 
 if TYPE_CHECKING:  # pragma: no cover - import only for type checking
-    import torch
-    from ultralytics import YOLO as YOLOType
-    import open_clip as open_clip_type
+    pass
 
 Y8F_DEFAULT = "yolov8l-face.pt"  # default remains; pass "scrfd_10g_bnkps" to switch backends
 
@@ -438,7 +439,7 @@ class FaceEmbedder:
             self.det = _YOLO(yolo_path)
         else:
             try:
-                from insightface.model_zoo.scrfd import SCRFD as _SCRFD
+                pass
             except Exception as e:
                 raise RuntimeError(
                     "SCRFD backend requires 'insightface'. Install or update the package and retry."
@@ -1249,7 +1250,6 @@ class FaceEmbedder:
                 assert self._arc_scratch.flags["C_CONTIGUOUS"]
             feat_dim = int(self._arc_feat_dim or 512)
             feats = np.empty((X.shape[0], feat_dim), dtype=np.float32)
-            import onnxruntime as ort
             t = self._torch
             inp = self.arc_input
             out_name = getattr(self, "arc_output", self.arc_sess.get_outputs()[0].name)
@@ -1589,7 +1589,6 @@ class FaceEmbedder:
         tensors = []
         for bgr in bgr_list:
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            from PIL import Image
             pil = Image.fromarray(rgb)
             tensors.append(self.preprocess(pil))
         batch = self._torch.stack(tensors).to(self.device, non_blocking=True)

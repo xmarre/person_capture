@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # pragma: no cover
-    import torch; from ultralytics import YOLO as YOLOType
+    pass
 
 class PersonDetector:
     def __init__(self, model_name='yolov8n.pt', device='cuda', progress=None):

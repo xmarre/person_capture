@@ -13,8 +13,16 @@ Run:
 from __future__ import annotations
 import time
 
-import os, sys, subprocess, shutil, threading, struct, hashlib
-import json, csv, traceback
+import os
+import sys
+import subprocess
+import shutil
+import threading
+import struct
+import hashlib
+import json
+import csv
+import traceback
 import logging
 
 # Ensure logs also go to stdout (console), not only to the Qt log widget.
@@ -6404,6 +6412,13 @@ class Processor(QtCore.QObject):
         self._hdr_preview_latest = None
         self._hdr_passthrough_active = False
 
+    @QtCore.Slot()
+    def disable_hdr_passthrough(self) -> None:
+        """Disable HDR passthrough and clean up resources.
+        Called from MainWindow when watchdog detects HDR preview is stale/dead.
+        """
+        self._hdr_preview_close()
+
     def _normalize_hdr_preview_payload(
         self,
         payload: object,
@@ -9206,6 +9221,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 log.debug("SDR preview taking over preview_stack (HDR passthrough stale/dead)")
                 self._hdr_passthrough_enabled = False
                 hdr_passthrough_enabled = False
+                # Propagate to worker: disable HDR passthrough and clean up reader
+                worker = getattr(self, "_worker", None)
+                if worker is not None:
+                    try:
+                        worker.disable_hdr_passthrough()
+                    except Exception:
+                        pass
 
         # If HDR passthrough is not active, SDR preview owns the stack.
         if not hdr_passthrough_enabled:
@@ -9270,6 +9292,11 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         log = logging.getLogger(__name__)
 
+        # Early check: if the worker has disabled HDR passthrough, stop processing frames.
+        worker = getattr(self, "_worker", None)
+        if worker is not None and not getattr(worker, "_hdr_passthrough_active", False):
+            return
+
         widget = getattr(self, "hdr_widget", None)
         if widget is None:
             return
@@ -9288,6 +9315,13 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._hdr_passthrough_enabled:
                 log.info("HDR passthrough: disabling (init failed)")
             self._hdr_passthrough_enabled = False
+            # Propagate to worker: disable HDR passthrough and clean up reader
+            worker = getattr(self, "_worker", None)
+            if worker is not None:
+                try:
+                    worker.disable_hdr_passthrough()
+                except Exception:
+                    pass
             if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
                 log.debug("SDR preview taking over preview_stack (index 0)")
                 self.preview_stack.setCurrentIndex(0)
@@ -9316,6 +9350,13 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._hdr_passthrough_enabled:
                 log.info("HDR passthrough: disabling (upload failed)")
             self._hdr_passthrough_enabled = False
+            # Propagate to worker: disable HDR passthrough and clean up reader
+            worker = getattr(self, "_worker", None)
+            if worker is not None:
+                try:
+                    worker.disable_hdr_passthrough()
+                except Exception:
+                    pass
             if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
                 log.debug("SDR preview taking over preview_stack (index 0)")
                 self.preview_stack.setCurrentIndex(0)
@@ -9331,6 +9372,13 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._hdr_passthrough_enabled:
                 log.info("HDR passthrough: disabling (no valid context)")
             self._hdr_passthrough_enabled = False
+            # Propagate to worker: disable HDR passthrough and clean up reader
+            worker = getattr(self, "_worker", None)
+            if worker is not None:
+                try:
+                    worker.disable_hdr_passthrough()
+                except Exception:
+                    pass
             if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
                 log.debug("SDR preview taking over preview_stack (index 0)")
                 self.preview_stack.setCurrentIndex(0)
@@ -10093,10 +10141,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main():
     # Suppress noisy HF hub warnings in GUI
-    import os, logging
+    import os
+    import logging
     os.environ.setdefault('HF_HUB_DISABLE_TELEMETRY', '1')
     try:
-        import huggingface_hub
         logging.getLogger('huggingface_hub').setLevel(logging.ERROR)
         logging.getLogger('huggingface_hub.file_download').setLevel(logging.ERROR)
     except Exception:

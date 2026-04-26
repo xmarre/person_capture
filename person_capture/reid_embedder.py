@@ -5,8 +5,7 @@ import cv2
 from PIL import Image
 
 if TYPE_CHECKING:  # pragma: no cover
-    import torch
-    import open_clip as open_clip_type
+    pass
 
 class ReIDEmbedder:
     """
