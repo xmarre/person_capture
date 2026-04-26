@@ -372,8 +372,6 @@ class SessionConfig:
     preview_every: int = 3
     # I/O
     async_save: bool = True                # write crops/CSV on a background thread
-    hdr_sdr_fallback_to_decoded: bool = True # if full-res HDR still export fails, save current decoded crop instead of dropping
-    hdr_sdr_disable_after_failures: int = 1  # disable full-res HDR still export for this run after consecutive failures
     jpg_quality: int = 85                  # JPEG quality (lower = faster, smaller)
     # Face full-frame fallback cadence (frames). 0 disables.
     face_fullframe_cadence: int = 12
@@ -2030,25 +2028,27 @@ class Processor(QtCore.QObject):
                 validated_user_ratios.append(rs)
 
         def _ratio_list_for_profile(profile: str) -> list[str]:
-            # Respect user-provided ratios as-is; only use profile defaults if the
-            # user list is empty/invalid.
             preferred = {
-                "close": ["1:1", "2:3"],
-                "upper": ["2:3", "1:1"],
-                "body": ["2:3", "1:1", "3:2"],
+                "close": ["1:1", "2:3", "3:4"],
+                "upper": ["2:3", "3:4", "1:1"],
+                "body": ["2:3", "3:4", "1:1", "3:2"],
                 "base": ["1:1", "2:3"],
             }.get(profile, ["1:1", "2:3"])
             if validated_user_ratios:
                 return list(validated_user_ratios)
+            allow_landscape = profile == "body"
             out: list[str] = []
             for rs in preferred:
                 try:
-                    parse_ratio(rs)
+                    rw, rh = parse_ratio(rs)
+                    aspect = float(rw) / max(1e-6, float(rh))
                 except Exception:
+                    continue
+                if not allow_landscape and aspect > 1.05:
                     continue
                 if rs not in out:
                     out.append(rs)
-            return out or ["1:1", "2:3"]
+            return out or preferred
 
         base = self._coerce_box_xyxy(base_crop_xyxy, bounds)
         subj = self._coerce_box_xyxy(subject_box, bounds)
@@ -2150,6 +2150,8 @@ class Processor(QtCore.QObject):
                 except Exception:
                     continue
                 is_landscape = aspect > 1.05
+                if not validated_user_ratios and profile in {"close", "upper"} and is_landscape:
+                    continue
 
                 crop = self._ratio_crop_containing_box(
                     protect,
@@ -2163,12 +2165,18 @@ class Processor(QtCore.QObject):
                 crop_h = max(1.0, float(cy2 - cy1))
                 crop_area = crop_w * crop_h
 
-                containment = 0.0
-                if face_protect is not None:
-                    containment += 120.0 * self._containment_deficit_xyxy(crop, face_protect, margin_px=1.0)
-                if profile == "body" and subj is not None:
-                    containment += 120.0 * self._containment_deficit_xyxy(crop, subj, margin_px=1.0)
-                containment += 20.0 * self._containment_deficit_xyxy(crop, protect, margin_px=1.0)
+                face_deficit = self._containment_deficit_xyxy(crop, face_protect, margin_px=1.0) if face_protect is not None else 0.0
+                body_deficit = self._containment_deficit_xyxy(crop, subj, margin_px=1.0) if (profile == "body" and subj is not None) else 0.0
+                protect_deficit = self._containment_deficit_xyxy(crop, protect, margin_px=1.0)
+                # A crop candidate that cuts the identified face/head is invalid,
+                # not merely lower quality. Penalizing it was too weak and let
+                # wide/body candidates win after dark-scene repairs.
+                if face_deficit > 0.01:
+                    continue
+                if body_deficit > 0.02:
+                    continue
+
+                containment = 120.0 * face_deficit + 120.0 * body_deficit + 20.0 * protect_deficit
 
                 ratio_prior = 0.0
                 if profile == "close":
@@ -2182,7 +2190,14 @@ class Processor(QtCore.QObject):
                     profile_prior = 0.78
                     if body_cadence or face_frame_frac < 0.10 or subj_h_frac > 0.62:
                         profile_prior -= 0.076 * landscape_penalty
-                    ratio_prior += 0.00 if rs == "2:3" else (0.12 if rs == "1:1" else 0.30)
+                    if rs == "2:3":
+                        ratio_prior += 0.00
+                    elif rs == "3:4":
+                        ratio_prior += 0.08
+                    elif rs == "1:1":
+                        ratio_prior += 0.12
+                    else:
+                        ratio_prior += 0.30
                     if is_landscape and subj is not None:
                         subj_aspect = (subj[2] - subj[0]) / max(1.0, subj[3] - subj[1])
                         if subj_aspect < 0.72:
@@ -4227,24 +4242,6 @@ class Processor(QtCore.QObject):
                                     tuple(item.get("crop_xyxy") or (0, 0, 1, 1)),
                                     img_path,
                                 )
-                                if (
-                                    not ok
-                                    and bool(getattr(self.cfg, "hdr_sdr_fallback_to_decoded", True))
-                                    and isinstance(item.get("fallback_img"), np.ndarray)
-                                ):
-                                    fallback_img = item.get("fallback_img")
-                                    fallback_row = item.get("fallback_row")
-                                    ok2, why2 = _atomic_jpeg_write(fallback_img, img_path, jpg_q)
-                                    if ok2:
-                                        ok = True
-                                        why = f"fallback_decoded_after_{why or 'hdr_export_failed'}"
-                                        if isinstance(fallback_row, list):
-                                            if isinstance(row, list):
-                                                row[:] = fallback_row
-                                            else:
-                                                row = fallback_row
-                                    else:
-                                        why = f"{why}; decoded_fallback_failed={why2}"
                             elif kind == "jpeg":
                                 img_path = str(item.get("path") or "")
                                 row = item.get("row")
@@ -4329,7 +4326,6 @@ class Processor(QtCore.QObject):
             locked_reid = None
             prev_box = None
             source_size_cached: Optional[tuple[int, int]] = None
-            hdr_sdr_failures = 0
             frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
             if keep_spans:
                 span_i = self._span_index_for(frame_idx, keep_spans)
@@ -4453,8 +4449,6 @@ class Processor(QtCore.QObject):
                             "hdr_sdr_contrast_recovery",
                             "hdr_sdr_peak_detect",
                             "hdr_sdr_allow_inaccurate_fallback",
-                            "hdr_sdr_fallback_to_decoded",
-                            "hdr_sdr_disable_after_failures",
                             "compose_crop_enable",
                             "compose_detect_person_for_face",
                             "compose_close_face_h_frac",
@@ -4685,6 +4679,10 @@ class Processor(QtCore.QObject):
                     H2, W2 = frame_for_det.shape[:2]
                 else:
                     H2, W2 = H, W
+                # Keep the original border-aware content ROI for save/repair bounds
+                # even if person detection later falls back to full-frame inference.
+                base_det_off_x, base_det_off_y = off_x, off_y
+                base_det_w, base_det_h = W2, H2
 
                 candidates = []
                 faces_local = {}
@@ -5238,15 +5236,13 @@ class Processor(QtCore.QObject):
                     det_w,
                     det_h,
                     ratio_list,
+                    repair_bounds_xyxy=None,
                 ):
-                    nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box, ref_face_feat, ref_bank_list, source_size_cached, hdr_sdr_failures
+                    nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box, ref_face_feat, ref_bank_list, source_size_cached
                     crop_img_path = os.path.join(crops_dir, f"f{idx:08d}.jpg")
-                    hdr_disable_after = max(0, int(getattr(self.cfg, "hdr_sdr_disable_after_failures", 1) or 0))
-                    hdr_fullres_suspended = hdr_disable_after > 0 and hdr_sdr_failures >= hdr_disable_after
                     hdr_primary_fullres = bool(
                         hdr_active
                         and bool(getattr(self.cfg, "hdr_screencap_fullres", True))
-                        and not hdr_fullres_suspended
                     )
                     hdr_out_path = None
                     if hdr_active and bool(getattr(self.cfg, "hdr_archive_crops", False)):
@@ -5308,7 +5304,9 @@ class Processor(QtCore.QObject):
                         except Exception:
                             pass
 
-                    if bool(getattr(cfg, "auto_crop_borders", False)):
+                    if repair_bounds_xyxy is not None and len(repair_bounds_xyxy) == 4:
+                        bx1, by1, bx2, by2 = [int(v) for v in repair_bounds_xyxy]
+                    elif bool(getattr(cfg, "auto_crop_borders", False)):
                         bx1 = int(det_off_x)
                         by1 = int(det_off_y)
                         bx2 = int(bx1 + det_w)
@@ -5317,62 +5315,13 @@ class Processor(QtCore.QObject):
                         bx1, by1, bx2, by2 = 0, 0, frame_w, frame_h
                     repair_bx1, repair_by1, repair_bx2, repair_by2 = bx1, by1, bx2, by2
 
-                    # Final black-border trim on the saved crop, then re-expand to exact ratio
-                    try:
-                        try:
-                            from .utils import detect_black_borders  # type: ignore
-                        except Exception:
-                            from utils import detect_black_borders  # type: ignore
-                        sub = frame[int(round(cy1)):int(round(cy2)), int(round(cx1)):int(round(cx2))]
-                        if sub.size > 0:
-                            scan_frac = max(0.0, float(getattr(cfg, "border_scan_frac", 0.25)))
-                            # full depth on the final crop to guarantee complete removal
-                            max_scan = min(sub.shape[0], sub.shape[1])
-                            if scan_frac == 0.0:
-                                l, t, r, b = 0, 0, sub.shape[1], sub.shape[0]
-                            else:
-                                l, t, r, b = detect_black_borders(
-                                    sub,
-                                    thr=int(getattr(cfg, "border_threshold", 22)),
-                                    max_scan=max_scan,
-                                )
-                            if (l > 0) or (t > 0) or (r < sub.shape[1]) or (b < sub.shape[0]):
-                                nx1, ny1 = int(round(cx1)) + int(l), int(round(cy1)) + int(t)
-                                nx2, ny2 = int(round(cx1)) + int(r), int(round(cy1)) + int(b)
-                                try:
-                                    tw, th = parse_ratio(ratio_str)
-                                except Exception:
-                                    tw, th = 2, 3
-                                # anchor-aware shrink INSIDE trimmed ROI to exact ratio
-                                anchor_glob = None
-                                fb = c.get("face_box")
-                                if fb is not None:
-                                    fcx = 0.5 * (fb[0] + fb[2])
-                                    fcy = 0.5 * (fb[1] + fb[3])
-                                    fh  = max(1.0, fb[3] - fb[1])
-                                    anchor_glob = (
-                                        fcx,
-                                        fcy + 0.5 * float(getattr(cfg, "face_anchor_down_frac", 1.1)) * fh,
-                                    )
-                                cx1, cy1, cx2, cy2 = self._shrink_to_ratio_inside(
-                                    (nx1, ny1, nx2, ny2), int(tw), int(th),
-                                    (nx1, ny1, nx2, ny2), anchor=anchor_glob
-                                )
-                                repair_bx1, repair_by1, repair_bx2, repair_by2 = int(nx1), int(ny1), int(nx2), int(ny2)
-                                # Final guard: ensure the shrunken crop still honors face side margins.
-                                try:
-                                    cx1, cy1, cx2, cy2 = self._enforce_scale_and_margins(
-                                        (cx1, cy1, cx2, cy2),
-                                        ratio_str,
-                                        W,
-                                        H,
-                                        face_box=fb,
-                                        anchor=anchor_glob,
-                                    )
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
+                    # Do not run border detection on the already-composed crop.
+                    # In candle-lit/dark scenes the subject's hair, clothing, or a dark
+                    # room edge can look like a black border.  Trimming inside the final
+                    # crop destroys the composition after identity/crop selection and can
+                    # leave only a partial face or bright background object.  Letterbox
+                    # removal is handled once at frame level through auto_crop_borders and
+                    # the resulting content bounds above.
 
                     cx1 = max(0, min(frame_w - 1, int(round(cx1))))
                     cy1 = max(0, min(frame_h - 1, int(round(cy1))))
@@ -5531,22 +5480,6 @@ class Processor(QtCore.QObject):
                         )
                     primary_row_crop = source_crop_xyxy if hdr_primary_fullres else processed_crop_xyxy
                     crop_img2 = frame[cy1:cy2, cx1:cx2]
-                    fallback_row = None
-                    if hdr_primary_fullres:
-                        fallback_row = [
-                            idx,
-                            frame_pts_sec if frame_pts_sec is not None else (idx / float(fps) if fps > 0 else 0.0),
-                            c.get("score"),
-                            c.get("fd"),
-                            c.get("rd"),
-                            processed_crop_xyxy[0],
-                            processed_crop_xyxy[1],
-                            processed_crop_xyxy[2],
-                            processed_crop_xyxy[3],
-                            crop_img_path,
-                            c.get("sharp"),
-                            str(ratio_str),
-                        ]
                     row = [
                         idx,
                         frame_pts_sec if frame_pts_sec is not None else (idx / float(fps) if fps > 0 else 0.0),
@@ -5573,8 +5506,6 @@ class Processor(QtCore.QObject):
                                     "frame_idx": int(idx),
                                     "frame_pts_sec": frame_pts_sec,
                                     "crop_xyxy": source_crop_xyxy,
-                                    "fallback_img": np.ascontiguousarray(crop_img2),
-                                    "fallback_row": fallback_row,
                                     "ack_q": ack_q,
                                 })
                             else:
@@ -5608,33 +5539,12 @@ class Processor(QtCore.QObject):
                             return False
                         ack_why = str(why or "")
                         if not ok:
-                            if hdr_primary_fullres:
-                                hdr_sdr_failures += 1
-                                hdr_disable_after = max(0, int(getattr(self.cfg, "hdr_sdr_disable_after_failures", 1) or 0))
-                                if hdr_disable_after > 0 and hdr_sdr_failures >= hdr_disable_after:
-                                    self._status(
-                                        "HDR full-res still export disabled for this run after repeated failures; using decoded-frame JPEG fallback",
-                                        key="hdr_sdr_export_disable",
-                                        interval=30.0,
-                                    )
                             self._status(
                                 f"Save failed ({why}): {crop_img_path}",
                                 key="save_err",
                                 interval=0.5,
                             )
                             return False
-                        if hdr_primary_fullres:
-                            if ack_why.startswith("fallback_decoded_after_"):
-                                hdr_sdr_failures += 1
-                                hdr_disable_after = max(0, int(getattr(self.cfg, "hdr_sdr_disable_after_failures", 1) or 0))
-                                if hdr_disable_after > 0 and hdr_sdr_failures >= hdr_disable_after:
-                                    self._status(
-                                        "HDR full-res still export disabled for this run after repeated failures; using decoded-frame JPEG fallback",
-                                        key="hdr_sdr_export_disable",
-                                        interval=30.0,
-                                    )
-                            else:
-                                hdr_sdr_failures = 0
                         if hdr_primary_fullres and isinstance(row, list) and len(row) > 10:
                             try:
                                 c["sharp"] = float(row[10])
@@ -5649,31 +5559,10 @@ class Processor(QtCore.QObject):
                                 source_crop_xyxy,
                                 crop_img_path,
                             )
-                            if not ok and bool(getattr(self.cfg, "hdr_sdr_fallback_to_decoded", True)):
-                                ok2, why2 = _atomic_jpeg_write(crop_img2, crop_img_path, jpg_q)
-                                if ok2:
-                                    ok = True
-                                    why = f"fallback_decoded_after_{why or 'hdr_export_failed'}"
-                                    if isinstance(fallback_row, list):
-                                        row = fallback_row
-                                else:
-                                    why = f"{why}; decoded_fallback_failed={why2}"
                         else:
                             ok, why = _atomic_jpeg_write(crop_img2, crop_img_path, jpg_q)
-                        sync_why = str(why or "")
                         if ok:
                             if hdr_primary_fullres:
-                                if sync_why.startswith("fallback_decoded_after_"):
-                                    hdr_sdr_failures += 1
-                                    hdr_disable_after = max(0, int(getattr(self.cfg, "hdr_sdr_disable_after_failures", 1) or 0))
-                                    if hdr_disable_after > 0 and hdr_sdr_failures >= hdr_disable_after:
-                                        self._status(
-                                            "HDR full-res still export disabled for this run after repeated failures; using decoded-frame JPEG fallback",
-                                            key="hdr_sdr_export_disable",
-                                            interval=30.0,
-                                        )
-                                else:
-                                    hdr_sdr_failures = 0
                                 saved_sharp = self._calc_saved_file_sharpness(crop_img_path)
                                 if saved_sharp is not None:
                                     row[10] = float(saved_sharp)
@@ -5689,15 +5578,6 @@ class Processor(QtCore.QObject):
                             except Exception:
                                 logger.exception("CSV write failed for %s", crop_img_path)
                         else:
-                            if hdr_primary_fullres:
-                                hdr_sdr_failures += 1
-                                hdr_disable_after = max(0, int(getattr(self.cfg, "hdr_sdr_disable_after_failures", 1) or 0))
-                                if hdr_disable_after > 0 and hdr_sdr_failures >= hdr_disable_after:
-                                    self._status(
-                                        "HDR full-res still export disabled for this run after repeated failures; using decoded-frame JPEG fallback",
-                                        key="hdr_sdr_export_disable",
-                                        interval=30.0,
-                                    )
                             self._status(
                                 f"Save failed ({why}): {crop_img_path}",
                                 key="save_err",
@@ -6154,6 +6034,12 @@ class Processor(QtCore.QObject):
                             det_off_y=off_y,
                             det_w=W2,
                             det_h=H2,
+                            repair_bounds_xyxy=(
+                                int(base_det_off_x),
+                                int(base_det_off_y),
+                                int(base_det_off_x + base_det_w),
+                                int(base_det_off_y + base_det_h),
+                            ),
                             ratio_list=ratios,
                         ):
                             hit_count += 1
@@ -7626,17 +7512,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "Allow inaccurate full-res scale fallback if HDR tone-map filters fail. Off preserves fidelity by failing instead of saving washed-out crops."
         )
         self.hdr_sdr_bad_fallback_check.stateChanged.connect(self._on_ui_change)
-        self.hdr_sdr_fallback_to_decoded_check = QtWidgets.QCheckBox()
-        self.hdr_sdr_fallback_to_decoded_check.setChecked(bool(getattr(self.cfg, "hdr_sdr_fallback_to_decoded", True)))
-        self.hdr_sdr_fallback_to_decoded_check.setToolTip(
-            "bool: hdr_sdr_fallback_to_decoded (fall back to decoded crop if full-res HDR still export fails)"
-        )
-        self.hdr_sdr_fallback_to_decoded_check.stateChanged.connect(self._on_ui_change)
-        self.hdr_sdr_disable_after_failures_spin = QtWidgets.QSpinBox()
-        self.hdr_sdr_disable_after_failures_spin.setRange(0, 50)
-        self.hdr_sdr_disable_after_failures_spin.setValue(int(getattr(self.cfg, "hdr_sdr_disable_after_failures", 1)))
-        self.hdr_sdr_disable_after_failures_spin.setToolTip("int: hdr_sdr_disable_after_failures (0=never disable full-res export)")
-        self.hdr_sdr_disable_after_failures_spin.valueChanged.connect(self._on_ui_change)
         self.hwaccel_combo = QtWidgets.QComboBox()
         self.hwaccel_combo.addItem("CPU decode (no hwaccel)", "off")
         self.hwaccel_combo.addItem("CUDA / NVDEC (GPU decode)", "cuda")
@@ -8123,8 +7998,6 @@ class MainWindow(QtWidgets.QMainWindow):
             ("HDR contrast recovery", self.hdr_sdr_contrast_spin),
             ("HDR peak detect", self.hdr_sdr_peak_check),
             ("Allow inaccurate HDR fallback", self.hdr_sdr_bad_fallback_check),
-            ("Fallback to decoded crop on HDR export fail", self.hdr_sdr_fallback_to_decoded_check),
-            ("Disable full-res HDR after N failures", self.hdr_sdr_disable_after_failures_spin),
             ("FFmpeg hardware decode", self.hwaccel_combo),
             ("HDR archive format", self.hdr_crop_format_combo),
             ("Frame stride", self.stride_spin),
@@ -9396,8 +9269,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "hdr_sdr_contrast_recovery",
             "hdr_sdr_peak_detect",
             "hdr_sdr_allow_inaccurate_fallback",
-            "hdr_sdr_fallback_to_decoded",
-            "hdr_sdr_disable_after_failures",
         }
         live |= {
             "lambda_facefrac",
@@ -9623,8 +9494,6 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg.hdr_sdr_contrast_recovery = float(self.hdr_sdr_contrast_spin.value()) if hasattr(self, "hdr_sdr_contrast_spin") else 0.30
         cfg.hdr_sdr_peak_detect = bool(self.hdr_sdr_peak_check.isChecked()) if hasattr(self, "hdr_sdr_peak_check") else True
         cfg.hdr_sdr_allow_inaccurate_fallback = bool(self.hdr_sdr_bad_fallback_check.isChecked()) if hasattr(self, "hdr_sdr_bad_fallback_check") else False
-        cfg.hdr_sdr_fallback_to_decoded = bool(self.hdr_sdr_fallback_to_decoded_check.isChecked()) if hasattr(self, "hdr_sdr_fallback_to_decoded_check") else bool(getattr(self.cfg, "hdr_sdr_fallback_to_decoded", True))
-        cfg.hdr_sdr_disable_after_failures = int(self.hdr_sdr_disable_after_failures_spin.value()) if hasattr(self, "hdr_sdr_disable_after_failures_spin") else int(getattr(self.cfg, "hdr_sdr_disable_after_failures", 1))
         return cfg
 
     def _apply_cfg(self, cfg: SessionConfig):
@@ -9716,10 +9585,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.hdr_sdr_peak_check.setChecked(bool(getattr(cfg, "hdr_sdr_peak_detect", True)))
         if hasattr(self, "hdr_sdr_bad_fallback_check"):
             self.hdr_sdr_bad_fallback_check.setChecked(bool(getattr(cfg, "hdr_sdr_allow_inaccurate_fallback", False)))
-        if hasattr(self, "hdr_sdr_fallback_to_decoded_check"):
-            self.hdr_sdr_fallback_to_decoded_check.setChecked(bool(getattr(cfg, "hdr_sdr_fallback_to_decoded", True)))
-        if hasattr(self, "hdr_sdr_disable_after_failures_spin"):
-            self.hdr_sdr_disable_after_failures_spin.setValue(int(getattr(cfg, "hdr_sdr_disable_after_failures", 1)))
         self.ratio_edit.setText(cfg.ratio)
         try:
             self.sdr_nits_spin.setValue(float(getattr(cfg, "sdr_nits", 125.0)))
@@ -10653,16 +10518,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 s.value("hdr_sdr_allow_inaccurate_fallback", getattr(self.cfg, "hdr_sdr_allow_inaccurate_fallback", False), type=bool)
             )
             self.cfg.hdr_sdr_allow_inaccurate_fallback = bool(self.hdr_sdr_bad_fallback_check.isChecked())
-        if hasattr(self, "hdr_sdr_fallback_to_decoded_check"):
-            self.hdr_sdr_fallback_to_decoded_check.setChecked(
-                s.value("hdr_sdr_fallback_to_decoded", getattr(self.cfg, "hdr_sdr_fallback_to_decoded", True), type=bool)
-            )
-            self.cfg.hdr_sdr_fallback_to_decoded = bool(self.hdr_sdr_fallback_to_decoded_check.isChecked())
-        if hasattr(self, "hdr_sdr_disable_after_failures_spin"):
-            self.hdr_sdr_disable_after_failures_spin.setValue(
-                int(s.value("hdr_sdr_disable_after_failures", getattr(self.cfg, "hdr_sdr_disable_after_failures", 1)))
-            )
-            self.cfg.hdr_sdr_disable_after_failures = int(self.hdr_sdr_disable_after_failures_spin.value())
         try:
             self.cfg.hdr_export_timeout_sec = max(
                 5,
