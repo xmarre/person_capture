@@ -7884,7 +7884,7 @@ class MainWindow(QtWidgets.QMainWindow):
         param_group = QtWidgets.QGroupBox("Parameters")
         grid = QtWidgets.QGridLayout(param_group)
 
-        self.ratio_edit = QtWidgets.QLineEdit("1:1,2:3,3:2")
+        self.ratio_edit = QtWidgets.QLineEdit("1:1,2:3,3:4")
         self.sdr_nits_spin = QtWidgets.QDoubleSpinBox()
         self.sdr_nits_spin.setRange(50.0, 400.0)
         self.sdr_nits_spin.setDecimals(0)
@@ -9785,7 +9785,7 @@ class MainWindow(QtWidgets.QMainWindow):
             video=self.video_edit.text().strip(),
             ref=ref_join,
             out_dir=self.out_edit.text().strip() or "output",
-            ratio=self.ratio_edit.text().strip() or "1:1,2:3,3:2",
+            ratio=self.ratio_edit.text().strip() or "1:1,2:3,3:4",
             sdr_nits=float(self.sdr_nits_spin.value()),
             tm_desat=float(self.tm_desat_spin.value()),
             tm_param=float(self.tm_param_spin.value()),
@@ -10382,6 +10382,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hdr_passthrough_enabled = passthrough_active
         self._last_hdr_preview_t = time.perf_counter()
         self._hdr_preview_seen = False
+        try:
+            if hasattr(self, "preview_stack"):
+                self.preview_stack.setCurrentIndex(0)
+        except Exception:
+            pass
 
         # basic validation
         if not os.path.isfile(cfg.video):
