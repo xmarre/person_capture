@@ -6991,9 +6991,14 @@ class Processor(QtCore.QObject):
             # renderer. The live reader starts with BT.2390, then tries aliases if
             # a build dislikes the dotted spelling. Passing literal auto here made
             # saved crops use a different curve than the preview.
-            lp_algos = ["bt.2390" if algo == "auto" else algo]
-            if lp_algos[0] in {"bt.2390", "bt2390"}:
-                lp_algos.append("bt2390" if lp_algos[0] == "bt.2390" else "bt.2390")
+            if algo == "auto":
+                # Keep still-export fallback order aligned with live preview:
+                # bt.2390 -> mobius -> hable -> clip, with bt2390 alias handling.
+                lp_algos = ["bt.2390", "bt2390", "mobius", "hable", "clip"]
+            else:
+                lp_algos = [algo]
+                if algo in {"bt.2390", "bt2390"}:
+                    lp_algos.append("bt2390" if algo == "bt.2390" else "bt.2390")
 
             lp_variants: list[list[str]] = []
             for lp_algo in lp_algos:
