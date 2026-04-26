@@ -390,8 +390,8 @@ class SessionConfig:
     crop_top_headroom_max_frac: float = 0.15     # max(top margin / crop_h)
     crop_bottom_min_face_heights: float = 1.5    # min bottom margin in face-heights
     crop_penalty_weight: float = 3.0             # weight for placement penalties vs area growth
-    crop_head_side_pad_frac: float = 0.70        # protect hair/head around detected face width
-    crop_head_top_pad_frac: float = 0.85         # protect hair/forehead above detected face height
+    crop_head_side_pad_frac: float = 0.88        # protect hair/head around detected face width
+    crop_head_top_pad_frac: float = 0.95         # protect hair/forehead above detected face height
     crop_head_bottom_pad_frac: float = 0.30      # protect chin/neck below detected face height
     wide_face_aspect_penalty_weight: float = 10.0# penalize landscape crops when face is prominent
     wide_face_min_frame_frac: float = 0.12       # prominent-face threshold for landscape penalty
@@ -2168,13 +2168,15 @@ class Processor(QtCore.QObject):
                 if profile in {"close", "upper", "base"} and is_landscape:
                     continue
                 if profile == "body" and is_landscape:
-                    # A landscape body crop is only useful when the frame is truly
-                    # body/context dominated. If the matched face is already
-                    # prominent, a 3:2 crop is the wrong dataset sample and is more
-                    # likely to cut facial context near the edge.
-                    if face is not None and face_frame_frac >= 0.12:
+                    # Landscape is a rare context/body sample, not a normal face
+                    # framing choice. It is only allowed on the deterministic body
+                    # cadence, with a real associated person box, and only when the
+                    # matched face is small in the frame.
+                    if subj is None or not body_cadence:
                         continue
-                    if subj_h_frac < 0.60:
+                    if face is not None and face_frame_frac >= 0.075:
+                        continue
+                    if subj_h_frac < 0.68:
                         continue
 
                 crop = self._ratio_crop_containing_box(
@@ -2212,12 +2214,12 @@ class Processor(QtCore.QObject):
                 elif profile == "body":
                     landscape_penalty = max(0.0, min(20.0, float(getattr(cfg, "compose_landscape_face_penalty", 5.0))))
                     profile_prior = 0.78
-                    if body_cadence or face_frame_frac < 0.10 or subj_h_frac > 0.62:
+                    if body_cadence and face_frame_frac < 0.10 and subj_h_frac > 0.62:
                         profile_prior -= 0.076 * landscape_penalty
-                    if face is not None and face_frame_frac >= 0.12:
-                        profile_prior += 0.55
+                    if face is not None and face_frame_frac >= 0.10:
+                        profile_prior += 0.70
                     if is_landscape:
-                        profile_prior += 0.35
+                        profile_prior += 0.70
                     if rs == "2:3":
                         ratio_prior += 0.00
                     elif rs == "3:4":
@@ -2276,9 +2278,11 @@ class Processor(QtCore.QObject):
                 continue
             is_landscape = aspect > 1.05
             if is_landscape:
-                if face is not None and face_frame_frac >= 0.12:
+                if subj is None or not body_cadence:
                     continue
-                if subj_h_frac < 0.60:
+                if face is not None and face_frame_frac >= 0.075:
+                    continue
+                if subj_h_frac < 0.68:
                     continue
                 fallback_profile = "body"
             fallback_ratio = rs
@@ -5406,14 +5410,13 @@ class Processor(QtCore.QObject):
                             c.get("face_box"),
                         )
                     else:
-                        protect_box = (
-                            self._union_boxes_xyxy(
-                                c.get("head_box"),
-                                c.get("face_box"),
-                            )
-                            or self._union_boxes_xyxy(
-                                c.get("subject_box") or c.get("show_box"),
-                            )
+                        # Close/upper/portrait crops protect the detected head and
+                        # face only. show_box/candidate boxes are identity/debug
+                        # evidence and must not force the final crop shape. Including
+                        # them here made stale wide boxes survive portrait repair.
+                        protect_box = self._union_boxes_xyxy(
+                            c.get("head_box"),
+                            c.get("face_box"),
                         )
                     if protect_box is not None:
                         try:
@@ -5459,12 +5462,17 @@ class Processor(QtCore.QObject):
                             ) or fb
                             cur_w = max(1.0, float(cx2 - cx1))
                             cur_h = max(1.0, float(cy2 - cy1))
+                            side_guard_box = self._union_boxes_xyxy(protect_box, padded_face) or padded_face
+                            # Do not preserve a stale landscape crop size for non-body
+                            # profiles. Side repair must keep the face/head visible,
+                            # not lock in a bad earlier composition.
+                            min_size_for_side = (cur_w, cur_h) if crop_profile_for_guard == "body" else None
                             cx1, cy1, cx2, cy2 = self._ratio_crop_containing_box(
-                                self._union_boxes_xyxy(protect_box, padded_face) or padded_face,
+                                side_guard_box,
                                 ratio_str,
                                 (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                 anchor=((cx1 + cx2) * 0.5, (cy1 + cy2) * 0.5),
-                                min_size_xy=(cur_w, cur_h),
+                                min_size_xy=min_size_for_side,
                             )
                             left_margin = max(0.0, float(fb[0]) - float(cx1))
                             right_margin = max(0.0, float(cx2) - float(fb[2]))
@@ -5489,12 +5497,16 @@ class Processor(QtCore.QObject):
                                 hfx1, hfy1, hfx2, hfy2 = hf
                                 hfw = max(1.0, hfx2 - hfx1)
                                 hfh = max(1.0, hfy2 - hfy1)
-                                hard_face_padded = self._pad_box_xyxy(
-                                    hf,
-                                    pad_x=0.06 * hfw,
-                                    pad_y_top=0.10 * hfh,
-                                    pad_y_bottom=0.16 * hfh,
-                                    bounds_xyxy=(repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                hard_head_box = self._coerce_box_xyxy(c.get("head_box"), (repair_bx1, repair_by1, repair_bx2, repair_by2))
+                                hard_face_padded = self._union_boxes_xyxy(
+                                    hard_head_box,
+                                    self._pad_box_xyxy(
+                                        hf,
+                                        pad_x=0.12 * hfw,
+                                        pad_y_top=0.18 * hfh,
+                                        pad_y_bottom=0.18 * hfh,
+                                        bounds_xyxy=(repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                    ) or hf,
                                 ) or hf
                                 cur_crop = (float(cx1), float(cy1), float(cx2), float(cy2))
                                 cur_w = max(1.0, float(cx2 - cx1))
@@ -5507,22 +5519,39 @@ class Processor(QtCore.QObject):
                                     cur_aspect = cur_w / cur_h
                                 was_landscape = cur_aspect > 1.05
                                 hard_def = self._containment_deficit_xyxy(cur_crop, hard_face_padded, margin_px=1.0)
-                                prominent_face = cur_face_h_frac >= 0.16 or float(c.get("face_frac") or 0.0) >= 0.12
+                                frame_face_h_frac = hfh / max(1.0, float(repair_by2 - repair_by1))
+                                prominent_face = (
+                                    cur_face_h_frac >= 0.10
+                                    or frame_face_h_frac >= 0.075
+                                    or float(c.get("face_frac") or 0.0) >= 0.035
+                                )
                                 force_portrait = was_landscape and (crop_profile_for_guard != "body" or prominent_face)
                                 if hard_def > 0.01 or force_portrait:
-                                    identity_guard = self._coerce_box_xyxy(
-                                        self._union_boxes_xyxy(
-                                            c.get("subject_box") or c.get("show_box"),
-                                            c.get("head_box"),
-                                            c.get("face_box"),
-                                        ),
-                                        (repair_bx1, repair_by1, repair_bx2, repair_by2),
-                                    )
+                                    if crop_profile_for_guard == "body" and not force_portrait:
+                                        identity_guard = self._coerce_box_xyxy(
+                                            self._union_boxes_xyxy(
+                                                c.get("subject_box"),
+                                                c.get("head_box"),
+                                                c.get("face_box"),
+                                            ),
+                                            (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                        )
+                                    else:
+                                        identity_guard = self._coerce_box_xyxy(
+                                            self._union_boxes_xyxy(
+                                                c.get("head_box"),
+                                                c.get("face_box"),
+                                            ),
+                                            (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                        )
                                     protect_box_clamped = (
                                         self._coerce_box_xyxy(protect_box, (repair_bx1, repair_by1, repair_bx2, repair_by2))
-                                        if protect_box is not None
+                                        if (protect_box is not None and crop_profile_for_guard == "body" and not force_portrait)
                                         else None
                                     )
+                                    # No show_box fallback here. show_box may be the stale
+                                    # candidate/preview box; using it as a guard resurrects
+                                    # bad wide crops and can still cut the head.
                                     full_guard_box = self._union_boxes_xyxy(
                                         hard_face_padded,
                                         identity_guard,
@@ -5536,7 +5565,7 @@ class Processor(QtCore.QObject):
                                                 fix_ratio,
                                                 (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                                 anchor=((hfx1 + hfx2) * 0.5, (hfy1 + hfy2) * 0.5 + 0.18 * hfh),
-                                                min_size_xy=(max(hfw * 1.18, 2.0), max(hfh * 1.22, 2.0)),
+                                                min_size_xy=(max(hfw * 1.45, 2.0), max(hfh * 1.55, 2.0)),
                                             )
                                             guard_def = self._containment_deficit_xyxy(fixed, full_guard_box, margin_px=1.0)
                                             if guard_def > 0.01:
@@ -5569,7 +5598,10 @@ class Processor(QtCore.QObject):
                                                 fallback_ratio,
                                                 (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                                 anchor=((hfx1 + hfx2) * 0.5, (hfy1 + hfy2) * 0.5 + 0.18 * hfh),
-                                                min_size_xy=(max(cur_w, hfw * 1.18), max(cur_h, hfh * 1.22)),
+                                                min_size_xy=(
+                                                    (max(cur_w, hfw * 1.45) if not force_portrait else max(hfw * 1.45, 2.0)),
+                                                    (max(cur_h, hfh * 1.55) if not force_portrait else max(hfh * 1.55, 2.0)),
+                                                ),
                                             )
                                             guard_def = self._containment_deficit_xyxy(fixed, full_guard_box, margin_px=1.0)
                                             if guard_def <= 0.01:
@@ -5586,7 +5618,10 @@ class Processor(QtCore.QObject):
                                                     fallback_ratio,
                                                     (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                                     anchor=((hfx1 + hfx2) * 0.5, (hfy1 + hfy2) * 0.5 + 0.18 * hfh),
-                                                    min_size_xy=(max(cur_w, hfw * 1.18), max(cur_h, hfh * 1.22)),
+                                                    min_size_xy=(
+                                                        (max(cur_w, hfw * 1.45) if not force_portrait else max(hfw * 1.45, 2.0)),
+                                                        (max(cur_h, hfh * 1.55) if not force_portrait else max(hfh * 1.55, 2.0)),
+                                                    ),
                                                 )
                                                 cx1, cy1, cx2, cy2 = fixed
                                                 ratio_str = fallback_ratio
@@ -5606,7 +5641,10 @@ class Processor(QtCore.QObject):
                                                         fallback_ratio,
                                                         (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                                         anchor=((hfx1 + hfx2) * 0.5, (hfy1 + hfy2) * 0.5 + 0.18 * hfh),
-                                                        min_size_xy=(max(cur_w, hfw * 1.18), max(cur_h, hfh * 1.22)),
+                                                        min_size_xy=(
+                                                            (max(cur_w, hfw * 1.45) if not force_portrait else max(hfw * 1.45, 2.0)),
+                                                            (max(cur_h, hfh * 1.55) if not force_portrait else max(hfh * 1.55, 2.0)),
+                                                        ),
                                                     )
                                                 cx1, cy1, cx2, cy2 = self._shift_crop_to_include_box(
                                                     shift_seed,
@@ -5622,7 +5660,7 @@ class Processor(QtCore.QObject):
                                                             fallback_ratio,
                                                             (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                                             anchor=((hfx1 + hfx2) * 0.5, (hfy1 + hfy2) * 0.5 + 0.18 * hfh),
-                                                            min_size_xy=(max(hfw * 1.18, 2.0), max(hfh * 1.22, 2.0)),
+                                                            min_size_xy=(max(hfw * 1.45, 2.0), max(hfh * 1.55, 2.0)),
                                                         )
                                                     except Exception:
                                                         pass
