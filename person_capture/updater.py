@@ -199,17 +199,17 @@ def git_update(repo: Path, autostash: bool = True) -> Tuple[bool, str]:
         prev = _call(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
         # prepare
         _call(["git", "fetch", "--tags", "--prune"], cwd=repo)
-        # stash if dirty (so update doesn't fail)
-        if autostash:
-            try:
-                status = _call(["git", "status", "--porcelain"], cwd=repo).stdout.strip()
-                if status:
-                    _call(["git", "stash", "push", "-u", "-m", "PersonCapture autostash"], cwd=repo)
-            except Exception:
-                pass
-        # Rebase onto upstream
+        # Rebase onto upstream. Do not run our own `git stash push -u` here:
+        # - `-u` includes untracked, non-ignored files and can make user output
+        #   directories appear to vanish during updates.
+        # - the old code never popped that manual stash.
+        # Git's `--autostash` is enough for tracked local edits and is restored by
+        # git itself at the end of the pull/rebase.
         upstream = _git_tracking_remote(repo) or "origin/main"
-        pull = _call(["git", "pull", "--rebase", "--autostash"], cwd=repo)
+        pull_args = ["git", "pull", "--rebase"]
+        if autostash:
+            pull_args.append("--autostash")
+        pull = _call(pull_args, cwd=repo)
         if pull.returncode != 0 and pull.stderr:
             # attempt a non-rebase pull
             _call(["git", "pull", upstream.split('/')[0], upstream.split('/')[1]], cwd=repo, check=True)
@@ -332,6 +332,86 @@ def stage_zip_update(repo: Path, branch: Optional[str] = None) -> Tuple[bool, st
     except Exception as e:
         return False, f"stage error: {e}", None
 
+def _remove_path_for_update_replace(path: Path) -> None:
+    """Remove a path that is about to be replaced by an update payload."""
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=False)
+        else:
+            path.unlink(missing_ok=True)
+    except FileNotFoundError:
+        pass
+
+
+_PRESERVED_UPDATE_PATHS = {
+    ("person_capture", "output"),
+    ("person_capture", "out"),
+    ("output",),
+    ("out",),
+}
+
+
+def _is_preserved_update_path(path_parts: tuple[str, ...]) -> bool:
+    return any(path_parts[:len(prefix)] == prefix for prefix in _PRESERVED_UPDATE_PATHS)
+
+
+def _merge_staged_item_preserving_user_data(
+    src: Path,
+    dst: Path,
+    rel_parts: tuple[str, ...],
+) -> None:
+    """
+    Merge one staged update item into the install tree.
+
+    The previous zip updater removed a destination directory before moving the
+    staged directory into place. That is safe for pure source trees, but it is
+    wrong for this app because users commonly keep runtime data under the
+    install root, and sometimes under package subdirectories. Directory-level
+    replacement can therefore delete output/crops while updating the code.
+
+    This applies files that are present in the update payload. For destination
+    paths that are not explicit runtime-data roots, destination-only children
+    are removed so deleted shipped files do not linger after an update. We only
+    preserve destination-only content under known runtime-data roots.
+
+    This function intentionally does not mutate the staged source tree while it
+    is applying changes. If apply fails part-way through, retry should still
+    observe the full original staged payload.
+    """
+    if src.is_dir() and not src.is_symlink():
+        if dst.exists() and (not dst.is_dir() or dst.is_symlink()):
+            _remove_path_for_update_replace(dst)
+        dst.mkdir(parents=True, exist_ok=True)
+        staged_names = set()
+        for child in list(src.iterdir()):
+            staged_names.add(child.name)
+            _merge_staged_item_preserving_user_data(
+                child,
+                dst / child.name,
+                rel_parts + (child.name,),
+            )
+        for existing in list(dst.iterdir()):
+            if existing.name in staged_names:
+                continue
+            rel_existing = rel_parts + (existing.name,)
+            if _is_preserved_update_path(rel_existing):
+                continue
+            _remove_path_for_update_replace(existing)
+        return
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if (
+        _is_preserved_update_path(rel_parts)
+        and dst.exists()
+        and dst.is_dir()
+        and not dst.is_symlink()
+    ):
+        raise RuntimeError(f"refusing to replace preserved runtime dir: {dst}")
+    if dst.exists() or dst.is_symlink():
+        _remove_path_for_update_replace(dst)
+    shutil.copy2(str(src), str(dst), follow_symlinks=False)
+
+
 def _pip_install_requirements(req_file: Path) -> str:
     try:
         if os.environ.get(PIP_ENV_SKIP, "").strip().lower() in ("1","true","yes","on"):
@@ -359,6 +439,23 @@ def apply_staged_update(repo: Path) -> Tuple[bool, str]:
             info = json.load(f)
         sha_applied = str(info.get("sha") or "")
         staged = Path(info.get("staged_dir") or (repo / "update_staged"))
+        repo_resolved = repo.resolve()
+        staged_path = repo_resolved / "update_staged"
+        if staged_path.is_symlink():
+            try:
+                flag.unlink()
+            except Exception:
+                pass
+            return False, "invalid staged dir"
+        staged_base = staged_path.resolve()
+        staged_resolved = staged.resolve(strict=False)
+        if staged_resolved != staged_base:
+            try:
+                flag.unlink()
+            except Exception:
+                pass
+            return False, "invalid staged dir"
+        staged = staged_resolved
         if not staged.exists():
             try:
                 flag.unlink()
@@ -372,19 +469,16 @@ def apply_staged_update(repo: Path) -> Tuple[bool, str]:
         repo_req = _select_req_file(repo_reqs)
         staged_bytes = staged_req.read_bytes() if staged_req and staged_req.exists() else b""
         repo_bytes = repo_req.read_bytes() if repo_req and repo_req.exists() else b""
-        # Move all files/dirs from staged into repo (in-place overwrite)
-        for item in staged.iterdir():
-            dst = repo / item.name
-            # Remove existing dst first to avoid merge weirdness
-            if dst.exists():
-                if dst.is_dir():
-                    shutil.rmtree(dst, ignore_errors=True)
-                else:
-                    try:
-                        dst.unlink()
-                    except Exception:
-                        pass
-            shutil.move(str(item), str(dst))
+        # Move files/dirs from staged into repo while preserving destination-only
+        # runtime data under explicit output roots. For non-preserved paths we
+        # still remove destination-only entries so deleted shipped files do not
+        # survive updates.
+        for item in list(staged.iterdir()):
+            _merge_staged_item_preserving_user_data(
+                item,
+                repo_resolved / item.name,
+                (item.name,),
+            )
         try:
             shutil.rmtree(staged, ignore_errors=True)
         except Exception:

@@ -59,3 +59,7 @@ Thumbs.db
 /onnxruntime/
 
 .codex
+
+# Runtime output can be large and must survive updater operations.
+/person_capture/output/
+/person_capture/out/
