@@ -6665,22 +6665,30 @@ class Processor(QtCore.QObject):
         opts.append(f"{name}={value}")
         return True
 
-    def _ffmpeg_accurate_seek_input_args(self, seek_sec: Optional[float]) -> tuple[list[str], list[str]]:
-        """Return (pre-input args, post-input args) for accurate still export seeking."""
+    def _ffmpeg_still_seek_args_and_filter(self, seek_sec: Optional[float]) -> tuple[list[str], str]:
+        """Return FFmpeg input seek args and a filter-prefix for exact still export.
+
+        Do not use a second output-side ``-ss`` for HDR still exports. With some
+        HEVC/MKV streams, especially after bounded pre-roll, FFmpeg can legally
+        complete with a tiny/empty image muxer output when no decoded frame
+        survives the output seek at the requested timestamp. Decode from a short
+        pre-roll and perform the exact selection inside the filter graph instead,
+        before tone mapping/cropping.
+        """
         if seek_sec is None:
-            return [], []
+            return [], ""
         try:
             seek_f = max(0.0, float(seek_sec))
         except Exception:
-            return [], []
+            return [], ""
         try:
             preroll_sec = max(0.0, float(os.getenv("PC_HDR_EXPORT_PREROLL_SEC", "2.0")))
         except Exception:
             preroll_sec = 2.0
         preroll_sec = min(seek_f, preroll_sec)
         if preroll_sec > 1e-6:
-            return ["-ss", f"{max(0.0, seek_f - preroll_sec):.6f}"], ["-ss", f"{preroll_sec:.6f}"]
-        return [], ["-ss", f"{seek_f:.6f}"]
+            return ["-ss", f"{max(0.0, seek_f - preroll_sec):.6f}"], f"trim=start={preroll_sec:.6f},setpts=PTS-STARTPTS,"
+        return [], f"trim=start={seek_f:.6f},setpts=PTS-STARTPTS,"
 
     @staticmethod
     def _validated_jpeg_quality(cfg: object, default: int = 95) -> int:
@@ -6690,19 +6698,33 @@ class Processor(QtCore.QObject):
             return default
 
     @staticmethod
-    def _validate_hdr_sdr_export_image(path: str) -> tuple[bool, str]:
-        """Reject empty/corrupt/all-black HDR still exports before accepting them."""
+    def _validate_hdr_sdr_export_image(
+        path: str,
+        expected_size: Optional[tuple[int, int]] = None,
+    ) -> tuple[bool, str]:
+        """Reject missing/corrupt/black HDR still exports without a byte-size heuristic.
+
+        A valid high-quality JPEG of a small, very dark crop can be below 1 KiB.
+        Rejecting by file size caused successful FFmpeg still renders to be
+        treated as failed exports. Decode first, then validate image shape and
+        near-black failure characteristics.
+        """
         try:
             if not path or not os.path.exists(path):
                 return False, "missing_output"
-            if os.path.getsize(path) < 1024:
-                return False, "tiny_output"
+            if os.path.getsize(path) <= 16:
+                return False, "empty_output"
             data = np.fromfile(path, dtype=np.uint8)
-            if data.size < 1024:
-                return False, "tiny_output"
+            if data.size <= 16:
+                return False, "empty_output"
             img = cv2.imdecode(data, cv2.IMREAD_COLOR)
             if img is None or img.ndim != 3 or img.size == 0:
                 return False, "decode_failed"
+            ih, iw = int(img.shape[0]), int(img.shape[1])
+            if expected_size is not None:
+                ew, eh = int(expected_size[0]), int(expected_size[1])
+                if ew > 0 and eh > 0 and (abs(iw - ew) > 2 or abs(ih - eh) > 2):
+                    return False, f"wrong_size got={iw}x{ih} expected={ew}x{eh}"
             y = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             mean = float(np.mean(y))
             p95 = float(np.percentile(y, 95.0))
@@ -6737,12 +6759,11 @@ class Processor(QtCore.QObject):
             fps = float(getattr(self, "_fps", 0.0) or 0.0)
             if fps > 0 and math.isfinite(fps):
                 seek_sec = max(0.0, float(frame_idx) / fps)
-        pre_seek_args, post_seek_args = self._ffmpeg_accurate_seek_input_args(seek_sec)
+        pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(seek_sec)
         base = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
         base += pre_seek_args
-        base += ["-i", self.cfg.video]
-        base += post_seek_args
-        base += ["-map", "0:v:0", "-frames:v", "1"]
+        base += ["-i", self.cfg.video, "-map", "0:v:0"]
+        out_once = ["-frames:v", "1"]
         crop = f"crop={w}:{h}:{x1}:{y1}"
         src = "setparams=color_trc=smpte2084:color_primaries=bt2020:colorspace=bt2020nc:range=limited"
         desat = float(getattr(self.cfg, "tm_desat", 0.25))
@@ -6842,17 +6863,20 @@ class Processor(QtCore.QObject):
                 # then crop in SDR/RGB. Cropping before tone mapping changes the
                 # peak/gamut context and can misalign 4:2:0 chroma at arbitrary crop
                 # offsets, causing visible artifacts versus madVR/MPCVR-style output.
-                has_readback_fmt = any(
-                    opt.startswith(("format=", "out_format=", "out_pfmt="))
-                    for opt in opts
+                # libplacebo still outputs hardware frames; always download before
+                # the CPU-only format/crop/encoder path.  The libplacebo ``format``
+                # option chooses the rendered pixel format, it is not a readback.
+                lp = (
+                    f"{seek_filter}format=p010le,{src},"
+                    f"hwupload=extra_hw_frames=1,libplacebo={opt_str},"
+                    f"hwdownload,format=bgra,format=bgr24,{crop}"
                 )
-                readback = "" if has_readback_fmt else ",hwdownload,format=bgra"
-                lp = f"format=p010le,{src},hwupload=extra_hw_frames=1,libplacebo={opt_str}{readback},format=bgr24,{crop}"
                 cmds.append(
                     base[:1]
                     + ["-init_hw_device", "vulkan=vk:0", "-filter_hw_device", "vk"]
                     + base[1:]
                     + ["-vf", lp]
+                    + out_once
                     + enc
                 )
         if filters.get("zscale") and filters.get("tonemap") and pref in ("auto", "zscale"):
@@ -6891,21 +6915,21 @@ class Processor(QtCore.QObject):
             elif gamut == "relative":
                 z_desat = max(0.0, z_desat - 0.05)
             zf = (
-                f"{src},"
+                f"{seek_filter}{src},"
                 "zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc,"
                 "zscale=transfer=linear:npl=1000,format=gbrpf32le,"
                 f"tonemap=tonemap={z_algo}:param={z_param:.6g}:desat={z_desat:.6g}:peak={z_peak:.6g},"
                 f"zscale=transfer=bt709:primaries=bt709:matrix=bt709:dither={z_dither},"
                 f"zscale=rangein=pc:range=pc,format=bgr24,{crop}"
             )
-            cmds.append(base + ["-vf", zf] + enc)
+            cmds.append(base + ["-vf", zf] + out_once + enc)
         if allow_inaccurate and pref in ("auto", "scale"):
             # Last-resort full-res export. This is not correct HDR tone mapping,
             # but it is still original-resolution and only used if the HDR filters fail.
             # Disabled by default because the goal is faithful HDR->SDR rendering,
             # not silently saving a washed-out fallback frame.
-            sf = f"scale=in_range=limited:out_range=full,format=bgr24,{crop}"
-            cmds.append(base + ["-vf", sf] + enc)
+            sf = f"{seek_filter}scale=in_range=limited:out_range=full,format=bgr24,{crop}"
+            cmds.append(base + ["-vf", sf] + out_once + enc)
         return cmds
 
     def _save_hdr_sdr_screencap(
@@ -6934,7 +6958,7 @@ class Processor(QtCore.QObject):
             try:
                 cp = subprocess.run(cmd, text=True, capture_output=True, check=False, timeout=timeout_sec)
                 if cp.returncode == 0:
-                    valid, invalid_why = self._validate_hdr_sdr_export_image(tmp)
+                    valid, invalid_why = self._validate_hdr_sdr_export_image(tmp, (int(crop_xyxy[2] - crop_xyxy[0]), int(crop_xyxy[3] - crop_xyxy[1])))
                     if valid:
                         os.replace(tmp, out_path)
                         return True, ""
@@ -7009,19 +7033,16 @@ class Processor(QtCore.QObject):
 
         is_avif = out_path.lower().endswith(".avif")
 
-        pre_seek_args, post_seek_args = self._ffmpeg_accurate_seek_input_args(seek_sec)
+        pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(seek_sec)
         cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
         cmd += pre_seek_args
         cmd += [
             "-i",
             self.cfg.video,
-        ]
-        cmd += post_seek_args
-        cmd += [
-            "-vf",
-            vf,
             "-map",
             "0:v:0",
+            "-vf",
+            f"{seek_filter}{vf}",
             "-frames:v",
             "1",
         ]
