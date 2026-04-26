@@ -16,7 +16,7 @@
   "auto_crop_borders": true,
   "hdr_passthrough": true,
   "hdr_crop_format": "avif",
-  "log_interval_sec": 1.0,
+  "log_interval_sec": 0.2,
   "lock_after_hits": 1,
   "lock_face_thresh": 0.26,
   "lock_reid_thresh": 0.34,
