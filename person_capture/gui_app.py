@@ -284,6 +284,7 @@ APP_NAME = "PersonCapture GUI"
 
 _SETTINGS_KEY_FFMPEG_DIR = "paths/ffmpeg_dir"
 _SETTINGS_KEY_SDR_NITS_MIGRATED = "migrations/sdr_nits_default_100_v1"
+_SETTINGS_KEY_CROP_HEAD_PAD_MIGRATED = "migrations/crop_head_pad_defaults_088_095_v1"
 
 # ---------------------- Data & Settings ----------------------
 
@@ -390,8 +391,8 @@ class SessionConfig:
     crop_top_headroom_max_frac: float = 0.15     # max(top margin / crop_h)
     crop_bottom_min_face_heights: float = 1.5    # min bottom margin in face-heights
     crop_penalty_weight: float = 3.0             # weight for placement penalties vs area growth
-    crop_head_side_pad_frac: float = 0.70        # protect hair/head around detected face width
-    crop_head_top_pad_frac: float = 0.85         # protect hair/forehead above detected face height
+    crop_head_side_pad_frac: float = 0.88        # protect hair/head around detected face width
+    crop_head_top_pad_frac: float = 0.95         # protect hair/forehead above detected face height
     crop_head_bottom_pad_frac: float = 0.30      # protect chin/neck below detected face height
     wide_face_aspect_penalty_weight: float = 10.0# penalize landscape crops when face is prominent
     wide_face_min_frame_frac: float = 0.12       # prominent-face threshold for landscape penalty
@@ -2168,10 +2169,12 @@ class Processor(QtCore.QObject):
                 if profile in {"close", "upper", "base"} and is_landscape:
                     continue
                 if profile == "body" and is_landscape:
-                    # A landscape body crop is only useful when the frame is truly
-                    # body/context dominated. If the matched face is already
-                    # prominent, a 3:2 crop is the wrong dataset sample and is more
-                    # likely to cut facial context near the edge.
+                    # Landscape is a rare context/body sample, not a normal face
+                    # framing choice. Eligibility requires an associated subject
+                    # plus small-face/tall-subject gates; body_cadence influences
+                    # scoring later and is not an eligibility gate.
+                    if subj is None:
+                        continue
                     if face is not None and face_frame_frac >= 0.12:
                         continue
                     if subj_h_frac < 0.60:
@@ -2212,12 +2215,12 @@ class Processor(QtCore.QObject):
                 elif profile == "body":
                     landscape_penalty = max(0.0, min(20.0, float(getattr(cfg, "compose_landscape_face_penalty", 5.0))))
                     profile_prior = 0.78
-                    if body_cadence or face_frame_frac < 0.10 or subj_h_frac > 0.62:
+                    if body_cadence and face_frame_frac < 0.10 and subj_h_frac > 0.62:
                         profile_prior -= 0.076 * landscape_penalty
-                    if face is not None and face_frame_frac >= 0.12:
-                        profile_prior += 0.55
+                    if face is not None and face_frame_frac >= 0.10:
+                        profile_prior += 0.70
                     if is_landscape:
-                        profile_prior += 0.35
+                        profile_prior += 0.70
                     if rs == "2:3":
                         ratio_prior += 0.00
                     elif rs == "3:4":
@@ -2276,6 +2279,8 @@ class Processor(QtCore.QObject):
                 continue
             is_landscape = aspect > 1.05
             if is_landscape:
+                if subj is None:
+                    continue
                 if face is not None and face_frame_frac >= 0.12:
                     continue
                 if subj_h_frac < 0.60:
@@ -5406,14 +5411,15 @@ class Processor(QtCore.QObject):
                             c.get("face_box"),
                         )
                     else:
-                        protect_box = (
-                            self._union_boxes_xyxy(
-                                c.get("head_box"),
-                                c.get("face_box"),
-                            )
-                            or self._union_boxes_xyxy(
-                                c.get("subject_box") or c.get("show_box"),
-                            )
+                        # Close/upper/portrait crops protect the detected head and
+                        # face plus the active associated person box. show_box is
+                        # a fallback only when subject_box is missing, because
+                        # show_box can be stale composed geometry.
+                        subject_or_show = c.get("subject_box") or c.get("show_box")
+                        protect_box = self._union_boxes_xyxy(
+                            subject_or_show,
+                            c.get("head_box"),
+                            c.get("face_box"),
                         )
                     if protect_box is not None:
                         try:
@@ -5459,12 +5465,17 @@ class Processor(QtCore.QObject):
                             ) or fb
                             cur_w = max(1.0, float(cx2 - cx1))
                             cur_h = max(1.0, float(cy2 - cy1))
+                            side_guard_box = self._union_boxes_xyxy(protect_box, padded_face) or padded_face
+                            # Do not preserve a stale landscape crop size for non-body
+                            # profiles. Side repair must keep the face/head visible,
+                            # not lock in a bad earlier composition.
+                            min_size_for_side = (cur_w, cur_h) if crop_profile_for_guard == "body" else None
                             cx1, cy1, cx2, cy2 = self._ratio_crop_containing_box(
-                                self._union_boxes_xyxy(protect_box, padded_face) or padded_face,
+                                side_guard_box,
                                 ratio_str,
                                 (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                 anchor=((cx1 + cx2) * 0.5, (cy1 + cy2) * 0.5),
-                                min_size_xy=(cur_w, cur_h),
+                                min_size_xy=min_size_for_side,
                             )
                             left_margin = max(0.0, float(fb[0]) - float(cx1))
                             right_margin = max(0.0, float(cx2) - float(fb[2]))
@@ -5489,12 +5500,16 @@ class Processor(QtCore.QObject):
                                 hfx1, hfy1, hfx2, hfy2 = hf
                                 hfw = max(1.0, hfx2 - hfx1)
                                 hfh = max(1.0, hfy2 - hfy1)
-                                hard_face_padded = self._pad_box_xyxy(
-                                    hf,
-                                    pad_x=0.06 * hfw,
-                                    pad_y_top=0.10 * hfh,
-                                    pad_y_bottom=0.16 * hfh,
-                                    bounds_xyxy=(repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                hard_head_box = self._coerce_box_xyxy(c.get("head_box"), (repair_bx1, repair_by1, repair_bx2, repair_by2))
+                                hard_face_padded = self._union_boxes_xyxy(
+                                    hard_head_box,
+                                    self._pad_box_xyxy(
+                                        hf,
+                                        pad_x=0.12 * hfw,
+                                        pad_y_top=0.18 * hfh,
+                                        pad_y_bottom=0.18 * hfh,
+                                        bounds_xyxy=(repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                    ) or hf,
                                 ) or hf
                                 cur_crop = (float(cx1), float(cy1), float(cx2), float(cy2))
                                 cur_w = max(1.0, float(cx2 - cx1))
@@ -5507,22 +5522,51 @@ class Processor(QtCore.QObject):
                                     cur_aspect = cur_w / cur_h
                                 was_landscape = cur_aspect > 1.05
                                 hard_def = self._containment_deficit_xyxy(cur_crop, hard_face_padded, margin_px=1.0)
-                                prominent_face = cur_face_h_frac >= 0.16 or float(c.get("face_frac") or 0.0) >= 0.12
+                                frame_face_h_frac = hfh / max(1.0, float(repair_by2 - repair_by1))
+                                if crop_profile_for_guard == "body":
+                                    # Keep body-landscape portrait forcing aligned with the
+                                    # upstream body eligibility gate (face_h/frame_h >= 0.12).
+                                    prominent_face = (
+                                        cur_face_h_frac >= 0.12
+                                        or frame_face_h_frac >= 0.12
+                                    )
+                                else:
+                                    prominent_face = (
+                                        cur_face_h_frac >= 0.10
+                                        or frame_face_h_frac >= 0.075
+                                        or float(c.get("face_frac") or 0.0) >= 0.035
+                                    )
                                 force_portrait = was_landscape and (crop_profile_for_guard != "body" or prominent_face)
                                 if hard_def > 0.01 or force_portrait:
-                                    identity_guard = self._coerce_box_xyxy(
-                                        self._union_boxes_xyxy(
-                                            c.get("subject_box") or c.get("show_box"),
-                                            c.get("head_box"),
-                                            c.get("face_box"),
-                                        ),
-                                        (repair_bx1, repair_by1, repair_bx2, repair_by2),
-                                    )
+                                    if crop_profile_for_guard == "body" and not force_portrait:
+                                        identity_guard = self._coerce_box_xyxy(
+                                            self._union_boxes_xyxy(
+                                                c.get("subject_box"),
+                                                c.get("head_box"),
+                                                c.get("face_box"),
+                                            ),
+                                            (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                        )
+                                    else:
+                                        subject_or_show = c.get("subject_box") or c.get("show_box")
+                                        identity_guard = self._coerce_box_xyxy(
+                                            self._union_boxes_xyxy(
+                                                subject_or_show,
+                                                c.get("head_box"),
+                                                c.get("face_box"),
+                                            ),
+                                            (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                        )
                                     protect_box_clamped = (
                                         self._coerce_box_xyxy(protect_box, (repair_bx1, repair_by1, repair_bx2, repair_by2))
-                                        if protect_box is not None
+                                        if (protect_box is not None and crop_profile_for_guard == "body" and not force_portrait)
                                         else None
                                     )
+                                    # Do not add any extra show_box-only guard here.
+                                    # identity_guard already carries subject_or_show in the
+                                    # non-body / forced-portrait branch; adding another
+                                    # standalone show_box guard can resurrect stale wide
+                                    # preview geometry.
                                     full_guard_box = self._union_boxes_xyxy(
                                         hard_face_padded,
                                         identity_guard,
@@ -5536,7 +5580,7 @@ class Processor(QtCore.QObject):
                                                 fix_ratio,
                                                 (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                                 anchor=((hfx1 + hfx2) * 0.5, (hfy1 + hfy2) * 0.5 + 0.18 * hfh),
-                                                min_size_xy=(max(hfw * 1.18, 2.0), max(hfh * 1.22, 2.0)),
+                                                min_size_xy=(max(hfw * 1.45, 2.0), max(hfh * 1.55, 2.0)),
                                             )
                                             guard_def = self._containment_deficit_xyxy(fixed, full_guard_box, margin_px=1.0)
                                             if guard_def > 0.01:
@@ -5569,7 +5613,10 @@ class Processor(QtCore.QObject):
                                                 fallback_ratio,
                                                 (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                                 anchor=((hfx1 + hfx2) * 0.5, (hfy1 + hfy2) * 0.5 + 0.18 * hfh),
-                                                min_size_xy=(max(cur_w, hfw * 1.18), max(cur_h, hfh * 1.22)),
+                                                min_size_xy=(
+                                                    (max(cur_w, hfw * 1.45) if not force_portrait else max(hfw * 1.45, 2.0)),
+                                                    (max(cur_h, hfh * 1.55) if not force_portrait else max(hfh * 1.55, 2.0)),
+                                                ),
                                             )
                                             guard_def = self._containment_deficit_xyxy(fixed, full_guard_box, margin_px=1.0)
                                             if guard_def <= 0.01:
@@ -5586,7 +5633,10 @@ class Processor(QtCore.QObject):
                                                     fallback_ratio,
                                                     (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                                     anchor=((hfx1 + hfx2) * 0.5, (hfy1 + hfy2) * 0.5 + 0.18 * hfh),
-                                                    min_size_xy=(max(cur_w, hfw * 1.18), max(cur_h, hfh * 1.22)),
+                                                    min_size_xy=(
+                                                        (max(cur_w, hfw * 1.45) if not force_portrait else max(hfw * 1.45, 2.0)),
+                                                        (max(cur_h, hfh * 1.55) if not force_portrait else max(hfh * 1.55, 2.0)),
+                                                    ),
                                                 )
                                                 cx1, cy1, cx2, cy2 = fixed
                                                 ratio_str = fallback_ratio
@@ -5606,7 +5656,10 @@ class Processor(QtCore.QObject):
                                                         fallback_ratio,
                                                         (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                                         anchor=((hfx1 + hfx2) * 0.5, (hfy1 + hfy2) * 0.5 + 0.18 * hfh),
-                                                        min_size_xy=(max(cur_w, hfw * 1.18), max(cur_h, hfh * 1.22)),
+                                                        min_size_xy=(
+                                                            (max(cur_w, hfw * 1.45) if not force_portrait else max(hfw * 1.45, 2.0)),
+                                                            (max(cur_h, hfh * 1.55) if not force_portrait else max(hfh * 1.55, 2.0)),
+                                                        ),
                                                     )
                                                 cx1, cy1, cx2, cy2 = self._shift_crop_to_include_box(
                                                     shift_seed,
@@ -5622,7 +5675,7 @@ class Processor(QtCore.QObject):
                                                             fallback_ratio,
                                                             (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                                             anchor=((hfx1 + hfx2) * 0.5, (hfy1 + hfy2) * 0.5 + 0.18 * hfh),
-                                                            min_size_xy=(max(hfw * 1.18, 2.0), max(hfh * 1.22, 2.0)),
+                                                            min_size_xy=(max(hfw * 1.45, 2.0), max(hfh * 1.55, 2.0)),
                                                         )
                                                     except Exception:
                                                         pass
@@ -6899,11 +6952,17 @@ class Processor(QtCore.QObject):
         jpg_quality = self._validated_jpeg_quality(self.cfg, default=95)
         q = max(1, min(31, int(round((100 - jpg_quality) / 5.0 + 1))))
         if quality in ("resolve_like", "madvr_like"):
-            q = min(q, 2)
+            # Full-res still export is the final dataset artifact, not a fast
+            # preview cache. Keep it at the visually lossless end of FFmpeg's
+            # MJPEG scale; q=2 is still visibly softer in very dark, low-texture
+            # faces once the UI or training tooling magnifies the crop.
+            q = 1
         enc = [
             "-an", "-sn", "-dn",
             "-c:v", "mjpeg",
             "-q:v", str(q),
+            "-qmin", "1",
+            "-qmax", str(q),
             "-pix_fmt", "yuvj444p",
             "-color_range", "pc",
             "-colorspace", "bt709",
@@ -6937,37 +6996,56 @@ class Processor(QtCore.QObject):
                     _add_first_lp_opt(opts, ("saturation", "sat"), f"{sat:.6g}")
                 _add_first_lp_opt(opts, ("gamut_mode", "gamut_mapping"), gamut)
 
-            base_lp_opts = [f"tonemapping='{algo}'"]
-            _add_output_color_opts(base_lp_opts)
-            _add_first_lp_opt(base_lp_opts, ("format", "out_format", "out_pfmt"), "bgra")
-            self._add_lp_opt(base_lp_opts, supported, "peak_detect", "true" if peak_detect else "false")
-            if algo in {"mobius", "hable", "reinhard", "gamma"}:
-                self._add_lp_opt(base_lp_opts, supported, "tonemapping_param", f"{param:.6g}")
-            if quality in ("resolve_like", "madvr_like"):
-                self._add_lp_opt(base_lp_opts, supported, "peak_detection_preset", "high_quality")
-                self._add_lp_opt(base_lp_opts, supported, "color_map_preset", "high_quality")
-                self._add_lp_opt(base_lp_opts, supported, "contrast_recovery", f"{contrast_recovery:.6g}")
-                self._add_lp_opt(base_lp_opts, supported, "contrast_smoothness", "3.5")
-                self._add_lp_opt(base_lp_opts, supported, "deband", "true")
-                if not self._add_lp_opt(base_lp_opts, supported, "tonemapping_lut_size", "1024"):
-                    self._add_lp_opt(base_lp_opts, supported, "tone_lut_size", "1024")
-                # Match the live preview renderer path: ordered dithering, not a
-                # separate still-export blue-noise path that changes dark gradients.
-                if not self._add_lp_opt(base_lp_opts, supported, "dithering", "ordered"):
-                    self._add_lp_opt(base_lp_opts, supported, "dither_method", "ordered")
-            elif quality == "balanced":
-                self._add_lp_opt(base_lp_opts, supported, "contrast_recovery", f"{min(contrast_recovery, 0.20):.6g}")
-                self._add_lp_opt(base_lp_opts, supported, "tonemapping_lut_size", "512")
-                if not self._add_lp_opt(base_lp_opts, supported, "dithering", "ordered"):
-                    self._add_lp_opt(base_lp_opts, supported, "dither_method", "ordered")
+            # Match the live HDR preview reader's libplacebo algorithm resolution:
+            # GUI/default "auto" does not mean pass literal auto to the still
+            # renderer. The live reader starts with BT.2390, then tries aliases if
+            # a build dislikes the dotted spelling. Passing literal auto here made
+            # saved crops use a different curve than the preview.
+            if algo == "auto":
+                # Keep still-export fallback order aligned with live preview:
+                # bt.2390 -> mobius -> hable -> clip, with bt2390 alias handling.
+                lp_algos = ["bt.2390", "bt2390", "mobius", "hable", "clip"]
+            else:
+                lp_algos = [algo]
+                if algo in {"bt.2390", "bt2390"}:
+                    lp_algos.append("bt2390" if algo == "bt.2390" else "bt.2390")
 
-            lp_variants: list[list[str]] = [base_lp_opts]
-            minimal_lp_opts = [f"tonemapping='{algo}'"]
-            _add_output_color_opts(minimal_lp_opts)
-            _add_first_lp_opt(minimal_lp_opts, ("format", "out_format", "out_pfmt"), "bgra")
-            if not self._add_lp_opt(minimal_lp_opts, supported, "dithering", "ordered"):
-                self._add_lp_opt(minimal_lp_opts, supported, "dither_method", "ordered")
-            lp_variants.append(minimal_lp_opts)
+            lp_variants: list[list[str]] = []
+            for lp_algo in lp_algos:
+                base_lp_opts = [f"tonemapping='{lp_algo}'"]
+                _add_output_color_opts(base_lp_opts)
+                _add_first_lp_opt(base_lp_opts, ("format", "out_format", "out_pfmt"), "bgra")
+                self._add_lp_opt(base_lp_opts, supported, "peak_detect", "true" if peak_detect else "false")
+                if lp_algo in {"mobius", "hable", "reinhard", "gamma"}:
+                    self._add_lp_opt(base_lp_opts, supported, "tonemapping_param", f"{param:.6g}")
+                if quality in ("resolve_like", "madvr_like"):
+                    self._add_lp_opt(base_lp_opts, supported, "peak_detection_preset", "high_quality")
+                    self._add_lp_opt(base_lp_opts, supported, "color_map_preset", "high_quality")
+                    self._add_lp_opt(base_lp_opts, supported, "contrast_recovery", f"{contrast_recovery:.6g}")
+                    self._add_lp_opt(base_lp_opts, supported, "contrast_smoothness", "3.5")
+                    # Do not enable libplacebo debanding for dataset stills. It is
+                    # useful for playback gradients, but on close face crops it
+                    # smooths skin/eye detail and makes the saved crop look worse
+                    # than the live preview.
+                    if not self._add_lp_opt(base_lp_opts, supported, "tonemapping_lut_size", "1024"):
+                        self._add_lp_opt(base_lp_opts, supported, "tone_lut_size", "1024")
+                    # Match the live preview renderer path: ordered dithering, not a
+                    # separate still-export blue-noise path that changes dark gradients.
+                    if not self._add_lp_opt(base_lp_opts, supported, "dithering", "ordered"):
+                        self._add_lp_opt(base_lp_opts, supported, "dither_method", "ordered")
+                elif quality == "balanced":
+                    self._add_lp_opt(base_lp_opts, supported, "contrast_recovery", f"{min(contrast_recovery, 0.20):.6g}")
+                    self._add_lp_opt(base_lp_opts, supported, "tonemapping_lut_size", "512")
+                    if not self._add_lp_opt(base_lp_opts, supported, "dithering", "ordered"):
+                        self._add_lp_opt(base_lp_opts, supported, "dither_method", "ordered")
+                lp_variants.append(base_lp_opts)
+
+                minimal_lp_opts = [f"tonemapping='{lp_algo}'"]
+                _add_output_color_opts(minimal_lp_opts)
+                _add_first_lp_opt(minimal_lp_opts, ("format", "out_format", "out_pfmt"), "bgra")
+                if not self._add_lp_opt(minimal_lp_opts, supported, "dithering", "ordered"):
+                    self._add_lp_opt(minimal_lp_opts, supported, "dither_method", "ordered")
+                lp_variants.append(minimal_lp_opts)
 
             seen_lp: set[str] = set()
             for opts in lp_variants:
@@ -7065,6 +7143,7 @@ class Processor(QtCore.QObject):
         except Exception:
             pass
         timeout_sec = max(5, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
+        deadline = time.monotonic() + float(timeout_sec)
         for cmd in self._hdr_tonemap_filter_cmds(ffmpeg_bin, frame_idx, frame_pts_sec, crop_xyxy, tmp):
             try:
                 if os.path.exists(tmp):
@@ -7072,7 +7151,10 @@ class Processor(QtCore.QObject):
             except Exception:
                 pass
             try:
-                cp = subprocess.run(cmd, text=True, capture_output=True, check=False, timeout=timeout_sec)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False, f"ffmpeg_timeout_{timeout_sec}s"
+                cp = subprocess.run(cmd, text=True, capture_output=True, check=False, timeout=remaining)
                 if cp.returncode == 0:
                     valid, invalid_why = self._validate_hdr_sdr_export_image(tmp, (int(crop_xyxy[2] - crop_xyxy[0]), int(crop_xyxy[3] - crop_xyxy[1])))
                     if valid:
@@ -7094,7 +7176,7 @@ class Processor(QtCore.QObject):
                 self._status(f"HDR full-res export fallback: {why}", key="hdr_sdr_export", interval=10.0)
             except subprocess.TimeoutExpired as exc:
                 self._status(
-                    f"HDR full-res export timeout after {timeout_sec}s: {exc}",
+                    f"HDR full-res export timeout after {timeout_sec}s total budget: {exc}",
                     key="hdr_sdr_export",
                     interval=10.0,
                 )
@@ -10003,17 +10085,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'crop_penalty_weight_spin'):
             self.crop_penalty_weight_spin.setValue(cfg.crop_penalty_weight)
         try:
-            self.cfg.crop_head_side_pad_frac = float(getattr(cfg, "crop_head_side_pad_frac", 0.70))
+            self.cfg.crop_head_side_pad_frac = float(
+                getattr(cfg, "crop_head_side_pad_frac", SessionConfig.crop_head_side_pad_frac)
+            )
         except Exception:
-            self.cfg.crop_head_side_pad_frac = 0.70
+            self.cfg.crop_head_side_pad_frac = float(SessionConfig.crop_head_side_pad_frac)
         try:
-            self.cfg.crop_head_top_pad_frac = float(getattr(cfg, "crop_head_top_pad_frac", 0.85))
+            self.cfg.crop_head_top_pad_frac = float(
+                getattr(cfg, "crop_head_top_pad_frac", SessionConfig.crop_head_top_pad_frac)
+            )
         except Exception:
-            self.cfg.crop_head_top_pad_frac = 0.85
+            self.cfg.crop_head_top_pad_frac = float(SessionConfig.crop_head_top_pad_frac)
         try:
-            self.cfg.crop_head_bottom_pad_frac = float(getattr(cfg, "crop_head_bottom_pad_frac", 0.30))
+            self.cfg.crop_head_bottom_pad_frac = float(
+                getattr(cfg, "crop_head_bottom_pad_frac", SessionConfig.crop_head_bottom_pad_frac)
+            )
         except Exception:
-            self.cfg.crop_head_bottom_pad_frac = 0.30
+            self.cfg.crop_head_bottom_pad_frac = float(SessionConfig.crop_head_bottom_pad_frac)
         try:
             self.cfg.wide_face_aspect_penalty_weight = float(
                 getattr(cfg, "wide_face_aspect_penalty_weight", 10.0)
@@ -10426,13 +10514,28 @@ class MainWindow(QtWidgets.QMainWindow):
         def _set(img: QtGui.QImage) -> bool:
             if img.isNull():
                 return False
-            self.hit_label.setPixmap(
-                QtGui.QPixmap.fromImage(img).scaled(
-                    self.hit_label.size(),
+            label_size = self.hit_label.size()
+            pix = QtGui.QPixmap.fromImage(img)
+            # The saved-crop panel is a QC surface. Do not upscale the crop or
+            # smooth-filter it; that made the UI itself look softer than the live
+            # preview and hid whether the file was actually sharp.
+            if img.width() > label_size.width() or img.height() > label_size.height():
+                pix = pix.scaled(
+                    label_size,
                     QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-                    QtCore.Qt.TransformationMode.SmoothTransformation,
+                    QtCore.Qt.TransformationMode.FastTransformation,
                 )
-            )
+            self.hit_label.setPixmap(pix)
+            try:
+                self.hit_label.setToolTip(f"{crop_path}\n{img.width()}x{img.height()}")
+            except Exception:
+                logging.getLogger(__name__).debug(
+                    "Failed to set hit preview tooltip for %s (%sx%s)",
+                    crop_path,
+                    img.width(),
+                    img.height(),
+                    exc_info=True,
+                )
             return True
 
         img = QtGui.QImage(crop_path)
@@ -10649,6 +10752,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sdr_nits_spin.setValue(_sdr_nits)
         except Exception:
             self.sdr_nits_spin.setValue(float(self.cfg.sdr_nits))
+        try:
+            # One-time migration for the face/head protection defaults so
+            # persisted pre-change defaults pick up the final alignment fix.
+            if not bool(s.value(_SETTINGS_KEY_CROP_HEAD_PAD_MIGRATED, False, type=bool)):
+                def _migrate_crop_pad(key: str, old_default: float, new_default: float) -> None:
+                    raw = s.value(key, None)
+                    if raw is None:
+                        s.setValue(key, float(new_default))
+                        return
+                    try:
+                        current = float(raw)
+                    except Exception:
+                        return
+                    if abs(current - old_default) < 1e-6:
+                        s.setValue(key, float(new_default))
+
+                _migrate_crop_pad("crop_head_side_pad_frac", 0.70, 0.88)
+                _migrate_crop_pad("crop_head_top_pad_frac", 0.85, 0.95)
+                s.setValue(_SETTINGS_KEY_CROP_HEAD_PAD_MIGRATED, True)
+        except Exception:
+            pass
         try:
             self.tm_desat_spin.setValue(float(s.value("tm_desat", self.cfg.tm_desat)))
         except Exception:
@@ -10949,22 +11073,31 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         try:
             self.cfg.crop_head_side_pad_frac = float(
-                s.value("crop_head_side_pad_frac", getattr(self.cfg, "crop_head_side_pad_frac", 0.70))
+                s.value(
+                    "crop_head_side_pad_frac",
+                    getattr(self.cfg, "crop_head_side_pad_frac", SessionConfig.crop_head_side_pad_frac),
+                )
             )
         except Exception:
-            self.cfg.crop_head_side_pad_frac = 0.70
+            self.cfg.crop_head_side_pad_frac = float(SessionConfig.crop_head_side_pad_frac)
         try:
             self.cfg.crop_head_top_pad_frac = float(
-                s.value("crop_head_top_pad_frac", getattr(self.cfg, "crop_head_top_pad_frac", 0.85))
+                s.value(
+                    "crop_head_top_pad_frac",
+                    getattr(self.cfg, "crop_head_top_pad_frac", SessionConfig.crop_head_top_pad_frac),
+                )
             )
         except Exception:
-            self.cfg.crop_head_top_pad_frac = 0.85
+            self.cfg.crop_head_top_pad_frac = float(SessionConfig.crop_head_top_pad_frac)
         try:
             self.cfg.crop_head_bottom_pad_frac = float(
-                s.value("crop_head_bottom_pad_frac", getattr(self.cfg, "crop_head_bottom_pad_frac", 0.30))
+                s.value(
+                    "crop_head_bottom_pad_frac",
+                    getattr(self.cfg, "crop_head_bottom_pad_frac", SessionConfig.crop_head_bottom_pad_frac),
+                )
             )
         except Exception:
-            self.cfg.crop_head_bottom_pad_frac = 0.30
+            self.cfg.crop_head_bottom_pad_frac = float(SessionConfig.crop_head_bottom_pad_frac)
         try:
             self.cfg.wide_face_aspect_penalty_weight = float(
                 s.value(
