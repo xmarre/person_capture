@@ -4370,6 +4370,13 @@ class Processor(QtCore.QObject):
                             "hdr_sdr_contrast_recovery",
                             "hdr_sdr_peak_detect",
                             "hdr_sdr_allow_inaccurate_fallback",
+                            "compose_crop_enable",
+                            "compose_detect_person_for_face",
+                            "compose_close_face_h_frac",
+                            "compose_upper_face_h_frac",
+                            "compose_body_face_h_frac",
+                            "compose_landscape_face_penalty",
+                            "compose_body_every_n",
                         }
                         rot_keys = {
                             "rot_adaptive",
@@ -4743,12 +4750,11 @@ class Processor(QtCore.QObject):
                                     subject_box_global = None
                                     if subject_box_abs is not None:
                                         sx1, sy1, sx2, sy2 = subject_box_abs
-                                        subject_box_global = (
-                                            max(0, min(W - 1, int(round(sx1 + off_x)))),
-                                            max(0, min(H - 1, int(round(sy1 + off_y)))),
-                                            max(1, min(W, int(round(sx2 + off_x)))),
-                                            max(1, min(H, int(round(sy2 + off_y)))),
-                                        )
+                                        sgx1 = max(0, min(W - 1, int(round(sx1 + off_x))))
+                                        sgy1 = max(0, min(H - 1, int(round(sy1 + off_y))))
+                                        sgx2 = max(sgx1 + 1, min(W, int(round(sx2 + off_x))))
+                                        sgy2 = max(sgy1 + 1, min(H, int(round(sy2 + off_y))))
+                                        subject_box_global = (sgx1, sgy1, sgx2, sgy2)
                                     head_box_global = None
                                     head_box_roi = self._face_head_proxy_box(face_box_abs, W2, H2)
                                     if head_box_roi is not None:
@@ -5666,12 +5672,11 @@ class Processor(QtCore.QObject):
                                     subject_box_global = None
                                     if subject_box_abs is not None:
                                         sx1, sy1, sx2, sy2 = subject_box_abs
-                                        subject_box_global = (
-                                            max(0, min(W - 1, int(round(sx1 + off_x)))),
-                                            max(0, min(H - 1, int(round(sy1 + off_y)))),
-                                            max(1, min(W, int(round(sx2 + off_x)))),
-                                            max(1, min(H, int(round(sy2 + off_y)))),
-                                        )
+                                        sgx1 = max(0, min(W - 1, int(round(sx1 + off_x))))
+                                        sgy1 = max(0, min(H - 1, int(round(sy1 + off_y))))
+                                        sgx2 = max(sgx1 + 1, min(W, int(round(sx2 + off_x))))
+                                        sgy2 = max(sgy1 + 1, min(H, int(round(sy2 + off_y))))
+                                        subject_box_global = (sgx1, sgy1, sgx2, sgy2)
                                     head_box_global = None
                                     head_box_roi = self._face_head_proxy_box(face_box_abs, W2, H2)
                                     if head_box_roi is not None:
