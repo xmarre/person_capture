@@ -5029,6 +5029,24 @@ class Processor(QtCore.QObject):
                                     key="side_guard_dbg2",
                                     interval=0.8,
                                 )
+                        # Re-check head containment after side-guard salvage: salvage may
+                        # shift or shrink the crop relative to the earlier head guard.
+                        hb = c.get("head_box")
+                        if hb is not None:
+                            head_inner_px = inner_px
+                            head_cut = (
+                                float(hb[0]) < float(cx1) + head_inner_px
+                                or float(hb[2]) > float(cx2) - head_inner_px
+                                or float(hb[1]) < float(cy1) + head_inner_px
+                                or float(hb[3]) > float(cy2) - head_inner_px
+                            )
+                            if head_cut:
+                                self._status(
+                                    "skip: head_guard_drop (visible head would be cut)",
+                                    key="cap",
+                                    interval=1.5,
+                                )
+                                return False
                         # final guard (also catches actual face cuts)
                         edge_cut = (float(fb[0]) < float(cx1) + inner_px) or (float(fb[2]) > float(cx2) - inner_px)
                         if min(left_margin, right_margin) < required or edge_cut:
@@ -5676,7 +5694,7 @@ class Processor(QtCore.QObject):
                             by2 = max(0, min(H - 1, by2))
                             if bx2 > bx1 and by2 > by1:
                                 cv2.rectangle(show, (bx1, by1), (bx2, by2), (255,0,0), 2)
-                                rs = candidates[0].get("reasons")
+                                rs = selected_preview.get("reasons")
                                 if rs:
                                     cv2.putText(
                                         show,
@@ -6209,12 +6227,6 @@ class Processor(QtCore.QObject):
         pref = str(getattr(self.cfg, "hdr_tonemap_pref", "auto") or "auto").lower()
         quality = str(getattr(self.cfg, "hdr_sdr_quality", "madvr_like") or "madvr_like").lower()
         algo = str(getattr(self.cfg, "hdr_sdr_tonemap", "auto") or "auto").lower()
-        # Older presets stored the previous default as spline. For the high-quality
-        # renderer path, treat that legacy value as automatic libplacebo tone mapping
-        # so saved crops match the live renderer path instead of the old bright still
-        # export path. Explicit non-default curves are still honored.
-        if quality in {"resolve_like", "madvr_like"} and algo == "spline":
-            algo = "auto"
         if algo not in {"auto", "spline", "bt.2390", "st2094-40", "mobius", "hable", "reinhard", "clip"}:
             algo = "auto"
         gamut = str(getattr(self.cfg, "hdr_sdr_gamut_mapping", "clip") or "clip").lower()
@@ -9236,6 +9248,32 @@ class MainWindow(QtWidgets.QMainWindow):
             self.crop_bottom_min_face_spin.setValue(cfg.crop_bottom_min_face_heights)
         if hasattr(self, 'crop_penalty_weight_spin'):
             self.crop_penalty_weight_spin.setValue(cfg.crop_penalty_weight)
+        try:
+            self.cfg.crop_head_side_pad_frac = float(getattr(cfg, "crop_head_side_pad_frac", 0.70))
+        except Exception:
+            self.cfg.crop_head_side_pad_frac = 0.70
+        try:
+            self.cfg.crop_head_top_pad_frac = float(getattr(cfg, "crop_head_top_pad_frac", 0.85))
+        except Exception:
+            self.cfg.crop_head_top_pad_frac = 0.85
+        try:
+            self.cfg.crop_head_bottom_pad_frac = float(getattr(cfg, "crop_head_bottom_pad_frac", 0.30))
+        except Exception:
+            self.cfg.crop_head_bottom_pad_frac = 0.30
+        try:
+            self.cfg.wide_face_aspect_penalty_weight = float(
+                getattr(cfg, "wide_face_aspect_penalty_weight", 10.0)
+            )
+        except Exception:
+            self.cfg.wide_face_aspect_penalty_weight = 10.0
+        try:
+            self.cfg.wide_face_min_frame_frac = float(getattr(cfg, "wide_face_min_frame_frac", 0.12))
+        except Exception:
+            self.cfg.wide_face_min_frame_frac = 0.12
+        try:
+            self.cfg.wide_face_aspect_limit = float(getattr(cfg, "wide_face_aspect_limit", 1.05))
+        except Exception:
+            self.cfg.wide_face_aspect_limit = 1.05
         if hasattr(self, 'face_anchor_down_spin'):
             self.face_anchor_down_spin.setValue(cfg.face_anchor_down_frac)
         if hasattr(self, 'lambda_facefrac_spin'):
@@ -10130,6 +10168,45 @@ class MainWindow(QtWidgets.QMainWindow):
             self.crop_penalty_weight_spin.setValue(
                 float(s.value("crop_penalty_weight", self.cfg.crop_penalty_weight))
             )
+        try:
+            self.cfg.crop_head_side_pad_frac = float(
+                s.value("crop_head_side_pad_frac", getattr(self.cfg, "crop_head_side_pad_frac", 0.70))
+            )
+        except Exception:
+            self.cfg.crop_head_side_pad_frac = 0.70
+        try:
+            self.cfg.crop_head_top_pad_frac = float(
+                s.value("crop_head_top_pad_frac", getattr(self.cfg, "crop_head_top_pad_frac", 0.85))
+            )
+        except Exception:
+            self.cfg.crop_head_top_pad_frac = 0.85
+        try:
+            self.cfg.crop_head_bottom_pad_frac = float(
+                s.value("crop_head_bottom_pad_frac", getattr(self.cfg, "crop_head_bottom_pad_frac", 0.30))
+            )
+        except Exception:
+            self.cfg.crop_head_bottom_pad_frac = 0.30
+        try:
+            self.cfg.wide_face_aspect_penalty_weight = float(
+                s.value(
+                    "wide_face_aspect_penalty_weight",
+                    getattr(self.cfg, "wide_face_aspect_penalty_weight", 10.0),
+                )
+            )
+        except Exception:
+            self.cfg.wide_face_aspect_penalty_weight = 10.0
+        try:
+            self.cfg.wide_face_min_frame_frac = float(
+                s.value("wide_face_min_frame_frac", getattr(self.cfg, "wide_face_min_frame_frac", 0.12))
+            )
+        except Exception:
+            self.cfg.wide_face_min_frame_frac = 0.12
+        try:
+            self.cfg.wide_face_aspect_limit = float(
+                s.value("wide_face_aspect_limit", getattr(self.cfg, "wide_face_aspect_limit", 1.05))
+            )
+        except Exception:
+            self.cfg.wide_face_aspect_limit = 1.05
         if hasattr(self, 'face_anchor_down_spin'):
             self.face_anchor_down_spin.setValue(
                 float(s.value("face_anchor_down_frac", self.cfg.face_anchor_down_frac))
