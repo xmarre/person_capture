@@ -5594,13 +5594,38 @@ class Processor(QtCore.QObject):
                                                 fallback_done = True
                                             except Exception:
                                                 pass
-                                        if (not fallback_done) and (hard_def > 0.01):
-                                            cx1, cy1, cx2, cy2 = self._shift_crop_to_include_box(
-                                                cur_crop,
-                                                hard_face_padded,
-                                                (repair_bx1, repair_by1, repair_bx2, repair_by2),
-                                                margin_px=1.0,
-                                            )
+                                        if (not fallback_done) and (hard_def > 0.01 or force_portrait):
+                                            if force_portrait:
+                                                ratio_str = fallback_ratio
+                                                c["ratio"] = fallback_ratio
+                                            try:
+                                                shift_seed = cur_crop
+                                                if force_portrait:
+                                                    shift_seed = self._ratio_crop_containing_box(
+                                                        hard_face_padded,
+                                                        fallback_ratio,
+                                                        (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                                        anchor=((hfx1 + hfx2) * 0.5, (hfy1 + hfy2) * 0.5 + 0.18 * hfh),
+                                                        min_size_xy=(max(cur_w, hfw * 1.18), max(cur_h, hfh * 1.22)),
+                                                    )
+                                                cx1, cy1, cx2, cy2 = self._shift_crop_to_include_box(
+                                                    shift_seed,
+                                                    hard_face_padded,
+                                                    (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                                    margin_px=1.0,
+                                                )
+                                            except Exception:
+                                                if force_portrait:
+                                                    try:
+                                                        cx1, cy1, cx2, cy2 = self._ratio_crop_containing_box(
+                                                            hard_face_padded,
+                                                            fallback_ratio,
+                                                            (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                                            anchor=((hfx1 + hfx2) * 0.5, (hfy1 + hfy2) * 0.5 + 0.18 * hfh),
+                                                            min_size_xy=(max(hfw * 1.18, 2.0), max(hfh * 1.22, 2.0)),
+                                                        )
+                                                    except Exception:
+                                                        pass
                                         if crop_profile_for_guard == "body" and was_landscape and c.get("ratio") in {"1:1", "2:3", "3:4"}:
                                             c["crop_profile"] = "upper"
                                             crop_profile_for_guard = "upper"
