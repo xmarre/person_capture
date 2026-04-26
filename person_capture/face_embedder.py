@@ -439,7 +439,7 @@ class FaceEmbedder:
             self.det = _YOLO(yolo_path)
         else:
             try:
-                pass
+                from insightface.model_zoo.scrfd import SCRFD as _SCRFD  # noqa: F401
             except Exception as e:
                 raise RuntimeError(
                     "SCRFD backend requires 'insightface'. Install or update the package and retry."

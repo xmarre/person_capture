@@ -6614,6 +6614,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # HDR preview UI state flag (mirrors cfg.hdr_passthrough_preview)
         self._hdr_passthrough_enabled: bool = False
         self._last_hdr_preview_t: float = 0.0
+        self._hdr_preview_seen: bool = False
         self._curator_fallback: Optional[Processor] = None
         self._fps: Optional[float] = None
         self._total_frames: Optional[int] = None
@@ -8355,6 +8356,27 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             self._log(f"Curator dispatch failed: {exc}")
 
+    def _queue_worker_disable_hdr_passthrough(self) -> None:
+        worker = getattr(self, "_worker", None)
+        if worker is None:
+            return
+        try:
+            conn_type = (
+                QtCore.Qt.ConnectionType.QueuedConnection
+                if hasattr(QtCore.Qt, "ConnectionType")
+                else QtCore.Qt.QueuedConnection
+            )
+            QtCore.QMetaObject.invokeMethod(
+                worker,
+                "disable_hdr_passthrough",
+                conn_type,
+            )
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "Failed to queue HDR passthrough shutdown",
+                exc_info=True,
+            )
+
     def _on_speed_combo_changed(self, txt: str):
         if not self._worker:
             return
@@ -9067,7 +9089,8 @@ class MainWindow(QtWidgets.QMainWindow):
             cfg.hdr_passthrough and getattr(self, "_hdr_passthrough_supported", False)
         )
         self._hdr_passthrough_enabled = passthrough_active
-        self._last_hdr_preview_t = 0.0
+        self._last_hdr_preview_t = time.perf_counter()
+        self._hdr_preview_seen = False
 
         # basic validation
         if not os.path.isfile(cfg.video):
@@ -9212,22 +9235,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 ctx_ok = bool(has_ctx()) if callable(has_ctx) else False
             except Exception:
                 ctx_ok = False
+            hdr_seen = bool(getattr(self, "_hdr_preview_seen", False))
             try:
                 last_hdr_t = float(getattr(self, "_last_hdr_preview_t", 0.0) or 0.0)
-                hdr_stale = last_hdr_t <= 0.0 or (time.perf_counter() - last_hdr_t) > 2.0
+                hdr_stale = hdr_seen and ((time.perf_counter() - last_hdr_t) > 2.0)
             except Exception:
-                hdr_stale = True
-            if not ctx_ok or hdr_stale:
+                hdr_stale = False
+            if (hdr_seen and not ctx_ok) or hdr_stale:
                 log.debug("SDR preview taking over preview_stack (HDR passthrough stale/dead)")
                 self._hdr_passthrough_enabled = False
                 hdr_passthrough_enabled = False
                 # Propagate to worker: disable HDR passthrough and clean up reader
-                worker = getattr(self, "_worker", None)
-                if worker is not None:
-                    try:
-                        worker.disable_hdr_passthrough()
-                    except Exception:
-                        pass
+                self._queue_worker_disable_hdr_passthrough()
 
         # If HDR passthrough is not active, SDR preview owns the stack.
         if not hdr_passthrough_enabled:
@@ -9316,12 +9335,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 log.info("HDR passthrough: disabling (init failed)")
             self._hdr_passthrough_enabled = False
             # Propagate to worker: disable HDR passthrough and clean up reader
-            worker = getattr(self, "_worker", None)
-            if worker is not None:
-                try:
-                    worker.disable_hdr_passthrough()
-                except Exception:
-                    pass
+            self._queue_worker_disable_hdr_passthrough()
             if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
                 log.debug("SDR preview taking over preview_stack (index 0)")
                 self.preview_stack.setCurrentIndex(0)
@@ -9351,16 +9365,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 log.info("HDR passthrough: disabling (upload failed)")
             self._hdr_passthrough_enabled = False
             # Propagate to worker: disable HDR passthrough and clean up reader
-            worker = getattr(self, "_worker", None)
-            if worker is not None:
-                try:
-                    worker.disable_hdr_passthrough()
-                except Exception:
-                    pass
+            self._queue_worker_disable_hdr_passthrough()
             if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
                 log.debug("SDR preview taking over preview_stack (index 0)")
                 self.preview_stack.setCurrentIndex(0)
             return
+        self._hdr_preview_seen = True
+        self._last_hdr_preview_t = time.perf_counter()
 
         try:
             has_ctx = getattr(widget, "has_valid_ctx", None)
@@ -9373,12 +9384,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 log.info("HDR passthrough: disabling (no valid context)")
             self._hdr_passthrough_enabled = False
             # Propagate to worker: disable HDR passthrough and clean up reader
-            worker = getattr(self, "_worker", None)
-            if worker is not None:
-                try:
-                    worker.disable_hdr_passthrough()
-                except Exception:
-                    pass
+            self._queue_worker_disable_hdr_passthrough()
             if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 0:
                 log.debug("SDR preview taking over preview_stack (index 0)")
                 self.preview_stack.setCurrentIndex(0)
@@ -9388,7 +9394,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._hdr_passthrough_enabled:
             log.info("HDR passthrough: enabling (context OK)")
         self._hdr_passthrough_enabled = True
-        self._last_hdr_preview_t = time.perf_counter()
 
         if hasattr(self, "preview_stack") and self.preview_stack.currentIndex() != 1:
             log.debug("HDR preview taking over preview_stack (index 1)")
