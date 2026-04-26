@@ -2021,17 +2021,26 @@ class Processor(QtCore.QObject):
         bound_area = max(1.0, bound_w * bound_h)
 
         def _ratio_list_for_profile(profile: str) -> list[str]:
-            # Always make portrait/headshot ratios available even if the UI still
-            # has stale landscape-heavy settings. Landscape remains available for
-            # body/context crops only.
+            # Respect user-provided ratios as-is; only use profile defaults if the
+            # user list is empty/invalid.
             preferred = {
                 "close": ["1:1", "2:3"],
                 "upper": ["2:3", "1:1"],
                 "body": ["2:3", "1:1", "3:2"],
                 "base": ["1:1", "2:3"],
             }.get(profile, ["1:1", "2:3"])
+            user_ratios: list[str] = []
+            for rs in [str(r).strip() for r in (ratio_candidates or []) if str(r).strip()]:
+                try:
+                    parse_ratio(rs)
+                except Exception:
+                    continue
+                if rs not in user_ratios:
+                    user_ratios.append(rs)
+            if user_ratios:
+                return user_ratios
             out: list[str] = []
-            for rs in preferred + [str(r).strip() for r in (ratio_candidates or []) if str(r).strip()]:
+            for rs in preferred:
                 try:
                     parse_ratio(rs)
                 except Exception:
@@ -2170,14 +2179,15 @@ class Processor(QtCore.QObject):
                     profile_prior = 0.12
                     ratio_prior += 0.00 if rs == "2:3" else 0.06
                 elif profile == "body":
+                    landscape_penalty = max(0.0, min(20.0, float(getattr(cfg, "compose_landscape_face_penalty", 5.0))))
                     profile_prior = 0.78
                     if body_cadence or face_frame_frac < 0.10 or subj_h_frac > 0.62:
-                        profile_prior -= 0.38
+                        profile_prior -= 0.076 * landscape_penalty
                     ratio_prior += 0.00 if rs == "2:3" else (0.12 if rs == "1:1" else 0.30)
                     if is_landscape and subj is not None:
                         subj_aspect = (subj[2] - subj[0]) / max(1.0, subj[3] - subj[1])
                         if subj_aspect < 0.72:
-                            ratio_prior += 0.60
+                            ratio_prior += 0.12 * landscape_penalty
                 else:
                     profile_prior = 0.35
 
@@ -4230,7 +4240,10 @@ class Processor(QtCore.QObject):
                                         ok = True
                                         why = f"fallback_decoded_after_{why or 'hdr_export_failed'}"
                                         if isinstance(fallback_row, list):
-                                            row = fallback_row
+                                            if isinstance(row, list):
+                                                row[:] = fallback_row
+                                            else:
+                                                row = fallback_row
                                     else:
                                         why = f"{why}; decoded_fallback_failed={why2}"
                             elif kind == "jpeg":
@@ -5398,9 +5411,14 @@ class Processor(QtCore.QObject):
                             c.get("face_box"),
                         )
                     else:
-                        protect_box = self._union_boxes_xyxy(
-                            c.get("head_box"),
-                            c.get("face_box"),
+                        protect_box = (
+                            self._union_boxes_xyxy(
+                                c.get("head_box"),
+                                c.get("face_box"),
+                            )
+                            or self._union_boxes_xyxy(
+                                c.get("subject_box") or c.get("show_box"),
+                            )
                         )
                     if protect_box is not None:
                         try:
@@ -7570,6 +7588,17 @@ class MainWindow(QtWidgets.QMainWindow):
             "Allow inaccurate full-res scale fallback if HDR tone-map filters fail. Off preserves fidelity by failing instead of saving washed-out crops."
         )
         self.hdr_sdr_bad_fallback_check.stateChanged.connect(self._on_ui_change)
+        self.hdr_sdr_fallback_to_decoded_check = QtWidgets.QCheckBox()
+        self.hdr_sdr_fallback_to_decoded_check.setChecked(bool(getattr(self.cfg, "hdr_sdr_fallback_to_decoded", True)))
+        self.hdr_sdr_fallback_to_decoded_check.setToolTip(
+            "bool: hdr_sdr_fallback_to_decoded (fall back to decoded crop if full-res HDR still export fails)"
+        )
+        self.hdr_sdr_fallback_to_decoded_check.stateChanged.connect(self._on_ui_change)
+        self.hdr_sdr_disable_after_failures_spin = QtWidgets.QSpinBox()
+        self.hdr_sdr_disable_after_failures_spin.setRange(0, 50)
+        self.hdr_sdr_disable_after_failures_spin.setValue(int(getattr(self.cfg, "hdr_sdr_disable_after_failures", 1)))
+        self.hdr_sdr_disable_after_failures_spin.setToolTip("int: hdr_sdr_disable_after_failures (0=never disable full-res export)")
+        self.hdr_sdr_disable_after_failures_spin.valueChanged.connect(self._on_ui_change)
         self.hwaccel_combo = QtWidgets.QComboBox()
         self.hwaccel_combo.addItem("CPU decode (no hwaccel)", "off")
         self.hwaccel_combo.addItem("CUDA / NVDEC (GPU decode)", "cuda")
@@ -8038,6 +8067,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.compose_body_every_n_spin.setValue(int(self.cfg.compose_body_every_n))
         self.compose_body_every_n_spin.setToolTip("int: compose_body_every_n")
         self.compose_body_every_n_spin.valueChanged.connect(self._on_ui_change)
+        self.compose_person_detect_cadence_spin = QtWidgets.QSpinBox()
+        self.compose_person_detect_cadence_spin.setRange(1, 300)
+        self.compose_person_detect_cadence_spin.setValue(int(getattr(self.cfg, "compose_person_detect_cadence", 6)))
+        self.compose_person_detect_cadence_spin.setToolTip("int: compose_person_detect_cadence")
+        self.compose_person_detect_cadence_spin.valueChanged.connect(self._on_ui_change)
 
         labels = [
             ("Aspect ratio W:H", self.ratio_edit),
@@ -8051,6 +8085,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ("HDR contrast recovery", self.hdr_sdr_contrast_spin),
             ("HDR peak detect", self.hdr_sdr_peak_check),
             ("Allow inaccurate HDR fallback", self.hdr_sdr_bad_fallback_check),
+            ("Fallback to decoded crop on HDR export fail", self.hdr_sdr_fallback_to_decoded_check),
+            ("Disable full-res HDR after N failures", self.hdr_sdr_disable_after_failures_spin),
             ("FFmpeg hardware decode", self.hwaccel_combo),
             ("HDR archive format", self.hdr_crop_format_combo),
             ("Frame stride", self.stride_spin),
@@ -8170,6 +8206,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("compose_body_face_h_frac", self.compose_body_face_h_frac_spin),
             ("compose_landscape_face_penalty", self.compose_landscape_face_penalty_spin),
             ("compose_body_every_n", self.compose_body_every_n_spin),
+            ("compose_person_detect_cadence", self.compose_person_detect_cadence_spin),
         ]
         for row, (lab, w) in enumerate(labels):
             if lab:
@@ -9513,6 +9550,7 @@ class MainWindow(QtWidgets.QMainWindow):
             compose_body_face_h_frac=float(self.compose_body_face_h_frac_spin.value()) if hasattr(self, "compose_body_face_h_frac_spin") else float(getattr(self.cfg, "compose_body_face_h_frac", 0.085)),
             compose_landscape_face_penalty=float(self.compose_landscape_face_penalty_spin.value()) if hasattr(self, "compose_landscape_face_penalty_spin") else float(getattr(self.cfg, "compose_landscape_face_penalty", 5.0)),
             compose_body_every_n=int(self.compose_body_every_n_spin.value()) if hasattr(self, "compose_body_every_n_spin") else int(getattr(self.cfg, "compose_body_every_n", 6)),
+            compose_person_detect_cadence=int(self.compose_person_detect_cadence_spin.value()) if hasattr(self, "compose_person_detect_cadence_spin") else int(getattr(self.cfg, "compose_person_detect_cadence", 6)),
             hdr_export_timeout_sec=int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300),
         )
         cfg.hdr_passthrough = (
@@ -9547,6 +9585,8 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg.hdr_sdr_contrast_recovery = float(self.hdr_sdr_contrast_spin.value()) if hasattr(self, "hdr_sdr_contrast_spin") else 0.30
         cfg.hdr_sdr_peak_detect = bool(self.hdr_sdr_peak_check.isChecked()) if hasattr(self, "hdr_sdr_peak_check") else True
         cfg.hdr_sdr_allow_inaccurate_fallback = bool(self.hdr_sdr_bad_fallback_check.isChecked()) if hasattr(self, "hdr_sdr_bad_fallback_check") else False
+        cfg.hdr_sdr_fallback_to_decoded = bool(self.hdr_sdr_fallback_to_decoded_check.isChecked()) if hasattr(self, "hdr_sdr_fallback_to_decoded_check") else bool(getattr(self.cfg, "hdr_sdr_fallback_to_decoded", True))
+        cfg.hdr_sdr_disable_after_failures = int(self.hdr_sdr_disable_after_failures_spin.value()) if hasattr(self, "hdr_sdr_disable_after_failures_spin") else int(getattr(self.cfg, "hdr_sdr_disable_after_failures", 1))
         return cfg
 
     def _apply_cfg(self, cfg: SessionConfig):
@@ -9603,6 +9643,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.compose_body_every_n = int(getattr(cfg, "compose_body_every_n", 6))
         except Exception:
             self.cfg.compose_body_every_n = 6
+        try:
+            self.cfg.compose_person_detect_cadence = int(getattr(cfg, "compose_person_detect_cadence", 6))
+        except Exception:
+            self.cfg.compose_person_detect_cadence = 6
         self.video_edit.setText(cfg.video)
         paths = [part.strip() for part in (cfg.ref or "").split(';') if part.strip()]
         self._set_ref_paths(paths)
@@ -9634,6 +9678,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.hdr_sdr_peak_check.setChecked(bool(getattr(cfg, "hdr_sdr_peak_detect", True)))
         if hasattr(self, "hdr_sdr_bad_fallback_check"):
             self.hdr_sdr_bad_fallback_check.setChecked(bool(getattr(cfg, "hdr_sdr_allow_inaccurate_fallback", False)))
+        if hasattr(self, "hdr_sdr_fallback_to_decoded_check"):
+            self.hdr_sdr_fallback_to_decoded_check.setChecked(bool(getattr(cfg, "hdr_sdr_fallback_to_decoded", True)))
+        if hasattr(self, "hdr_sdr_disable_after_failures_spin"):
+            self.hdr_sdr_disable_after_failures_spin.setValue(int(getattr(cfg, "hdr_sdr_disable_after_failures", 1)))
         self.ratio_edit.setText(cfg.ratio)
         try:
             self.sdr_nits_spin.setValue(float(getattr(cfg, "sdr_nits", 125.0)))
@@ -9926,6 +9974,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.compose_landscape_face_penalty_spin.setValue(float(cfg.compose_landscape_face_penalty))
         if hasattr(self, 'compose_body_every_n_spin'):
             self.compose_body_every_n_spin.setValue(int(cfg.compose_body_every_n))
+        if hasattr(self, 'compose_person_detect_cadence_spin'):
+            self.compose_person_detect_cadence_spin.setValue(int(getattr(cfg, "compose_person_detect_cadence", 6)))
 
     # Thread control
     def on_start(self):
@@ -10565,6 +10615,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 s.value("hdr_sdr_allow_inaccurate_fallback", getattr(self.cfg, "hdr_sdr_allow_inaccurate_fallback", False), type=bool)
             )
             self.cfg.hdr_sdr_allow_inaccurate_fallback = bool(self.hdr_sdr_bad_fallback_check.isChecked())
+        if hasattr(self, "hdr_sdr_fallback_to_decoded_check"):
+            self.hdr_sdr_fallback_to_decoded_check.setChecked(
+                s.value("hdr_sdr_fallback_to_decoded", getattr(self.cfg, "hdr_sdr_fallback_to_decoded", True), type=bool)
+            )
+            self.cfg.hdr_sdr_fallback_to_decoded = bool(self.hdr_sdr_fallback_to_decoded_check.isChecked())
+        if hasattr(self, "hdr_sdr_disable_after_failures_spin"):
+            self.hdr_sdr_disable_after_failures_spin.setValue(
+                int(s.value("hdr_sdr_disable_after_failures", getattr(self.cfg, "hdr_sdr_disable_after_failures", 1)))
+            )
+            self.cfg.hdr_sdr_disable_after_failures = int(self.hdr_sdr_disable_after_failures_spin.value())
         try:
             self.cfg.hdr_export_timeout_sec = max(
                 5,
@@ -10854,6 +10914,12 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         except Exception:
             self.cfg.compose_body_every_n = 6
+        try:
+            self.cfg.compose_person_detect_cadence = int(
+                s.value("compose_person_detect_cadence", getattr(self.cfg, "compose_person_detect_cadence", 6))
+            )
+        except Exception:
+            self.cfg.compose_person_detect_cadence = 6
         if hasattr(self, 'face_anchor_down_spin'):
             self.face_anchor_down_spin.setValue(
                 float(s.value("face_anchor_down_frac", self.cfg.face_anchor_down_frac))
@@ -10978,6 +11044,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'compose_body_every_n_spin'):
             self.compose_body_every_n_spin.setValue(
                 int(s.value("compose_body_every_n", self.cfg.compose_body_every_n))
+            )
+        if hasattr(self, 'compose_person_detect_cadence_spin'):
+            self.compose_person_detect_cadence_spin.setValue(
+                int(s.value("compose_person_detect_cadence", getattr(self.cfg, "compose_person_detect_cadence", 6)))
             )
         # Face-first defaults if controls not present
         if hasattr(self, 'pref_face_check'):
