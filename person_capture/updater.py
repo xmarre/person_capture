@@ -343,14 +343,6 @@ def _remove_path_for_update_replace(path: Path) -> None:
         pass
 
 
-def _path_is_within(path: Path, base: Path) -> bool:
-    try:
-        path.relative_to(base)
-        return True
-    except ValueError:
-        return False
-
-
 _PRESERVED_UPDATE_PATHS = {
     ("person_capture", "output"),
     ("person_capture", "out"),
@@ -408,6 +400,13 @@ def _merge_staged_item_preserving_user_data(
         return
 
     dst.parent.mkdir(parents=True, exist_ok=True)
+    if (
+        _is_preserved_update_path(rel_parts)
+        and dst.exists()
+        and dst.is_dir()
+        and not dst.is_symlink()
+    ):
+        raise RuntimeError(f"refusing to replace preserved runtime dir: {dst}")
     if dst.exists() or dst.is_symlink():
         _remove_path_for_update_replace(dst)
     shutil.move(str(src), str(dst))
@@ -443,7 +442,7 @@ def apply_staged_update(repo: Path) -> Tuple[bool, str]:
         repo_resolved = repo.resolve()
         staged_base = (repo_resolved / "update_staged").resolve()
         staged_resolved = staged.resolve(strict=False)
-        if not _path_is_within(staged_resolved, staged_base):
+        if staged_resolved != staged_base:
             try:
                 flag.unlink()
             except Exception:
