@@ -5250,6 +5250,15 @@ class Processor(QtCore.QObject):
                         except Exception:
                             pass
 
+                    if bool(getattr(cfg, "auto_crop_borders", False)):
+                        bx1 = int(det_off_x)
+                        by1 = int(det_off_y)
+                        bx2 = int(bx1 + det_w)
+                        by2 = int(by1 + det_h)
+                    else:
+                        bx1, by1, bx2, by2 = 0, 0, frame_w, frame_h
+                    repair_bx1, repair_by1, repair_bx2, repair_by2 = bx1, by1, bx2, by2
+
                     # Final black-border trim on the saved crop, then re-expand to exact ratio
                     try:
                         try:
@@ -5291,6 +5300,7 @@ class Processor(QtCore.QObject):
                                     (nx1, ny1, nx2, ny2), int(tw), int(th),
                                     (nx1, ny1, nx2, ny2), anchor=anchor_glob
                                 )
+                                repair_bx1, repair_by1, repair_bx2, repair_by2 = int(nx1), int(ny1), int(nx2), int(ny2)
                                 # Final guard: ensure the shrunken crop still honors face side margins.
                                 try:
                                     cx1, cy1, cx2, cy2 = self._enforce_scale_and_margins(
@@ -5311,14 +5321,6 @@ class Processor(QtCore.QObject):
                     cx2 = max(cx1 + 1, min(frame_w, int(round(cx2))))
                     cy2 = max(cy1 + 1, min(frame_h, int(round(cy2))))
 
-                    if bool(getattr(cfg, "auto_crop_borders", False)):
-                        bx1 = int(det_off_x)
-                        by1 = int(det_off_y)
-                        bx2 = int(bx1 + det_w)
-                        by2 = int(by1 + det_h)
-                    else:
-                        bx1, by1, bx2, by2 = 0, 0, frame_w, frame_h
-
                     # Ensure ratio terms exist before using them in corrections
                     try:
                         rw, rh = parse_ratio(ratio_str)
@@ -5332,12 +5334,12 @@ class Processor(QtCore.QObject):
                         # Only correct if materially off (avoid jitter from rounding)
                         if abs(w - target_w) > 1:
                             # Center inside content window, not full frame
-                            cx1 = max(bx1, min(bx2 - target_w, cx1 + (w - target_w) // 2))
+                            cx1 = max(repair_bx1, min(repair_bx2 - target_w, cx1 + (w - target_w) // 2))
                             cx2 = cx1 + target_w
                         # Height correction stays inside the same content window
                         target_h = max(1, int(round((cx2 - cx1) * float(rh) / float(rw))))
                         if abs((cy2 - cy1) - target_h) > 1:
-                            cy1 = max(by1, min(by2 - target_h, cy1 + ((cy2 - cy1) - target_h) // 2))
+                            cy1 = max(repair_by1, min(repair_by2 - target_h, cy1 + ((cy2 - cy1) - target_h) // 2))
                             cy2 = cy1 + target_h
                     except Exception:
                         pass
@@ -5354,7 +5356,7 @@ class Processor(QtCore.QObject):
                             cx1, cy1, cx2, cy2 = self._ratio_crop_containing_box(
                                 protect_box,
                                 ratio_str,
-                                (bx1, by1, bx2, by2),
+                                (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                 anchor=((cx1 + cx2) * 0.5, (cy1 + cy2) * 0.5),
                                 min_size_xy=(cur_w, cur_h),
                             )
@@ -5362,7 +5364,7 @@ class Processor(QtCore.QObject):
                             cx1, cy1, cx2, cy2 = self._shift_crop_to_include_box(
                                 (cx1, cy1, cx2, cy2),
                                 protect_box,
-                                (bx1, by1, bx2, by2),
+                                (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                 margin_px=1.0,
                             )
 
@@ -5387,14 +5389,14 @@ class Processor(QtCore.QObject):
                                 pad_x=required,
                                 pad_y_top=float(getattr(cfg, "face_edge_inner_px", 1.0)),
                                 pad_y_bottom=float(getattr(cfg, "face_edge_inner_px", 1.0)),
-                                bounds_xyxy=(bx1, by1, bx2, by2),
+                                bounds_xyxy=(repair_bx1, repair_by1, repair_bx2, repair_by2),
                             ) or fb
                             cur_w = max(1.0, float(cx2 - cx1))
                             cur_h = max(1.0, float(cy2 - cy1))
                             cx1, cy1, cx2, cy2 = self._ratio_crop_containing_box(
                                 self._union_boxes_xyxy(protect_box, padded_face) or padded_face,
                                 ratio_str,
-                                (bx1, by1, bx2, by2),
+                                (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                 anchor=((cx1 + cx2) * 0.5, (cy1 + cy2) * 0.5),
                                 min_size_xy=(cur_w, cur_h),
                             )
@@ -5409,10 +5411,10 @@ class Processor(QtCore.QObject):
                             pass
 
                     # Final clamp inside de-barred content window (prevents 1px bar re-entry)
-                    cx1 = max(bx1, min(bx2 - 1, cx1))
-                    cy1 = max(by1, min(by2 - 1, cy1))
-                    cx2 = max(cx1 + 1, min(bx2, cx2))
-                    cy2 = max(cy1 + 1, min(by2, cy2))
+                    cx1 = max(repair_bx1, min(repair_bx2 - 1, cx1))
+                    cy1 = max(repair_by1, min(repair_by2 - 1, cy1))
+                    cx2 = max(cx1 + 1, min(repair_bx2, cx2))
+                    cy2 = max(cy1 + 1, min(repair_by2, cy2))
                     try:
                         rw, rh = parse_ratio(ratio_str)
                         asp = (cx2 - cx1) / float(max(1, cy2 - cy1))
@@ -5703,7 +5705,7 @@ class Processor(QtCore.QObject):
                                 subject_box_abs = None
                                 if bool(getattr(cfg, "compose_detect_person_for_face", True)):
                                     try:
-                                        assoc_persons = det.detect(frame_for_det, conf=float(cfg.min_det_conf))
+                                        assoc_persons = persons or det.detect(frame_for_det, conf=float(cfg.min_det_conf))
                                         subject_box_abs = self._find_person_box_for_face(face_box_abs, assoc_persons, W2, H2)
                                     except Exception:
                                         subject_box_abs = None
