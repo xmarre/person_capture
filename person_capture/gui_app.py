@@ -399,6 +399,13 @@ class SessionConfig:
     side_guard_drop_enable: bool = True          # drop frames that still violate side margin after all steps
     side_guard_drop_factor: float = 0.66         # require at least this * desired margin on both sides before saving
     face_anchor_down_frac: float = 1.1           # shift center downward by this * face_h (torso bias)
+    compose_crop_enable: bool = True             # compose final dataset crop from identity boxes
+    compose_detect_person_for_face: bool = True  # associate global face hits with YOLO person boxes
+    compose_close_face_h_frac: float = 0.34      # target face_h / crop_h for close/head crops
+    compose_upper_face_h_frac: float = 0.22      # target face_h / crop_h for portrait/upper-body crops
+    compose_body_face_h_frac: float = 0.085      # target face_h / crop_h for full-body crops
+    compose_landscape_face_penalty: float = 5.0  # discourage landscape crops for prominent faces
+    compose_body_every_n: int = 6                # deterministic body-shot bias cadence when viable
     border_threshold: int = 22                   # grayscale threshold for border trimming
     border_scan_frac: float = 0.25               # scan depth as fraction of min(w,h)
     # --- smart crop ---
@@ -1749,6 +1756,452 @@ class Processor(QtCore.QObject):
         iy2 = max(iy1 + 1, min(by2, int(round(ny2))))
         return ix1, iy1, ix2, iy2
 
+    @staticmethod
+    def _coerce_box_xyxy(
+        box: Optional[Tuple[float, float, float, float]],
+        bounds_xyxy: Tuple[int, int, int, int],
+    ) -> Optional[Tuple[float, float, float, float]]:
+        if box is None:
+            return None
+        try:
+            x1, y1, x2, y2 = [float(v) for v in box]
+            bx1, by1, bx2, by2 = [float(v) for v in bounds_xyxy]
+        except Exception:
+            return None
+        if not all(math.isfinite(v) for v in (x1, y1, x2, y2, bx1, by1, bx2, by2)):
+            return None
+        x1 = max(bx1, min(bx2, x1))
+        y1 = max(by1, min(by2, y1))
+        x2 = max(bx1, min(bx2, x2))
+        y2 = max(by1, min(by2, y2))
+        if x2 <= x1 + 1.0 or y2 <= y1 + 1.0:
+            return None
+        return x1, y1, x2, y2
+
+    @staticmethod
+    def _union_boxes_xyxy(*boxes: Optional[Tuple[float, float, float, float]]) -> Optional[Tuple[float, float, float, float]]:
+        valid = []
+        for box in boxes:
+            if box is None:
+                continue
+            try:
+                x1, y1, x2, y2 = [float(v) for v in box]
+            except Exception:
+                continue
+            if all(math.isfinite(v) for v in (x1, y1, x2, y2)) and x2 > x1 + 1.0 and y2 > y1 + 1.0:
+                valid.append((x1, y1, x2, y2))
+        if not valid:
+            return None
+        return (
+            min(b[0] for b in valid),
+            min(b[1] for b in valid),
+            max(b[2] for b in valid),
+            max(b[3] for b in valid),
+        )
+
+    @staticmethod
+    def _pad_box_xyxy(
+        box: Optional[Tuple[float, float, float, float]],
+        pad_x: float,
+        pad_y_top: float,
+        pad_y_bottom: Optional[float],
+        bounds_xyxy: Tuple[int, int, int, int],
+    ) -> Optional[Tuple[float, float, float, float]]:
+        if box is None:
+            return None
+        try:
+            x1, y1, x2, y2 = [float(v) for v in box]
+            bx1, by1, bx2, by2 = [float(v) for v in bounds_xyxy]
+        except Exception:
+            return None
+        pxb = max(0.0, float(pad_x))
+        pyt = max(0.0, float(pad_y_top))
+        pyb = pyt if pad_y_bottom is None else max(0.0, float(pad_y_bottom))
+        x1 = max(bx1, x1 - pxb)
+        y1 = max(by1, y1 - pyt)
+        x2 = min(bx2, x2 + pxb)
+        y2 = min(by2, y2 + pyb)
+        if x2 <= x1 + 1.0 or y2 <= y1 + 1.0:
+            return None
+        return x1, y1, x2, y2
+
+    @staticmethod
+    def _containment_deficit_xyxy(
+        crop_xyxy: Tuple[float, float, float, float],
+        protect_xyxy: Optional[Tuple[float, float, float, float]],
+        margin_px: float = 0.0,
+    ) -> float:
+        if protect_xyxy is None:
+            return 0.0
+        cx1, cy1, cx2, cy2 = [float(v) for v in crop_xyxy]
+        px1, py1, px2, py2 = [float(v) for v in protect_xyxy]
+        pw = max(1.0, px2 - px1)
+        ph = max(1.0, py2 - py1)
+        m = max(0.0, float(margin_px))
+        dx = max(0.0, (cx1 + m) - px1) + max(0.0, px2 - (cx2 - m))
+        dy = max(0.0, (cy1 + m) - py1) + max(0.0, py2 - (cy2 - m))
+        return (dx / pw) + (dy / ph)
+
+    def _ratio_crop_containing_box(
+        self,
+        protect_xyxy: Tuple[float, float, float, float],
+        ratio_str: str,
+        bounds_xyxy: Tuple[int, int, int, int],
+        anchor: Optional[Tuple[float, float]] = None,
+        min_size_xy: Optional[Tuple[float, float]] = None,
+    ) -> Tuple[int, int, int, int]:
+        """Return the smallest in-bounds ratio crop that tries to contain protect_xyxy.
+
+        Unlike expand_box_to_ratio(), this is allowed to grow after clamping.
+        It therefore preserves the invariant needed by dataset crops: the identity
+        boxes are inputs to composition, and the final crop must not cut the
+        protected face/head/person region just because the requested ratio hits a
+        frame edge.
+        """
+        bx1, by1, bx2, by2 = [float(v) for v in bounds_xyxy]
+        bounds_w = max(1.0, bx2 - bx1)
+        bounds_h = max(1.0, by2 - by1)
+        px1, py1, px2, py2 = [float(v) for v in protect_xyxy]
+        px1 = max(bx1, min(bx2, px1))
+        py1 = max(by1, min(by2, py1))
+        px2 = max(px1 + 1.0, min(bx2, px2))
+        py2 = max(py1 + 1.0, min(by2, py2))
+        try:
+            rw, rh = parse_ratio(str(ratio_str))
+            target = max(1e-6, float(rw) / float(rh))
+        except Exception:
+            target = 1.0
+
+        need_w = max(1.0, px2 - px1)
+        need_h = max(1.0, py2 - py1)
+        if min_size_xy is not None:
+            try:
+                need_w = max(need_w, float(min_size_xy[0]))
+                need_h = max(need_h, float(min_size_xy[1]))
+            except Exception:
+                pass
+
+        crop_w = max(need_w, need_h * target)
+        crop_h = crop_w / target
+        if crop_h < need_h:
+            crop_h = need_h
+            crop_w = crop_h * target
+
+        # Largest legal crop at this ratio inside the content bounds.
+        if (bounds_w / bounds_h) >= target:
+            max_h = bounds_h
+            max_w = bounds_h * target
+        else:
+            max_w = bounds_w
+            max_h = bounds_w / target
+        crop_w = min(crop_w, max_w)
+        crop_h = min(crop_h, max_h)
+
+        if anchor is not None:
+            try:
+                ax, ay = float(anchor[0]), float(anchor[1])
+            except Exception:
+                ax, ay = (px1 + px2) * 0.5, (py1 + py2) * 0.5
+        else:
+            ax, ay = (px1 + px2) * 0.5, (py1 + py2) * 0.5
+        ax = max(bx1, min(bx2, ax))
+        ay = max(by1, min(by2, ay))
+
+        x1 = ax - crop_w * 0.5
+        y1 = ay - crop_h * 0.5
+
+        # Shift to contain the protected box first, then clamp to content bounds.
+        if px1 < x1:
+            x1 = px1
+        if px2 > x1 + crop_w:
+            x1 = px2 - crop_w
+        if py1 < y1:
+            y1 = py1
+        if py2 > y1 + crop_h:
+            y1 = py2 - crop_h
+        x1 = max(bx1, min(bx2 - crop_w, x1))
+        y1 = max(by1, min(by2 - crop_h, y1))
+        x2 = x1 + crop_w
+        y2 = y1 + crop_h
+
+        # Quantize content bounds first, then clip in local coordinates so
+        # rounding cannot re-enter trimmed regions when bounds are offset.
+        ibx1 = int(math.ceil(bx1))
+        iby1 = int(math.ceil(by1))
+        ibx2 = int(math.floor(bx2))
+        iby2 = int(math.floor(by2))
+        if ibx2 <= ibx1:
+            ibx1 = int(round(bx1))
+            ibx2 = max(ibx1 + 1, int(round(bx2)))
+        if iby2 <= iby1:
+            iby1 = int(round(by1))
+            iby2 = max(iby1 + 1, int(round(by2)))
+
+        lx1, ly1, lx2, ly2 = self._clip_to_frame(
+            x1 - float(ibx1),
+            y1 - float(iby1),
+            x2 - float(ibx1),
+            y2 - float(iby1),
+            ibx2 - ibx1,
+            iby2 - iby1,
+        )
+        return ibx1 + lx1, iby1 + ly1, ibx1 + lx2, iby1 + ly2
+
+    @staticmethod
+    def _find_person_box_for_face(
+        face_xyxy: Tuple[float, float, float, float],
+        persons: list,
+        frame_w: int,
+        frame_h: int,
+    ) -> Optional[Tuple[float, float, float, float]]:
+        """Find the detected person box most likely to own a matched face box."""
+        try:
+            fx1, fy1, fx2, fy2 = [float(v) for v in face_xyxy]
+        except Exception:
+            return None
+        fcx = 0.5 * (fx1 + fx2)
+        fcy = 0.5 * (fy1 + fy2)
+        fw = max(1.0, fx2 - fx1)
+        fh = max(1.0, fy2 - fy1)
+        best = None
+        best_score = 1.0e18
+        for p in persons or []:
+            try:
+                px1, py1, px2, py2 = [float(v) for v in p.get("xyxy", p)]
+            except Exception:
+                continue
+            px1 = max(0.0, min(float(frame_w), px1))
+            py1 = max(0.0, min(float(frame_h), py1))
+            px2 = max(px1 + 1.0, min(float(frame_w), px2))
+            py2 = max(py1 + 1.0, min(float(frame_h), py2))
+            pw = max(1.0, px2 - px1)
+            ph = max(1.0, py2 - py1)
+            # A face belonging to a person should be near the top portion and
+            # horizontally inside the person box.  Give containment priority, then
+            # use normalized distance as a tiebreaker.
+            contains_center = (px1 <= fcx <= px2) and (py1 <= fcy <= py2)
+            face_inside = (px1 <= fx1 + 0.2 * fw and fx2 - 0.2 * fw <= px2 and py1 <= fy1 + 0.2 * fh and fy2 - 0.2 * fh <= py2)
+            top_band_y = py1 + 0.42 * ph
+            top_bias = max(0.0, (fcy - top_band_y) / ph)
+            dx = 0.0 if px1 <= fcx <= px2 else min(abs(fcx - px1), abs(fcx - px2)) / pw
+            dy = 0.0 if py1 <= fcy <= py2 else min(abs(fcy - py1), abs(fcy - py2)) / ph
+            area_penalty = 0.02 * ((pw * ph) / max(1.0, float(frame_w * frame_h)))
+            score = (0.0 if contains_center else 4.0) + (0.0 if face_inside else 1.5) + dx + dy + top_bias + area_penalty
+            if score < best_score:
+                best_score = score
+                best = (px1, py1, px2, py2)
+        if best is None or best_score >= 5.0:
+            return None
+        return best
+
+    def _compose_dataset_crop(
+        self,
+        base_crop_xyxy: Tuple[float, float, float, float],
+        ratio_candidates: list[str],
+        bounds_xyxy: Tuple[int, int, int, int],
+        subject_box: Optional[Tuple[float, float, float, float]] = None,
+        face_box: Optional[Tuple[float, float, float, float]] = None,
+        frame_idx: Optional[int] = None,
+    ) -> Tuple[Tuple[int, int, int, int], str, str]:
+        """Compose the final LoRA-dataset crop after identity has been decided.
+
+        Detection boxes identify the person. They do not directly define the saved
+        crop.  This method selects a close/upper/body crop from face and person
+        constraints, with portrait/square crops preferred unless the current frame
+        is genuinely better suited to a body crop.
+        """
+        cfg = self.cfg
+        bx1, by1, bx2, by2 = [int(v) for v in bounds_xyxy]
+        bounds = (bx1, by1, bx2, by2)
+        bound_w = max(1.0, float(bx2 - bx1))
+        bound_h = max(1.0, float(by2 - by1))
+        bound_area = max(1.0, bound_w * bound_h)
+
+        ratios: list[str] = []
+        for r in ratio_candidates or []:
+            rs = str(r).strip()
+            if not rs:
+                continue
+            try:
+                parse_ratio(rs)
+            except Exception:
+                continue
+            if rs not in ratios:
+                ratios.append(rs)
+        display_ratios = list(ratios) if ratios else ["1:1", "2:3"]
+
+        base = self._coerce_box_xyxy(base_crop_xyxy, bounds)
+        subj = self._coerce_box_xyxy(subject_box, bounds)
+        face = self._coerce_box_xyxy(face_box, bounds)
+        if base is None:
+            base = subj or face or (bx1, by1, bx2, by2)
+
+        head = self._face_head_proxy_box(face, bx2, by2) if face is not None else None
+        head = self._coerce_box_xyxy(head, bounds)
+        protect_face = self._union_boxes_xyxy(face, head) or face
+
+        profiles: list[tuple[str, Tuple[float, float, float, float], float]] = []
+        if face is not None:
+            fx1, fy1, fx2, fy2 = face
+            fw = max(1.0, fx2 - fx1)
+            fh = max(1.0, fy2 - fy1)
+            fcx = 0.5 * (fx1 + fx2)
+            fcy = 0.5 * (fy1 + fy2)
+            head_or_face = protect_face or face
+            hx1, hy1, hx2, hy2 = head_or_face
+
+            close_box = (
+                max(float(bx1), hx1 - 0.35 * fw),
+                max(float(by1), hy1 - 0.10 * fh),
+                min(float(bx2), hx2 + 0.35 * fw),
+                min(float(by2), max(hy2, fy2 + 1.65 * fh)),
+            )
+            profiles.append(("close", close_box, float(getattr(cfg, "compose_close_face_h_frac", 0.34))))
+
+            if subj is not None:
+                sx1, sy1, sx2, sy2 = subj
+                sh = max(1.0, sy2 - sy1)
+                sw = max(1.0, sx2 - sx1)
+                # Upper crop includes the head and shoulders/torso, but avoids making
+                # every face hit a full-body crop.
+                upper_bottom = min(float(by2), max(fy2 + 3.8 * fh, sy1 + 0.55 * sh))
+                shoulder_half_w = max(0.55 * sw, 2.2 * fw)
+                upper_box = (
+                    max(float(bx1), min(sx1, fcx - shoulder_half_w)),
+                    max(float(by1), min(hy1, sy1)),
+                    min(float(bx2), max(sx2, fcx + shoulder_half_w)),
+                    upper_bottom,
+                )
+                profiles.append(("upper", upper_box, float(getattr(cfg, "compose_upper_face_h_frac", 0.22))))
+
+                body_box = self._pad_box_xyxy(
+                    subj,
+                    pad_x=max(0.08 * sw, 0.55 * fw),
+                    pad_y_top=max(0.04 * sh, 0.45 * fh),
+                    pad_y_bottom=max(0.04 * sh, 0.70 * fh),
+                    bounds_xyxy=bounds,
+                ) or subj
+                profiles.append(("body", body_box, float(getattr(cfg, "compose_body_face_h_frac", 0.085))))
+            else:
+                upper_box = (
+                    max(float(bx1), hx1 - 0.65 * fw),
+                    max(float(by1), hy1 - 0.10 * fh),
+                    min(float(bx2), hx2 + 0.65 * fw),
+                    min(float(by2), max(hy2, fy2 + 3.2 * fh)),
+                )
+                profiles.append(("upper", upper_box, float(getattr(cfg, "compose_upper_face_h_frac", 0.22))))
+        elif subj is not None:
+            profiles.append(("body", subj, float(getattr(cfg, "compose_body_face_h_frac", 0.085))))
+        else:
+            profiles.append(("base", base, 0.20))
+
+        best: Optional[tuple[float, Tuple[int, int, int, int], str, str]] = None
+        face_h = (face[3] - face[1]) if face is not None else 0.0
+        face_frame_frac = face_h / max(1.0, bound_h)
+        subj_h_frac = ((subj[3] - subj[1]) / max(1.0, bound_h)) if subj is not None else 0.0
+        body_period = max(0, int(getattr(cfg, "compose_body_every_n", 6)))
+        body_cadence = body_period > 0 and frame_idx is not None and (int(frame_idx) % body_period == 0)
+
+        for profile, protect, target_face_h_frac in profiles:
+            protect = self._coerce_box_xyxy(protect, bounds)
+            if protect is None:
+                continue
+            px1, py1, px2, py2 = protect
+            protect_w = max(1.0, px2 - px1)
+            protect_h = max(1.0, py2 - py1)
+            anchor = ((px1 + px2) * 0.5, (py1 + py2) * 0.5)
+            if face is not None:
+                fcx = 0.5 * (face[0] + face[2])
+                fcy = 0.5 * (face[1] + face[3])
+                if profile == "close":
+                    anchor = (fcx, fcy + 0.85 * face_h)
+                elif profile == "upper":
+                    anchor = (fcx, fcy + 1.65 * face_h)
+                elif profile == "body" and subj is not None:
+                    anchor = ((subj[0] + subj[2]) * 0.5, (subj[1] + subj[3]) * 0.5)
+
+            for rs in display_ratios:
+                try:
+                    rw, rh = parse_ratio(rs)
+                    aspect = float(rw) / float(rh)
+                except Exception:
+                    continue
+                is_landscape = aspect > 1.05
+                # Landscape is not a headshot/portrait shape. Keep it available for
+                # real body/context frames only; otherwise it should lose hard.
+                if is_landscape and profile in {"close", "upper"}:
+                    ratio_penalty = float(getattr(cfg, "compose_landscape_face_penalty", 5.0))
+                elif is_landscape and face_frame_frac >= float(getattr(cfg, "wide_face_min_frame_frac", 0.12)):
+                    ratio_penalty = 0.75 * float(getattr(cfg, "compose_landscape_face_penalty", 5.0))
+                else:
+                    ratio_penalty = 0.0
+                if rs == "1:1":
+                    ratio_penalty += 0.05
+                elif rs == "2:3":
+                    ratio_penalty += 0.00
+                elif aspect > 1.05:
+                    ratio_penalty += 0.40
+                else:
+                    ratio_penalty += 0.15
+
+                crop = self._ratio_crop_containing_box(
+                    protect,
+                    rs,
+                    bounds,
+                    anchor=anchor,
+                    min_size_xy=(protect_w, protect_h),
+                )
+                cx1, cy1, cx2, cy2 = crop
+                crop_w = max(1.0, float(cx2 - cx1))
+                crop_h = max(1.0, float(cy2 - cy1))
+                crop_area = crop_w * crop_h
+
+                containment = 0.0
+                if protect_face is not None:
+                    containment += 80.0 * self._containment_deficit_xyxy(crop, protect_face, margin_px=1.0)
+                if profile == "body" and subj is not None:
+                    containment += 80.0 * self._containment_deficit_xyxy(crop, subj, margin_px=1.0)
+                else:
+                    containment += 20.0 * self._containment_deficit_xyxy(crop, protect, margin_px=1.0)
+
+                profile_prior = {"close": 0.00, "upper": 0.16, "body": 0.58, "base": 0.35}.get(profile, 0.35)
+                if face is not None:
+                    actual_face_h_frac = face_h / crop_h
+                    face_loss = abs(actual_face_h_frac - max(1e-6, target_face_h_frac))
+                    if profile == "close" and face_frame_frac < 0.085:
+                        profile_prior += 0.55
+                    if profile == "body" and (face_frame_frac < 0.10 or subj_h_frac > 0.62):
+                        profile_prior -= 0.30
+                    if profile == "upper" and face_frame_frac < 0.10:
+                        profile_prior -= 0.12
+                    if profile == "body" and body_cadence and subj is not None:
+                        profile_prior -= 0.22
+                    if profile != "body" and subj is not None and subj_h_frac > 0.72 and face_frame_frac < 0.14:
+                        profile_prior += 0.22
+                else:
+                    face_loss = 0.0
+
+                # Avoid selecting full-frame-ish crops unless the subject actually
+                # needs the room.  This still allows full-body shots when the person
+                # box is tall/large in the source frame.
+                area_penalty = 0.10 * (crop_area / bound_area)
+                if profile != "body" and crop_area / bound_area > 0.75:
+                    area_penalty += 0.40
+
+                score = containment + profile_prior + ratio_penalty + 2.5 * face_loss + area_penalty
+                if best is None or score < best[0]:
+                    best = (score, crop, rs, profile)
+
+        if best is not None:
+            _, crop, rs, profile = best
+            return crop, rs, profile
+
+        # Last-resort: repair the existing crop to contain the best known identity box.
+        fallback_protect = protect_face or subj or base
+        fallback_ratio = ratios[0] if ratios else display_ratios[0]
+        crop = self._ratio_crop_containing_box(fallback_protect, fallback_ratio, bounds)
+        return crop, fallback_ratio, "fallback"
+
     def _enforce_scale_and_margins(
         self,
         crop_xyxy: Tuple[int, int, int, int],
@@ -2020,6 +2473,18 @@ class Processor(QtCore.QObject):
         variance = float(np.var(lap))
         mean_intensity = float(np.mean(g))
         return variance / (mean_intensity * mean_intensity + 1e-6)
+
+    def _calc_saved_file_sharpness(self, path: str):
+        try:
+            img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        except Exception:
+            return None
+        if img is None or getattr(img, "size", 0) == 0:
+            return None
+        try:
+            return self._calc_sharpness(img)
+        except Exception:
+            return None
 
     def _autocrop_borders(self, frame, thr):
         # Package-safe import (supports both module and flat execution)
@@ -3718,6 +4183,7 @@ class Processor(QtCore.QObject):
                         why = "save_not_attempted"
                         img_path = ""
                         row = None
+                        kind = ""
                         if isinstance(item, dict):
                             ack_q = item.get("ack_q")
                             kind = str(item.get("type") or "")
@@ -3750,12 +4216,16 @@ class Processor(QtCore.QObject):
                             img_path, img, row = item
                             ok, why = _atomic_jpeg_write(img, img_path, jpg_q)
 
+                        if ok:
+                            if kind == "hdr_sdr" and isinstance(row, list) and len(row) > 10:
+                                saved_sharp = self._calc_saved_file_sharpness(img_path)
+                                if saved_sharp is not None:
+                                    row[10] = float(saved_sharp)
                         if ack_q is not None:
                             try:
                                 ack_q.put_nowait((bool(ok), str(why or "")))
                             except Exception:
                                 pass
-
                         if ok:
                             # hand off to worker thread for emitting
                             try:
@@ -3939,6 +4409,13 @@ class Processor(QtCore.QObject):
                             "hdr_sdr_contrast_recovery",
                             "hdr_sdr_peak_detect",
                             "hdr_sdr_allow_inaccurate_fallback",
+                            "compose_crop_enable",
+                            "compose_detect_person_for_face",
+                            "compose_close_face_h_frac",
+                            "compose_upper_face_h_frac",
+                            "compose_body_face_h_frac",
+                            "compose_landscape_face_penalty",
+                            "compose_body_every_n",
                         }
                         rot_keys = {
                             "rot_adaptive",
@@ -4272,8 +4749,18 @@ class Processor(QtCore.QObject):
                             acy = (fy1 + fy2) / 2.0
                             fd_val = self._fd_min(gbest["feat"], ref_face_feat)
                             if fd_val <= float(cfg.face_thresh):
+                                subject_box_abs = None
+                                assoc_persons = []
+                                if bool(getattr(cfg, "compose_detect_person_for_face", True)):
+                                    try:
+                                        assoc_persons = det.detect(frame_for_det, conf=float(cfg.min_det_conf))
+                                        subject_box_abs = self._find_person_box_for_face(face_box_abs, assoc_persons, W2, H2)
+                                    except Exception:
+                                        assoc_persons = []
+                                        subject_box_abs = None
+                                compose_seed_box = subject_box_abs or face_box_abs
                                 (ex1, ey1, ex2, ey2), chosen_ratio, chosen_tloss = self._choose_best_ratio(
-                                    face_box_abs, ratios, W2, H2, anchor=(acx, acy), face_box=face_box_abs
+                                    compose_seed_box, ratios, W2, H2, anchor=(acx, acy), face_box=face_box_abs
                                 )
                                 ex1, ey1, ex2, ey2 = self._enforce_scale_and_margins(
                                     (ex1, ey1, ex2, ey2),
@@ -4299,6 +4786,14 @@ class Processor(QtCore.QObject):
                                     fx2i = int(round(float(np.clip(fx2 + off_x, 0, W - 1))))
                                     fy2i = int(round(float(np.clip(fy2 + off_y, 0, H - 1))))
                                     face_box_global = (fx1i, fy1i, fx2i, fy2i)
+                                    subject_box_global = None
+                                    if subject_box_abs is not None:
+                                        sx1, sy1, sx2, sy2 = subject_box_abs
+                                        sgx1 = max(0, min(W - 1, int(round(sx1 + off_x))))
+                                        sgy1 = max(0, min(H - 1, int(round(sy1 + off_y))))
+                                        sgx2 = max(sgx1 + 1, min(W, int(round(sx2 + off_x))))
+                                        sgy2 = max(sgy1 + 1, min(H, int(round(sy2 + off_y))))
+                                        subject_box_global = (sgx1, sgy1, sgx2, sgy2)
                                     head_box_global = None
                                     head_box_roi = self._face_head_proxy_box(face_box_abs, W2, H2)
                                     if head_box_roi is not None:
@@ -4316,7 +4811,8 @@ class Processor(QtCore.QObject):
                                         sharp=sharp,
                                         box=(ox1, oy1, ox2, oy2),
                                         area=(ox2 - ox1) * (oy2 - oy1),
-                                        show_box=face_box_global,
+                                        show_box=subject_box_global or (ox1, oy1, ox2, oy2),
+                                        subject_box=subject_box_global,
                                         face_box=face_box_global,
                                         head_box=head_box_global,
                                         face_feat=gbest["feat"],
@@ -4329,7 +4825,7 @@ class Processor(QtCore.QObject):
                                         accept_pre=True,
                                     )
                                     candidates = [short_circuit_candidate]
-                                    diag_persons = 0
+                                    diag_persons = len(assoc_persons)
                                     reid_feats = []
                                     faces_local = {}
                                     faces_detected = tmp_faces_detected
@@ -4657,6 +5153,12 @@ class Processor(QtCore.QObject):
                                 int(x2 + off_x),
                                 int(y2 + off_y),
                             ),
+                            subject_box=(
+                                int(x1 + off_x),
+                                int(y1 + off_y),
+                                int(x2 + off_x),
+                                int(y2 + off_y),
+                            ),
                             face_box=face_box_global,
                             head_box=head_box_global,
                             face_feat=(bf["feat"] if bf is not None else None),
@@ -4671,7 +5173,18 @@ class Processor(QtCore.QObject):
                     )
 
                 # Choose best and save with cadence + lock + margin + IoU gate
-                def save_hit(c, idx):
+                def save_hit(
+                    c,
+                    idx,
+                    *,
+                    frame_w,
+                    frame_h,
+                    det_off_x,
+                    det_off_y,
+                    det_w,
+                    det_h,
+                    ratio_list,
+                ):
                     nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box, ref_face_feat, ref_bank_list, source_size_cached
                     crop_img_path = os.path.join(crops_dir, f"f{idx:08d}.jpg")
                     hdr_primary_fullres = bool(
@@ -4691,127 +5204,44 @@ class Processor(QtCore.QObject):
                     ratio_str = str(
                         c.get("ratio")
                         or (
-                            ratios[0]
-                            if 'ratios' in locals() and ratios
+                            ratio_list[0]
+                            if ratio_list
                             else (self.cfg.ratio.split(',')[0] if self.cfg.ratio else '2:3')
                         )
                     )
 
-                    # If auto-crop borders were applied for detection, run smart-crop inside the ROI
-                    use_roi = bool(getattr(cfg, "auto_crop_borders", True)) and (
-                        (W2 != W) or (H2 != H) or (off_x != 0) or (off_y != 0)
-                    )
-                    if use_roi:
-                        rx1 = max(0.0, min(float(W2), gx1 - off_x))
-                        ry1 = max(0.0, min(float(H2), gy1 - off_y))
-                        rx2 = min(float(W2), max(rx1 + 1.0, gx2 - off_x))
-                        ry2 = min(float(H2), max(ry1 + 1.0, gy2 - off_y))
-                        # Keep the candidate's chosen ratio to avoid re-selecting here.
-                        ratio_str = str(c.get("ratio") or ratio_str)
-                        face_box_roi = None
-                        if c.get("face_box") is not None:
-                            fx1, fy1, fx2, fy2 = c["face_box"]
-                            face_box_roi = (
-                                max(0.0, min(float(W2), fx1 - off_x)),
-                                max(0.0, min(float(H2), fy1 - off_y)),
-                                max(0.0, min(float(W2), fx2 - off_x)),
-                                max(0.0, min(float(H2), fy2 - off_y)),
-                            )
-                        if bool(getattr(cfg, "smart_crop_enable", True)):
-                            rx1, ry1, rx2, ry2 = self._smart_crop_box(
-                                frame_for_det, (rx1, ry1, rx2, ry2), face_box_roi, ratio_str, cfg
-                            )
-                            # nudge center downwards toward torso when a face is present
-                            anchor_roi = None
-                            if face_box_roi is not None:
-                                fcx = 0.5 * (face_box_roi[0] + face_box_roi[2])
-                                fcy = 0.5 * (face_box_roi[1] + face_box_roi[3])
-                                fh = max(1.0, face_box_roi[3] - face_box_roi[1])
-                                anchor_roi = (
-                                    fcx,
-                                    fcy + 0.5 * float(getattr(cfg, "face_anchor_down_frac", 1.1)) * fh,
-                                )
-                            rx1, ry1, rx2, ry2 = self._enforce_scale_and_margins(
-                                (rx1, ry1, rx2, ry2),
-                                ratio_str,
-                                W2,
-                                H2,
-                                face_box=face_box_roi,
-                                anchor=anchor_roi,
-                            )
-                        else:
-                            try:
-                                tw, th = parse_ratio(ratio_str)
-                            except Exception:
-                                tw, th = 2.0, 3.0
-                            w = rx2 - rx1
-                            h = ry2 - ry1
-                            target = float(tw) / float(th)
-                            cur = w / float(h) if h > 0 else target
-                            if abs(cur - target) > 1e-3 and w > 2 and h > 2:
-                                if cur < target:
-                                    new_h = int(round(w / target))
-                                    dy = (h - new_h) // 2
-                                    ry1 = max(0, min(H2 - new_h, ry1 + dy))
-                                    ry2 = ry1 + new_h
-                                else:
-                                    new_w = int(round(h * target))
-                                    dx = (w - new_w) // 2
-                                    rx1 = max(0, min(W2 - new_w, rx1 + dx))
-                                    rx2 = rx1 + new_w
-                        try:
-                            rw, rh = parse_ratio(ratio_str)
-                            rx1, ry1, rx2, ry2 = expand_box_to_ratio(
-                                rx1, ry1, rx2, ry2, rw, rh, W2, H2, anchor=None, head_bias=0.0
-                            )
-                        except Exception:
-                            pass
-                        cx1, cy1, cx2, cy2 = rx1 + off_x, ry1 + off_y, rx2 + off_x, ry2 + off_y
+                    # Compose the saved dataset crop from identity evidence.
+                    # The detector/person/face boxes identify the target; they do not
+                    # directly dictate the final crop.  The composition stage chooses
+                    # close/portrait/body framing while preserving the invariant that
+                    # the target face/head or person is not cut off when a feasible
+                    # in-bounds ratio crop exists.
+                    if bool(getattr(cfg, "auto_crop_borders", False)):
+                        bx1 = int(det_off_x)
+                        by1 = int(det_off_y)
+                        bx2 = int(bx1 + det_w)
+                        by2 = int(by1 + det_h)
+                    else:
+                        bx1, by1, bx2, by2 = 0, 0, frame_w, frame_h
+                    bx1 = max(0, min(frame_w - 1, bx1))
+                    by1 = max(0, min(frame_h - 1, by1))
+                    bx2 = max(bx1 + 1, min(frame_w, bx2))
+                    by2 = max(by1 + 1, min(frame_h, by2))
+
+                    ratio_candidates = list(ratio_list) if ratio_list else [ratio_str]
+                    if bool(getattr(cfg, "compose_crop_enable", True)):
+                        (cx1, cy1, cx2, cy2), ratio_str, crop_profile = self._compose_dataset_crop(
+                            (gx1, gy1, gx2, gy2),
+                            ratio_candidates,
+                            (bx1, by1, bx2, by2),
+                            subject_box=c.get("subject_box") or c.get("show_box"),
+                            face_box=c.get("face_box"),
+                            frame_idx=idx,
+                        )
+                        c["crop_profile"] = crop_profile
+                        c["ratio"] = ratio_str
                     else:
                         cx1, cy1, cx2, cy2 = gx1, gy1, gx2, gy2
-                        if bool(getattr(cfg, "smart_crop_enable", True)):
-                            cx1, cy1, cx2, cy2 = self._smart_crop_box(
-                                frame, (cx1, cy1, cx2, cy2), c.get("face_box"), ratio_str, cfg
-                            )
-                            H_, W_ = frame.shape[:2]
-                            anchor_final = None
-                            fb = c.get("face_box")
-                            if fb is not None:
-                                fcx = 0.5 * (fb[0] + fb[2])
-                                fcy = 0.5 * (fb[1] + fb[3])
-                                fh = max(1.0, fb[3] - fb[1])
-                                anchor_final = (
-                                    fcx,
-                                    fcy + 0.5 * float(getattr(cfg, "face_anchor_down_frac", 1.1)) * fh,
-                                )
-                            cx1, cy1, cx2, cy2 = self._enforce_scale_and_margins(
-                                (cx1, cy1, cx2, cy2),
-                                ratio_str,
-                                W_,
-                                H_,
-                                face_box=c.get("face_box"),
-                                anchor=anchor_final,
-                            )
-                        else:
-                            try:
-                                tw, th = parse_ratio(ratio_str)
-                            except Exception:
-                                tw, th = 2.0, 3.0
-                            w = cx2 - cx1
-                            h = cy2 - cy1
-                            target = float(tw) / float(th)
-                            cur = w / float(h) if h > 0 else target
-                            if abs(cur - target) > 1e-3 and w > 2 and h > 2:
-                                if cur < target:
-                                    new_h = int(round(w / target))
-                                    dy = (h - new_h) // 2
-                                    cy1 += dy
-                                    cy2 = cy1 + new_h
-                                else:
-                                    new_w = int(round(h * target))
-                                    dx = (w - new_w) // 2
-                                    cx1 += dx
-                                    cx2 = cx1 + new_w
                         try:
                             rw, rh = parse_ratio(ratio_str)
                             cx1, cy1, cx2, cy2 = expand_box_to_ratio(
@@ -4819,6 +5249,15 @@ class Processor(QtCore.QObject):
                             )
                         except Exception:
                             pass
+
+                    if bool(getattr(cfg, "auto_crop_borders", False)):
+                        bx1 = int(det_off_x)
+                        by1 = int(det_off_y)
+                        bx2 = int(bx1 + det_w)
+                        by2 = int(by1 + det_h)
+                    else:
+                        bx1, by1, bx2, by2 = 0, 0, frame_w, frame_h
+                    repair_bx1, repair_by1, repair_bx2, repair_by2 = bx1, by1, bx2, by2
 
                     # Final black-border trim on the saved crop, then re-expand to exact ratio
                     try:
@@ -4861,6 +5300,7 @@ class Processor(QtCore.QObject):
                                     (nx1, ny1, nx2, ny2), int(tw), int(th),
                                     (nx1, ny1, nx2, ny2), anchor=anchor_glob
                                 )
+                                repair_bx1, repair_by1, repair_bx2, repair_by2 = int(nx1), int(ny1), int(nx2), int(ny2)
                                 # Final guard: ensure the shrunken crop still honors face side margins.
                                 try:
                                     cx1, cy1, cx2, cy2 = self._enforce_scale_and_margins(
@@ -4876,18 +5316,10 @@ class Processor(QtCore.QObject):
                     except Exception:
                         pass
 
-                    cx1 = max(0, min(W - 1, int(round(cx1))))
-                    cy1 = max(0, min(H - 1, int(round(cy1))))
-                    cx2 = max(cx1 + 1, min(W, int(round(cx2))))
-                    cy2 = max(cy1 + 1, min(H, int(round(cy2))))
-
-                    if bool(getattr(cfg, "auto_crop_borders", False)):
-                        bx1 = int(locals().get("off_x", 0))
-                        by1 = int(locals().get("off_y", 0))
-                        bx2 = int(bx1 + locals().get("W2", W))
-                        by2 = int(by1 + locals().get("H2", H))
-                    else:
-                        bx1, by1, bx2, by2 = 0, 0, W, H
+                    cx1 = max(0, min(frame_w - 1, int(round(cx1))))
+                    cy1 = max(0, min(frame_h - 1, int(round(cy1))))
+                    cx2 = max(cx1 + 1, min(frame_w, int(round(cx2))))
+                    cy2 = max(cy1 + 1, min(frame_h, int(round(cy2))))
 
                     # Ensure ratio terms exist before using them in corrections
                     try:
@@ -4902,172 +5334,87 @@ class Processor(QtCore.QObject):
                         # Only correct if materially off (avoid jitter from rounding)
                         if abs(w - target_w) > 1:
                             # Center inside content window, not full frame
-                            cx1 = max(bx1, min(bx2 - target_w, cx1 + (w - target_w) // 2))
+                            cx1 = max(repair_bx1, min(repair_bx2 - target_w, cx1 + (w - target_w) // 2))
                             cx2 = cx1 + target_w
                         # Height correction stays inside the same content window
                         target_h = max(1, int(round((cx2 - cx1) * float(rh) / float(rw))))
                         if abs((cy2 - cy1) - target_h) > 1:
-                            cy1 = max(by1, min(by2 - target_h, cy1 + ((cy2 - cy1) - target_h) // 2))
+                            cy1 = max(repair_by1, min(repair_by2 - target_h, cy1 + ((cy2 - cy1) - target_h) // 2))
                             cy2 = cy1 + target_h
                     except Exception:
                         pass
 
-                    protect_box = c.get("head_box") or c.get("face_box")
+                    protect_box = self._union_boxes_xyxy(
+                        c.get("subject_box") or c.get("show_box"),
+                        c.get("head_box"),
+                        c.get("face_box"),
+                    )
                     if protect_box is not None:
-                        cx1, cy1, cx2, cy2 = self._shift_crop_to_include_box(
-                            (cx1, cy1, cx2, cy2),
-                            protect_box,
-                            (bx1, by1, bx2, by2),
-                            margin_px=1.0,
-                        )
-
-                    hb = c.get("head_box")
-                    if hb is not None:
-                        inner_px_head = float(getattr(cfg, "face_edge_inner_px", 1.0))
-                        head_cut = (
-                            float(hb[0]) < float(cx1) + inner_px_head
-                            or float(hb[2]) > float(cx2) - inner_px_head
-                            or float(hb[1]) < float(cy1) + inner_px_head
-                            or float(hb[3]) > float(cy2) - inner_px_head
-                        )
-                        if head_cut:
-                            self._status(
-                                "skip: head_guard_drop (visible head would be cut)",
-                                key="cap",
-                                interval=1.5,
+                        try:
+                            cur_w = max(1.0, float(cx2 - cx1))
+                            cur_h = max(1.0, float(cy2 - cy1))
+                            cx1, cy1, cx2, cy2 = self._ratio_crop_containing_box(
+                                protect_box,
+                                ratio_str,
+                                (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                anchor=((cx1 + cx2) * 0.5, (cy1 + cy2) * 0.5),
+                                min_size_xy=(cur_w, cur_h),
                             )
-                            return False
+                        except Exception:
+                            cx1, cy1, cx2, cy2 = self._shift_crop_to_include_box(
+                                (cx1, cy1, cx2, cy2),
+                                protect_box,
+                                (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                margin_px=1.0,
+                            )
 
-                    # Edge-aware side-margin safety: avoid saving half-face crops pinned to an edge.
+                    # Edge-aware face-margin repair.  This must repair the crop, not
+                    # reject the frame.  A rejected frame here means the cropper failed
+                    # after identity had already succeeded.
                     fb = c.get("face_box")
                     if fb is not None and bool(getattr(cfg, "side_guard_drop_enable", True)):
-                        fw = max(1.0, float(fb[2]) - float(fb[0]))
-                        # Use face *edges* vs crop edges
-                        left_margin  = max(0.0, float(fb[0]) - float(cx1))
-                        right_margin = max(0.0, float(cx2) - float(fb[2]))
-                        desired = float(cfg.crop_face_side_margin_frac) * fw
-                        required = float(getattr(cfg, "side_guard_drop_factor", 0.66)) * desired
-
-                        fd_val = float(c.get("fd")) if c.get("fd") is not None else 9.0
-                        reasons = set(c.get("reasons", []))
-                        is_rescue = ("face_short_circuit" in reasons) or ("global_face" in reasons)
-                        relax_fd = float(getattr(cfg, "side_guard_relax_fd", 0.22))
-                        relax_factor = float(getattr(cfg, "side_guard_relax_factor", 0.50))
-                        if (fd_val <= relax_fd) or is_rescue:
-                            required *= relax_factor
-
-                        inner_px = float(getattr(cfg, "face_edge_inner_px", 1.0))
-                        if (fd_val <= relax_fd) or is_rescue:
-                            inner_px *= float(getattr(cfg, "face_edge_inner_relax", 0.25))
-
-                        self._status(
-                            f"side_guard L={left_margin:.1f} R={right_margin:.1f} "
-                            f"req={required:.1f} fw={fw:.1f} fd={fd_val:.3f} "
-                            f"inner={inner_px:.2f}",
-                            key="side_guard_dbg",
-                            interval=0.8,
-                        )
-                        # Try a minimal salvage shift before drop
-                        if min(left_margin, right_margin) < required:
-                            reqL = max(required, inner_px)
-                            reqR = max(required, inner_px)
-                            needL = max(0.0, reqL - left_margin)
-                            needR = max(0.0, reqR - right_margin)
-                            if (needL > 0.0) or (needR > 0.0):
-                                width = cx2 - cx1
-                                # positive shift → move right; negative → left
-                                shift = needR - needL
-                                nx1 = max(bx1, min(bx2 - width, int(round(cx1 + shift))))
-                                nx2 = nx1 + width
-                                # recompute
-                                left_margin  = max(0.0, float(fb[0]) - float(nx1))
-                                right_margin = max(0.0, float(nx2) - float(fb[2]))
-                                if min(left_margin, right_margin) >= required:
-                                    cx1, cx2 = nx1, nx2
-                                    self._status(
-                                        f"side_guard after-shift L={left_margin:.1f} R={right_margin:.1f}",
-                                        key="side_guard_dbg2",
-                                        interval=0.8,
-                                    )
-                        # If we still can't meet margins, try a tiny ratio-preserving shrink around the face.
-                        if (
-                            (min(left_margin, right_margin) < required)
-                            and ((fd_val <= relax_fd) or is_rescue)
-                            and bool(getattr(cfg, "side_guard_allow_shrink", True))
-                        ):
-                            deficit = max(0.0, required - min(left_margin, right_margin))
-                            max_shrink_px = float(getattr(cfg, "side_guard_max_shrink_px", 32))
-                            min_shrink_frac = float(getattr(cfg, "side_guard_min_shrink_frac", 0.02))
-                            shrink_px = min(
-                                max_shrink_px,
-                                max(2.0, max(deficit * 2.0, (cx2 - cx1) * min_shrink_frac)),
+                        try:
+                            fw = max(1.0, float(fb[2]) - float(fb[0]))
+                            desired = float(cfg.crop_face_side_margin_frac) * fw
+                            fd_val = float(c.get("fd")) if c.get("fd") is not None else 9.0
+                            reasons = set(c.get("reasons", []))
+                            is_rescue = ("face_short_circuit" in reasons) or ("global_face" in reasons)
+                            relax_fd = float(getattr(cfg, "side_guard_relax_fd", 0.22))
+                            relax_factor = float(getattr(cfg, "side_guard_relax_factor", 0.50))
+                            required = float(getattr(cfg, "side_guard_drop_factor", 0.66)) * desired
+                            if (fd_val <= relax_fd) or is_rescue:
+                                required *= relax_factor
+                            padded_face = self._pad_box_xyxy(
+                                fb,
+                                pad_x=required,
+                                pad_y_top=float(getattr(cfg, "face_edge_inner_px", 1.0)),
+                                pad_y_bottom=float(getattr(cfg, "face_edge_inner_px", 1.0)),
+                                bounds_xyxy=(repair_bx1, repair_by1, repair_bx2, repair_by2),
+                            ) or fb
+                            cur_w = max(1.0, float(cx2 - cx1))
+                            cur_h = max(1.0, float(cy2 - cy1))
+                            cx1, cy1, cx2, cy2 = self._ratio_crop_containing_box(
+                                self._union_boxes_xyxy(protect_box, padded_face) or padded_face,
+                                ratio_str,
+                                (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                anchor=((cx1 + cx2) * 0.5, (cy1 + cy2) * 0.5),
+                                min_size_xy=(cur_w, cur_h),
                             )
-
-                            old_w = (cx2 - cx1)
-                            new_w = max(2, int(round(old_w - shrink_px)))
-                            if new_w >= old_w:
-                                new_w = max(2, old_w - 2)
-                            new_h = max(2, int(round(new_w * float(rh) / float(rw))))
-
-                            face_cx = 0.5 * (float(fb[0]) + float(fb[2]))
-                            cx1_try = int(round(face_cx - new_w * 0.5))
-                            cx1_try = max(bx1, min(bx2 - new_w, cx1_try))
-                            cx2_try = cx1_try + new_w
-
-                            cy_mid = int(round((cy1 + cy2) * 0.5))
-                            cy1_try = max(by1, min(by2 - new_h, cy_mid - new_h // 2))
-                            cy2_try = cy1_try + new_h
-
-                            left_margin_try = max(0.0, float(fb[0]) - float(cx1_try))
-                            right_margin_try = max(0.0, float(cx2_try) - float(fb[2]))
-
-                            if min(left_margin_try, right_margin_try) >= required:
-                                cx1, cx2, cy1, cy2 = cx1_try, cx2_try, cy1_try, cy2_try
-                                left_margin, right_margin = left_margin_try, right_margin_try
-                                self._status(
-                                    f"side_guard after-shrink L={left_margin:.1f} R={right_margin:.1f}",
-                                    key="side_guard_dbg2",
-                                    interval=0.8,
-                                )
-                        # Re-check head containment after side-guard salvage: salvage may
-                        # shift or shrink the crop relative to the earlier head guard.
-                        hb = c.get("head_box")
-                        if hb is not None:
-                            head_inner_px = inner_px
-                            head_cut = (
-                                float(hb[0]) < float(cx1) + head_inner_px
-                                or float(hb[2]) > float(cx2) - head_inner_px
-                                or float(hb[1]) < float(cy1) + head_inner_px
-                                or float(hb[3]) > float(cy2) - head_inner_px
-                            )
-                            if head_cut:
-                                self._status(
-                                    "skip: head_guard_drop (visible head would be cut)",
-                                    key="cap",
-                                    interval=1.5,
-                                )
-                                return False
-                        # final guard (also catches actual face cuts)
-                        edge_cut = (float(fb[0]) < float(cx1) + inner_px) or (float(fb[2]) > float(cx2) - inner_px)
-                        if min(left_margin, right_margin) < required or edge_cut:
-                            drop_reasons = ["side_guard_drop", *list(c.get("reasons", []))]
+                            left_margin = max(0.0, float(fb[0]) - float(cx1))
+                            right_margin = max(0.0, float(cx2) - float(fb[2]))
                             self._status(
-                                f"reject_reasons={drop_reasons[:6]}",
-                                key="rej_reasons",
-                                interval=1.0,
+                                f"side_guard repair L={left_margin:.1f} R={right_margin:.1f} req={required:.1f} fw={fw:.1f} fd={fd_val:.3f}",
+                                key="side_guard_dbg",
+                                interval=0.8,
                             )
-                            self._status(
-                                "skip: side_guard_drop (insufficient face margin)",
-                                key="cap",
-                                interval=1.5,
-                            )
-                            return False
+                        except Exception:
+                            pass
 
                     # Final clamp inside de-barred content window (prevents 1px bar re-entry)
-                    cx1 = max(bx1, min(bx2 - 1, cx1))
-                    cy1 = max(by1, min(by2 - 1, cy1))
-                    cx2 = max(cx1 + 1, min(bx2, cx2))
-                    cy2 = max(cy1 + 1, min(by2, cy2))
+                    cx1 = max(repair_bx1, min(repair_bx2 - 1, cx1))
+                    cy1 = max(repair_by1, min(repair_by2 - 1, cy1))
+                    cx2 = max(cx1 + 1, min(repair_bx2, cx2))
+                    cy2 = max(cy1 + 1, min(repair_by2, cy2))
                     try:
                         rw, rh = parse_ratio(ratio_str)
                         asp = (cx2 - cx1) / float(max(1, cy2 - cy1))
@@ -5085,6 +5432,13 @@ class Processor(QtCore.QObject):
                     )
 
                     processed_crop_xyxy = (int(cx1), int(cy1), int(cx2), int(cy2))
+                    if not hdr_primary_fullres:
+                        try:
+                            final_crop_for_sharp = frame[int(cy1):int(cy2), int(cx1):int(cx2)]
+                            if final_crop_for_sharp.size > 0:
+                                c["sharp"] = self._calc_sharpness(final_crop_for_sharp)
+                        except Exception:
+                            pass
                     # Keep the annotated preview in sync with the actual saved crop.
                     # Earlier preview boxes were drawn from the pre-final candidate box,
                     # while save_hit later changed the crop via smart-crop, border trim,
@@ -5171,6 +5525,11 @@ class Processor(QtCore.QObject):
                                 interval=0.5,
                             )
                             return False
+                        if hdr_primary_fullres and isinstance(row, list) and len(row) > 10:
+                            try:
+                                c["sharp"] = float(row[10])
+                            except Exception:
+                                pass
                         primary_saved_or_enqueued = True
                     else:
                         if hdr_primary_fullres:
@@ -5183,6 +5542,11 @@ class Processor(QtCore.QObject):
                         else:
                             ok, why = _atomic_jpeg_write(crop_img2, crop_img_path, jpg_q)
                         if ok:
+                            if hdr_primary_fullres:
+                                saved_sharp = self._calc_saved_file_sharpness(crop_img_path)
+                                if saved_sharp is not None:
+                                    row[10] = float(saved_sharp)
+                                    c["sharp"] = float(saved_sharp)
                             # emit on worker thread directly
                             self.hit.emit(crop_img_path)
                             # CSV best-effort
@@ -5343,8 +5707,16 @@ class Processor(QtCore.QObject):
                                 acx = (fx1 + fx2) / 2.0
                                 acy = (fy1 + fy2) / 2.0
                                 face_box_abs = (fx1, fy1, fx2, fy2)
+                                subject_box_abs = None
+                                if bool(getattr(cfg, "compose_detect_person_for_face", True)):
+                                    try:
+                                        assoc_persons = persons or det.detect(frame_for_det, conf=float(cfg.min_det_conf))
+                                        subject_box_abs = self._find_person_box_for_face(face_box_abs, assoc_persons, W2, H2)
+                                    except Exception:
+                                        subject_box_abs = None
+                                compose_seed_box = subject_box_abs or face_box_abs
                                 (ex1, ey1, ex2, ey2), chosen_ratio, chosen_tloss = self._choose_best_ratio(
-                                    face_box_abs, ratios, W2, H2, anchor=(acx, acy), face_box=face_box_abs
+                                    compose_seed_box, ratios, W2, H2, anchor=(acx, acy), face_box=face_box_abs
                                 )
                                 ex1, ey1, ex2, ey2 = self._enforce_scale_and_margins(
                                     (ex1, ey1, ex2, ey2),
@@ -5366,6 +5738,14 @@ class Processor(QtCore.QObject):
                                     sfy1 = max(0, min(H - 1, int(round(fy1 + off_y))))
                                     sfx2 = max(sfx1 + 1, min(W, int(round(fx2 + off_x))))
                                     sfy2 = max(sfy1 + 1, min(H, int(round(fy2 + off_y))))
+                                    subject_box_global = None
+                                    if subject_box_abs is not None:
+                                        sx1, sy1, sx2, sy2 = subject_box_abs
+                                        sgx1 = max(0, min(W - 1, int(round(sx1 + off_x))))
+                                        sgy1 = max(0, min(H - 1, int(round(sy1 + off_y))))
+                                        sgx2 = max(sgx1 + 1, min(W, int(round(sx2 + off_x))))
+                                        sgy2 = max(sgy1 + 1, min(H, int(round(sy2 + off_y))))
+                                        subject_box_global = (sgx1, sgy1, sgx2, sgy2)
                                     head_box_global = None
                                     head_box_roi = self._face_head_proxy_box(face_box_abs, W2, H2)
                                     if head_box_roi is not None:
@@ -5386,7 +5766,8 @@ class Processor(QtCore.QObject):
                                         sharp=sharp,
                                         box=(ox1, oy1, ox2, oy2),
                                         area=(ox2 - ox1) * (oy2 - oy1),
-                                        show_box=(sfx1, sfy1, sfx2, sfy2),
+                                        show_box=subject_box_global or (ox1, oy1, ox2, oy2),
+                                        subject_box=subject_box_global,
                                         face_box=(sfx1, sfy1, sfx2, sfy2),
                                         head_box=head_box_global,
                                         face_feat=gbest["feat"],
@@ -5513,6 +5894,7 @@ class Processor(QtCore.QObject):
                                             box=(ex1, ey1, ex2, ey2),
                                             area=(ex2 - ex1) * (ey2 - ey1),
                                             show_box=(x1, y1, x2, y2),
+                                            subject_box=(x1, y1, x2, y2),
                                             face_feat=None,
                                             reid_feat=None,
                                             ratio=chosen_ratio,
@@ -5616,7 +5998,17 @@ class Processor(QtCore.QObject):
                         chosen is not None
                         and now_t - self._last_hit_t >= float(cfg.min_gap_sec)
                     ):
-                        if save_hit(chosen, current_idx):
+                        if save_hit(
+                            chosen,
+                            current_idx,
+                            frame_w=W,
+                            frame_h=H,
+                            det_off_x=off_x,
+                            det_off_y=off_y,
+                            det_w=W2,
+                            det_h=H2,
+                            ratio_list=ratios,
+                        ):
                             hit_count += 1
                             self._last_hit_t = now_t
 
@@ -7507,6 +7899,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self.face_min_frac_spin.setValue(float(self.cfg.face_min_frac_in_crop))
         self.crop_min_height_frac_spin = _mk_fspin(0.0, 1.0, 0.01, 3, "float: crop_min_height_frac")
         self.crop_min_height_frac_spin.setValue(float(self.cfg.crop_min_height_frac))
+        self.compose_crop_enable_check = QtWidgets.QCheckBox()
+        self.compose_crop_enable_check.setChecked(bool(self.cfg.compose_crop_enable))
+        self.compose_crop_enable_check.setToolTip("bool: compose_crop_enable")
+        self.compose_crop_enable_check.stateChanged.connect(self._on_ui_change)
+        self.compose_detect_person_for_face_check = QtWidgets.QCheckBox()
+        self.compose_detect_person_for_face_check.setChecked(bool(self.cfg.compose_detect_person_for_face))
+        self.compose_detect_person_for_face_check.setToolTip("bool: compose_detect_person_for_face")
+        self.compose_detect_person_for_face_check.stateChanged.connect(self._on_ui_change)
+        self.compose_close_face_h_frac_spin = _mk_fspin(0.01, 1.0, 0.01, 3, "float: compose_close_face_h_frac")
+        self.compose_close_face_h_frac_spin.setValue(float(self.cfg.compose_close_face_h_frac))
+        self.compose_close_face_h_frac_spin.valueChanged.connect(self._on_ui_change)
+        self.compose_upper_face_h_frac_spin = _mk_fspin(0.01, 1.0, 0.01, 3, "float: compose_upper_face_h_frac")
+        self.compose_upper_face_h_frac_spin.setValue(float(self.cfg.compose_upper_face_h_frac))
+        self.compose_upper_face_h_frac_spin.valueChanged.connect(self._on_ui_change)
+        self.compose_body_face_h_frac_spin = _mk_fspin(0.01, 1.0, 0.005, 3, "float: compose_body_face_h_frac")
+        self.compose_body_face_h_frac_spin.setValue(float(self.cfg.compose_body_face_h_frac))
+        self.compose_body_face_h_frac_spin.valueChanged.connect(self._on_ui_change)
+        self.compose_landscape_face_penalty_spin = _mk_fspin(0.0, 20.0, 0.1, 2, "float: compose_landscape_face_penalty")
+        self.compose_landscape_face_penalty_spin.setValue(float(self.cfg.compose_landscape_face_penalty))
+        self.compose_landscape_face_penalty_spin.valueChanged.connect(self._on_ui_change)
+        self.compose_body_every_n_spin = QtWidgets.QSpinBox()
+        self.compose_body_every_n_spin.setRange(0, 300)
+        self.compose_body_every_n_spin.setValue(int(self.cfg.compose_body_every_n))
+        self.compose_body_every_n_spin.setToolTip("int: compose_body_every_n")
+        self.compose_body_every_n_spin.valueChanged.connect(self._on_ui_change)
 
         labels = [
             ("Aspect ratio W:H", self.ratio_edit),
@@ -7632,6 +8049,13 @@ class MainWindow(QtWidgets.QMainWindow):
             ("face_max_frac_in_crop", self.face_max_frac_spin),
             ("face_min_frac_in_crop", self.face_min_frac_spin),
             ("crop_min_height_frac", self.crop_min_height_frac_spin),
+            ("compose_crop_enable", self.compose_crop_enable_check),
+            ("compose_detect_person_for_face", self.compose_detect_person_for_face_check),
+            ("compose_close_face_h_frac", self.compose_close_face_h_frac_spin),
+            ("compose_upper_face_h_frac", self.compose_upper_face_h_frac_spin),
+            ("compose_body_face_h_frac", self.compose_body_face_h_frac_spin),
+            ("compose_landscape_face_penalty", self.compose_landscape_face_penalty_spin),
+            ("compose_body_every_n", self.compose_body_every_n_spin),
         ]
         for row, (lab, w) in enumerate(labels):
             if lab:
@@ -8721,6 +9145,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "score_margin",
             "iou_gate",
             "preview_every",
+            "preview_max_dim",
+            "preview_fps_cap",
             "require_face_if_visible",
             "prefer_face_when_available",
             "suppress_negatives",
@@ -8741,6 +9167,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "faceless_max_area_frac",
             "faceless_center_max_frac",
             "faceless_min_motion_frac",
+            "seek_fast",
+            "seek_max_grabs",
+            "seek_preview_peek_every",
             "crop_face_side_margin_frac",
             "crop_top_headroom_max_frac",
             "crop_bottom_min_face_heights",
@@ -8763,10 +9192,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "face_quality_min",
             "face_det_conf",
             "face_det_pad",
+            "face_fullframe_imgsz",
             "rot_adaptive",
             "rot_every_n",
             "rot_after_hit_frames",
             "fast_no_face_imgsz",
+            "overlay_scores",
             "hdr_screencap_fullres",
             "hdr_archive_crops",
             "hdr_crop_format",
@@ -8794,6 +9225,13 @@ class MainWindow(QtWidgets.QMainWindow):
             "w_upper",
             "w_cowboy",
             "w_body",
+            "compose_crop_enable",
+            "compose_detect_person_for_face",
+            "compose_close_face_h_frac",
+            "compose_upper_face_h_frac",
+            "compose_body_face_h_frac",
+            "compose_landscape_face_penalty",
+            "compose_body_every_n",
         }
         delta = {}
         for k in prescan_live | live:
@@ -8951,6 +9389,13 @@ class MainWindow(QtWidgets.QMainWindow):
             face_max_frac_in_crop=float(self.face_max_frac_spin.value()) if hasattr(self, "face_max_frac_spin") else 0.42,
             face_min_frac_in_crop=float(self.face_min_frac_spin.value()) if hasattr(self, "face_min_frac_spin") else 0.18,
             crop_min_height_frac=float(self.crop_min_height_frac_spin.value()) if hasattr(self, "crop_min_height_frac_spin") else 0.28,
+            compose_crop_enable=bool(self.compose_crop_enable_check.isChecked()) if hasattr(self, "compose_crop_enable_check") else bool(getattr(self.cfg, "compose_crop_enable", True)),
+            compose_detect_person_for_face=bool(self.compose_detect_person_for_face_check.isChecked()) if hasattr(self, "compose_detect_person_for_face_check") else bool(getattr(self.cfg, "compose_detect_person_for_face", True)),
+            compose_close_face_h_frac=float(self.compose_close_face_h_frac_spin.value()) if hasattr(self, "compose_close_face_h_frac_spin") else float(getattr(self.cfg, "compose_close_face_h_frac", 0.34)),
+            compose_upper_face_h_frac=float(self.compose_upper_face_h_frac_spin.value()) if hasattr(self, "compose_upper_face_h_frac_spin") else float(getattr(self.cfg, "compose_upper_face_h_frac", 0.22)),
+            compose_body_face_h_frac=float(self.compose_body_face_h_frac_spin.value()) if hasattr(self, "compose_body_face_h_frac_spin") else float(getattr(self.cfg, "compose_body_face_h_frac", 0.085)),
+            compose_landscape_face_penalty=float(self.compose_landscape_face_penalty_spin.value()) if hasattr(self, "compose_landscape_face_penalty_spin") else float(getattr(self.cfg, "compose_landscape_face_penalty", 5.0)),
+            compose_body_every_n=int(self.compose_body_every_n_spin.value()) if hasattr(self, "compose_body_every_n_spin") else int(getattr(self.cfg, "compose_body_every_n", 6)),
             hdr_export_timeout_sec=int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300),
         )
         cfg.hdr_passthrough = (
@@ -9019,6 +9464,28 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.hdr_export_timeout_sec = max(5, int(getattr(cfg, "hdr_export_timeout_sec", 300) or 300))
         except Exception:
             self.cfg.hdr_export_timeout_sec = 300
+        self.cfg.compose_crop_enable = bool(getattr(cfg, "compose_crop_enable", True))
+        self.cfg.compose_detect_person_for_face = bool(getattr(cfg, "compose_detect_person_for_face", True))
+        try:
+            self.cfg.compose_close_face_h_frac = float(getattr(cfg, "compose_close_face_h_frac", 0.34))
+        except Exception:
+            self.cfg.compose_close_face_h_frac = 0.34
+        try:
+            self.cfg.compose_upper_face_h_frac = float(getattr(cfg, "compose_upper_face_h_frac", 0.22))
+        except Exception:
+            self.cfg.compose_upper_face_h_frac = 0.22
+        try:
+            self.cfg.compose_body_face_h_frac = float(getattr(cfg, "compose_body_face_h_frac", 0.085))
+        except Exception:
+            self.cfg.compose_body_face_h_frac = 0.085
+        try:
+            self.cfg.compose_landscape_face_penalty = float(getattr(cfg, "compose_landscape_face_penalty", 5.0))
+        except Exception:
+            self.cfg.compose_landscape_face_penalty = 5.0
+        try:
+            self.cfg.compose_body_every_n = int(getattr(cfg, "compose_body_every_n", 6))
+        except Exception:
+            self.cfg.compose_body_every_n = 6
         self.video_edit.setText(cfg.video)
         paths = [part.strip() for part in (cfg.ref or "").split(';') if part.strip()]
         self._set_ref_paths(paths)
@@ -9328,6 +9795,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.face_min_frac_spin.setValue(cfg.face_min_frac_in_crop)
         if hasattr(self, 'crop_min_height_frac_spin'):
             self.crop_min_height_frac_spin.setValue(cfg.crop_min_height_frac)
+        if hasattr(self, 'compose_crop_enable_check'):
+            self.compose_crop_enable_check.setChecked(bool(cfg.compose_crop_enable))
+        if hasattr(self, 'compose_detect_person_for_face_check'):
+            self.compose_detect_person_for_face_check.setChecked(bool(cfg.compose_detect_person_for_face))
+        if hasattr(self, 'compose_close_face_h_frac_spin'):
+            self.compose_close_face_h_frac_spin.setValue(float(cfg.compose_close_face_h_frac))
+        if hasattr(self, 'compose_upper_face_h_frac_spin'):
+            self.compose_upper_face_h_frac_spin.setValue(float(cfg.compose_upper_face_h_frac))
+        if hasattr(self, 'compose_body_face_h_frac_spin'):
+            self.compose_body_face_h_frac_spin.setValue(float(cfg.compose_body_face_h_frac))
+        if hasattr(self, 'compose_landscape_face_penalty_spin'):
+            self.compose_landscape_face_penalty_spin.setValue(float(cfg.compose_landscape_face_penalty))
+        if hasattr(self, 'compose_body_every_n_spin'):
+            self.compose_body_every_n_spin.setValue(int(cfg.compose_body_every_n))
 
     # Thread control
     def on_start(self):
@@ -10213,6 +10694,49 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         except Exception:
             self.cfg.wide_face_aspect_limit = 1.05
+        self.cfg.compose_crop_enable = s.value(
+            "compose_crop_enable",
+            getattr(self.cfg, "compose_crop_enable", True),
+            type=bool,
+        )
+        self.cfg.compose_detect_person_for_face = s.value(
+            "compose_detect_person_for_face",
+            getattr(self.cfg, "compose_detect_person_for_face", True),
+            type=bool,
+        )
+        try:
+            self.cfg.compose_close_face_h_frac = float(
+                s.value("compose_close_face_h_frac", getattr(self.cfg, "compose_close_face_h_frac", 0.34))
+            )
+        except Exception:
+            self.cfg.compose_close_face_h_frac = 0.34
+        try:
+            self.cfg.compose_upper_face_h_frac = float(
+                s.value("compose_upper_face_h_frac", getattr(self.cfg, "compose_upper_face_h_frac", 0.22))
+            )
+        except Exception:
+            self.cfg.compose_upper_face_h_frac = 0.22
+        try:
+            self.cfg.compose_body_face_h_frac = float(
+                s.value("compose_body_face_h_frac", getattr(self.cfg, "compose_body_face_h_frac", 0.085))
+            )
+        except Exception:
+            self.cfg.compose_body_face_h_frac = 0.085
+        try:
+            self.cfg.compose_landscape_face_penalty = float(
+                s.value(
+                    "compose_landscape_face_penalty",
+                    getattr(self.cfg, "compose_landscape_face_penalty", 5.0),
+                )
+            )
+        except Exception:
+            self.cfg.compose_landscape_face_penalty = 5.0
+        try:
+            self.cfg.compose_body_every_n = int(
+                s.value("compose_body_every_n", getattr(self.cfg, "compose_body_every_n", 6))
+            )
+        except Exception:
+            self.cfg.compose_body_every_n = 6
         if hasattr(self, 'face_anchor_down_spin'):
             self.face_anchor_down_spin.setValue(
                 float(s.value("face_anchor_down_frac", self.cfg.face_anchor_down_frac))
@@ -10300,6 +10824,43 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'crop_min_height_frac_spin'):
             self.crop_min_height_frac_spin.setValue(
                 float(s.value("crop_min_height_frac", self.cfg.crop_min_height_frac))
+            )
+        if hasattr(self, 'compose_crop_enable_check'):
+            self.compose_crop_enable_check.setChecked(
+                s.value("compose_crop_enable", self.cfg.compose_crop_enable, type=bool)
+            )
+        if hasattr(self, 'compose_detect_person_for_face_check'):
+            self.compose_detect_person_for_face_check.setChecked(
+                s.value(
+                    "compose_detect_person_for_face",
+                    self.cfg.compose_detect_person_for_face,
+                    type=bool,
+                )
+            )
+        if hasattr(self, 'compose_close_face_h_frac_spin'):
+            self.compose_close_face_h_frac_spin.setValue(
+                float(s.value("compose_close_face_h_frac", self.cfg.compose_close_face_h_frac))
+            )
+        if hasattr(self, 'compose_upper_face_h_frac_spin'):
+            self.compose_upper_face_h_frac_spin.setValue(
+                float(s.value("compose_upper_face_h_frac", self.cfg.compose_upper_face_h_frac))
+            )
+        if hasattr(self, 'compose_body_face_h_frac_spin'):
+            self.compose_body_face_h_frac_spin.setValue(
+                float(s.value("compose_body_face_h_frac", self.cfg.compose_body_face_h_frac))
+            )
+        if hasattr(self, 'compose_landscape_face_penalty_spin'):
+            self.compose_landscape_face_penalty_spin.setValue(
+                float(
+                    s.value(
+                        "compose_landscape_face_penalty",
+                        self.cfg.compose_landscape_face_penalty,
+                    )
+                )
+            )
+        if hasattr(self, 'compose_body_every_n_spin'):
+            self.compose_body_every_n_spin.setValue(
+                int(s.value("compose_body_every_n", self.cfg.compose_body_every_n))
             )
         # Face-first defaults if controls not present
         if hasattr(self, 'pref_face_check'):
