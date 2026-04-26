@@ -285,6 +285,8 @@ APP_NAME = "PersonCapture GUI"
 _SETTINGS_KEY_FFMPEG_DIR = "paths/ffmpeg_dir"
 _SETTINGS_KEY_SDR_NITS_MIGRATED = "migrations/sdr_nits_default_100_v1"
 _SETTINGS_KEY_CROP_HEAD_PAD_MIGRATED = "migrations/crop_head_pad_defaults_088_095_v1"
+_SETTINGS_KEY_RATIO_DEFAULTS_MIGRATED = "migrations/ratio_defaults_334_v1"
+_HDR_READER_DEFAULT = object()
 
 # ---------------------- Data & Settings ----------------------
 
@@ -300,7 +302,7 @@ class SessionConfig:
     # ≤0 uses fps-derived auto cap (~1s of decoding) to avoid long stalls.
     seek_max_grabs: int = 12
     out_dir: str = "output"
-    ratio: str = "1:1,2:3,3:2"
+    ratio: str = "1:1,2:3,3:4"
     frame_stride: int = 2
     min_det_conf: float = 0.35
     face_thresh: float = 0.45
@@ -457,6 +459,7 @@ class SessionConfig:
     prescan_max_width: int = 416           # downscale for prescan
     # Decoder-level prescan downscale (open a separate low-res reader only for prescan).
     prescan_decode_max_w: int = 384
+    prescan_hdr_preview: bool = False      # drive Vulkan HDR preview during pre-scan; off avoids duplicate decode/seek work
     prescan_face_conf: float = 0.5         # face detector confidence during prescan
     prescan_fd_enter: float = 0.45         # ArcFace dist to ENTER (looser)
     prescan_fd_add: float = 0.22           # ArcFace dist to add to bank (tighter)
@@ -921,9 +924,10 @@ class Processor(QtCore.QObject):
                 cap_override = None
         cap = cap_ps
         pos0 = int(cap_main.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+        prescan_hdr_preview = bool(getattr(cfg, "prescan_hdr_preview", False))
 
         def _run():
-            nonlocal cap
+            nonlocal cap, prescan_hdr_preview
             # seed bank
             if ref_feat is None:
                 ref_bank_list = []
@@ -980,7 +984,8 @@ class Processor(QtCore.QObject):
                 preview_step = max(stride, int(getattr(cfg, "preview_every", 3)))
                 last_preview_idx = -preview_step
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                self._hdr_preview_seek(0)
+                if prescan_hdr_preview and self._hdr_preview_enabled():
+                    self._hdr_preview_seek(0)
                 processed_samples = 0
                 fd9_streak = 0
                 fd9_skip_samples = 0
@@ -1030,6 +1035,7 @@ class Processor(QtCore.QObject):
                                     enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
                                     fd_add = float(getattr(cfg, "prescan_fd_add", enter))
                                     Wmax = int(cfg.prescan_max_width)
+                                    prescan_hdr_preview = bool(getattr(cfg, "prescan_hdr_preview", False))
                                     face.conf = float(cfg.prescan_face_conf)
                                     add_cooldown_samples = int(
                                         getattr(
@@ -1055,7 +1061,11 @@ class Processor(QtCore.QObject):
                             fast=bool(getattr(cfg, "seek_fast", True)),
                             max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
                             allow_partial=True,
-                            hdr_reader=self._hdr_preview_reader,
+                            hdr_reader=(
+                                self._hdr_preview_reader
+                                if (prescan_hdr_preview and self._hdr_preview_enabled())
+                                else None
+                            ),
                         )
                         # ensure forward progress even if seek advanced < stride
                         i_floor = (new_pos // stride) * stride
@@ -1121,6 +1131,7 @@ class Processor(QtCore.QObject):
                                     enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
                                     fd_add = float(getattr(cfg, "prescan_fd_add", enter))
                                     Wmax = int(cfg.prescan_max_width)
+                                    prescan_hdr_preview = bool(getattr(cfg, "prescan_hdr_preview", False))
                                     face.conf = float(cfg.prescan_face_conf)
                                     add_cooldown_samples = int(
                                         getattr(
@@ -1151,7 +1162,11 @@ class Processor(QtCore.QObject):
                             fast=bool(getattr(cfg, "seek_fast", True)),
                             max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
                             allow_partial=True,
-                            hdr_reader=self._hdr_preview_reader,
+                            hdr_reader=(
+                                self._hdr_preview_reader
+                                if (prescan_hdr_preview and self._hdr_preview_enabled())
+                                else None
+                            ),
                         )
                         i_floor = (new_pos // stride) * stride
                         if i_floor <= i:
@@ -1219,7 +1234,7 @@ class Processor(QtCore.QObject):
                             break
                         i = i + 1 + skipped
                         continue
-                    if self._hdr_preview_enabled():
+                    if prescan_hdr_preview and self._hdr_preview_enabled():
                         self._hdr_preview_seek(i)
                         self._pump_hdr_preview()
                     idx = i
@@ -1488,13 +1503,18 @@ class Processor(QtCore.QObject):
                                 fast=bool(getattr(cfg, "seek_fast", True)),
                                 max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
                                 allow_partial=False,
-                                hdr_reader=self._hdr_preview_reader,
+                                hdr_reader=(
+                                    self._hdr_preview_reader
+                                    if (prescan_hdr_preview and self._hdr_preview_enabled())
+                                    else None
+                                ),
                             )
                             ret, frame = cap.read()
                             if not ret or frame is None:
                                 j += stride_ref
                                 continue
-                            self._pump_hdr_preview()
+                            if prescan_hdr_preview and self._hdr_preview_enabled():
+                                self._pump_hdr_preview()
                             h, w = frame.shape[:2]
                             if Wmax > 0 and w > Wmax:
                                 scale = float(Wmax) / float(w)
@@ -1536,13 +1556,18 @@ class Processor(QtCore.QObject):
                                     fast=bool(getattr(cfg, "seek_fast", True)),
                                     max_grabs=int(getattr(cfg, "seek_max_grabs", 12)),
                                     allow_partial=False,
-                                    hdr_reader=self._hdr_preview_reader,
+                                    hdr_reader=(
+                                        self._hdr_preview_reader
+                                        if (prescan_hdr_preview and self._hdr_preview_enabled())
+                                        else None
+                                    ),
                                 )
                                 ret, frame = cap.read()
                                 if not ret or frame is None:
                                     j += stride_ref
                                     continue
-                                self._pump_hdr_preview()
+                                if prescan_hdr_preview and self._hdr_preview_enabled():
+                                    self._pump_hdr_preview()
                                 h, w = frame.shape[:2]
                                 if Wmax > 0 and w > Wmax:
                                     scale = float(Wmax) / float(w)
@@ -2588,8 +2613,119 @@ class Processor(QtCore.QObject):
         h, w = frame.shape[:2]
         scan_frac = float(getattr(self.cfg, "border_scan_frac", 0.25))
         max_scan = int(round(min(h, w) * max(0.0, scan_frac))) if scan_frac > 0 else None
-        x1,y1,x2,y2 = detect_black_borders(frame, thr=int(thr), max_scan=max_scan)
-        return frame[y1:y2, x1:x2], (x1,y1)
+        x1, y1, x2, y2 = detect_black_borders(frame, thr=int(thr), max_scan=max_scan)
+        x1 = max(0, min(w - 1, int(x1)))
+        y1 = max(0, min(h - 1, int(y1)))
+        x2 = max(x1 + 1, min(w, int(x2)))
+        y2 = max(y1 + 1, min(h, int(y2)))
+        if (x1, y1, x2, y2) == (0, 0, w, h):
+            return frame, (0, 0)
+        if not self._is_real_letterbox_crop(frame, (x1, y1, x2, y2), int(thr)):
+            self._status(
+                f"Ignoring false border crop x={x1} y={y1} w={x2 - x1} h={y2 - y1}",
+                key="border_guard",
+                interval=2.0,
+            )
+            return frame, (0, 0)
+        return frame[y1:y2, x1:x2], (x1, y1)
+
+    def _is_real_letterbox_crop(
+        self,
+        frame,
+        crop_xyxy: Tuple[int, int, int, int],
+        thr: int,
+    ) -> bool:
+        """Validate that a detected border crop is really a video border.
+
+        The low-level detector uses edge-row/edge-column means. In candle-lit
+        HDR scenes that can mistake dark hair, clothing, or a dark wall for a
+        border and then all later crop repair is clamped to that false content
+        window. A real letterbox/pillarbox strip is nearly uniform black across
+        the full side and normally appears as a matched pair. Reject one-sided
+        or textured/detailed edge crops.
+        """
+        if frame is None or getattr(frame, "size", 0) == 0:
+            return False
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in crop_xyxy]
+        left = max(0, x1)
+        top = max(0, y1)
+        right = max(0, w - x2)
+        bottom = max(0, h - y2)
+        if left <= 0 and top <= 0 and right <= 0 and bottom <= 0:
+            return True
+
+        # One-sided trims are almost never valid cinema mattes. They are the
+        # failure mode that shifts the final crop's left edge into the subject's
+        # face/head in dark scenes.
+        tol = max(3, int(round(min(w, h) * 0.006)))
+        if (left > 0) != (right > 0):
+            return False
+        if (top > 0) != (bottom > 0):
+            return False
+        if left and right and abs(left - right) > max(tol, int(0.35 * max(left, right))):
+            return False
+        if top and bottom and abs(top - bottom) > max(tol, int(0.35 * max(top, bottom))):
+            return False
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        max_luma = max(float(thr) + 8.0, 18.0)
+        max_std = 3.5
+
+        def _strip_ok(region) -> bool:
+            if region is None or region.size == 0:
+                return True
+            vals = region.reshape(-1).astype(np.float32)
+            # Use high percentiles instead of mean so a bright rim light, face
+            # edge, subtitle, or background object rejects the border candidate.
+            p95 = float(np.percentile(vals, 95.0))
+            p99 = float(np.percentile(vals, 99.0))
+            std = float(np.std(vals))
+            return p95 <= max_luma and p99 <= (max_luma + 4.0) and std <= max_std
+
+        if left and not _strip_ok(gray[:, :left]):
+            return False
+        if right and not _strip_ok(gray[:, w - right :]):
+            return False
+        if top and not _strip_ok(gray[:top, :]):
+            return False
+        if bottom and not _strip_ok(gray[h - bottom :, :]):
+            return False
+        return True
+
+    def _repair_crop_bounds_from_identity(
+        self,
+        bounds_xyxy: Tuple[int, int, int, int],
+        frame_w: int,
+        frame_h: int,
+        *boxes,
+    ) -> Tuple[int, int, int, int]:
+        """Do not let a false border/content ROI clamp through identity evidence.
+
+        Border removal is only a content-window hint. If the already matched
+        face/head/subject box lies outside that window, the window is wrong for
+        final dataset composition and must expand back to the full frame.
+        """
+        bx1, by1, bx2, by2 = [int(v) for v in bounds_xyxy]
+        bx1 = max(0, min(frame_w - 1, bx1))
+        by1 = max(0, min(frame_h - 1, by1))
+        bx2 = max(bx1 + 1, min(frame_w, bx2))
+        by2 = max(by1 + 1, min(frame_h, by2))
+        pad = 2.0
+        for box in boxes:
+            if box is None or len(box) != 4:
+                continue
+            try:
+                x1, y1, x2, y2 = [float(v) for v in box]
+            except Exception:
+                continue
+            if not all(np.isfinite([x1, y1, x2, y2])):
+                continue
+            if x2 <= x1 or y2 <= y1:
+                continue
+            if x1 < bx1 - pad or y1 < by1 - pad or x2 > bx2 + pad or y2 > by2 + pad:
+                return (0, 0, int(frame_w), int(frame_h))
+        return (bx1, by1, bx2, by2)
 
     def _iou(self, a, b):
         ax1,ay1,ax2,ay2 = a; bx1,by1,bx2,by2 = b
@@ -3089,9 +3225,10 @@ class Processor(QtCore.QObject):
         max_grabs: int = 0,
         peek_preview: bool = False,
         allow_partial: bool = False,
-        hdr_reader=None,
+        hdr_reader=_HDR_READER_DEFAULT,
     ) -> int:
         """Keyframe-aware seek. Fast UI seeks may return before target; internal jumps must not."""
+        hdr_reader_eff = self._hdr_preview_reader if hdr_reader is _HDR_READER_DEFAULT else hdr_reader
         if self._total_frames is not None:
             tgt_idx = max(0, min(self._total_frames - 1, int(tgt_idx)))
 
@@ -3154,7 +3291,8 @@ class Processor(QtCore.QObject):
                     cap.set(cv2.CAP_PROP_POS_FRAMES, base)
             else:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, base)
-            self._hdr_preview_seek(base, reader=hdr_reader)
+            if hdr_reader_eff is not None:
+                self._hdr_preview_seek(base, reader=hdr_reader_eff)
         idx = base
         limit = max(0, tgt_idx - base)
         # Cap forward grabs only for partial/UI fast seeks. Segment jumps in the
@@ -3188,14 +3326,17 @@ class Processor(QtCore.QObject):
                 ok, frame = cap.retrieve()
                 if ok:
                     try:
-                        self._pump_hdr_preview(reader=hdr_reader)
+                        if hdr_reader_eff is not None:
+                            self._pump_hdr_preview(reader=hdr_reader_eff)
                         self._emit_preview_bgr(frame)
                     except Exception:
                         pass
                 else:
-                    self._hdr_preview_skip(1, reader=hdr_reader)
+                    if hdr_reader_eff is not None:
+                        self._hdr_preview_skip(1, reader=hdr_reader_eff)
             else:
-                self._hdr_preview_skip(1, reader=hdr_reader)
+                if hdr_reader_eff is not None:
+                    self._hdr_preview_skip(1, reader=hdr_reader_eff)
             if fast and allow_partial and t0 is not None and (time.perf_counter() - t0) > budget:
                 try:
                     self._status(
@@ -3799,8 +3940,14 @@ class Processor(QtCore.QObject):
             except Exception:
                 pass
 
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
             # Default: HDR passthrough ON when available unless explicitly disabled in cfg.
             cfg_hdr_passthrough = bool(getattr(cfg, "hdr_passthrough", True))
+            prescan_enabled = bool(getattr(cfg, "prescan_enable", True))
+            prescan_will_run = prescan_enabled and total_frames > 0
+            allow_prescan_hdr_preview = bool(getattr(cfg, "prescan_hdr_preview", False))
             want_hdr_passthrough = (
                 hdr_active
                 and cfg_hdr_passthrough
@@ -3809,7 +3956,9 @@ class Processor(QtCore.QObject):
             )
             self._status(
                 f"HDR passthrough gate: hdr={hdr_active} cfg={cfg_hdr_passthrough} "
-                f"ui={self.ui_hdr_passthrough_enabled} dll={_hdr_passthrough_available()}",
+                f"ui={self.ui_hdr_passthrough_enabled} prescan={prescan_will_run} "
+                f"prescan_preview={allow_prescan_hdr_preview} "
+                f"dll={_hdr_passthrough_available()}",
                 key="hdr_gate",
                 interval=10.0,
             )
@@ -3844,11 +3993,14 @@ class Processor(QtCore.QObject):
                     # Drive preview from a dedicated P010 reader.
                     self._hdr_passthrough_active = True
                     self._hdr_preview_latest = None
-                    try:
-                        pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
-                        self._hdr_preview_seek(pos)
-                    except Exception:
-                        pass
+                    # Use prescan intent here instead of early total_frames because
+                    # total/fps may be repaired a few lines later.
+                    if (not prescan_enabled) or allow_prescan_hdr_preview:
+                        try:
+                            pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+                            self._hdr_preview_seek(pos)
+                        except Exception as exc:
+                            logger.debug("Initial HDR preview seek skipped after failure: %s", exc)
                     self._status(
                         "HDR passthrough preview: enabled (P010 preview reader)",
                         key="hdr_passthrough",
@@ -3912,9 +4064,6 @@ class Processor(QtCore.QObject):
                         pass
                 self._hdr_preview_seek(pos0)
                 return ok_any
-
-            fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
             defer_reader_probe = (
                 hdr_active
@@ -5333,6 +5482,14 @@ class Processor(QtCore.QObject):
                     by1 = max(0, min(frame_h - 1, by1))
                     bx2 = max(bx1 + 1, min(frame_w, bx2))
                     by2 = max(by1 + 1, min(frame_h, by2))
+                    bx1, by1, bx2, by2 = self._repair_crop_bounds_from_identity(
+                        (bx1, by1, bx2, by2),
+                        frame_w,
+                        frame_h,
+                        c.get("face_box"),
+                        c.get("head_box"),
+                        c.get("subject_box"),
+                    )
 
                     ratio_candidates = list(ratio_list) if ratio_list else [ratio_str]
                     if bool(getattr(cfg, "compose_crop_enable", True)):
@@ -5365,7 +5522,14 @@ class Processor(QtCore.QObject):
                         by2 = int(by1 + det_h)
                     else:
                         bx1, by1, bx2, by2 = 0, 0, frame_w, frame_h
-                    repair_bx1, repair_by1, repair_bx2, repair_by2 = bx1, by1, bx2, by2
+                    repair_bx1, repair_by1, repair_bx2, repair_by2 = self._repair_crop_bounds_from_identity(
+                        (bx1, by1, bx2, by2),
+                        frame_w,
+                        frame_h,
+                        c.get("face_box"),
+                        c.get("head_box"),
+                        c.get("subject_box"),
+                    )
 
                     # Do not run border detection on the already-composed crop.
                     # In candle-lit/dark scenes the subject's hair, clothing, or a dark
@@ -5848,7 +6012,12 @@ class Processor(QtCore.QObject):
                             return False
                         primary_saved_or_enqueued = True
                     if primary_saved_or_enqueued and hdr_out_path:
-                        hdr_crop_xyxy = self._even_hdr_crop_xyxy(source_crop_xyxy, source_size)
+                        is_avif_archive = hdr_out_path.lower().endswith(".avif")
+                        hdr_crop_xyxy = (
+                            source_crop_xyxy
+                            if is_avif_archive
+                            else self._even_hdr_crop_xyxy(source_crop_xyxy, source_size)
+                        )
                         if archive_q is not None:
                             try:
                                 archive_q.put_nowait({
@@ -7173,7 +7342,7 @@ class Processor(QtCore.QObject):
                     continue
                 tail = (cp.stderr or cp.stdout or "").splitlines()[-4:]
                 why = " | ".join(tail) if tail else f"ffmpeg_rc={cp.returncode}"
-                self._status(f"HDR full-res export fallback: {why}", key="hdr_sdr_export", interval=10.0)
+                self._status(f"HDR full-res export filter failed: {why}", key="hdr_sdr_export", interval=10.0)
             except subprocess.TimeoutExpired as exc:
                 self._status(
                     f"HDR full-res export timeout after {timeout_sec}s total budget: {exc}",
@@ -7187,7 +7356,7 @@ class Processor(QtCore.QObject):
                     pass
                 return False, f"ffmpeg_timeout_{timeout_sec}s"
             except Exception as exc:
-                self._status(f"HDR full-res export fallback: {exc}", key="hdr_sdr_export", interval=10.0)
+                self._status(f"HDR full-res export filter failed: {exc}", key="hdr_sdr_export", interval=10.0)
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
@@ -7230,6 +7399,13 @@ class Processor(QtCore.QObject):
                 seek_sec = max(0.0, float(frame_idx) / fps)
 
         is_avif = out_path.lower().endswith(".avif")
+        if is_avif:
+            # The AVIF path is intended for viewable HDR stills, not source-
+            # exact archive masters. Keep MKV/FFV1 as the default archive.
+            # If AVIF is explicitly selected, avoid reintroducing dark-region
+            # chroma blotches by encoding a true lossless 4:4:4 still instead
+            # of a CRF-0 4:2:0 AV1 still.
+            vf = f"{vf},format=yuv444p10le"
 
         pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(seek_sec)
         cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
@@ -7253,7 +7429,7 @@ class Processor(QtCore.QObject):
                 "-still-picture",
                 "1",
                 "-pix_fmt",
-                "yuv420p10le",
+                "yuv444p10le",
                 "-g",
                 "1",
                 "-tile-columns",
@@ -7263,11 +7439,17 @@ class Processor(QtCore.QObject):
                 "-row-mt",
                 "1",
                 "-cpu-used",
-                "4",
-                # Lossless-ish: CRF 0 + no bitrate cap.
+                "2",
+                # Real lossless AV1. CRF 0 alone is not a reliable archival
+                # guarantee and can still leave visible chroma artifacts in
+                # very dark HDR regions after viewer tone mapping.
+                "-lossless",
+                "1",
                 "-crf",
                 "0",
                 "-b:v",
+                "0",
+                "-aq-mode",
                 "0",
                 # Preserve HDR10 signaling in the AVIF container.
                 "-color_range",
@@ -7716,7 +7898,7 @@ class MainWindow(QtWidgets.QMainWindow):
         param_group = QtWidgets.QGroupBox("Parameters")
         grid = QtWidgets.QGridLayout(param_group)
 
-        self.ratio_edit = QtWidgets.QLineEdit("1:1,2:3,3:2")
+        self.ratio_edit = QtWidgets.QLineEdit("1:1,2:3,3:4")
         self.sdr_nits_spin = QtWidgets.QDoubleSpinBox()
         self.sdr_nits_spin.setRange(50.0, 400.0)
         self.sdr_nits_spin.setDecimals(0)
@@ -7886,6 +8068,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_prescan_decode_max_w.setValue(int(getattr(self.cfg, "prescan_decode_max_w", 384)))
         self.spin_prescan_decode_max_w.setToolTip("int: prescan_decode_max_w (decoder downscale; 0=disable)")
         self.spin_prescan_decode_max_w.valueChanged.connect(self._on_ui_change)
+        self.chk_prescan_hdr_preview = QtWidgets.QCheckBox()
+        self.chk_prescan_hdr_preview.setChecked(bool(getattr(self.cfg, "prescan_hdr_preview", False)))
+        self.chk_prescan_hdr_preview.setToolTip(
+            "bool: prescan_hdr_preview (drive Vulkan HDR preview during pre-scan; slower, detection unchanged)"
+        )
+        self.chk_prescan_hdr_preview.stateChanged.connect(self._on_ui_change)
         self.prescan_cache_combo = QtWidgets.QComboBox()
         self.prescan_cache_combo.addItem("Auto reuse matching cache", "auto")
         self.prescan_cache_combo.addItem("Refresh/rebuild cache", "refresh")
@@ -8318,6 +8506,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Pre-scan bank add dist ≤", self.spin_prescan_fd_add),
             ("Pre-scan max width (px)", self.spin_prescan_max_width),
             ("Pre-scan decode max width (px)", self.spin_prescan_decode_max_w),
+            ("Pre-scan HDR preview", self.chk_prescan_hdr_preview),
             ("Pre-scan cache", self.prescan_cache_widget),
             ("Pre-scan face det conf", self.spin_prescan_face_conf),
             ("Pre-scan ENTER dist ≤", self.spin_prescan_fd_enter),
@@ -9467,6 +9656,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "prescan_stride",
             "prescan_max_width",
             "prescan_decode_max_w",
+            "prescan_hdr_preview",
             "prescan_face_conf",
             "prescan_fd_enter",
             "prescan_fd_add",
@@ -9609,7 +9799,7 @@ class MainWindow(QtWidgets.QMainWindow):
             video=self.video_edit.text().strip(),
             ref=ref_join,
             out_dir=self.out_edit.text().strip() or "output",
-            ratio=self.ratio_edit.text().strip() or "1:1,2:3,3:2",
+            ratio=self.ratio_edit.text().strip() or "1:1,2:3,3:4",
             sdr_nits=float(self.sdr_nits_spin.value()),
             tm_desat=float(self.tm_desat_spin.value()),
             tm_param=float(self.tm_param_spin.value()),
@@ -9631,6 +9821,7 @@ class MainWindow(QtWidgets.QMainWindow):
             prescan_fd_add=float(self.spin_prescan_fd_add.value()) if hasattr(self, "spin_prescan_fd_add") else 0.22,
             prescan_max_width=int(self.spin_prescan_max_width.value()) if hasattr(self, "spin_prescan_max_width") else 416,
             prescan_decode_max_w=int(self.spin_prescan_decode_max_w.value()) if hasattr(self, "spin_prescan_decode_max_w") else int(getattr(self.cfg, "prescan_decode_max_w", 384)),
+            prescan_hdr_preview=bool(self.chk_prescan_hdr_preview.isChecked()) if hasattr(self, "chk_prescan_hdr_preview") else bool(getattr(self.cfg, "prescan_hdr_preview", False)),
             prescan_cache_mode=(self.prescan_cache_combo.currentData() if hasattr(self, "prescan_cache_combo") else getattr(self.cfg, "prescan_cache_mode", "auto")) or "auto",
             prescan_cache_dir=(
                 self.edit_prescan_cache_dir.text().strip()
@@ -9818,6 +10009,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.prescan_decode_max_w = int(getattr(cfg, "prescan_decode_max_w", 384))
         except Exception:
             self.cfg.prescan_decode_max_w = 384
+        self.cfg.prescan_hdr_preview = bool(getattr(cfg, "prescan_hdr_preview", False))
         self.cfg.prescan_cache_dir = str(getattr(cfg, "prescan_cache_dir", "prescan_cache") or "prescan_cache")
         try:
             self.cfg.hdr_export_timeout_sec = max(5, int(getattr(cfg, "hdr_export_timeout_sec", 300) or 300))
@@ -9956,6 +10148,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spin_prescan_max_width.setValue(int(cfg.prescan_max_width))
         if hasattr(self, 'spin_prescan_decode_max_w'):
             self.spin_prescan_decode_max_w.setValue(int(getattr(cfg, 'prescan_decode_max_w', 384)))
+        if hasattr(self, 'chk_prescan_hdr_preview'):
+            self.chk_prescan_hdr_preview.setChecked(bool(getattr(cfg, 'prescan_hdr_preview', False)))
         if hasattr(self, "prescan_cache_combo"):
             mode = str(getattr(cfg, "prescan_cache_mode", "auto") or "auto")
             idx = self.prescan_cache_combo.findData(mode)
@@ -10202,6 +10396,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hdr_passthrough_enabled = passthrough_active
         self._last_hdr_preview_t = time.perf_counter()
         self._hdr_preview_seen = False
+        try:
+            if hasattr(self, "preview_stack"):
+                self.preview_stack.setCurrentIndex(0)
+        except Exception:
+            pass
 
         # basic validation
         if not os.path.isfile(cfg.video):
@@ -10732,12 +10931,17 @@ class MainWindow(QtWidgets.QMainWindow):
         paths = self._filter_images([part.strip() for part in refs.split(';') if part.strip()])
         self._set_ref_paths(paths)
         self.out_edit.setText(s.value("out_dir", "output"))
-        _stored_ratio = str(s.value("ratio", getattr(self.cfg, "ratio", "1:1,2:3,3:2")) or "1:1,2:3,3:2")
-        if _stored_ratio.strip() == "2:3":
-            # Migrate the old single portrait default to the new composition-safe
-            # candidate list.  A lone 2:3 default deprived the scorer of square
-            # alternatives for close/prominent faces.
-            _stored_ratio = "1:1,2:3,3:2"
+        _stored_ratio = str(s.value("ratio", getattr(self.cfg, "ratio", "1:1,2:3,3:4")) or "1:1,2:3,3:4")
+        _ratio_defaults_migrated = bool(s.value(_SETTINGS_KEY_RATIO_DEFAULTS_MIGRATED, False, type=bool))
+        if not _ratio_defaults_migrated:
+            _ratio_norm = ",".join(part.strip() for part in _stored_ratio.split(",") if part.strip())
+            if _ratio_norm in {"1:1,3:2,2:3", "1:1,2:3,3:2"}:
+                # Migrate old defaults away from landscape availability. Landscape
+                # crops are still possible from explicit user settings, but the solid
+                # dataset preset should not let 3:2 leak into head/portrait decisions.
+                _stored_ratio = "1:1,2:3,3:4"
+                s.setValue("ratio", _stored_ratio)
+            s.setValue(_SETTINGS_KEY_RATIO_DEFAULTS_MIGRATED, True)
         self.ratio_edit.setText(_stored_ratio)
         try:
             _sdr_nits = float(s.value("sdr_nits", self.cfg.sdr_nits))
@@ -10932,6 +11136,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spin_prescan_max_width.setValue(int(s.value("prescan_max_width", self.cfg.prescan_max_width)))
         if hasattr(self, 'spin_prescan_decode_max_w'):
             self.spin_prescan_decode_max_w.setValue(int(s.value("prescan_decode_max_w", getattr(self.cfg, "prescan_decode_max_w", 384))))
+        if hasattr(self, 'chk_prescan_hdr_preview'):
+            self.chk_prescan_hdr_preview.setChecked(s.value("prescan_hdr_preview", getattr(self.cfg, "prescan_hdr_preview", False), type=bool))
+            self.cfg.prescan_hdr_preview = bool(self.chk_prescan_hdr_preview.isChecked())
         if hasattr(self, "prescan_cache_combo"):
             mode = str(s.value("prescan_cache_mode", getattr(self.cfg, "prescan_cache_mode", "auto")) or "auto")
             idx = self.prescan_cache_combo.findData(mode)
@@ -11370,6 +11577,11 @@ class MainWindow(QtWidgets.QMainWindow):
             s.setValue(
                 "prescan_trim_pad",
                 bool(self.chk_prescan_trim_pad.isChecked()),
+            )
+        if hasattr(self, 'chk_prescan_hdr_preview'):
+            s.setValue(
+                "prescan_hdr_preview",
+                bool(self.chk_prescan_hdr_preview.isChecked()),
             )
         if hasattr(self, 'disable_reid_check'):
             s.setValue("disable_reid", self.disable_reid_check.isChecked())
