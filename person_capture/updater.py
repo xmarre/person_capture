@@ -369,10 +369,14 @@ def _merge_staged_item_preserving_user_data(
     install root, and sometimes under package subdirectories. Directory-level
     replacement can therefore delete output/crops while updating the code.
 
-    This replaces files that are present in the update payload. For destination
+    This applies files that are present in the update payload. For destination
     paths that are not explicit runtime-data roots, destination-only children
     are removed so deleted shipped files do not linger after an update. We only
     preserve destination-only content under known runtime-data roots.
+
+    This function intentionally does not mutate the staged source tree while it
+    is applying changes. If apply fails part-way through, retry should still
+    observe the full original staged payload.
     """
     if src.is_dir() and not src.is_symlink():
         if dst.exists() and (not dst.is_dir() or dst.is_symlink()):
@@ -393,10 +397,6 @@ def _merge_staged_item_preserving_user_data(
             if _is_preserved_update_path(rel_existing):
                 continue
             _remove_path_for_update_replace(existing)
-        try:
-            src.rmdir()
-        except OSError:
-            shutil.rmtree(src, ignore_errors=True)
         return
 
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -409,7 +409,7 @@ def _merge_staged_item_preserving_user_data(
         raise RuntimeError(f"refusing to replace preserved runtime dir: {dst}")
     if dst.exists() or dst.is_symlink():
         _remove_path_for_update_replace(dst)
-    shutil.move(str(src), str(dst))
+    shutil.copy2(str(src), str(dst), follow_symlinks=False)
 
 
 def _pip_install_requirements(req_file: Path) -> str:
@@ -440,7 +440,14 @@ def apply_staged_update(repo: Path) -> Tuple[bool, str]:
         sha_applied = str(info.get("sha") or "")
         staged = Path(info.get("staged_dir") or (repo / "update_staged"))
         repo_resolved = repo.resolve()
-        staged_base = (repo_resolved / "update_staged").resolve()
+        staged_path = repo_resolved / "update_staged"
+        if staged_path.is_symlink():
+            try:
+                flag.unlink()
+            except Exception:
+                pass
+            return False, "invalid staged dir"
+        staged_base = staged_path.resolve()
         staged_resolved = staged.resolve(strict=False)
         if staged_resolved != staged_base:
             try:
