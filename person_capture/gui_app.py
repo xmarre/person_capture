@@ -2267,6 +2267,7 @@ class Processor(QtCore.QObject):
 
         fallback_protect = face_protect or subj or base or (bx1, by1, bx2, by2)
         fallback_ratio = None
+        fallback_profile = "fallback"
         for rs in validated_user_ratios:
             try:
                 rw, rh = parse_ratio(rs)
@@ -2279,12 +2280,14 @@ class Processor(QtCore.QObject):
                     continue
                 if subj_h_frac < 0.60:
                     continue
+                fallback_profile = "body"
             fallback_ratio = rs
             break
         if fallback_ratio is None:
             fallback_ratio = "1:1" if face_protect is not None else "2:3"
+            fallback_profile = "fallback"
         crop = self._ratio_crop_containing_box(fallback_protect, fallback_ratio, bounds)
-        return crop, fallback_ratio, "fallback"
+        return crop, fallback_ratio, fallback_profile
 
     def _enforce_scale_and_margins(
         self,
