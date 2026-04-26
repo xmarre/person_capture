@@ -6695,7 +6695,9 @@ class Processor(QtCore.QObject):
             preroll_sec = 2.0
         preroll_sec = min(seek_f, preroll_sec)
         if preroll_sec > 1e-6:
-            return ["-ss", f"{max(0.0, seek_f - preroll_sec):.6f}"], f"trim=start={preroll_sec:.6f},setpts=PTS-STARTPTS,"
+            start_offset = max(0.0, seek_f - preroll_sec)
+            seek_args = ["-ss", f"{start_offset:.6f}"] if start_offset > 1e-6 else []
+            return seek_args, f"trim=start={preroll_sec:.6f},setpts=PTS-STARTPTS,"
         return [], f"trim=start={seek_f:.6f},setpts=PTS-STARTPTS,"
 
     @staticmethod
