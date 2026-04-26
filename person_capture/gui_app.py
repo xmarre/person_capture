@@ -372,6 +372,8 @@ class SessionConfig:
     preview_every: int = 3
     # I/O
     async_save: bool = True                # write crops/CSV on a background thread
+    hdr_sdr_fallback_to_decoded: bool = True # if full-res HDR still export fails, save current decoded crop instead of dropping
+    hdr_sdr_disable_after_failures: int = 1  # disable full-res HDR still export for this run after consecutive failures
     jpg_quality: int = 85                  # JPEG quality (lower = faster, smaller)
     # Face full-frame fallback cadence (frames). 0 disables.
     face_fullframe_cadence: int = 12
@@ -406,6 +408,7 @@ class SessionConfig:
     compose_body_face_h_frac: float = 0.085      # target face_h / crop_h for full-body crops
     compose_landscape_face_penalty: float = 5.0  # discourage landscape crops for prominent faces
     compose_body_every_n: int = 6                # deterministic body-shot bias cadence when viable
+    compose_person_detect_cadence: int = 6        # only run YOLO person association for face hits on body-suited cadence
     border_threshold: int = 22                   # grayscale threshold for border trimming
     border_scan_frac: float = 0.25               # scan depth as fraction of min(w,h)
     # --- smart crop ---
@@ -2003,12 +2006,12 @@ class Processor(QtCore.QObject):
         face_box: Optional[Tuple[float, float, float, float]] = None,
         frame_idx: Optional[int] = None,
     ) -> Tuple[Tuple[int, int, int, int], str, str]:
-        """Compose the final LoRA-dataset crop after identity has been decided.
+        """Compose the final dataset crop after identity has been decided.
 
-        Detection boxes identify the person. They do not directly define the saved
-        crop.  This method selects a close/upper/body crop from face and person
-        constraints, with portrait/square crops preferred unless the current frame
-        is genuinely better suited to a body crop.
+        The candidate detector boxes are identity evidence.  They are not allowed
+        to become arbitrary crop anchors.  Composition is driven by the matched
+        face/head and, only when it is a real associated person detection, the
+        subject/body box.
         """
         cfg = self.cfg
         bx1, by1, bx2, by2 = [int(v) for v in bounds_xyxy]
@@ -2017,139 +2020,135 @@ class Processor(QtCore.QObject):
         bound_h = max(1.0, float(by2 - by1))
         bound_area = max(1.0, bound_w * bound_h)
 
-        ratios: list[str] = []
-        for r in ratio_candidates or []:
-            rs = str(r).strip()
-            if not rs:
-                continue
-            try:
-                parse_ratio(rs)
-            except Exception:
-                continue
-            if rs not in ratios:
-                ratios.append(rs)
-        display_ratios = list(ratios) if ratios else ["1:1", "2:3"]
+        def _ratio_list_for_profile(profile: str) -> list[str]:
+            # Always make portrait/headshot ratios available even if the UI still
+            # has stale landscape-heavy settings. Landscape remains available for
+            # body/context crops only.
+            preferred = {
+                "close": ["1:1", "2:3"],
+                "upper": ["2:3", "1:1"],
+                "body": ["2:3", "1:1", "3:2"],
+                "base": ["1:1", "2:3"],
+            }.get(profile, ["1:1", "2:3"])
+            out: list[str] = []
+            for rs in preferred + [str(r).strip() for r in (ratio_candidates or []) if str(r).strip()]:
+                try:
+                    parse_ratio(rs)
+                except Exception:
+                    continue
+                if rs not in out:
+                    out.append(rs)
+            return out or ["1:1", "2:3"]
 
         base = self._coerce_box_xyxy(base_crop_xyxy, bounds)
         subj = self._coerce_box_xyxy(subject_box, bounds)
         face = self._coerce_box_xyxy(face_box, bounds)
         if base is None:
-            base = subj or face or (bx1, by1, bx2, by2)
+            base = face or subj or (bx1, by1, bx2, by2)
 
         head = self._face_head_proxy_box(face, bx2, by2) if face is not None else None
         head = self._coerce_box_xyxy(head, bounds)
-        protect_face = self._union_boxes_xyxy(face, head) or face
+        face_protect = self._union_boxes_xyxy(head, face) or face
 
-        profiles: list[tuple[str, Tuple[float, float, float, float], float]] = []
-        if face is not None:
-            fx1, fy1, fx2, fy2 = face
-            fw = max(1.0, fx2 - fx1)
-            fh = max(1.0, fy2 - fy1)
-            fcx = 0.5 * (fx1 + fx2)
-            fcy = 0.5 * (fy1 + fy2)
-            head_or_face = protect_face or face
-            hx1, hy1, hx2, hy2 = head_or_face
-
-            close_box = (
-                max(float(bx1), hx1 - 0.35 * fw),
-                max(float(by1), hy1 - 0.10 * fh),
-                min(float(bx2), hx2 + 0.35 * fw),
-                min(float(by2), max(hy2, fy2 + 1.65 * fh)),
-            )
-            profiles.append(("close", close_box, float(getattr(cfg, "compose_close_face_h_frac", 0.34))))
-
-            if subj is not None:
-                sx1, sy1, sx2, sy2 = subj
-                sh = max(1.0, sy2 - sy1)
-                sw = max(1.0, sx2 - sx1)
-                # Upper crop includes the head and shoulders/torso, but avoids making
-                # every face hit a full-body crop.
-                upper_bottom = min(float(by2), max(fy2 + 3.8 * fh, sy1 + 0.55 * sh))
-                shoulder_half_w = max(0.55 * sw, 2.2 * fw)
-                upper_box = (
-                    max(float(bx1), min(sx1, fcx - shoulder_half_w)),
-                    max(float(by1), min(hy1, sy1)),
-                    min(float(bx2), max(sx2, fcx + shoulder_half_w)),
-                    upper_bottom,
-                )
-                profiles.append(("upper", upper_box, float(getattr(cfg, "compose_upper_face_h_frac", 0.22))))
-
-                body_box = self._pad_box_xyxy(
-                    subj,
-                    pad_x=max(0.08 * sw, 0.55 * fw),
-                    pad_y_top=max(0.04 * sh, 0.45 * fh),
-                    pad_y_bottom=max(0.04 * sh, 0.70 * fh),
-                    bounds_xyxy=bounds,
-                ) or subj
-                profiles.append(("body", body_box, float(getattr(cfg, "compose_body_face_h_frac", 0.085))))
-            else:
-                upper_box = (
-                    max(float(bx1), hx1 - 0.65 * fw),
-                    max(float(by1), hy1 - 0.10 * fh),
-                    min(float(bx2), hx2 + 0.65 * fw),
-                    min(float(by2), max(hy2, fy2 + 3.2 * fh)),
-                )
-                profiles.append(("upper", upper_box, float(getattr(cfg, "compose_upper_face_h_frac", 0.22))))
-        elif subj is not None:
-            profiles.append(("body", subj, float(getattr(cfg, "compose_body_face_h_frac", 0.085))))
-        else:
-            profiles.append(("base", base, 0.20))
-
-        best: Optional[tuple[float, Tuple[int, int, int, int], str, str]] = None
-        face_h = (face[3] - face[1]) if face is not None else 0.0
-        face_frame_frac = face_h / max(1.0, bound_h)
-        subj_h_frac = ((subj[3] - subj[1]) / max(1.0, bound_h)) if subj is not None else 0.0
+        profiles: list[tuple[str, Tuple[float, float, float, float], float, Tuple[float, float], Tuple[float, float]]] = []
+        face_h = 0.0
+        face_frame_frac = 0.0
+        subj_h_frac = ((subj[3] - subj[1]) / bound_h) if subj is not None else 0.0
         body_period = max(0, int(getattr(cfg, "compose_body_every_n", 6)))
         body_cadence = body_period > 0 and frame_idx is not None and (int(frame_idx) % body_period == 0)
 
-        for profile, protect, target_face_h_frac in profiles:
-            protect = self._coerce_box_xyxy(protect, bounds)
+        if face is not None:
+            fx1, fy1, fx2, fy2 = face
+            fw = max(1.0, fx2 - fx1)
+            face_h = max(1.0, fy2 - fy1)
+            fcx = 0.5 * (fx1 + fx2)
+            fcy = 0.5 * (fy1 + fy2)
+            face_frame_frac = face_h / bound_h
+            hx1, hy1, hx2, hy2 = face_protect or face
+
+            close_target = max(0.20, min(0.46, float(getattr(cfg, "compose_close_face_h_frac", 0.34))))
+            upper_target = max(0.12, min(0.34, float(getattr(cfg, "compose_upper_face_h_frac", 0.22))))
+            body_target = max(0.035, min(0.16, float(getattr(cfg, "compose_body_face_h_frac", 0.085))))
+
+            close_protect = self._pad_box_xyxy(
+                (hx1, hy1, hx2, max(hy2, fy2 + 0.85 * face_h)),
+                pad_x=0.12 * fw,
+                pad_y_top=0.00,
+                pad_y_bottom=0.45 * face_h,
+                bounds_xyxy=bounds,
+            ) or (hx1, hy1, hx2, max(hy2, fy2 + 0.85 * face_h))
+            profiles.append(("close", close_protect, close_target, (fcx, fcy + 0.70 * face_h), (fw * 2.0, face_h / close_target)))
+
+            if subj is not None:
+                sx1, sy1, sx2, sy2 = subj
+                sw = max(1.0, sx2 - sx1)
+                sh = max(1.0, sy2 - sy1)
+                upper_bottom = min(float(by2), max(fy2 + 3.6 * face_h, sy1 + 0.58 * sh))
+                upper_half_w = max(1.15 * fw, 0.48 * sw)
+                upper_protect = (
+                    max(float(bx1), min(hx1, fcx - upper_half_w)),
+                    max(float(by1), min(hy1, sy1)),
+                    min(float(bx2), max(hx2, fcx + upper_half_w)),
+                    upper_bottom,
+                )
+            else:
+                upper_protect = self._pad_box_xyxy(
+                    (hx1, hy1, hx2, max(hy2, fy2 + 2.6 * face_h)),
+                    pad_x=0.35 * fw,
+                    pad_y_top=0.00,
+                    pad_y_bottom=0.55 * face_h,
+                    bounds_xyxy=bounds,
+                ) or (hx1, hy1, hx2, max(hy2, fy2 + 2.6 * face_h))
+            profiles.append(("upper", upper_protect, upper_target, (fcx, fcy + 1.45 * face_h), (fw * 2.8, face_h / upper_target)))
+
+            if subj is not None:
+                sx1, sy1, sx2, sy2 = subj
+                sw = max(1.0, sx2 - sx1)
+                sh = max(1.0, sy2 - sy1)
+                body_box = self._pad_box_xyxy(
+                    subj,
+                    pad_x=max(0.07 * sw, 0.35 * fw),
+                    pad_y_top=max(0.025 * sh, 0.25 * face_h),
+                    pad_y_bottom=max(0.035 * sh, 0.35 * face_h),
+                    bounds_xyxy=bounds,
+                ) or subj
+                profiles.append(("body", body_box, body_target, ((sx1 + sx2) * 0.5, (sy1 + sy2) * 0.5), (sw, sh)))
+        elif subj is not None:
+            sx1, sy1, sx2, sy2 = subj
+            sw = max(1.0, sx2 - sx1)
+            sh = max(1.0, sy2 - sy1)
+            profiles.append(("body", subj, float(getattr(cfg, "compose_body_face_h_frac", 0.085)), ((sx1 + sx2) * 0.5, (sy1 + sy2) * 0.5), (sw, sh)))
+        else:
+            b = base or (bx1, by1, bx2, by2)
+            profiles.append(("base", b, 0.20, ((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5), (b[2] - b[0], b[3] - b[1])))
+
+        best: Optional[tuple[float, Tuple[int, int, int, int], str, str]] = None
+        for profile, protect_raw, target_face_h_frac, anchor, min_size in profiles:
+            protect = self._coerce_box_xyxy(protect_raw, bounds)
             if protect is None:
                 continue
             px1, py1, px2, py2 = protect
             protect_w = max(1.0, px2 - px1)
             protect_h = max(1.0, py2 - py1)
-            anchor = ((px1 + px2) * 0.5, (py1 + py2) * 0.5)
-            if face is not None:
-                fcx = 0.5 * (face[0] + face[2])
-                fcy = 0.5 * (face[1] + face[3])
-                if profile == "close":
-                    anchor = (fcx, fcy + 0.85 * face_h)
-                elif profile == "upper":
-                    anchor = (fcx, fcy + 1.65 * face_h)
-                elif profile == "body" and subj is not None:
-                    anchor = ((subj[0] + subj[2]) * 0.5, (subj[1] + subj[3]) * 0.5)
+            min_w = max(float(min_size[0]), protect_w)
+            min_h = max(float(min_size[1]), protect_h)
 
-            for rs in display_ratios:
+            for rs in _ratio_list_for_profile(profile):
                 try:
                     rw, rh = parse_ratio(rs)
                     aspect = float(rw) / float(rh)
                 except Exception:
                     continue
                 is_landscape = aspect > 1.05
-                # Landscape is not a headshot/portrait shape. Keep it available for
-                # real body/context frames only; otherwise it should lose hard.
-                if is_landscape and profile in {"close", "upper"}:
-                    ratio_penalty = float(getattr(cfg, "compose_landscape_face_penalty", 5.0))
-                elif is_landscape and face_frame_frac >= float(getattr(cfg, "wide_face_min_frame_frac", 0.12)):
-                    ratio_penalty = 0.75 * float(getattr(cfg, "compose_landscape_face_penalty", 5.0))
-                else:
-                    ratio_penalty = 0.0
-                if rs == "1:1":
-                    ratio_penalty += 0.05
-                elif rs == "2:3":
-                    ratio_penalty += 0.00
-                elif aspect > 1.05:
-                    ratio_penalty += 0.40
-                else:
-                    ratio_penalty += 0.15
+                if is_landscape and profile != "body":
+                    continue
 
                 crop = self._ratio_crop_containing_box(
                     protect,
                     rs,
                     bounds,
                     anchor=anchor,
-                    min_size_xy=(protect_w, protect_h),
+                    min_size_xy=(min_w, min_h),
                 )
                 cx1, cy1, cx2, cy2 = crop
                 crop_w = max(1.0, float(cx2 - cx1))
@@ -2157,38 +2156,56 @@ class Processor(QtCore.QObject):
                 crop_area = crop_w * crop_h
 
                 containment = 0.0
-                if protect_face is not None:
-                    containment += 80.0 * self._containment_deficit_xyxy(crop, protect_face, margin_px=1.0)
+                if face_protect is not None:
+                    containment += 120.0 * self._containment_deficit_xyxy(crop, face_protect, margin_px=1.0)
                 if profile == "body" and subj is not None:
-                    containment += 80.0 * self._containment_deficit_xyxy(crop, subj, margin_px=1.0)
-                else:
-                    containment += 20.0 * self._containment_deficit_xyxy(crop, protect, margin_px=1.0)
+                    containment += 120.0 * self._containment_deficit_xyxy(crop, subj, margin_px=1.0)
+                containment += 20.0 * self._containment_deficit_xyxy(crop, protect, margin_px=1.0)
 
-                profile_prior = {"close": 0.00, "upper": 0.16, "body": 0.58, "base": 0.35}.get(profile, 0.35)
+                ratio_prior = 0.0
+                if profile == "close":
+                    profile_prior = 0.00
+                    ratio_prior += 0.00 if rs == "1:1" else 0.08
+                elif profile == "upper":
+                    profile_prior = 0.12
+                    ratio_prior += 0.00 if rs == "2:3" else 0.06
+                elif profile == "body":
+                    profile_prior = 0.78
+                    if body_cadence or face_frame_frac < 0.10 or subj_h_frac > 0.62:
+                        profile_prior -= 0.38
+                    ratio_prior += 0.00 if rs == "2:3" else (0.12 if rs == "1:1" else 0.30)
+                    if is_landscape and subj is not None:
+                        subj_aspect = (subj[2] - subj[0]) / max(1.0, subj[3] - subj[1])
+                        if subj_aspect < 0.72:
+                            ratio_prior += 0.60
+                else:
+                    profile_prior = 0.35
+
                 if face is not None:
                     actual_face_h_frac = face_h / crop_h
                     face_loss = abs(actual_face_h_frac - max(1e-6, target_face_h_frac))
                     if profile == "close" and face_frame_frac < 0.085:
-                        profile_prior += 0.55
-                    if profile == "body" and (face_frame_frac < 0.10 or subj_h_frac > 0.62):
-                        profile_prior -= 0.30
-                    if profile == "upper" and face_frame_frac < 0.10:
+                        profile_prior += 0.65
+                    if profile == "upper" and face_frame_frac < 0.085:
                         profile_prior -= 0.12
-                    if profile == "body" and body_cadence and subj is not None:
-                        profile_prior -= 0.22
-                    if profile != "body" and subj is not None and subj_h_frac > 0.72 and face_frame_frac < 0.14:
-                        profile_prior += 0.22
                 else:
                     face_loss = 0.0
 
-                # Avoid selecting full-frame-ish crops unless the subject actually
-                # needs the room.  This still allows full-body shots when the person
-                # box is tall/large in the source frame.
-                area_penalty = 0.10 * (crop_area / bound_area)
-                if profile != "body" and crop_area / bound_area > 0.75:
-                    area_penalty += 0.40
+                area_penalty = 0.08 * (crop_area / bound_area)
+                if profile != "body" and crop_area / bound_area > 0.72:
+                    area_penalty += 0.35
 
-                score = containment + profile_prior + ratio_penalty + 2.5 * face_loss + area_penalty
+                placement_penalty = 0.0
+                if face is not None and profile in {"close", "upper"}:
+                    fcx = 0.5 * (face[0] + face[2])
+                    fcy = 0.5 * (face[1] + face[3])
+                    rel_x = (fcx - cx1) / crop_w
+                    rel_y = (fcy - cy1) / crop_h
+                    placement_penalty += 0.25 * abs(rel_x - 0.50)
+                    target_y = 0.36 if profile == "close" else 0.28
+                    placement_penalty += 0.35 * abs(rel_y - target_y)
+
+                score = containment + profile_prior + ratio_prior + 2.2 * face_loss + area_penalty + placement_penalty
                 if best is None or score < best[0]:
                     best = (score, crop, rs, profile)
 
@@ -2196,9 +2213,8 @@ class Processor(QtCore.QObject):
             _, crop, rs, profile = best
             return crop, rs, profile
 
-        # Last-resort: repair the existing crop to contain the best known identity box.
-        fallback_protect = protect_face or subj or base
-        fallback_ratio = ratios[0] if ratios else display_ratios[0]
+        fallback_protect = face_protect or subj or base or (bx1, by1, bx2, by2)
+        fallback_ratio = "1:1" if face_protect is not None else "2:3"
         crop = self._ratio_crop_containing_box(fallback_protect, fallback_ratio, bounds)
         return crop, fallback_ratio, "fallback"
 
@@ -4202,6 +4218,21 @@ class Processor(QtCore.QObject):
                                     tuple(item.get("crop_xyxy") or (0, 0, 1, 1)),
                                     img_path,
                                 )
+                                if (
+                                    not ok
+                                    and bool(getattr(self.cfg, "hdr_sdr_fallback_to_decoded", True))
+                                    and isinstance(item.get("fallback_img"), np.ndarray)
+                                ):
+                                    fallback_img = item.get("fallback_img")
+                                    fallback_row = item.get("fallback_row")
+                                    ok2, why2 = _atomic_jpeg_write(fallback_img, img_path, jpg_q)
+                                    if ok2:
+                                        ok = True
+                                        why = f"fallback_decoded_after_{why or 'hdr_export_failed'}"
+                                        if isinstance(fallback_row, list):
+                                            row = fallback_row
+                                    else:
+                                        why = f"{why}; decoded_fallback_failed={why2}"
                             elif kind == "jpeg":
                                 img_path = str(item.get("path") or "")
                                 row = item.get("row")
@@ -4286,6 +4317,7 @@ class Processor(QtCore.QObject):
             locked_reid = None
             prev_box = None
             source_size_cached: Optional[tuple[int, int]] = None
+            hdr_sdr_failures = 0
             frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
             if keep_spans:
                 span_i = self._span_index_for(frame_idx, keep_spans)
@@ -4409,6 +4441,8 @@ class Processor(QtCore.QObject):
                             "hdr_sdr_contrast_recovery",
                             "hdr_sdr_peak_detect",
                             "hdr_sdr_allow_inaccurate_fallback",
+                            "hdr_sdr_fallback_to_decoded",
+                            "hdr_sdr_disable_after_failures",
                             "compose_crop_enable",
                             "compose_detect_person_for_face",
                             "compose_close_face_h_frac",
@@ -4416,6 +4450,7 @@ class Processor(QtCore.QObject):
                             "compose_body_face_h_frac",
                             "compose_landscape_face_penalty",
                             "compose_body_every_n",
+                            "compose_person_detect_cadence",
                         }
                         rot_keys = {
                             "rot_adaptive",
@@ -4753,11 +4788,18 @@ class Processor(QtCore.QObject):
                                 assoc_persons = []
                                 if bool(getattr(cfg, "compose_detect_person_for_face", True)):
                                     try:
-                                        assoc_persons = det.detect(frame_for_det, conf=float(cfg.min_det_conf))
-                                        subject_box_abs = self._find_person_box_for_face(face_box_abs, assoc_persons, W2, H2)
+                                        body_period = max(1, int(getattr(cfg, "compose_person_detect_cadence", getattr(cfg, "compose_body_every_n", 6)) or 1))
                                     except Exception:
-                                        assoc_persons = []
-                                        subject_box_abs = None
+                                        body_period = 6
+                                    face_h_frac = (fy2 - fy1) / max(1.0, float(H2))
+                                    need_person_assoc = (face_h_frac < 0.11) or (body_period > 0 and int(idx) % body_period == 0)
+                                    if need_person_assoc:
+                                        try:
+                                            assoc_persons = det.detect(frame_for_det, conf=float(cfg.min_det_conf))
+                                            subject_box_abs = self._find_person_box_for_face(face_box_abs, assoc_persons, W2, H2)
+                                        except Exception:
+                                            assoc_persons = []
+                                            subject_box_abs = None
                                 compose_seed_box = subject_box_abs or face_box_abs
                                 (ex1, ey1, ex2, ey2), chosen_ratio, chosen_tloss = self._choose_best_ratio(
                                     compose_seed_box, ratios, W2, H2, anchor=(acx, acy), face_box=face_box_abs
@@ -4781,10 +4823,10 @@ class Processor(QtCore.QObject):
                                     carea = max(1.0, float((ex2 - ex1) * (ey2 - ey1)))
                                     farea = max(1.0, (fx2 - fx1) * (fy2 - fy1))
                                     face_frac = float(farea) / carea
-                                    fx1i = int(round(float(np.clip(fx1 + off_x, 0, W - 1))))
-                                    fy1i = int(round(float(np.clip(fy1 + off_y, 0, H - 1))))
-                                    fx2i = int(round(float(np.clip(fx2 + off_x, 0, W - 1))))
-                                    fy2i = int(round(float(np.clip(fy2 + off_y, 0, H - 1))))
+                                    fx1i = max(0, min(W - 1, int(round(fx1 + off_x))))
+                                    fy1i = max(0, min(H - 1, int(round(fy1 + off_y))))
+                                    fx2i = max(fx1i + 1, min(W, int(round(fx2 + off_x))))
+                                    fy2i = max(fy1i + 1, min(H, int(round(fy2 + off_y))))
                                     face_box_global = (fx1i, fy1i, fx2i, fy2i)
                                     subject_box_global = None
                                     if subject_box_abs is not None:
@@ -5185,10 +5227,14 @@ class Processor(QtCore.QObject):
                     det_h,
                     ratio_list,
                 ):
-                    nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box, ref_face_feat, ref_bank_list, source_size_cached
+                    nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box, ref_face_feat, ref_bank_list, source_size_cached, hdr_sdr_failures
                     crop_img_path = os.path.join(crops_dir, f"f{idx:08d}.jpg")
+                    hdr_disable_after = max(0, int(getattr(self.cfg, "hdr_sdr_disable_after_failures", 1) or 0))
+                    hdr_fullres_suspended = hdr_disable_after > 0 and hdr_sdr_failures >= hdr_disable_after
                     hdr_primary_fullres = bool(
-                        hdr_active and bool(getattr(self.cfg, "hdr_screencap_fullres", True))
+                        hdr_active
+                        and bool(getattr(self.cfg, "hdr_screencap_fullres", True))
+                        and not hdr_fullres_suspended
                     )
                     hdr_out_path = None
                     if hdr_active and bool(getattr(self.cfg, "hdr_archive_crops", False)):
@@ -5234,7 +5280,7 @@ class Processor(QtCore.QObject):
                             (gx1, gy1, gx2, gy2),
                             ratio_candidates,
                             (bx1, by1, bx2, by2),
-                            subject_box=c.get("subject_box") or c.get("show_box"),
+                            subject_box=c.get("subject_box"),
                             face_box=c.get("face_box"),
                             frame_idx=idx,
                         )
@@ -5344,11 +5390,18 @@ class Processor(QtCore.QObject):
                     except Exception:
                         pass
 
-                    protect_box = self._union_boxes_xyxy(
-                        c.get("subject_box") or c.get("show_box"),
-                        c.get("head_box"),
-                        c.get("face_box"),
-                    )
+                    crop_profile_for_guard = str(c.get("crop_profile") or "").lower()
+                    if crop_profile_for_guard == "body":
+                        protect_box = self._union_boxes_xyxy(
+                            c.get("subject_box"),
+                            c.get("head_box"),
+                            c.get("face_box"),
+                        )
+                    else:
+                        protect_box = self._union_boxes_xyxy(
+                            c.get("head_box"),
+                            c.get("face_box"),
+                        )
                     if protect_box is not None:
                         try:
                             cur_w = max(1.0, float(cx2 - cx1))
@@ -5461,6 +5514,22 @@ class Processor(QtCore.QObject):
                         )
                     primary_row_crop = source_crop_xyxy if hdr_primary_fullres else processed_crop_xyxy
                     crop_img2 = frame[cy1:cy2, cx1:cx2]
+                    fallback_row = None
+                    if hdr_primary_fullres:
+                        fallback_row = [
+                            idx,
+                            frame_pts_sec if frame_pts_sec is not None else (idx / float(fps) if fps > 0 else 0.0),
+                            c.get("score"),
+                            c.get("fd"),
+                            c.get("rd"),
+                            processed_crop_xyxy[0],
+                            processed_crop_xyxy[1],
+                            processed_crop_xyxy[2],
+                            processed_crop_xyxy[3],
+                            crop_img_path,
+                            c.get("sharp"),
+                            str(ratio_str),
+                        ]
                     row = [
                         idx,
                         frame_pts_sec if frame_pts_sec is not None else (idx / float(fps) if fps > 0 else 0.0),
@@ -5487,6 +5556,8 @@ class Processor(QtCore.QObject):
                                     "frame_idx": int(idx),
                                     "frame_pts_sec": frame_pts_sec,
                                     "crop_xyxy": source_crop_xyxy,
+                                    "fallback_img": np.ascontiguousarray(crop_img2),
+                                    "fallback_row": fallback_row,
                                     "ack_q": ack_q,
                                 })
                             else:
@@ -5518,13 +5589,28 @@ class Processor(QtCore.QObject):
                                 interval=0.5,
                             )
                             return False
+                        ack_why = str(why or "")
                         if not ok:
+                            if hdr_primary_fullres:
+                                hdr_sdr_failures += 1
                             self._status(
                                 f"Save failed ({why}): {crop_img_path}",
                                 key="save_err",
                                 interval=0.5,
                             )
                             return False
+                        if hdr_primary_fullres:
+                            if ack_why.startswith("fallback_decoded_after_"):
+                                hdr_sdr_failures += 1
+                                hdr_disable_after = max(0, int(getattr(self.cfg, "hdr_sdr_disable_after_failures", 1) or 0))
+                                if hdr_disable_after > 0 and hdr_sdr_failures >= hdr_disable_after:
+                                    self._status(
+                                        "HDR full-res still export disabled for this run after repeated failures; using decoded-frame JPEG fallback",
+                                        key="hdr_sdr_export_disable",
+                                        interval=30.0,
+                                    )
+                            else:
+                                hdr_sdr_failures = 0
                         if hdr_primary_fullres and isinstance(row, list) and len(row) > 10:
                             try:
                                 c["sharp"] = float(row[10])
@@ -5539,10 +5625,31 @@ class Processor(QtCore.QObject):
                                 source_crop_xyxy,
                                 crop_img_path,
                             )
+                            if not ok and bool(getattr(self.cfg, "hdr_sdr_fallback_to_decoded", True)):
+                                ok2, why2 = _atomic_jpeg_write(crop_img2, crop_img_path, jpg_q)
+                                if ok2:
+                                    ok = True
+                                    why = f"fallback_decoded_after_{why or 'hdr_export_failed'}"
+                                    if isinstance(fallback_row, list):
+                                        row = fallback_row
+                                else:
+                                    why = f"{why}; decoded_fallback_failed={why2}"
                         else:
                             ok, why = _atomic_jpeg_write(crop_img2, crop_img_path, jpg_q)
+                        sync_why = str(why or "")
                         if ok:
                             if hdr_primary_fullres:
+                                if sync_why.startswith("fallback_decoded_after_"):
+                                    hdr_sdr_failures += 1
+                                    hdr_disable_after = max(0, int(getattr(self.cfg, "hdr_sdr_disable_after_failures", 1) or 0))
+                                    if hdr_disable_after > 0 and hdr_sdr_failures >= hdr_disable_after:
+                                        self._status(
+                                            "HDR full-res still export disabled for this run after repeated failures; using decoded-frame JPEG fallback",
+                                            key="hdr_sdr_export_disable",
+                                            interval=30.0,
+                                        )
+                                else:
+                                    hdr_sdr_failures = 0
                                 saved_sharp = self._calc_saved_file_sharpness(crop_img_path)
                                 if saved_sharp is not None:
                                     row[10] = float(saved_sharp)
@@ -5710,10 +5817,17 @@ class Processor(QtCore.QObject):
                                 subject_box_abs = None
                                 if bool(getattr(cfg, "compose_detect_person_for_face", True)):
                                     try:
-                                        assoc_persons = persons or det.detect(frame_for_det, conf=float(cfg.min_det_conf))
-                                        subject_box_abs = self._find_person_box_for_face(face_box_abs, assoc_persons, W2, H2)
+                                        body_period = max(1, int(getattr(cfg, "compose_person_detect_cadence", getattr(cfg, "compose_body_every_n", 6)) or 1))
                                     except Exception:
-                                        subject_box_abs = None
+                                        body_period = 6
+                                    face_h_frac = (fy2 - fy1) / max(1.0, float(H2))
+                                    need_person_assoc = (face_h_frac < 0.11) or (body_period > 0 and int(idx) % body_period == 0)
+                                    if need_person_assoc:
+                                        try:
+                                            assoc_persons = persons or det.detect(frame_for_det, conf=float(cfg.min_det_conf))
+                                            subject_box_abs = self._find_person_box_for_face(face_box_abs, assoc_persons, W2, H2)
+                                        except Exception:
+                                            subject_box_abs = None
                                 compose_seed_box = subject_box_abs or face_box_abs
                                 (ex1, ey1, ex2, ey2), chosen_ratio, chosen_tloss = self._choose_best_ratio(
                                     compose_seed_box, ratios, W2, H2, anchor=(acx, acy), face_box=face_box_abs
@@ -9207,6 +9321,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "hdr_sdr_contrast_recovery",
             "hdr_sdr_peak_detect",
             "hdr_sdr_allow_inaccurate_fallback",
+            "hdr_sdr_fallback_to_decoded",
+            "hdr_sdr_disable_after_failures",
         }
         live |= {
             "lambda_facefrac",
@@ -9232,6 +9348,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "compose_body_face_h_frac",
             "compose_landscape_face_penalty",
             "compose_body_every_n",
+            "compose_person_detect_cadence",
         }
         delta = {}
         for k in prescan_live | live:
