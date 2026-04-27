@@ -4462,8 +4462,8 @@ class Processor(QtCore.QObject):
             jpg_q = int(getattr(cfg, "jpg_quality", 85))
 
             def _atomic_jpeg_write(img: np.ndarray, out_path: str, q: int) -> tuple[bool, str]:
+                tmp = out_path + ".tmp"
                 try:
-                    tmp = out_path + ".tmp"
                     params: list[int] = []
                     try:
                         qi = int(q)
@@ -4478,19 +4478,26 @@ class Processor(QtCore.QObject):
                         fh.write(buf.tobytes())
                         if bool(getattr(self.cfg, "save_fsync", False)):
                             fh.flush()
-                            try:
-                                os.fsync(fh.fileno())
-                            except Exception:
-                                pass
+                            os.fsync(fh.fileno())
                     os.replace(tmp, out_path)
+                    if bool(getattr(self.cfg, "save_fsync", False)):
+                        # On POSIX, fsync the containing directory so the rename
+                        # itself is durable, not just the file contents.
+                        o_directory = getattr(os, "O_DIRECTORY", None)
+                        if o_directory is not None:
+                            dir_path = os.path.dirname(out_path) or "."
+                            dir_fd = os.open(dir_path, os.O_RDONLY | int(o_directory))
+                            try:
+                                os.fsync(dir_fd)
+                            finally:
+                                os.close(dir_fd)
                     if not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
                         return False, "file_too_small"
                     return True, ""
                 except Exception as e:
                     try:
-                        tmp_path = out_path + ".tmp"
-                        if os.path.exists(tmp_path):
-                            os.remove(tmp_path)
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
                     except Exception:
                         pass
                     return False, f"{type(e).__name__}: {e}"
