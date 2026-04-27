@@ -331,6 +331,15 @@ class SessionConfig:
     # Windows Imaging Component, then write a PNG. "ffmpeg" keeps the internal
     # libplacebo/zscale SDR renderer used by the preview.
     hdr_sdr_conversion: str = "windows_wic"  # windows_wic | ffmpeg
+    # Windows' HDR AVIF still renderer can create saturated blue/red/magenta
+    # pixels in dark regions. Keep the visible WIC/Paint-style rendering for
+    # primary PNGs, but repair only those impossible saturated salt pixels after
+    # WIC conversion. Optional AVIF archives default to a viewer-safe display
+    # AVIF derived from that same WIC conversion instead of a source HDR AVIF
+    # that Windows renders incorrectly. Set PC_HDR_AVIF_SOURCE_ARCHIVE=1 to
+    # force raw source-HDR AVIF archives for debugging/comparison.
+    hdr_wic_speckle_cleanup: bool = True
+    hdr_avif_wic_display_compat: bool = True
     # Full-resolution HDR->SDR still-render quality controls. These affect only
     # primary crops/f*.png/f*.jpg source export, not pre-scan/detection preview.
     hdr_sdr_quality: str = "madvr_like"  # madvr_like | resolve_like | balanced | fast
@@ -4536,12 +4545,27 @@ class Processor(QtCore.QObject):
                                     frame_pts_sec = float(frame_pts_sec)
                                 except (TypeError, ValueError):
                                     frame_pts_sec = None
-                            self._save_hdr_crop_p010(
-                                int(item.get("frame_idx", 0)),
-                                frame_pts_sec,
-                                tuple(item.get("crop_xyxy") or (0, 0, 2, 2)),
-                                str(item.get("path") or ""),
-                            )
+                            archive_path = str(item.get("path") or "")
+                            archive_crop = tuple(item.get("crop_xyxy") or (0, 0, 2, 2))
+                            force_source_avif = self._truthy_env("PC_HDR_AVIF_SOURCE_ARCHIVE")
+                            if (
+                                archive_path.lower().endswith(".avif")
+                                and bool(getattr(self.cfg, "hdr_avif_wic_display_compat", True))
+                                and not force_source_avif
+                            ):
+                                self._save_wic_display_avif_from_hdr_crop(
+                                    int(item.get("frame_idx", 0)),
+                                    frame_pts_sec,
+                                    archive_crop,
+                                    archive_path,
+                                )
+                            else:
+                                self._save_hdr_crop_p010(
+                                    int(item.get("frame_idx", 0)),
+                                    frame_pts_sec,
+                                    archive_crop,
+                                    archive_path,
+                                )
                         finally:
                             archive_q.task_done()
 
@@ -6074,7 +6098,14 @@ class Processor(QtCore.QObject):
                                 )
                                 logger.warning("Dropping optional HDR archive crop after primary save: %s", hdr_out_path)
                         else:
-                            self._save_hdr_crop_p010(idx, frame_pts_sec, hdr_crop_xyxy, hdr_out_path)
+                            if (
+                                str(hdr_out_path).lower().endswith(".avif")
+                                and bool(getattr(self.cfg, "hdr_avif_wic_display_compat", True))
+                                and not self._truthy_env("PC_HDR_AVIF_SOURCE_ARCHIVE")
+                            ):
+                                self._save_wic_display_avif_from_hdr_crop(idx, frame_pts_sec, hdr_crop_xyxy, hdr_out_path)
+                            else:
+                                self._save_hdr_crop_p010(idx, frame_pts_sec, hdr_crop_xyxy, hdr_out_path)
                     reasons_list = c.get("reasons") or []
                     reasons = "|".join(reasons_list)
                     bx1, by1, bx2, by2 = c["box"]
@@ -7422,7 +7453,210 @@ class Processor(QtCore.QObject):
         (diag_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
         self._status(f"HDR speckle diagnostics done: {diag_dir}", key="hdr_speckle_diag", interval=0.0)
 
-    def _save_wic_png_from_hdr_image(self, hdr_path: str, out_path: str, *, repair: bool = False) -> tuple[bool, str]:
+    def _repair_wic_saturated_rgb_speckles(self, path: str) -> int:
+        """Remove WIC/Windows HDR-AVIF salt pixels from an already-rendered SDR image.
+
+        This is deliberately not a tone-map, blur, chroma denoise, or global
+        color change. The diagnostic isolated the first visible failure at the
+        WIC/browser HDR-AVIF render boundary: the source YUV and libdav1d AVIF
+        decode are bit-exact, while WIC turns some very dark pixels into
+        impossible saturated blue/magenta/red RGB dots. The safest place to keep
+        the user's preferred WIC/Paint-like rendering while removing only the
+        false pixels is immediately after WIC has produced the display image.
+        """
+        if not bool(getattr(self.cfg, "hdr_wic_speckle_cleanup", True)):
+            return 0
+        if self._truthy_env("PC_DISABLE_WIC_SPECKLE_CLEANUP"):
+            return 0
+        try:
+            img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+            if img is None or img.ndim != 3 or img.shape[2] < 3:
+                return 0
+            bgr = img[:, :, :3]
+            pix = bgr.astype(np.int16, copy=False)
+            b = pix[:, :, 0]
+            g = pix[:, :, 1]
+            r = pix[:, :, 2]
+            max_rg = np.maximum(r, g)
+            max_bg = np.maximum(b, g)
+            min_rb = np.minimum(r, b)
+            # Use a local luma gate so real bright colored content such as
+            # candles/fire is never treated as a defect. The observed WIC bug is
+            # confined to hair/clothes/shadow regions.
+            luma = np.clip((0.114 * b + 0.587 * g + 0.299 * r), 0, 255).astype(np.uint8)
+            local_luma = cv2.medianBlur(luma, 5)
+            dark = local_luma <= 112
+            blue = dark & (b >= 160) & ((b - max_rg) >= 50) & (r <= 96) & (g <= 96)
+            magenta = dark & (r >= 160) & (b >= 160) & ((min_rb - g) >= 50) & (g <= 96)
+            red = dark & (r >= 180) & ((r - max_bg) >= 70) & (b <= 80) & (g <= 80)
+            mask = (blue | magenta | red).astype(np.uint8)
+            if int(mask.sum()) <= 0:
+                return 0
+            # Reject broad regions. The defect is salt-like; connected areas much
+            # larger than this are likely real image content or a bad threshold.
+            n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+            keep = np.zeros_like(mask, dtype=np.uint8)
+            for i in range(1, n):
+                area = int(stats[i, cv2.CC_STAT_AREA])
+                if 1 <= area <= 96:
+                    keep[labels == i] = 255
+            changed = int(np.count_nonzero(keep))
+            if changed <= 0:
+                return 0
+            # Inpaint exact defective pixels from surrounding good WIC-rendered
+            # pixels. Do not dilate the mask; that would alter valid fine detail.
+            repaired = cv2.inpaint(bgr, keep, 2.0, cv2.INPAINT_TELEA)
+            out = img.copy()
+            out[:, :, :3] = repaired
+            ok = cv2.imwrite(str(path), out)
+            if not ok:
+                return 0
+            return changed
+        except Exception as exc:
+            self._status(
+                f"HDR WIC speckle cleanup failed: {type(exc).__name__}: {exc}",
+                key="hdr_wic_speckle_cleanup",
+                interval=10.0,
+            )
+            return 0
+
+    def _encode_sdr_avif_from_image(self, image_path: str, out_path: str) -> tuple[bool, str]:
+        """Encode a display-referred SDR image as AVIF without invoking HDR WIC."""
+        ffmpeg_bin = self._resolve_ffmpeg_bin()
+        if not ffmpeg_bin:
+            return False, "ffmpeg_unavailable"
+        try:
+            ensure_dir(os.path.dirname(out_path))
+        except Exception:
+            pass
+        out_ext = Path(out_path).suffix or ".avif"
+        tmp_out = out_path + f".tmp{out_ext}"
+        try:
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+        except Exception:
+            pass
+        cmd = [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(image_path),
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            "1",
+            "-vf",
+            "format=yuv420p10le",
+            "-an",
+            "-sn",
+            "-dn",
+            "-c:v",
+            "libaom-av1",
+            "-still-picture",
+            "1",
+            "-pix_fmt",
+            "yuv420p10le",
+            "-g",
+            "1",
+            "-tile-columns",
+            "0",
+            "-tile-rows",
+            "0",
+            "-row-mt",
+            "1",
+            "-cpu-used",
+            "5",
+            "-lossless",
+            "1",
+            "-crf",
+            "0",
+            "-b:v",
+            "0",
+            "-aq-mode",
+            "0",
+            "-color_range",
+            "2",
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "iec61966-2-1",
+            tmp_out,
+        ]
+        timeout_sec = max(5, int(getattr(self.cfg, "hdr_archive_timeout_sec", getattr(self.cfg, "hdr_export_timeout_sec", 90)) or 90))
+        try:
+            cp = subprocess.run(cmd, check=False, timeout=timeout_sec, capture_output=True, text=True)
+            if cp.returncode == 0 and os.path.exists(tmp_out) and os.path.getsize(tmp_out) > 0:
+                os.replace(tmp_out, out_path)
+                return True, ""
+            try:
+                if os.path.exists(tmp_out):
+                    os.remove(tmp_out)
+            except Exception:
+                pass
+            tail = (cp.stderr or cp.stdout or "").splitlines()[-4:]
+            why = " | ".join(tail) if tail else f"ffmpeg_rc={cp.returncode}"
+            return False, f"sdr_avif_encode_failed:{why}"
+        except subprocess.TimeoutExpired as exc:
+            try:
+                if os.path.exists(tmp_out):
+                    os.remove(tmp_out)
+            except Exception:
+                pass
+            return False, f"sdr_avif_encode_timeout_{timeout_sec}s:{exc}"
+        except Exception as exc:
+            try:
+                if os.path.exists(tmp_out):
+                    os.remove(tmp_out)
+            except Exception:
+                pass
+            return False, f"sdr_avif_encode_failed:{type(exc).__name__}:{exc}"
+
+    def _save_wic_display_avif_from_hdr_crop(
+        self,
+        frame_idx: int,
+        frame_pts_sec: Optional[float],
+        crop_xyxy: tuple[int, int, int, int],
+        out_path: str,
+    ) -> tuple[bool, str]:
+        """Write a Windows-viewer-safe AVIF matching the WIC/Paint-style image.
+
+        The raw HDR AVIF itself is valid and libdav1d decodes it bit-exactly, but
+        Windows' HDR AVIF render path creates saturated salt pixels. This path
+        keeps the desired WIC/Paint-style display transform, removes only those
+        impossible saturated salt pixels in SDR space, then stores that display
+        image as AVIF. It is intentionally AVIF, not an MKV fallback.
+        """
+        base = out_path + ".tmp_wic_display"
+        tmp_hdr = base + ".hdr.avif"
+        tmp_png = base + ".png"
+        try:
+            for pth in (tmp_hdr, tmp_png):
+                if os.path.exists(pth):
+                    os.remove(pth)
+        except Exception:
+            pass
+        try:
+            ok_hdr, why_hdr = self._save_hdr_crop_p010(frame_idx, frame_pts_sec, crop_xyxy, tmp_hdr, quiet=True)
+            if not ok_hdr:
+                return False, f"wic_display_hdr_source_failed:{why_hdr}"
+            ok_wic, why_wic = self._save_wic_png_from_hdr_image(tmp_hdr, tmp_png, repair=True)
+            if not ok_wic:
+                return False, f"wic_display_render_failed:{why_wic}"
+            return self._encode_sdr_avif_from_image(tmp_png, out_path)
+        finally:
+            for pth in (tmp_hdr, tmp_png):
+                try:
+                    if os.path.exists(pth):
+                        os.remove(pth)
+                except Exception:
+                    pass
+
+    def _save_wic_png_from_hdr_image(self, hdr_path: str, out_path: str, *, repair: bool = True) -> tuple[bool, str]:
         """Convert an HDR still to SDR PNG using Windows Imaging Component.
 
         This intentionally follows the user's manual workflow more closely than
@@ -7501,6 +7735,15 @@ try {{
                 return False, f"windows_wic_invalid:{invalid_why}"
             valid, invalid_why = self._validate_hdr_sdr_export_image(tmp, None)
             if valid:
+                changed = 0
+                if repair:
+                    changed = self._repair_wic_saturated_rgb_speckles(tmp)
+                    if changed > 0:
+                        self._status(
+                            f"HDR WIC saturated speckle cleanup: {changed} px",
+                            key="hdr_wic_speckle_cleanup",
+                            interval=5.0,
+                        )
                 os.replace(tmp, out_path)
                 return True, ""
             try:
@@ -8022,23 +8265,13 @@ try {{
 
         is_avif = out_path.lower().endswith(".avif")
         if is_avif:
-            # Windows/WIC's HDR AVIF path has shown saturated blue/magenta salt
-            # pixels when fed limited-range PQ/BT.2020 4:2:0 stills, even though
-            # libdav1d decodes the same AVIF bit-exactly. Avoid that broken WIC
-            # limited-range boundary by storing the AVIF as full-range YUV while
-            # preserving the same PQ/BT.2020 image values. A round-trip back to
-            # limited-range changes at most one code value from rounding in the
-            # diagnostic sample, so this is not a tone-map, denoise, gamut, or
-            # chroma-quality change.
-            # Only expand when we explicitly probed limited-range source.
-            if src_range == "limited":
-                vf = f"{vf},zscale=rangein=limited:range=full"
-            vf = (
-                f"{vf},"
-                "format=yuv420p10le,"
-                "setparams=color_trc=smpte2084:color_primaries=bt2020:"
-                "colorspace=bt2020nc:range=full"
-            )
+            # Store source HDR AVIF with the source range metadata. The visible
+            # blue/magenta speckles were isolated to Windows' HDR AVIF render
+            # boundary, not to libaom lossless encode/decode. Do not range-shift,
+            # denoise, or tone-map the source-HDR temporary here; WIC/display
+            # compatibility is handled after WIC conversion when a display AVIF is
+            # requested.
+            vf = f"{vf},format=yuv420p10le"
 
         pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(seek_sec)
         cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
@@ -8086,12 +8319,10 @@ try {{
                 "0",
                 "-aq-mode",
                 "0",
-                # Preserve HDR10 signaling and 4:2:0 chroma siting in the AVIF
-                # container. The pixel data is range-expanded above, so mark the
-                # AVIF as full-range instead of asking WIC to handle limited-range
-                # HDR stills.
+                # Preserve HDR10 signaling and source range/chroma siting in
+                # the AVIF container.
                 "-color_range",
-                "2",
+                "2" if src_range == "full" else "1",
                 "-colorspace",
                 "bt2020nc",
                 "-color_primaries",
