@@ -7485,29 +7485,54 @@ class Processor(QtCore.QObject):
             # confined to hair/clothes/shadow regions.
             luma = np.clip((0.114 * b + 0.587 * g + 0.299 * r), 0, 255).astype(np.uint8)
             local_luma = cv2.medianBlur(luma, 5)
-            dark = local_luma <= 112
-            blue = dark & (b >= 160) & ((b - max_rg) >= 50) & (r <= 96) & (g <= 96)
+            dark = local_luma <= 128
+            # The remaining WIC failures are not always a one-pixel core. They
+            # can leave a short, lower-intensity blue halo around the saturated
+            # pixel, and 4:2:0 AVIF chroma subsampling makes that halo visible
+            # even after the old exact-pixel mask removed the brightest center.
+            # Use a strict seed for impossible blue pixels, then grow only into
+            # nearby low-intensity blue contamination. Keep red/magenta on the
+            # original strict thresholds so normal warm shadow detail is not
+            # pulled into the repair mask.
+            blue_seed = dark & (
+                ((b >= 145) & ((b - max_rg) >= 45) & (r <= 112) & (g <= 112))
+                | ((b >= 88) & ((b - max_rg) >= 60) & (r <= 40) & (g <= 40))
+            )
+            blue_halo = dark & (b >= 70) & ((b - max_rg) >= 22) & (r <= 128) & (g <= 128)
             magenta = dark & (r >= 160) & (b >= 160) & ((min_rb - g) >= 50) & (g <= 96)
             red = dark & (r >= 180) & ((r - max_bg) >= 70) & (b <= 80) & (g <= 80)
-            mask = (blue | magenta | red).astype(np.uint8)
+            blue_near_seed = cv2.dilate(
+                blue_seed.astype(np.uint8),
+                np.ones((5, 5), dtype=np.uint8),
+                iterations=1,
+            ).astype(bool)
+            seed = blue_seed | magenta | red
+            mask = (seed | (blue_halo & blue_near_seed)).astype(np.uint8)
             if int(mask.sum()) <= 0:
                 return 0
-            # Reject broad regions. The defect is salt-like; connected areas much
-            # larger than this are likely real image content or a bad threshold.
+            # Reject broad regions. Blue WIC faults can be short streaks after
+            # display conversion, so accept slightly larger/longer blue-seeded
+            # components; keep the previous compact-component rule for strict
+            # red/magenta seeds.
             n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
             keep = np.zeros_like(mask, dtype=np.uint8)
             for i in range(1, n):
                 area = int(stats[i, cv2.CC_STAT_AREA])
                 if area <= 0:
                     continue
-                if 1 <= area <= 4:
-                    keep[labels == i] = 255
-                    continue
-                if not (5 <= area <= 80):
-                    continue
                 bbox_w = int(stats[i, cv2.CC_STAT_WIDTH])
                 bbox_h = int(stats[i, cv2.CC_STAT_HEIGHT])
                 if bbox_w <= 0 or bbox_h <= 0:
+                    continue
+                component = labels == i
+                if bool(np.any(blue_seed[component])):
+                    if area <= 220 and bbox_w <= 32 and bbox_h <= 32:
+                        keep[component] = 255
+                    continue
+                if 1 <= area <= 4:
+                    keep[component] = 255
+                    continue
+                if not (5 <= area <= 80):
                     continue
                 long_edge = max(bbox_w, bbox_h)
                 short_edge = max(1, min(bbox_w, bbox_h))
@@ -7515,12 +7540,12 @@ class Processor(QtCore.QObject):
                 # Preserve tiny compact blobs, but reject thin/elongated regions
                 # that are more likely real scene detail than WIC salt speckles.
                 if long_edge <= 12 and (long_edge / short_edge) <= 3.0 and fill_ratio >= 0.40:
-                    keep[labels == i] = 255
+                    keep[component] = 255
             changed = int(np.count_nonzero(keep))
             if changed <= 0:
                 return 0
-            # Inpaint exact defective pixels from surrounding good WIC-rendered
-            # pixels. Do not dilate the mask; that would alter valid fine detail.
+            # Inpaint only the connected defective component from surrounding
+            # good WIC-rendered pixels. Do not globally blur or denoise.
             repaired = cv2.inpaint(bgr, keep, 2.0, cv2.INPAINT_TELEA)
             out = img.copy()
             out[:, :, :3] = repaired
@@ -7565,7 +7590,7 @@ class Processor(QtCore.QObject):
             "-frames:v",
             "1",
             "-vf",
-            "format=yuv420p10le",
+            "format=yuv444p10le",
             "-an",
             "-sn",
             "-dn",
@@ -7574,7 +7599,7 @@ class Processor(QtCore.QObject):
             "-still-picture",
             "1",
             "-pix_fmt",
-            "yuv420p10le",
+            "yuv444p10le",
             "-g",
             "1",
             "-tile-columns",
