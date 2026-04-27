@@ -7427,12 +7427,18 @@ class Processor(QtCore.QObject):
                 interpretation.append("AVIF decoded raw differs from source raw; inspect source_vs_avif_decode before blaming WIC/display conversion.")
             wic_blue = int(rgb_stats.get("wic_from_libaom_avif_png", {}).get("blue_excess_50", 0) or 0)
             ff_blue = int(rgb_stats.get("source_ffmpeg_sdr_png", {}).get("blue_excess_50", 0) or 0)
-            if wic_blue > 0 and ff_blue == 0:
-                interpretation.append("WIC-from-AVIF has blue-excess pixels while direct FFmpeg SDR does not; first visible failure is the AVIF/WIC HDR rendering-conversion boundary.")
-            elif wic_blue > 0 and ff_blue > 0:
-                interpretation.append("Both WIC-from-AVIF and direct FFmpeg SDR show blue-excess pixels; inspect source raw dark chroma stats and source frame before isolating WIC.")
-            elif wic_blue == 0 and ff_blue > 0:
-                interpretation.append("Direct FFmpeg SDR has blue-excess pixels but WIC-from-AVIF does not; first visible failure is in the FFmpeg SDR tonemap path.")
+            wic_cyan_40 = int(rgb_stats.get("wic_from_libaom_avif_png", {}).get("cyan_excess_40", 0) or 0)
+            ff_cyan_40 = int(rgb_stats.get("source_ffmpeg_sdr_png", {}).get("cyan_excess_40", 0) or 0)
+            wic_cyan_60 = int(rgb_stats.get("wic_from_libaom_avif_png", {}).get("cyan_excess_60", 0) or 0)
+            ff_cyan_60 = int(rgb_stats.get("source_ffmpeg_sdr_png", {}).get("cyan_excess_60", 0) or 0)
+            wic_blue_or_cyan = max(wic_blue, wic_cyan_40, wic_cyan_60)
+            ff_blue_or_cyan = max(ff_blue, ff_cyan_40, ff_cyan_60)
+            if wic_blue_or_cyan > 0 and ff_blue_or_cyan == 0:
+                interpretation.append("WIC-from-AVIF has blue/turquoise excess pixels while direct FFmpeg SDR does not; first visible failure is the AVIF/WIC HDR rendering-conversion boundary.")
+            elif wic_blue_or_cyan > 0 and ff_blue_or_cyan > 0:
+                interpretation.append("Both WIC-from-AVIF and direct FFmpeg SDR show blue/turquoise excess pixels; inspect source raw dark chroma stats and source frame before isolating WIC.")
+            elif wic_blue_or_cyan == 0 and ff_blue_or_cyan > 0:
+                interpretation.append("Direct FFmpeg SDR has blue/turquoise excess pixels but WIC-from-AVIF does not; first visible failure is in the FFmpeg SDR tonemap path.")
         except Exception as exc:
             interpretation.append(f"interpretation_failed:{type(exc).__name__}:{exc}")
 
