@@ -4491,8 +4491,16 @@ class Processor(QtCore.QObject):
                                 os.fsync(dir_fd)
                             finally:
                                 os.close(dir_fd)
-                    if not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
-                        return False, "file_too_small"
+                    if not os.path.exists(out_path):
+                        return False, "file_missing_after_replace"
+                    expected_size = int(getattr(buf, "nbytes", len(buf)))
+                    actual_size = int(os.path.getsize(out_path))
+                    if actual_size != expected_size:
+                        try:
+                            os.remove(out_path)
+                        except Exception:
+                            pass
+                        return False, f"file_size_mismatch:{actual_size}!={expected_size}"
                     return True, ""
                 except Exception as e:
                     try:
@@ -4526,6 +4534,7 @@ class Processor(QtCore.QObject):
                             break
 
                         ack_q = None
+                        cancel_evt: Optional[threading.Event] = None
                         ok = False
                         why = "save_not_attempted"
                         img_path = ""
@@ -4533,7 +4542,11 @@ class Processor(QtCore.QObject):
                         kind = ""
                         if isinstance(item, dict):
                             ack_q = item.get("ack_q")
+                            cancel_evt = item.get("cancel_evt")
                             kind = str(item.get("type") or "")
+                            cancelled = bool(cancel_evt is not None and cancel_evt.is_set())
+                            if cancelled:
+                                ok, why = False, "save_cancelled"
                             if kind == "hdr_sdr":
                                 img_path = str(item.get("path") or "")
                                 row = item.get("row")
@@ -4543,20 +4556,22 @@ class Processor(QtCore.QObject):
                                         frame_pts_sec = float(frame_pts_sec)
                                     except Exception:
                                         frame_pts_sec = None
-                                ok, why = self._save_hdr_sdr_screencap(
-                                    int(item.get("frame_idx", 0)),
-                                    frame_pts_sec,
-                                    tuple(item.get("crop_xyxy") or (0, 0, 1, 1)),
-                                    img_path,
-                                )
+                                if not cancelled:
+                                    ok, why = self._save_hdr_sdr_screencap(
+                                        int(item.get("frame_idx", 0)),
+                                        frame_pts_sec,
+                                        tuple(item.get("crop_xyxy") or (0, 0, 1, 1)),
+                                        img_path,
+                                    )
                             elif kind == "jpeg":
                                 img_path = str(item.get("path") or "")
                                 row = item.get("row")
                                 img = item.get("img")
-                                if isinstance(img, np.ndarray):
-                                    ok, why = _atomic_jpeg_write(img, img_path, jpg_q)
-                                else:
-                                    ok, why = False, "invalid_jpeg_payload"
+                                if not cancelled:
+                                    if isinstance(img, np.ndarray):
+                                        ok, why = _atomic_jpeg_write(img, img_path, jpg_q)
+                                    else:
+                                        ok, why = False, "invalid_jpeg_payload"
                             else:
                                 ok, why = False, f"unknown_save_item_type:{kind or 'none'}"
                         else:
@@ -4573,7 +4588,8 @@ class Processor(QtCore.QObject):
                                 ack_q.put_nowait((bool(ok), str(why or "")))
                             except Exception:
                                 pass
-                        if ok:
+                        cancelled_after_save = bool(cancel_evt is not None and cancel_evt.is_set())
+                        if ok and not cancelled_after_save:
                             # hand off to worker thread for emitting
                             try:
                                 hit_q.put_nowait(img_path)
@@ -4587,8 +4603,7 @@ class Processor(QtCore.QObject):
                                     f.flush()
                             except Exception:
                                 logger.exception("CSV write failed for %s", img_path)
-
-                        else:
+                        elif not cancelled_after_save:
                             logger.error("Failed to save crop %s (%s)", img_path, why)
                             self._status(
                                 f"Save failed ({why}): {img_path}",
@@ -6058,6 +6073,7 @@ class Processor(QtCore.QObject):
                             # never counted as successful before optional archive enqueue.
                             wait_for_save = True
                         ack_q: Optional[queue.Queue] = queue.Queue(maxsize=1) if wait_for_save else None
+                        save_cancel_evt: Optional[threading.Event] = threading.Event() if wait_for_save else None
                         try:
                             if hdr_primary_fullres:
                                 save_q.put_nowait({
@@ -6068,6 +6084,7 @@ class Processor(QtCore.QObject):
                                     "frame_pts_sec": frame_pts_sec,
                                     "crop_xyxy": source_crop_xyxy,
                                     "ack_q": ack_q,
+                                    "cancel_evt": save_cancel_evt,
                                 })
                             else:
                                 # enqueue a contiguous copy; slices are views into `frame`
@@ -6080,6 +6097,7 @@ class Processor(QtCore.QObject):
                                     "row": row,
                                     "img": buf,
                                     "ack_q": ack_q,
+                                    "cancel_evt": save_cancel_evt,
                                 })
                         except queue.Full:
                             self._status(
@@ -6093,6 +6111,8 @@ class Processor(QtCore.QObject):
                             try:
                                 ok, why = ack_q.get(timeout=float(save_timeout_sec))
                             except queue.Empty:
+                                if save_cancel_evt is not None:
+                                    save_cancel_evt.set()
                                 self._status(
                                     f"Save ack timeout after {save_timeout_sec}s: {crop_img_path}",
                                     key="save_timeout",
