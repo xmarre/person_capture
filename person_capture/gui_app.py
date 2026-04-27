@@ -634,6 +634,46 @@ class Processor(QtCore.QObject):
             return v.item()
         return v
 
+    @staticmethod
+    def _safe_filename_component(value: str, fallback: str = "video", max_len: int = 96) -> str:
+        raw = str(value or "").strip()
+        out: list[str] = []
+        prev_sep = False
+        for ch in raw:
+            if ch.isalnum() or ch in {"-", "_", "."}:
+                out.append(ch)
+                prev_sep = False
+            else:
+                if not prev_sep:
+                    out.append("_")
+                    prev_sep = True
+        safe = "".join(out).strip("._-")
+        if not safe:
+            safe = str(fallback or "video")
+        if len(safe) > max_len:
+            safe = safe[:max_len].rstrip("._-") or str(fallback or "video")
+        return safe
+
+    @staticmethod
+    def _source_filename_prefix(path: str) -> str:
+        src = str(path or "").strip()
+        stem = Processor._safe_filename_component(Path(src).stem if src else "", fallback="video")
+        try:
+            ident_path = os.path.abspath(src) if src else ""
+        except Exception:
+            ident_path = src
+        parts = [ident_path]
+        try:
+            st = os.stat(ident_path)
+            parts.extend([
+                str(int(getattr(st, "st_size", 0) or 0)),
+                str(int(getattr(st, "st_mtime_ns", 0) or 0)),
+            ])
+        except Exception:
+            pass
+        digest = hashlib.sha1(chr(0).join(parts).encode("utf-8", "surrogatepass")).hexdigest()[:10]
+        return f"{stem}-{digest}"
+
     def _prescan_cache_root(self, cfg: SessionConfig) -> Path:
         raw = str(getattr(cfg, "prescan_cache_dir", "prescan_cache") or "prescan_cache").strip()
         root = Path(raw)
@@ -3694,6 +3734,7 @@ class Processor(QtCore.QObject):
             hdr_crops_dir = os.path.join(cfg.out_dir, "hdr_crops")
             ann_dir = os.path.join(cfg.out_dir, "annot") if cfg.save_annot else None
             ensure_dir(crops_dir)
+            source_file_prefix = self._source_filename_prefix(cfg.video)
             if ann_dir:
                 ensure_dir(ann_dir)
             # Debug I/O
@@ -5506,7 +5547,7 @@ class Processor(QtCore.QObject):
                     if primary_fmt not in {"png", "jpg", "jpeg"}:
                         primary_fmt = "png"
                     primary_ext = ".png" if (hdr_primary_fullres and primary_fmt == "png") else ".jpg"
-                    crop_img_path = os.path.join(crops_dir, f"f{idx:08d}{primary_ext}")
+                    crop_img_path = os.path.join(crops_dir, f"{source_file_prefix}_f{idx:08d}{primary_ext}")
                     hdr_out_path = None
                     if hdr_active and bool(getattr(self.cfg, "hdr_archive_crops", False)):
                         try:
@@ -5515,7 +5556,7 @@ class Processor(QtCore.QObject):
                             pass
                         hdr_fmt = str(getattr(self.cfg, "hdr_crop_format", "avif") or "avif").lower()
                         hdr_ext = ".mkv" if hdr_fmt == "mkv" else ".avif"
-                        hdr_out_path = os.path.join(hdr_crops_dir, f"f{idx:08d}{hdr_ext}")
+                        hdr_out_path = os.path.join(hdr_crops_dir, f"{source_file_prefix}_f{idx:08d}{hdr_ext}")
                     # Start from candidate box in GLOBAL coords
                     gx1, gy1, gx2, gy2 = c["box"]
                     ratio_str = str(
@@ -6634,7 +6675,7 @@ class Processor(QtCore.QObject):
                                         cv2.LINE_AA,
                                     )
                     if ann_dir and cfg.save_annot:
-                        ann_path = os.path.join(ann_dir, f"f{current_idx:08d}.jpg")
+                        ann_path = os.path.join(ann_dir, f"{source_file_prefix}_f{current_idx:08d}.jpg")
                         ok, why = _atomic_jpeg_write(show, ann_path, jpg_q)
                         if not ok:
                             self._status(
