@@ -6916,13 +6916,15 @@ class Processor(QtCore.QObject):
             rng = ""
         if not rng:
             try:
-                probe_range = None
+                ffprobe_json = None
                 try:
-                    from .video_io import _probe_range as probe_range  # type: ignore
+                    from .video_io import _ffprobe_json as ffprobe_json  # type: ignore
                 except Exception:
-                    from video_io import _probe_range as probe_range  # type: ignore
-                if probe_range is not None:
-                    rng = _normalize(probe_range(str(getattr(self.cfg, "video", "") or "")))
+                    from video_io import _ffprobe_json as ffprobe_json  # type: ignore
+                if ffprobe_json is not None:
+                    meta = ffprobe_json(str(getattr(self.cfg, "video", "") or ""))
+                    stream = (meta.get("streams") or [{}])[0]
+                    rng = _normalize(stream.get("color_range"))
             except Exception:
                 rng = ""
         if rng in {"limited", "full"}:
