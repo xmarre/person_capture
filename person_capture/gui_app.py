@@ -7111,9 +7111,9 @@ class Processor(QtCore.QObject):
             if n_labels <= 1:
                 break
             areas = stats[:, cv2.CC_STAT_AREA]
-            # The observed defects are salt-like clusters; avoid removing real
-            # saturated objects, labels, lights, or large color edges.
-            repair_mask = spike & (areas[labels] <= 64)
+            # The observed defects are tiny salt-like clusters (typically 2-4 px);
+            # keep the gate narrow to avoid touching legitimate small highlights.
+            repair_mask = spike & (areas[labels] >= 2) & (areas[labels] <= 4)
             changed = int(np.count_nonzero(repair_mask))
             if changed <= 0:
                 break
@@ -7207,8 +7207,7 @@ try {{
                 except Exception:
                     pass
                 return False, f"windows_wic_invalid:{invalid_why}"
-            os.replace(tmp, out_path)
-            cleaned, clean_why = self._repair_wic_hdr_sdr_chroma_speckles(out_path)
+            cleaned, clean_why = self._repair_wic_hdr_sdr_chroma_speckles(tmp)
             if clean_why:
                 self._status(
                     f"HDR WIC chroma speckle repair skipped: {clean_why}",
@@ -7221,9 +7220,15 @@ try {{
                     key="hdr_wic_speckles",
                     interval=5.0,
                 )
-            valid, invalid_why = self._validate_hdr_sdr_export_image(out_path, None)
+            valid, invalid_why = self._validate_hdr_sdr_export_image(tmp, None)
             if valid:
+                os.replace(tmp, out_path)
                 return True, ""
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
             return False, f"windows_wic_invalid:{invalid_why}"
         except subprocess.TimeoutExpired as exc:
             try:
