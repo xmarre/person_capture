@@ -7611,10 +7611,12 @@ try {{
         is_avif = out_path.lower().endswith(".avif")
         if is_avif:
             # AVIF HDR stills need a broadly compatible 10-bit 4:2:0 AV1 profile.
-            # The previous yuv444/lossless AVIF path looked correct in fewer
-            # Windows viewers and could lose the expected HDR presentation.
-            # Chroma artifacts are handled by even crop coordinates above plus
-            # CRF-0/no-AQ encoding, not by switching to incompatible 4:4:4.
+            # Keep 4:2:0 for Windows/Paint/HDR viewer compatibility, but make the
+            # AV1 encode itself lossless.  CRF-0 is still an AV1 quantized encode
+            # and can create isolated red/blue chroma speckles in very dark HDR
+            # regions.  The source is already 4:2:0, and the crop coordinates are
+            # legalized before this call, so lossless 4:2:0 preserves the decoded
+            # source crop without reintroducing the previous incompatible 4:4:4 path.
             vf = f"{vf},format=yuv420p10le"
 
         pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(seek_sec)
@@ -7650,16 +7652,23 @@ try {{
                 "1",
                 "-cpu-used",
                 "5",
-                # CRF 0 with AQ disabled keeps the previous broadly-compatible
-                # HDR AVIF behavior while avoiding very dark chroma blotches and
-                # the multi-minute stalls of libaom lossless 4:4:4.
+                # CRF 0 by itself is not a strict no-artifact guarantee for AV1.
+                # Keep the compatible 4:2:0 pixel format but force libaom's true
+                # lossless path so dark HDR chroma is not quantized into red/blue
+                # speckles.  AQ stays disabled because it can redistribute error
+                # into flat/dark regions.
+                "-lossless",
+                "1",
                 "-crf",
                 "0",
                 "-b:v",
                 "0",
                 "-aq-mode",
                 "0",
-                # Preserve HDR10 signaling in the AVIF container.
+                # Preserve HDR10 signaling and 4:2:0 chroma siting in the AVIF
+                # container.  Without an explicit chroma sample location, ffprobe
+                # reports "unspecified" and some Windows viewers can show colored
+                # dark-edge/chroma artifacts.
                 "-color_range",
                 "1",
                 "-colorspace",
@@ -7668,6 +7677,8 @@ try {{
                 "bt2020",
                 "-color_trc",
                 "smpte2084",
+                "-chroma_sample_location",
+                "left",
             ]
         else:
             # Lossless 10-bit HDR in Matroska via FFV1.
@@ -10266,9 +10277,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cfg.hdr_sdr_output_format = str(getattr(cfg, "hdr_sdr_output_format", "png") or "png").lower()
         if self.cfg.hdr_sdr_output_format not in {"png", "jpg", "jpeg"}:
             self.cfg.hdr_sdr_output_format = "png"
-        self.cfg.hdr_sdr_conversion = str(getattr(cfg, "hdr_sdr_conversion", "windows_wic") or "windows_wic").lower()
-        if self.cfg.hdr_sdr_conversion not in {"windows_wic", "ffmpeg"}:
-            self.cfg.hdr_sdr_conversion = "windows_wic"
+        hdr_sdr_conversion = str(getattr(cfg, "hdr_sdr_conversion", "windows_wic") or "windows_wic").strip().lower()
+        if hdr_sdr_conversion in {"wic", "paint", "paint_wic"}:
+            hdr_sdr_conversion = "windows_wic"
+        if hdr_sdr_conversion not in {"windows_wic", "ffmpeg"}:
+            hdr_sdr_conversion = "windows_wic"
+        if sys.platform != "win32" and hdr_sdr_conversion == "windows_wic":
+            hdr_sdr_conversion = "ffmpeg"
+        self.cfg.hdr_sdr_conversion = hdr_sdr_conversion
         self.cfg.compose_crop_enable = bool(getattr(cfg, "compose_crop_enable", True))
         self.cfg.compose_detect_person_for_face = bool(getattr(cfg, "compose_detect_person_for_face", True))
         try:
@@ -10310,7 +10326,7 @@ class MainWindow(QtWidgets.QMainWindow):
             idx = self.hdr_sdr_quality_combo.findData(val)
             self.hdr_sdr_quality_combo.setCurrentIndex(idx if idx >= 0 else 0)
         if hasattr(self, "hdr_sdr_conversion_combo"):
-            val = str(getattr(cfg, "hdr_sdr_conversion", "windows_wic") or "windows_wic")
+            val = self.cfg.hdr_sdr_conversion
             idx = self.hdr_sdr_conversion_combo.findData(val)
             self.hdr_sdr_conversion_combo.setCurrentIndex(idx if idx >= 0 else 0)
         if hasattr(self, "hdr_sdr_tonemap_combo"):
