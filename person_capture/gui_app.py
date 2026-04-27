@@ -7067,9 +7067,11 @@ class Processor(QtCore.QObject):
 
         out = img.copy()
         total_changed = 0
-        # Two bounded passes handle tiny 2-4 px clusters without touching the
-        # surrounding tone curve or ordinary texture.
-        for _ in range(2):
+        # Bounded passes handle single-pixel defects and small connected
+        # outlier islands. The matcher is intentionally local: it only touches
+        # saturated red/blue/magenta pixels that disagree strongly with the
+        # surrounding median inside a dark/low-chroma neighborhood.
+        for _ in range(3):
             bgr = out[:, :, :3]
             if min(bgr.shape[:2]) < 7:
                 break
@@ -7077,30 +7079,46 @@ class Processor(QtCore.QObject):
             pix_i = bgr.astype(np.int16, copy=False)
             med_i = med.astype(np.int16, copy=False)
 
+            # BGR order.
+            blue = pix_i[:, :, 0]
+            green = pix_i[:, :, 1]
+            red = pix_i[:, :, 2]
+            med_blue = med_i[:, :, 0]
+            med_green = med_i[:, :, 1]
+            med_red = med_i[:, :, 2]
+
             max_ch = pix_i.max(axis=2)
             min_ch = pix_i.min(axis=2)
             sat_span = max_ch - min_ch
             dev = np.max(np.abs(pix_i - med_i), axis=2)
-            # Chroma outlier relative to the local neighborhood. BGR order.
             chroma_dev = np.maximum.reduce((
-                np.abs((pix_i[:, :, 0] - pix_i[:, :, 1]) - (med_i[:, :, 0] - med_i[:, :, 1])),
-                np.abs((pix_i[:, :, 2] - pix_i[:, :, 1]) - (med_i[:, :, 2] - med_i[:, :, 1])),
-                np.abs((pix_i[:, :, 2] - pix_i[:, :, 0]) - (med_i[:, :, 2] - med_i[:, :, 0])),
+                np.abs((blue - green) - (med_blue - med_green)),
+                np.abs((red - green) - (med_red - med_green)),
+                np.abs((red - blue) - (med_red - med_blue)),
             ))
             local_luma = (
-                0.114 * med_i[:, :, 0]
-                + 0.587 * med_i[:, :, 1]
-                + 0.299 * med_i[:, :, 2]
+                0.114 * med_blue
+                + 0.587 * med_green
+                + 0.299 * med_red
             )
             med_span = med_i.max(axis=2) - med_i.min(axis=2)
 
+            blue_spike = (blue >= 50) & ((blue - red) >= 50) & ((blue - green) >= 50)
+            red_spike = (red >= 50) & ((red - green) >= 50) & ((red - blue) >= 50)
+            magenta_spike = (
+                (red >= 50)
+                & (blue >= 50)
+                & ((np.minimum(red, blue) - green) >= 50)
+            )
+            color_spike = blue_spike | red_spike | magenta_spike
+
             spike = (
-                (local_luma <= 115.0)
-                & (med_span <= 90)
-                & (max_ch >= 60)
-                & (sat_span >= 50)
-                & (dev >= 35)
-                & (chroma_dev >= 45)
+                (local_luma <= 130.0)
+                & (med_span <= 120)
+                & color_spike
+                & (sat_span >= 45)
+                & (dev >= 25)
+                & (chroma_dev >= 40)
             )
             if not bool(np.any(spike)):
                 break
@@ -7111,9 +7129,7 @@ class Processor(QtCore.QObject):
             if n_labels <= 1:
                 break
             areas = stats[:, cv2.CC_STAT_AREA]
-            # The observed defects are tiny salt-like clusters (typically 2-4 px);
-            # keep the gate narrow to avoid touching legitimate small highlights.
-            repair_mask = spike & (areas[labels] >= 2) & (areas[labels] <= 4)
+            repair_mask = spike & (areas[labels] <= 80)
             changed = int(np.count_nonzero(repair_mask))
             if changed <= 0:
                 break
@@ -7738,7 +7754,12 @@ try {{
             # regions.  The source is already 4:2:0, and the crop coordinates are
             # legalized before this call, so lossless 4:2:0 preserves the decoded
             # source crop without reintroducing the previous incompatible 4:4:4 path.
-            vf = f"{vf},format=yuv420p10le"
+            # Keep the AVIF 4:2:0/HDR-compatible, but clamp chroma to the
+            # legal limited-range code interval before encoding. setparams only
+            # labels the frame as limited range; it does not remove illegal U/V
+            # excursions from the decoded source. Windows' HDR AVIF path can map
+            # those dark chroma excursions to saturated blue/red/magenta pixels.
+            vf = f"{vf},format=yuv420p10le,limiter=min=64:max=960:planes=6"
 
         pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(seek_sec)
         cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
