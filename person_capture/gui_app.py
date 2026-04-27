@@ -393,6 +393,11 @@ class SessionConfig:
     preview_every: int = 3
     # I/O
     async_save: bool = True                # write crops/CSV on a background thread
+    # When async_save is enabled, do not wait for each crop to finish writing.
+    # The saver thread still flushes before run completion.  Enable this only
+    # for debugging old synchronous failure behavior.
+    async_save_wait: bool = False
+    save_fsync: bool = False               # fsync every JPEG temp file; safer but much slower
     jpg_quality: int = 85                  # JPEG quality (lower = faster, smaller)
     # Face full-frame fallback cadence (frames). 0 disables.
     face_fullframe_cadence: int = 12
@@ -922,6 +927,20 @@ class Processor(QtCore.QObject):
 
         advanced = 0
         remaining = max(0, int(count))
+        fast_skip = getattr(cap, "skip_frames", None)
+        if callable(fast_skip) and remaining > 0:
+            try:
+                skipped = int(fast_skip(remaining))
+            except Exception as exc:
+                if _at_known_eof():
+                    return advanced
+                self._status(
+                    f"Pre-scan fast skip failed: {exc}",
+                    key="prescan_skip_error",
+                    interval=0.5,
+                )
+                raise
+            return max(0, min(remaining, skipped))
         for _ in range(remaining):
             if self._abort or _at_known_eof():
                 break
@@ -1391,14 +1410,12 @@ class Processor(QtCore.QObject):
                         self._status(
                             f"Pre-scan fd9 cadence skip={fd9_skip_samples} probe={fd9_probe_samples} period={fd9_gate_period}",
                             key="prescan_skip_cadence",
-                            interval=5.0,
                         )
 
                     if fd9_gate_active and not skip_extract:
                         self._status(
                             f"Pre-scan fd9 cadence probe skip={fd9_skip_samples} probe={fd9_probe_samples} period={fd9_gate_period}",
                             key="prescan_skip_probe",
-                            interval=5.0,
                         )
 
                     if best >= 8.99:
@@ -1410,7 +1427,6 @@ class Processor(QtCore.QObject):
                         self._status(
                             f"Pre-scan {pct:.1f}% ({idx}/{total_frames})",
                             key="prescan_progress",
-                            interval=0.25,
                         )
                         try:
                             self.progress.emit(int(min(idx, max(total_frames - 1, 0))))
@@ -4460,11 +4476,12 @@ class Processor(QtCore.QObject):
                         return False, "imencode_failed"
                     with open(tmp, "wb") as fh:
                         fh.write(buf.tobytes())
-                        fh.flush()
-                        try:
-                            os.fsync(fh.fileno())
-                        except Exception:
-                            pass
+                        if bool(getattr(self.cfg, "save_fsync", False)):
+                            fh.flush()
+                            try:
+                                os.fsync(fh.fileno())
+                            except Exception:
+                                pass
                     os.replace(tmp, out_path)
                     if not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
                         return False, "file_too_small"
@@ -5752,7 +5769,6 @@ class Processor(QtCore.QObject):
                             self._status(
                                 f"side_guard repair L={left_margin:.1f} R={right_margin:.1f} req={required:.1f} fw={fw:.1f} fd={fd_val:.3f}",
                                 key="side_guard_dbg",
-                                interval=0.8,
                             )
                         except Exception:
                             pass
@@ -5973,13 +5989,12 @@ class Processor(QtCore.QObject):
                         self._status(
                             f"final_aspect={asp:.5f} target={targ:.5f} ratio={ratio_str}",
                             key="aspect",
-                            interval=2.0,
                         )
                     except Exception:
                         pass
 
                     self._status(
-                        f"crop@{idx}: face_box={c.get('face_box')}", key="cropface", interval=2.0
+                        f"crop@{idx}: face_box={c.get('face_box')}", key="cropface"
                     )
 
                     processed_crop_xyxy = (int(cx1), int(cy1), int(cx2), int(cy2))
@@ -6030,7 +6045,8 @@ class Processor(QtCore.QObject):
                     ]
                     primary_saved_or_enqueued = False
                     if save_q is not None:
-                        ack_q: queue.Queue = queue.Queue(maxsize=1)
+                        wait_for_save = bool(getattr(self.cfg, "async_save_wait", False))
+                        ack_q: Optional[queue.Queue] = queue.Queue(maxsize=1) if wait_for_save else None
                         try:
                             if hdr_primary_fullres:
                                 save_q.put_nowait({
@@ -6061,29 +6077,29 @@ class Processor(QtCore.QObject):
                                 interval=0.5,
                             )
                             return False
-                        save_timeout_sec = max(5, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
-                        try:
-                            ok, why = ack_q.get(timeout=float(save_timeout_sec))
-                        except queue.Empty:
-                            self._status(
-                                f"Save ack timeout after {save_timeout_sec}s: {crop_img_path}",
-                                key="save_timeout",
-                                interval=0.5,
-                            )
-                            return False
-                        ack_why = str(why or "")
-                        if not ok:
-                            self._status(
-                                f"Save failed ({why}): {crop_img_path}",
-                                key="save_err",
-                                interval=0.5,
-                            )
-                            return False
-                        if hdr_primary_fullres and isinstance(row, list) and len(row) > 10:
+                        if wait_for_save and ack_q is not None:
+                            save_timeout_sec = max(5, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
                             try:
-                                c["sharp"] = float(row[10])
-                            except Exception:
-                                pass
+                                ok, why = ack_q.get(timeout=float(save_timeout_sec))
+                            except queue.Empty:
+                                self._status(
+                                    f"Save ack timeout after {save_timeout_sec}s: {crop_img_path}",
+                                    key="save_timeout",
+                                    interval=0.5,
+                                )
+                                return False
+                            if not ok:
+                                self._status(
+                                    f"Save failed ({why}): {crop_img_path}",
+                                    key="save_err",
+                                    interval=0.5,
+                                )
+                                return False
+                            if hdr_primary_fullres and isinstance(row, list) and len(row) > 10:
+                                try:
+                                    c["sharp"] = float(row[10])
+                                except Exception:
+                                    pass
                         primary_saved_or_enqueued = True
                     else:
                         if hdr_primary_fullres:
@@ -6486,7 +6502,6 @@ class Processor(QtCore.QObject):
                         self._status(
                             f"reject_reasons={reasons_to_log}",
                             key="rej_reasons",
-                            interval=1.0,
                         )
                     extra_note = " (face-only mode; faceless fallback disabled)" if face_only_pipeline else ""
                     self._status(
@@ -6495,7 +6510,6 @@ class Processor(QtCore.QObject):
                         f"best_fd_qonly={best_face_dist if best_face_dist is not None else 'n/a'} "
                         f"min_fd_all={min_fd_all if min_fd_all is not None else 'n/a'}{extra_note}",
                         key="no_match",
-                        interval=1.0,
                     )
                 chosen = None
                 if candidates:
@@ -6515,7 +6529,6 @@ class Processor(QtCore.QObject):
                                 self._status(
                                     f"reject_reasons={last_reject_reasons[:6]}",
                                     key="rej_reasons",
-                                    interval=1.0,
                                 )
                                 candidates = []
                     def eff_score(c):
@@ -6928,12 +6941,38 @@ class Processor(QtCore.QObject):
         """
         k = key or "_global"
         now = time.time()
-        iv = float(interval if interval is not None else getattr(self.cfg, 'log_interval_sec', 1.0))
+        try:
+            iv = float(interval if interval is not None else getattr(self.cfg, 'log_interval_sec', 1.0))
+        except Exception:
+            iv = 1.0
+        if not math.isfinite(iv):
+            iv = 1.0
+        iv = max(0.0, iv)
         last_t = self._status_last_time.get(k, 0.0)
         last_txt = self._status_last_text.get(k, None)
-        if (now - last_t) >= iv or msg != last_txt:
+        # Progress/debug channels often include frame numbers, percentages, or
+        # score text that changes every sample.  The old condition emitted every
+        # text change, so cfg.log_interval_sec could not throttle those logs.
+        # Keep phase/state transitions immediate, but throttle noisy channels by
+        # key even when the formatted message changes.
+        immediate_on_change = k in {
+            "phase",
+            "hdr_state",
+            "hdr_passthrough",
+            "prescan_cache",
+            "curate_done",
+        }
+        should_emit = (
+            iv <= 0.0
+            or last_txt is None
+            or (immediate_on_change and msg != last_txt)
+            or (now - last_t) >= iv
+        )
+        if should_emit:
             self.status.emit(msg)
             self._status_last_time[k] = now
+            self._status_last_text[k] = msg
+        else:
             self._status_last_text[k] = msg
 
     def _resolve_ffmpeg_bin(self) -> Optional[str]:
