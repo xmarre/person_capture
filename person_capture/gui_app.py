@@ -286,6 +286,7 @@ _SETTINGS_KEY_FFMPEG_DIR = "paths/ffmpeg_dir"
 _SETTINGS_KEY_SDR_NITS_MIGRATED = "migrations/sdr_nits_default_100_v1"
 _SETTINGS_KEY_CROP_HEAD_PAD_MIGRATED = "migrations/crop_head_pad_defaults_088_095_v1"
 _SETTINGS_KEY_RATIO_DEFAULTS_MIGRATED = "migrations/ratio_defaults_334_v1"
+_SETTINGS_KEY_HDR_AVIF_PNG_MIGRATED = "migrations/hdr_avif_png_defaults_v1"
 _HDR_READER_DEFAULT = object()
 
 # ---------------------- Data & Settings ----------------------
@@ -323,9 +324,10 @@ class SessionConfig:
     # HDR output/export controls.
     hdr_screencap_fullres: bool = True   # write primary crops from original-resolution source frames
     hdr_archive_crops: bool = False      # additionally write source HDR crops to hdr_crops/
-    hdr_crop_format: str = "mkv"        # mkv (FFV1 lossless) | avif (AV1 lossless)
+    hdr_crop_format: str = "avif"       # avif (HDR still) | mkv (FFV1 lossless)
+    hdr_sdr_output_format: str = "png"  # png | jpg; PNG avoids dark-gradient JPEG artifacts
     # Full-resolution HDR->SDR still-render quality controls. These affect only
-    # primary crops/f*.jpg source export, not pre-scan/detection preview.
+    # primary crops/f*.png/f*.jpg source export, not pre-scan/detection preview.
     hdr_sdr_quality: str = "madvr_like"  # madvr_like | resolve_like | balanced | fast
     hdr_sdr_tonemap: str = "auto"        # auto | bt.2390 | spline | st2094-40 | mobius | hable
     hdr_sdr_gamut_mapping: str = "clip"  # clip | perceptual | relative | saturation
@@ -333,6 +335,7 @@ class SessionConfig:
     hdr_sdr_peak_detect: bool = True
     hdr_sdr_allow_inaccurate_fallback: bool = False
     hdr_export_timeout_sec: int = 300
+    hdr_archive_timeout_sec: int = 90
     log_interval_sec: float = 1.0
     lock_after_hits: int = 1
     lock_face_thresh: float = 0.28
@@ -465,7 +468,7 @@ class SessionConfig:
     prescan_fd_add: float = 0.22           # ArcFace dist to add to bank (tighter)
     prescan_fd_exit: float = 0.52          # ArcFace dist to EXIT  (hysteresis)
     prescan_add_cooldown_samples: int = 5  # add at most every N prescan samples
-    prescan_rot_probe_period: int = 1      # probe rotations every sample
+    prescan_rot_probe_period: int = 3      # probe rotations every N samples; upright pass still runs every sample
     prescan_probe_imgsz: int = 512         # slightly stronger probe
     prescan_probe_conf: float = 0.03
     prescan_heavy_90: int = 1536
@@ -480,7 +483,7 @@ class SessionConfig:
     prescan_trim_pad: bool = True              # remove pad if refine finds a tighter edge
     # --- pre-scan refine limits ---
     prescan_skip_trailing_refine: bool = True      # don’t refine spans that already hit EOF
-    prescan_refine_budget_sec: float = 3.0         # max wall time for refine pass
+    prescan_refine_budget_sec: float = 1.5         # max wall time for refine pass
     # --- pre-scan bank management ---
     prescan_bank_max: int = 64                 # target size
     prescan_diversity_dedup_cos: float = 0.968 # ≥ skip as duplicate
@@ -4406,7 +4409,10 @@ class Processor(QtCore.QObject):
                     pass
                 writer = None
                 save_q = queue.Queue(maxsize=512)
-                archive_q = queue.Queue(maxsize=256)
+                # Keep HDR archive saving close to the primary crop path.  A large
+                # queue lets slow AVIF exports lag minutes behind processing, and
+                # pause/resume then appears to split the regular and HDR crop paths.
+                archive_q = queue.Queue(maxsize=2)
                 hit_q = queue.Queue(maxsize=512)
 
                 def _saver():
@@ -4644,6 +4650,8 @@ class Processor(QtCore.QObject):
                             "hdr_screencap_fullres",
                             "hdr_archive_crops",
                             "hdr_crop_format",
+                            "hdr_sdr_output_format",
+                            "hdr_archive_timeout_sec",
                             "hdr_sdr_quality",
                             "hdr_sdr_tonemap",
                             "hdr_sdr_gamut_mapping",
@@ -5440,19 +5448,23 @@ class Processor(QtCore.QObject):
                     repair_bounds_xyxy=None,
                 ):
                     nonlocal hit_count, lock_hits, locked_face, locked_reid, prev_box, ref_face_feat, ref_bank_list, source_size_cached
-                    crop_img_path = os.path.join(crops_dir, f"f{idx:08d}.jpg")
                     hdr_primary_fullres = bool(
                         hdr_active
                         and bool(getattr(self.cfg, "hdr_screencap_fullres", True))
                     )
+                    primary_fmt = str(getattr(self.cfg, "hdr_sdr_output_format", "png") or "png").strip().lower()
+                    if primary_fmt not in {"png", "jpg", "jpeg"}:
+                        primary_fmt = "png"
+                    primary_ext = ".png" if (hdr_primary_fullres and primary_fmt == "png") else ".jpg"
+                    crop_img_path = os.path.join(crops_dir, f"f{idx:08d}{primary_ext}")
                     hdr_out_path = None
                     if hdr_active and bool(getattr(self.cfg, "hdr_archive_crops", False)):
                         try:
                             ensure_dir(hdr_crops_dir)
                         except Exception:
                             pass
-                        hdr_fmt = str(getattr(self.cfg, "hdr_crop_format", "mkv") or "mkv").lower()
-                        hdr_ext = ".avif" if hdr_fmt == "avif" else ".mkv"
+                        hdr_fmt = str(getattr(self.cfg, "hdr_crop_format", "avif") or "avif").lower()
+                        hdr_ext = ".mkv" if hdr_fmt == "mkv" else ".avif"
                         hdr_out_path = os.path.join(hdr_crops_dir, f"f{idx:08d}{hdr_ext}")
                     # Start from candidate box in GLOBAL coords
                     gx1, gy1, gx2, gy2 = c["box"]
@@ -5904,6 +5916,8 @@ class Processor(QtCore.QObject):
                             (int(W), int(H)),
                             source_size,
                         )
+                        if hdr_primary_fullres and primary_fmt == "png":
+                            source_crop_xyxy = self._even_hdr_crop_xyxy(source_crop_xyxy, source_size)
                     primary_row_crop = source_crop_xyxy if hdr_primary_fullres else processed_crop_xyxy
                     crop_img2 = frame[cy1:cy2, cx1:cx2]
                     row = [
@@ -6012,27 +6026,27 @@ class Processor(QtCore.QObject):
                             return False
                         primary_saved_or_enqueued = True
                     if primary_saved_or_enqueued and hdr_out_path:
-                        is_avif_archive = hdr_out_path.lower().endswith(".avif")
-                        hdr_crop_xyxy = (
-                            source_crop_xyxy
-                            if is_avif_archive
-                            else self._even_hdr_crop_xyxy(source_crop_xyxy, source_size)
-                        )
+                        # HDR archive crops are encoded from 4:2:0/10-bit source video.
+                        # Keep x/y/w/h even for AVIF and MKV; odd crop origins can shift
+                        # chroma and show up as blue/purple blotches in dark regions.
+                        hdr_crop_xyxy = self._even_hdr_crop_xyxy(source_crop_xyxy, source_size)
                         if archive_q is not None:
+                            archive_item = {
+                                "type": "hdr_archive",
+                                "path": hdr_out_path,
+                                "frame_idx": int(idx),
+                                "frame_pts_sec": frame_pts_sec,
+                                "crop_xyxy": hdr_crop_xyxy,
+                            }
                             try:
-                                archive_q.put_nowait({
-                                    "type": "hdr_archive",
-                                    "path": hdr_out_path,
-                                    "frame_idx": int(idx),
-                                    "frame_pts_sec": frame_pts_sec,
-                                    "crop_xyxy": hdr_crop_xyxy,
-                                })
+                                archive_q.put_nowait(archive_item)
                             except queue.Full:
                                 self._status(
-                                    f"HDR archive queue full: {hdr_out_path}",
+                                    f"HDR archive queue blocked too long: {hdr_out_path}",
                                     key="save_backpressure",
                                     interval=0.5,
                                 )
+                                logger.warning("Dropping optional HDR archive crop after primary save: %s", hdr_out_path)
                         else:
                             self._save_hdr_crop_p010(idx, frame_pts_sec, hdr_crop_xyxy, hdr_out_path)
                     reasons_list = c.get("reasons") or []
@@ -7118,28 +7132,53 @@ class Processor(QtCore.QObject):
         peak_detect = bool(getattr(self.cfg, "hdr_sdr_peak_detect", True))
         allow_inaccurate = bool(getattr(self.cfg, "hdr_sdr_allow_inaccurate_fallback", False))
 
-        jpg_quality = self._validated_jpeg_quality(self.cfg, default=95)
-        q = max(1, min(31, int(round((100 - jpg_quality) / 5.0 + 1))))
-        if quality in ("resolve_like", "madvr_like"):
-            # Full-res still export is the final dataset artifact, not a fast
-            # preview cache. Keep it at the visually lossless end of FFmpeg's
-            # MJPEG scale; q=2 is still visibly softer in very dark, low-texture
-            # faces once the UI or training tooling magnifies the crop.
-            q = 1
-        enc = [
-            "-an", "-sn", "-dn",
-            "-c:v", "mjpeg",
-            "-q:v", str(q),
-            "-qmin", "1",
-            "-qmax", str(q),
-            "-pix_fmt", "yuvj444p",
-            "-color_range", "pc",
-            "-colorspace", "bt709",
-            "-color_primaries", "bt709",
-            "-color_trc", "bt709",
-            "-update", "1",
-            out_path,
-        ]
+        out_ext = Path(out_path).suffix.lower()
+        output_png = out_ext == ".png"
+        # PNG is the preferred dataset still format for HDR source crops: it
+        # preserves dark gradients after tone mapping instead of adding JPEG
+        # block/chroma artifacts.  For PNG, mimic the user's manual path more
+        # closely: first make the HDR crop, then tone-map that cropped HDR image
+        # into a full-range sRGB PNG.  JPEG keeps the renderer-style full-frame
+        # tone-map-then-crop order for backwards compatibility.
+        out_pix_fmt = "rgb24" if output_png else "bgr24"
+        out_trc = "iec61966-2-1" if output_png else "bt709"
+        if output_png:
+            enc = [
+                "-an", "-sn", "-dn",
+                "-c:v", "png",
+                "-compression_level", "3",
+                "-pred", "mixed",
+                "-pix_fmt", "rgb24",
+                "-color_range", "pc",
+                "-colorspace", "bt709",
+                "-color_primaries", "bt709",
+                "-color_trc", "iec61966-2-1",
+                "-update", "1",
+                out_path,
+            ]
+        else:
+            jpg_quality = self._validated_jpeg_quality(self.cfg, default=95)
+            q = max(1, min(31, int(round((100 - jpg_quality) / 5.0 + 1))))
+            if quality in ("resolve_like", "madvr_like"):
+                # Full-res still export is the final dataset artifact, not a fast
+                # preview cache. Keep it at the visually lossless end of FFmpeg's
+                # MJPEG scale; q=2 is still visibly softer in very dark, low-texture
+                # faces once the UI or training tooling magnifies the crop.
+                q = 1
+            enc = [
+                "-an", "-sn", "-dn",
+                "-c:v", "mjpeg",
+                "-q:v", str(q),
+                "-qmin", "1",
+                "-qmax", str(q),
+                "-pix_fmt", "yuvj444p",
+                "-color_range", "pc",
+                "-colorspace", "bt709",
+                "-color_primaries", "bt709",
+                "-color_trc", "bt709",
+                "-update", "1",
+                out_path,
+            ]
 
         filters = ffmpeg_has_hdr_filters(ffmpeg_bin)
         cmds: list[list[str]] = []
@@ -7157,7 +7196,7 @@ class Processor(QtCore.QObject):
                 # Prefer target_* names when available: color_* is accepted by older
                 # ffmpeg builds but can be interpreted as the working frame metadata.
                 _add_first_lp_opt(opts, ("target_primaries", "color_primaries"), "bt709")
-                _add_first_lp_opt(opts, ("target_trc", "color_trc"), "bt709")
+                _add_first_lp_opt(opts, ("target_trc", "color_trc"), out_trc)
                 self._add_lp_opt(opts, supported, "range", "full")
                 _add_first_lp_opt(opts, ("sdr_peak", "target_peak", "dst_peak", "peak"), f"{nits:.6g}")
                 if not _add_first_lp_opt(opts, ("desaturation", "desat"), f"{desat:.6g}"):
@@ -7229,11 +7268,18 @@ class Processor(QtCore.QObject):
                 # libplacebo still outputs hardware frames; always download before
                 # the CPU-only format/crop/encoder path.  The libplacebo ``format``
                 # option chooses the rendered pixel format, it is not a readback.
-                lp = (
-                    f"{seek_filter}format=p010le,{src},"
-                    f"hwupload=extra_hw_frames=1,libplacebo={opt_str},"
-                    f"hwdownload,format=bgra,format=bgr24,{crop}"
-                )
+                if output_png:
+                    lp = (
+                        f"{seek_filter}format=p010le,{src},{crop},"
+                        f"hwupload=extra_hw_frames=1,libplacebo={opt_str},"
+                        f"hwdownload,format=bgra,format={out_pix_fmt}"
+                    )
+                else:
+                    lp = (
+                        f"{seek_filter}format=p010le,{src},"
+                        f"hwupload=extra_hw_frames=1,libplacebo={opt_str},"
+                        f"hwdownload,format=bgra,format={out_pix_fmt},{crop}"
+                    )
                 cmds.append(
                     base[:1]
                     + ["-init_hw_device", "vulkan=vk:0", "-filter_hw_device", "vk"]
@@ -7277,21 +7323,34 @@ class Processor(QtCore.QObject):
                 z_desat = max(0.0, z_desat - 0.10)
             elif gamut == "relative":
                 z_desat = max(0.0, z_desat - 0.05)
-            zf = (
-                f"{seek_filter}{src},"
-                "zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc,"
-                "zscale=transfer=linear:npl=1000,format=gbrpf32le,"
-                f"tonemap=tonemap={z_algo}:param={z_param:.6g}:desat={z_desat:.6g}:peak={z_peak:.6g},"
-                f"zscale=transfer=bt709:primaries=bt709:matrix=bt709:dither={z_dither},"
-                f"zscale=rangein=pc:range=pc,format=bgr24,{crop}"
-            )
+            if output_png:
+                zf = (
+                    f"{seek_filter}{src},{crop},"
+                    "zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc,"
+                    "zscale=transfer=linear:npl=1000,format=gbrpf32le,"
+                    f"tonemap=tonemap={z_algo}:param={z_param:.6g}:desat={z_desat:.6g}:peak={z_peak:.6g},"
+                    f"zscale=transfer={out_trc}:primaries=bt709:matrix=bt709:dither={z_dither},"
+                    f"zscale=rangein=pc:range=pc,format={out_pix_fmt}"
+                )
+            else:
+                zf = (
+                    f"{seek_filter}{src},"
+                    "zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc,"
+                    "zscale=transfer=linear:npl=1000,format=gbrpf32le,"
+                    f"tonemap=tonemap={z_algo}:param={z_param:.6g}:desat={z_desat:.6g}:peak={z_peak:.6g},"
+                    f"zscale=transfer={out_trc}:primaries=bt709:matrix=bt709:dither={z_dither},"
+                    f"zscale=rangein=pc:range=pc,format={out_pix_fmt},{crop}"
+                )
             cmds.append(base + ["-vf", zf] + out_once + enc)
         if allow_inaccurate and pref in ("auto", "scale"):
             # Last-resort full-res export. This is not correct HDR tone mapping,
             # but it is still original-resolution and only used if the HDR filters fail.
             # Disabled by default because the goal is faithful HDR->SDR rendering,
             # not silently saving a washed-out fallback frame.
-            sf = f"{seek_filter}scale=in_range=limited:out_range=full,format=bgr24,{crop}"
+            if output_png:
+                sf = f"{seek_filter}{src},{crop},scale=in_range=limited:out_range=full,format={out_pix_fmt}"
+            else:
+                sf = f"{seek_filter}scale=in_range=limited:out_range=full,format={out_pix_fmt},{crop}"
             cmds.append(base + ["-vf", sf] + out_once + enc)
         return cmds
 
@@ -7306,7 +7365,8 @@ class Processor(QtCore.QObject):
         ffmpeg_bin = self._resolve_ffmpeg_bin()
         if not ffmpeg_bin:
             return False, "ffmpeg_unavailable"
-        tmp = out_path + ".tmp.jpg"
+        tmp_ext = ".png" if str(out_path).lower().endswith(".png") else ".jpg"
+        tmp = out_path + f".tmp{tmp_ext}"
         try:
             ensure_dir(os.path.dirname(out_path))
         except Exception:
@@ -7386,7 +7446,12 @@ class Processor(QtCore.QObject):
         except Exception:
             pass
 
-        vf = f"crop={w}:{h}:{int(x1)}:{int(y1)}"
+        # Preserve HDR source metadata explicitly before cropping.  The archive
+        # path must stay HDR; it is not the SDR dataset still path.
+        vf = (
+            "setparams=color_trc=smpte2084:color_primaries=bt2020:"
+            f"colorspace=bt2020nc:range=limited,crop={w}:{h}:{int(x1)}:{int(y1)}"
+        )
         seek_sec: Optional[float] = None
         try:
             if frame_pts_sec is not None and math.isfinite(float(frame_pts_sec)):
@@ -7400,12 +7465,12 @@ class Processor(QtCore.QObject):
 
         is_avif = out_path.lower().endswith(".avif")
         if is_avif:
-            # The AVIF path is intended for viewable HDR stills, not source-
-            # exact archive masters. Keep MKV/FFV1 as the default archive.
-            # If AVIF is explicitly selected, avoid reintroducing dark-region
-            # chroma blotches by encoding a true lossless 4:4:4 still instead
-            # of a CRF-0 4:2:0 AV1 still.
-            vf = f"{vf},format=yuv444p10le"
+            # AVIF HDR stills need a broadly compatible 10-bit 4:2:0 AV1 profile.
+            # The previous yuv444/lossless AVIF path looked correct in fewer
+            # Windows viewers and could lose the expected HDR presentation.
+            # Chroma artifacts are handled by even crop coordinates above plus
+            # CRF-0/no-AQ encoding, not by switching to incompatible 4:4:4.
+            vf = f"{vf},format=yuv420p10le"
 
         pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(seek_sec)
         cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
@@ -7429,7 +7494,7 @@ class Processor(QtCore.QObject):
                 "-still-picture",
                 "1",
                 "-pix_fmt",
-                "yuv444p10le",
+                "yuv420p10le",
                 "-g",
                 "1",
                 "-tile-columns",
@@ -7439,12 +7504,10 @@ class Processor(QtCore.QObject):
                 "-row-mt",
                 "1",
                 "-cpu-used",
-                "2",
-                # Real lossless AV1. CRF 0 alone is not a reliable archival
-                # guarantee and can still leave visible chroma artifacts in
-                # very dark HDR regions after viewer tone mapping.
-                "-lossless",
-                "1",
+                "5",
+                # CRF 0 with AQ disabled keeps the previous broadly-compatible
+                # HDR AVIF behavior while avoiding very dark chroma blotches and
+                # the multi-minute stalls of libaom lossless 4:4:4.
                 "-crf",
                 "0",
                 "-b:v",
@@ -7485,7 +7548,7 @@ class Processor(QtCore.QObject):
             pass
         cmd.append(tmp_out)
 
-        timeout_sec = max(5, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
+        timeout_sec = max(5, int(getattr(self.cfg, "hdr_archive_timeout_sec", getattr(self.cfg, "hdr_export_timeout_sec", 90)) or 90))
         try:
             cp = subprocess.run(
                 cmd,
@@ -7880,7 +7943,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_hdr_screencap_fullres = QtWidgets.QCheckBox("HDR source-res screencaps")
         self.chk_hdr_screencap_fullres.setChecked(bool(getattr(self.cfg, "hdr_screencap_fullres", True)))
         self.chk_hdr_screencap_fullres.setToolTip(
-            "For HDR input, save the primary crops/f*.jpg by cropping the original source frame "
+            "For HDR input, save the primary crops/f*.png/f*.jpg by cropping the original source frame "
             "and tone-mapping it with FFmpeg/libplacebo/zscale. This is independent of Vulkan preview."
         )
         self.chk_hdr_screencap_fullres.toggled.connect(self._on_ui_change)
@@ -7997,8 +8060,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hwaccel_combo.setCurrentIndex(_hw_idx if _hw_idx >= 0 else 0)
         self.hwaccel_combo.currentIndexChanged.connect(self._on_ui_change)
         self.hdr_crop_format_combo = QtWidgets.QComboBox()
-        self.hdr_crop_format_combo.addItems(["mkv", "avif"])
-        _hdr_fmt = str(getattr(self.cfg, "hdr_crop_format", "mkv") or "mkv").lower()
+        self.hdr_crop_format_combo.addItems(["avif", "mkv"])
+        _hdr_fmt = str(getattr(self.cfg, "hdr_crop_format", "avif") or "avif").lower()
         _hdr_fmt_idx = self.hdr_crop_format_combo.findText(_hdr_fmt)
         self.hdr_crop_format_combo.setCurrentIndex(_hdr_fmt_idx if _hdr_fmt_idx >= 0 else 0)
         self.hdr_crop_format_combo.currentIndexChanged.connect(self._on_ui_change)
@@ -9748,6 +9811,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "hdr_screencap_fullres",
             "hdr_archive_crops",
             "hdr_crop_format",
+            "hdr_sdr_output_format",
+            "hdr_archive_timeout_sec",
             "hdr_sdr_quality",
             "hdr_sdr_tonemap",
             "hdr_sdr_gamut_mapping",
@@ -9964,7 +10029,9 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             cfg.hdr_crop_format = self.hdr_crop_format_combo.currentText().lower()
         except Exception:
-            cfg.hdr_crop_format = "mkv"
+            cfg.hdr_crop_format = "avif"
+        cfg.hdr_sdr_output_format = str(getattr(self.cfg, "hdr_sdr_output_format", "png") or "png").lower()
+        cfg.hdr_archive_timeout_sec = int(getattr(self.cfg, "hdr_archive_timeout_sec", 90) or 90)
         try:
             cfg.hdr_sdr_quality = self.hdr_sdr_quality_combo.currentData() or "madvr_like"
         except Exception:
@@ -10015,6 +10082,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.hdr_export_timeout_sec = max(5, int(getattr(cfg, "hdr_export_timeout_sec", 300) or 300))
         except Exception:
             self.cfg.hdr_export_timeout_sec = 300
+        try:
+            self.cfg.hdr_archive_timeout_sec = max(5, int(getattr(cfg, "hdr_archive_timeout_sec", 90) or 90))
+        except Exception:
+            self.cfg.hdr_archive_timeout_sec = 90
+        self.cfg.hdr_sdr_output_format = str(getattr(cfg, "hdr_sdr_output_format", "png") or "png").lower()
+        if self.cfg.hdr_sdr_output_format not in {"png", "jpg", "jpeg"}:
+            self.cfg.hdr_sdr_output_format = "png"
         self.cfg.compose_crop_enable = bool(getattr(cfg, "compose_crop_enable", True))
         self.cfg.compose_detect_person_for_face = bool(getattr(cfg, "compose_detect_person_for_face", True))
         try:
@@ -10099,7 +10173,7 @@ class MainWindow(QtWidgets.QMainWindow):
             fallback_idx = self.hwaccel_combo.findData("off")
             self.hwaccel_combo.setCurrentIndex(fallback_idx if fallback_idx >= 0 else 0)
         self.cfg.ff_hwaccel = self.hwaccel_combo.currentData() or "off"
-        fmt = str(getattr(cfg, "hdr_crop_format", "mkv") or "mkv").lower()
+        fmt = str(getattr(cfg, "hdr_crop_format", "avif") or "avif").lower()
         fmt_idx = self.hdr_crop_format_combo.findText(fmt)
         if fmt_idx >= 0:
             self.hdr_crop_format_combo.setCurrentIndex(fmt_idx)
@@ -10999,7 +11073,18 @@ class MainWindow(QtWidgets.QMainWindow):
             fallback_idx = self.hwaccel_combo.findData("off")
             self.hwaccel_combo.setCurrentIndex(fallback_idx if fallback_idx >= 0 else 0)
         self.cfg.ff_hwaccel = self.hwaccel_combo.currentData() or "off"
-        fmt = str(s.value("hdr_crop_format", self.cfg.hdr_crop_format)).lower()
+        fmt = str(s.value("hdr_crop_format", self.cfg.hdr_crop_format or "avif")).lower()
+        if not bool(s.value(_SETTINGS_KEY_HDR_AVIF_PNG_MIGRATED, False, type=bool)):
+            # The previous shipped preset briefly defaulted HDR archive crops to MKV.
+            # Preserve explicit non-default settings after this one-time migration,
+            # but restore the solid HDR still workflow: AVIF archive + PNG SDR crops.
+            stored_hdr_crop_format = str(s.value("hdr_crop_format", "") or "").strip().lower()
+            if not s.contains("hdr_crop_format") or not stored_hdr_crop_format:
+                fmt = "avif"
+                s.setValue("hdr_crop_format", fmt)
+            if not str(s.value("hdr_sdr_output_format", "") or "").strip():
+                s.setValue("hdr_sdr_output_format", "png")
+            s.setValue(_SETTINGS_KEY_HDR_AVIF_PNG_MIGRATED, True)
         fmt_idx = self.hdr_crop_format_combo.findText(fmt)
         if fmt_idx >= 0:
             self.hdr_crop_format_combo.setCurrentIndex(fmt_idx)
@@ -11075,6 +11160,18 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         except Exception:
             self.cfg.hdr_export_timeout_sec = 300
+        try:
+            self.cfg.hdr_archive_timeout_sec = max(
+                5,
+                int(s.value("hdr_archive_timeout_sec", getattr(self.cfg, "hdr_archive_timeout_sec", 90)) or 90),
+            )
+        except Exception:
+            self.cfg.hdr_archive_timeout_sec = 90
+        self.cfg.hdr_sdr_output_format = str(
+            s.value("hdr_sdr_output_format", getattr(self.cfg, "hdr_sdr_output_format", "png")) or "png"
+        ).lower()
+        if self.cfg.hdr_sdr_output_format not in {"png", "jpg", "jpeg"}:
+            self.cfg.hdr_sdr_output_format = "png"
         self.cfg.seek_fast = s.value("seek_fast", True, type=bool)
         try:
             self.cfg.seek_max_grabs = int(s.value("seek_max_grabs", 12))
