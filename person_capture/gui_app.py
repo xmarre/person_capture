@@ -7191,6 +7191,8 @@ class Processor(QtCore.QObject):
             blue_excess_30 = (b - np.maximum(r, g)) >= 30
             blue_excess_50 = (b - np.maximum(r, g)) >= 50
             blue_excess_80 = (b - np.maximum(r, g)) >= 80
+            cyan_excess_40 = (b >= 70) & (g >= 70) & ((np.minimum(b, g) - r) >= 40)
+            cyan_excess_60 = (b >= 90) & (g >= 90) & ((np.minimum(b, g) - r) >= 60)
             red_excess_50 = (r - np.maximum(b, g)) >= 50
             magenta_excess_50 = (np.minimum(r, b) - g) >= 50
             pure_blue = (b >= 240) & (r <= 16) & (g <= 16)
@@ -7202,6 +7204,8 @@ class Processor(QtCore.QObject):
                 "blue_excess_30": int(np.count_nonzero(blue_excess_30)),
                 "blue_excess_50": int(np.count_nonzero(blue_excess_50)),
                 "blue_excess_80": int(np.count_nonzero(blue_excess_80)),
+                "cyan_excess_40": int(np.count_nonzero(cyan_excess_40)),
+                "cyan_excess_60": int(np.count_nonzero(cyan_excess_60)),
                 "red_excess_50": int(np.count_nonzero(red_excess_50)),
                 "magenta_excess_50": int(np.count_nonzero(magenta_excess_50)),
                 "pure_blue": int(np.count_nonzero(pure_blue)),
@@ -7479,6 +7483,7 @@ class Processor(QtCore.QObject):
             r = pix[:, :, 2]
             max_rg = np.maximum(r, g)
             max_bg = np.maximum(b, g)
+            min_bg = np.minimum(b, g)
             min_rb = np.minimum(r, b)
             # Use a local luma gate so real bright colored content such as
             # candles/fire is never treated as a defect. The observed WIC bug is
@@ -7495,21 +7500,36 @@ class Processor(QtCore.QObject):
             # nearby low-intensity blue contamination. Keep red/magenta on the
             # original strict thresholds so normal warm shadow detail is not
             # pulled into the repair mask.
+            local_b = cv2.medianBlur(bgr[:, :, 0], 5).astype(np.int16, copy=False)
+            local_g = cv2.medianBlur(bgr[:, :, 1], 5).astype(np.int16, copy=False)
+            local_r = cv2.medianBlur(bgr[:, :, 2], 5).astype(np.int16, copy=False)
+            b_jump = b - local_b
+            g_jump = g - local_g
+            r_jump = r - local_r
             blue_seed = dark_blue & (
                 ((b >= 145) & ((b - max_rg) >= 45) & (r <= 112) & (g <= 112))
                 | ((b >= 88) & ((b - max_rg) >= 60) & (r <= 40) & (g <= 40))
+                | ((b >= 92) & ((b - max_rg) >= 34) & (r <= 80) & (g <= 120) & (b_jump >= 28))
             )
             blue_halo = dark_blue & (b >= 70) & ((b - max_rg) >= 22) & (r <= 128) & (g <= 128)
+            # Some remaining WIC defects are turquoise rather than pure blue:
+            # both B and G jump above the local neighborhood while red remains
+            # suppressed. These fail the old blue-vs-green seed test, so handle
+            # them as isolated local outliers rather than by loosening the blue
+            # threshold globally.
+            cyan_seed = dark_blue & (b >= 95) & (g >= 80) & (r <= 96) & ((min_bg - r) >= 38) & (b_jump >= 22) & (g_jump >= 16) & (r_jump <= 24)
+            cyan_halo = dark_blue & (b >= 74) & (g >= 56) & (r <= 112) & ((min_bg - r) >= 26) & (b_jump >= 14) & (g_jump >= 10)
             magenta = dark_strict & (r >= 160) & (b >= 160) & ((min_rb - g) >= 50) & (g <= 96)
             red = dark_strict & (r >= 180) & ((r - max_bg) >= 70) & (b <= 80) & (g <= 80)
+            blue_or_cyan_seed = blue_seed | cyan_seed
             blue_near_seed = cv2.dilate(
-                blue_seed.astype(np.uint8),
-                np.ones((5, 5), dtype=np.uint8),
+                blue_or_cyan_seed.astype(np.uint8),
+                np.ones((7, 7), dtype=np.uint8),
                 iterations=1,
             ).astype(bool)
             strict_seed = magenta | red
-            seed = blue_seed | strict_seed
-            mask = (seed | (blue_halo & blue_near_seed)).astype(np.uint8)
+            seed = blue_or_cyan_seed | strict_seed
+            mask = (seed | ((blue_halo | cyan_halo) & blue_near_seed)).astype(np.uint8)
             if int(mask.sum()) <= 0:
                 return 0
             # Reject broad regions. Blue WIC faults can be short streaks after
@@ -7528,9 +7548,10 @@ class Processor(QtCore.QObject):
                     continue
                 component = labels == i
                 has_blue_seed = bool(np.any(blue_seed[component]))
+                has_cyan_seed = bool(np.any(cyan_seed[component]))
                 has_strict_seed = bool(np.any(strict_seed[component]))
-                if has_blue_seed and not has_strict_seed:
-                    if area <= 220 and bbox_w <= 32 and bbox_h <= 32:
+                if (has_blue_seed or has_cyan_seed) and not has_strict_seed:
+                    if area <= 420 and bbox_w <= 48 and bbox_h <= 48:
                         keep[component] = 255
                     continue
                 if 1 <= area <= 4:
