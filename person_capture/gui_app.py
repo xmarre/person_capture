@@ -440,6 +440,8 @@ class SessionConfig:
     fast_no_face_imgsz: int = 512                # shrink 0° pass to this size during long streaks
 
     # Debug/diagnostics
+    hdr_speckle_diag: bool = False
+    hdr_speckle_diag_dir: str = ""
     debug_dump: bool = True
     debug_dir: str = "debug"
     overlay_scores: bool = False
@@ -4680,6 +4682,8 @@ class Processor(QtCore.QObject):
                             "hdr_sdr_contrast_recovery",
                             "hdr_sdr_peak_detect",
                             "hdr_sdr_allow_inaccurate_fallback",
+                            "hdr_speckle_diag",
+                            "hdr_speckle_diag_dir",
                             "compose_crop_enable",
                             "compose_detect_person_for_face",
                             "compose_close_face_h_frac",
@@ -7047,6 +7051,340 @@ class Processor(QtCore.QObject):
         return "'" + str(value).replace("'", "''") + "'"
 
     @staticmethod
+    def _truthy_env(name: str) -> bool:
+        val = os.getenv(name, "")
+        return str(val).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _hdr_speckle_diag_enabled(self) -> bool:
+        """Return true when heavy HDR speckle diagnostics should be written.
+
+        The normal control is the GUI checkbox persisted in SessionConfig. The
+        env var remains as an override for headless/debug runs. Diagnostics
+        export sibling artifacts from the exact same source frame and crop so
+        the first stage that creates blue/red/magenta speckles can be identified
+        instead of guessed.
+        """
+        return bool(getattr(self.cfg, "hdr_speckle_diag", False)) or self._truthy_env("PC_HDR_SPECKLE_DIAG")
+
+    def _hdr_speckle_diag_root(self, saved_path: str) -> Path:
+        root_env = os.getenv("PC_HDR_SPECKLE_DIAG_DIR", "").strip()
+        root_cfg = str(getattr(self.cfg, "hdr_speckle_diag_dir", "") or "").strip()
+        if root_env:
+            return Path(root_env)
+        if root_cfg:
+            return Path(root_cfg)
+        return Path(saved_path).parent / "hdr_speckle_diag"
+
+    @staticmethod
+    def _json_safe_cmd(cmd: list[str]) -> list[str]:
+        return [str(v) for v in cmd]
+
+    @staticmethod
+    def _array_stats(arr: np.ndarray) -> dict:
+        flat = np.asarray(arr).reshape(-1)
+        if flat.size <= 0:
+            return {"count": 0}
+        qs = [0.0, 0.01, 0.1, 1.0, 50.0, 99.0, 99.9, 99.99, 100.0]
+        pct = np.percentile(flat.astype(np.float64, copy=False), qs)
+        return {
+            "count": int(flat.size),
+            "min": int(np.min(flat)),
+            "max": int(np.max(flat)),
+            "mean": float(np.mean(flat)),
+            "p0": float(pct[0]),
+            "p001": float(pct[1]),
+            "p01": float(pct[2]),
+            "p1": float(pct[3]),
+            "p50": float(pct[4]),
+            "p99": float(pct[5]),
+            "p999": float(pct[6]),
+            "p9999": float(pct[7]),
+            "p100": float(pct[8]),
+        }
+
+    def _write_png_speckle_stats(self, path: Path) -> dict:
+        """Measure visible saturated RGB speckles in an SDR PNG/JPEG artifact."""
+        info: dict = {"path": str(path), "exists": path.exists()}
+        if not path.exists():
+            return info
+        try:
+            img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+            if img is None or img.ndim != 3 or img.shape[2] < 3:
+                info["error"] = "decode_failed"
+                return info
+            bgr = img[:, :, :3]
+            pix = bgr.astype(np.int16, copy=False)
+            b = pix[:, :, 0]
+            g = pix[:, :, 1]
+            r = pix[:, :, 2]
+            max_ch = pix.max(axis=2)
+            min_ch = pix.min(axis=2)
+            blue_excess_30 = (b - np.maximum(r, g)) >= 30
+            blue_excess_50 = (b - np.maximum(r, g)) >= 50
+            blue_excess_80 = (b - np.maximum(r, g)) >= 80
+            red_excess_50 = (r - np.maximum(b, g)) >= 50
+            magenta_excess_50 = (np.minimum(r, b) - g) >= 50
+            pure_blue = (b >= 240) & (r <= 16) & (g <= 16)
+            pure_red = (r >= 240) & (b <= 16) & (g <= 16)
+            pure_magenta = (r >= 220) & (b >= 220) & (g <= 32)
+            saturated_chroma = ((max_ch - min_ch) >= 80) & (max_ch >= 80)
+            info.update({
+                "shape": [int(v) for v in img.shape],
+                "blue_excess_30": int(np.count_nonzero(blue_excess_30)),
+                "blue_excess_50": int(np.count_nonzero(blue_excess_50)),
+                "blue_excess_80": int(np.count_nonzero(blue_excess_80)),
+                "red_excess_50": int(np.count_nonzero(red_excess_50)),
+                "magenta_excess_50": int(np.count_nonzero(magenta_excess_50)),
+                "pure_blue": int(np.count_nonzero(pure_blue)),
+                "pure_red": int(np.count_nonzero(pure_red)),
+                "pure_magenta": int(np.count_nonzero(pure_magenta)),
+                "saturated_chroma": int(np.count_nonzero(saturated_chroma)),
+            })
+        except Exception as exc:
+            info["error"] = f"{type(exc).__name__}:{exc}"
+        return info
+
+    def _read_yuv420p10le_planes(self, path: Path, w: int, h: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Read one planar yuv420p10le frame written by FFmpeg rawvideo."""
+        cw = (int(w) + 1) // 2
+        ch = (int(h) + 1) // 2
+        y_samples = int(w) * int(h)
+        c_samples = cw * ch
+        expected = y_samples + 2 * c_samples
+        raw = np.fromfile(str(path), dtype="<u2")
+        if raw.size < expected:
+            raise ValueError(f"raw frame too small: got_samples={raw.size} expected={expected}")
+        if raw.size > expected:
+            raw = raw[:expected]
+        y = raw[:y_samples].reshape((int(h), int(w)))
+        u = raw[y_samples:y_samples + c_samples].reshape((ch, cw))
+        v = raw[y_samples + c_samples:y_samples + 2 * c_samples].reshape((ch, cw))
+        return y, u, v
+
+    def _write_yuv420p10le_stats(self, path: Path, w: int, h: int) -> dict:
+        """Write statistics that expose dark-region source chroma outliers."""
+        info: dict = {"path": str(path), "exists": path.exists()}
+        if not path.exists():
+            return info
+        try:
+            y, u, v = self._read_yuv420p10le_planes(path, w, h)
+            y_f = y.astype(np.float32, copy=False)
+            u_f = u.astype(np.float32, copy=False)
+            v_f = v.astype(np.float32, copy=False)
+            chroma_size = (int(u.shape[1]), int(u.shape[0]))
+            y_chroma = cv2.resize(y_f, chroma_size, interpolation=cv2.INTER_AREA)
+            chroma_mag = np.sqrt((u_f - 512.0) ** 2 + (v_f - 512.0) ** 2)
+            u_med = cv2.medianBlur(u.astype(np.uint16, copy=False), 3).astype(np.int32, copy=False)
+            v_med = cv2.medianBlur(v.astype(np.uint16, copy=False), 3).astype(np.int32, copy=False)
+            u_i = u.astype(np.int32, copy=False)
+            v_i = v.astype(np.int32, copy=False)
+            local_delta = np.maximum(np.abs(u_i - u_med), np.abs(v_i - v_med))
+            dark_masks: dict[str, np.ndarray] = {
+                "y_lt_64": y_chroma < 64.0,
+                "y_lt_96": y_chroma < 96.0,
+                "y_lt_128": y_chroma < 128.0,
+                "y_lt_192": y_chroma < 192.0,
+            }
+            dark: dict[str, dict] = {}
+            for name, mask in dark_masks.items():
+                count = int(np.count_nonzero(mask))
+                entry: dict = {"count": count}
+                if count > 0:
+                    entry.update({
+                        "u": self._array_stats(u[mask]),
+                        "v": self._array_stats(v[mask]),
+                        "chroma_mag": self._array_stats(chroma_mag[mask]),
+                        "local_delta": self._array_stats(local_delta[mask]),
+                        "u_below_64": int(np.count_nonzero(u[mask] < 64)),
+                        "u_above_960": int(np.count_nonzero(u[mask] > 960)),
+                        "v_below_64": int(np.count_nonzero(v[mask] < 64)),
+                        "v_above_960": int(np.count_nonzero(v[mask] > 960)),
+                    })
+                    for thr in (8, 16, 32, 64, 96, 128):
+                        entry[f"local_delta_gt_{thr}"] = int(np.count_nonzero(local_delta[mask] > thr))
+                    for thr in (64, 96, 128, 192, 256):
+                        entry[f"chroma_mag_gt_{thr}"] = int(np.count_nonzero(chroma_mag[mask] > thr))
+                dark[name] = entry
+            info.update({
+                "shape": {"y": [int(y.shape[0]), int(y.shape[1])], "u": [int(u.shape[0]), int(u.shape[1])], "v": [int(v.shape[0]), int(v.shape[1])]},
+                "y": self._array_stats(y),
+                "u": self._array_stats(u),
+                "v": self._array_stats(v),
+                "chroma_mag": self._array_stats(chroma_mag),
+                "dark": dark,
+            })
+        except Exception as exc:
+            info["error"] = f"{type(exc).__name__}:{exc}"
+        return info
+
+    def _compare_yuv420p10le(self, a_path: Path, b_path: Path, w: int, h: int) -> dict:
+        info: dict = {"a": str(a_path), "b": str(b_path), "a_exists": a_path.exists(), "b_exists": b_path.exists()}
+        if not a_path.exists() or not b_path.exists():
+            return info
+        try:
+            ay, au, av = self._read_yuv420p10le_planes(a_path, w, h)
+            by, bu, bv = self._read_yuv420p10le_planes(b_path, w, h)
+            planes = {"y": (ay, by), "u": (au, bu), "v": (av, bv)}
+            out: dict = {}
+            for name, (aa, bb) in planes.items():
+                d = aa.astype(np.int32, copy=False) - bb.astype(np.int32, copy=False)
+                ad = np.abs(d)
+                out[name] = {
+                    "equal": bool(np.array_equal(aa, bb)),
+                    "changed": int(np.count_nonzero(d)),
+                    "max_abs": int(np.max(ad)) if ad.size else 0,
+                    "mean_abs": float(np.mean(ad)) if ad.size else 0.0,
+                    "p99_abs": float(np.percentile(ad, 99.0)) if ad.size else 0.0,
+                    "p999_abs": float(np.percentile(ad, 99.9)) if ad.size else 0.0,
+                }
+            info["planes"] = out
+        except Exception as exc:
+            info["error"] = f"{type(exc).__name__}:{exc}"
+        return info
+
+    def _run_hdr_diag_cmd(self, name: str, cmd: list[str], diag_dir: Path, timeout_sec: int) -> dict:
+        rec: dict = {"name": name, "cmd": self._json_safe_cmd(cmd)}
+        try:
+            (diag_dir / f"{name}.cmd.txt").write_text(" ".join(self._json_safe_cmd(cmd)) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+        try:
+            cp = subprocess.run(cmd, check=False, text=True, capture_output=True, timeout=timeout_sec)
+            rec["returncode"] = int(cp.returncode)
+            rec["ok"] = cp.returncode == 0
+            if cp.stdout:
+                (diag_dir / f"{name}.stdout.txt").write_text(cp.stdout, encoding="utf-8", errors="replace")
+            if cp.stderr:
+                (diag_dir / f"{name}.stderr.txt").write_text(cp.stderr, encoding="utf-8", errors="replace")
+        except subprocess.TimeoutExpired as exc:
+            rec.update({"ok": False, "error": f"timeout:{exc}"})
+        except Exception as exc:
+            rec.update({"ok": False, "error": f"{type(exc).__name__}:{exc}"})
+        return rec
+
+    def _maybe_run_hdr_speckle_diagnostics(self, ffmpeg_bin: str, frame_idx: int, frame_pts_sec: Optional[float], crop_xyxy: tuple[int, int, int, int], saved_path: str) -> None:
+        if not self._hdr_speckle_diag_enabled():
+            return
+        try:
+            self._run_hdr_speckle_diagnostics(ffmpeg_bin, frame_idx, frame_pts_sec, crop_xyxy, saved_path)
+        except Exception as exc:
+            self._status(f"HDR speckle diagnostics failed: {type(exc).__name__}: {exc}", key="hdr_speckle_diag", interval=5.0)
+
+    def _run_hdr_speckle_diagnostics(self, ffmpeg_bin: str, frame_idx: int, frame_pts_sec: Optional[float], crop_xyxy: tuple[int, int, int, int], saved_path: str) -> None:
+        """Export controlled sibling artifacts for one HDR crop."""
+        x1, y1, x2, y2 = [int(v) for v in crop_xyxy]
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+        timeout_sec = max(30, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
+        saved = Path(saved_path)
+        root = self._hdr_speckle_diag_root(str(saved))
+        try:
+            pts_tag = "none" if frame_pts_sec is None else f"{float(frame_pts_sec):.3f}".replace(".", "p")
+        except Exception:
+            pts_tag = "badpts"
+        diag_dir = root / f"{saved.stem}_f{int(frame_idx)}_t{pts_tag}_{int(time.time())}"
+        diag_dir.mkdir(parents=True, exist_ok=True)
+        self._status(f"HDR speckle diagnostics writing: {diag_dir}", key="hdr_speckle_diag", interval=0.0)
+
+        seek_sec: Optional[float] = None
+        try:
+            if frame_pts_sec is not None and math.isfinite(float(frame_pts_sec)):
+                seek_sec = max(0.0, float(frame_pts_sec))
+        except Exception:
+            seek_sec = None
+        if seek_sec is None:
+            fps = float(getattr(self, "_fps", 0.0) or 0.0)
+            if fps > 0 and math.isfinite(fps):
+                seek_sec = max(0.0, float(frame_idx) / fps)
+        pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(seek_sec)
+        src_vf = ("setparams=color_trc=smpte2084:color_primaries=bt2020:" f"colorspace=bt2020nc:range=limited,crop={w}:{h}:{x1}:{y1},format=yuv420p10le")
+        base = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"] + pre_seek_args + ["-i", self.cfg.video, "-map", "0:v:0", "-frames:v", "1"]
+
+        source_raw = diag_dir / "01_source_crop.yuv420p10le.raw"
+        source_mkv = diag_dir / "02_source_crop_ffv1.mkv"
+        source_avif = diag_dir / "03_source_crop_libaom_lossless.avif"
+        avif_raw = diag_dir / "04_avif_decoded.yuv420p10le.raw"
+        mkv_raw = diag_dir / "05_ffv1_decoded.yuv420p10le.raw"
+        source_sdr = diag_dir / "06_source_ffmpeg_sdr.png"
+        wic_from_avif = diag_dir / "07_wic_from_libaom_avif.png"
+
+        commands: list[dict] = []
+        commands.append(self._run_hdr_diag_cmd("01_source_raw", base + ["-vf", f"{seek_filter}{src_vf}", "-f", "rawvideo", "-pix_fmt", "yuv420p10le", str(source_raw)], diag_dir, timeout_sec))
+        commands.append(self._run_hdr_diag_cmd("02_source_ffv1", base + ["-vf", f"{seek_filter}{src_vf}", "-an", "-sn", "-dn", "-c:v", "ffv1", "-level", "3", "-g", "1", "-pix_fmt", "yuv420p10le", "-color_range", "1", "-colorspace", "bt2020nc", "-color_primaries", "bt2020", "-color_trc", "smpte2084", str(source_mkv)], diag_dir, timeout_sec))
+        commands.append(self._run_hdr_diag_cmd("03_source_avif_libaom_lossless", base + ["-vf", f"{seek_filter}{src_vf}", "-an", "-sn", "-dn", "-c:v", "libaom-av1", "-still-picture", "1", "-pix_fmt", "yuv420p10le", "-g", "1", "-tile-columns", "0", "-tile-rows", "0", "-row-mt", "1", "-cpu-used", "5", "-lossless", "1", "-crf", "0", "-b:v", "0", "-aq-mode", "0", "-color_range", "1", "-colorspace", "bt2020nc", "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-chroma_sample_location", "left", str(source_avif)], diag_dir, timeout_sec))
+        if source_avif.exists():
+            commands.append(self._run_hdr_diag_cmd("04_decode_avif_raw", [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source_avif), "-map", "0:v:0", "-vf", "format=yuv420p10le", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv420p10le", str(avif_raw)], diag_dir, timeout_sec))
+        if source_mkv.exists():
+            commands.append(self._run_hdr_diag_cmd("05_decode_ffv1_raw", [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source_mkv), "-map", "0:v:0", "-vf", "format=yuv420p10le", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv420p10le", str(mkv_raw)], diag_dir, timeout_sec))
+
+        for i, cmd in enumerate(self._hdr_tonemap_filter_cmds(ffmpeg_bin, frame_idx, frame_pts_sec, crop_xyxy, str(source_sdr))):
+            rec = self._run_hdr_diag_cmd(f"06_source_ffmpeg_sdr_try{i + 1}", cmd, diag_dir, timeout_sec)
+            commands.append(rec)
+            if rec.get("ok") and source_sdr.exists() and source_sdr.stat().st_size > 0:
+                break
+
+        if sys.platform == "win32" and source_avif.exists():
+            ok_wic, why_wic = self._save_wic_png_from_hdr_image(str(source_avif), str(wic_from_avif), repair=False)
+            commands.append({"name": "07_wic_from_libaom_avif", "ok": bool(ok_wic), "why": str(why_wic), "output": str(wic_from_avif)})
+        else:
+            commands.append({"name": "07_wic_from_libaom_avif", "ok": False, "why": "skipped_not_windows_or_avif_missing", "output": str(wic_from_avif)})
+
+        raw_compare = {
+            "source_vs_avif_decode": self._compare_yuv420p10le(source_raw, avif_raw, w, h),
+            "source_vs_ffv1_decode": self._compare_yuv420p10le(source_raw, mkv_raw, w, h),
+        }
+        rgb_stats = {
+            "saved_primary": self._write_png_speckle_stats(saved),
+            "source_ffmpeg_sdr_png": self._write_png_speckle_stats(source_sdr),
+            "wic_from_libaom_avif_png": self._write_png_speckle_stats(wic_from_avif),
+        }
+        raw_stats = {
+            "source_raw": self._write_yuv420p10le_stats(source_raw, w, h),
+            "avif_decoded_raw": self._write_yuv420p10le_stats(avif_raw, w, h),
+            "ffv1_decoded_raw": self._write_yuv420p10le_stats(mkv_raw, w, h),
+        }
+
+        interpretation: list[str] = []
+        try:
+            avif_cmp = raw_compare.get("source_vs_avif_decode", {}).get("planes", {})
+            avif_near_lossless = bool(avif_cmp) and all(int(v.get("max_abs", 999999)) <= 1 for v in avif_cmp.values())
+            if avif_near_lossless:
+                interpretation.append("AVIF decode is within 1 code value of source raw YUV; visible speckles after WIC/browser decode are not from lossy AV1 quantization.")
+            elif avif_cmp:
+                interpretation.append("AVIF decoded raw differs from source raw; inspect source_vs_avif_decode before blaming WIC/display conversion.")
+            wic_blue = int(rgb_stats.get("wic_from_libaom_avif_png", {}).get("blue_excess_50", 0) or 0)
+            ff_blue = int(rgb_stats.get("source_ffmpeg_sdr_png", {}).get("blue_excess_50", 0) or 0)
+            if wic_blue > 0 and ff_blue == 0:
+                interpretation.append("WIC-from-AVIF has blue-excess pixels while direct FFmpeg SDR does not; first visible failure is the AVIF/WIC HDR rendering-conversion boundary.")
+            elif wic_blue > 0 and ff_blue > 0:
+                interpretation.append("Both WIC-from-AVIF and direct FFmpeg SDR show blue-excess pixels; inspect source raw dark chroma stats and source frame before isolating WIC.")
+            elif wic_blue == 0 and ff_blue > 0:
+                interpretation.append("Direct FFmpeg SDR has blue-excess pixels but WIC-from-AVIF does not; first visible failure is in the FFmpeg SDR tonemap path.")
+        except Exception as exc:
+            interpretation.append(f"interpretation_failed:{type(exc).__name__}:{exc}")
+
+        summary = {
+            "version": 1,
+            "purpose": "HDR blue/red/magenta speckle boundary diagnostic; no repair or quality-changing filter is applied by this diagnostic.",
+            "source_video": str(getattr(self.cfg, "video", "")),
+            "saved_path": str(saved),
+            "frame_idx": int(frame_idx),
+            "frame_pts_sec": None if frame_pts_sec is None else float(frame_pts_sec),
+            "seek_sec_used": seek_sec,
+            "crop_xyxy": [int(x1), int(y1), int(x2), int(y2)],
+            "crop_size": [int(w), int(h)],
+            "ffmpeg_bin": str(ffmpeg_bin),
+            "commands": commands,
+            "outputs": {"saved_primary": str(saved), "source_raw": str(source_raw), "source_ffv1": str(source_mkv), "source_avif_libaom_lossless": str(source_avif), "avif_decoded_raw": str(avif_raw), "ffv1_decoded_raw": str(mkv_raw), "source_ffmpeg_sdr_png": str(source_sdr), "wic_from_libaom_avif_png": str(wic_from_avif)},
+            "raw_stats": raw_stats,
+            "raw_compare": raw_compare,
+            "rgb_stats": rgb_stats,
+            "interpretation": interpretation,
+        }
+        (diag_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+        self._status(f"HDR speckle diagnostics done: {diag_dir}", key="hdr_speckle_diag", interval=0.0)
+
+    @staticmethod
     def _repair_wic_hdr_sdr_chroma_speckles(path: str) -> tuple[int, str]:
         """Repair WIC HDR->SDR saturated chroma salt pixels in-place.
 
@@ -7167,7 +7505,7 @@ class Processor(QtCore.QObject):
         return total_changed, ""
 
 
-    def _save_wic_png_from_hdr_image(self, hdr_path: str, out_path: str) -> tuple[bool, str]:
+    def _save_wic_png_from_hdr_image(self, hdr_path: str, out_path: str, *, repair: bool = False) -> tuple[bool, str]:
         """Convert an HDR still to SDR PNG using Windows Imaging Component.
 
         This intentionally follows the user's manual workflow more closely than
@@ -7244,19 +7582,24 @@ try {{
                 except Exception:
                     pass
                 return False, f"windows_wic_invalid:{invalid_why}"
-            cleaned, clean_why = self._repair_wic_hdr_sdr_chroma_speckles(tmp)
-            if clean_why:
-                self._status(
-                    f"HDR WIC chroma speckle repair skipped: {clean_why}",
-                    key="hdr_wic_speckles",
-                    interval=30.0,
-                )
-            elif cleaned > 0:
-                self._status(
-                    f"HDR WIC chroma speckle repair: {cleaned} px",
-                    key="hdr_wic_speckles",
-                    interval=5.0,
-                )
+            # Do not mutate WIC output by default. Previous post-export
+            # "speckle repair" changed pixels without removing the visible
+            # artifact generator, which made the log misleading. Keep it only
+            # as an explicitly forced experiment.
+            if bool(repair) or self._truthy_env("PC_HDR_WIC_SPECKLE_REPAIR"):
+                cleaned, clean_why = self._repair_wic_hdr_sdr_chroma_speckles(tmp)
+                if clean_why:
+                    self._status(
+                        f"HDR WIC chroma speckle repair skipped: {clean_why}",
+                        key="hdr_wic_speckles",
+                        interval=30.0,
+                    )
+                elif cleaned > 0:
+                    self._status(
+                        f"HDR WIC chroma speckle repair: {cleaned} px",
+                        key="hdr_wic_speckles",
+                        interval=5.0,
+                    )
             valid, invalid_why = self._validate_hdr_sdr_export_image(tmp, None)
             if valid:
                 os.replace(tmp, out_path)
@@ -7659,6 +8002,10 @@ try {{
                 return False, f"windows_wic_hdr_source_failed:{why_hdr}"
             try:
                 ok_wic, why_wic = self._save_wic_png_from_hdr_image(tmp_hdr, out_path)
+                if ok_wic:
+                    self._maybe_run_hdr_speckle_diagnostics(
+                        ffmpeg_bin, frame_idx, frame_pts_sec, crop_xyxy, out_path
+                    )
                 return ok_wic, why_wic
             finally:
                 try:
@@ -7684,6 +8031,9 @@ try {{
                     valid, invalid_why = self._validate_hdr_sdr_export_image(tmp, (int(crop_xyxy[2] - crop_xyxy[0]), int(crop_xyxy[3] - crop_xyxy[1])))
                     if valid:
                         os.replace(tmp, out_path)
+                        self._maybe_run_hdr_speckle_diagnostics(
+                            ffmpeg_bin, frame_idx, frame_pts_sec, crop_xyxy, out_path
+                        )
                         return True, ""
                     try:
                         if os.path.exists(tmp):
@@ -7768,23 +8118,12 @@ try {{
 
         is_avif = out_path.lower().endswith(".avif")
         if is_avif:
-            # AVIF HDR stills need a broadly compatible 10-bit 4:2:0 AV1 profile.
-            # Keep 4:2:0 for Windows/Paint/HDR viewer compatibility, but make the
-            # AV1 encode itself lossless.  CRF-0 is still an AV1 quantized encode
-            # and can create isolated red/blue chroma speckles in very dark HDR
-            # regions.  The source is already 4:2:0, and the crop coordinates are
-            # legalized before this call, so lossless 4:2:0 preserves the decoded
-            # source crop without reintroducing the previous incompatible 4:4:4 path.
-            # Keep the AVIF 4:2:0/HDR-compatible, but clamp chroma to the
-            # legal limited-range code interval before encoding. setparams only
-            # labels the frame as limited range; it does not remove illegal U/V
-            # excursions from the decoded source. Windows' HDR AVIF path can map
-            # those dark chroma excursions to saturated blue/red/magenta pixels.
-            vf = (
-                f"{vf},format=yuv420p10le,"
-                "median=planes=6:radius=1:radiusV=1,"
-                "limiter=min=64:max=960:planes=6"
-            )
+            # Keep the AVIF path format-only here. Do not apply chroma repair,
+            # median filtering, limiter experiments, or 4:4:4 conversion in the
+            # writer; those attempts changed the export path without proving the
+            # first failing boundary. PC_HDR_SPECKLE_DIAG writes controlled
+            # sibling artifacts to identify the boundary instead.
+            vf = f"{vf},format=yuv420p10le"
 
         pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(seek_sec)
         cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
@@ -8401,6 +8740,31 @@ class MainWindow(QtWidgets.QMainWindow):
             "Allow inaccurate full-res scale fallback if HDR tone-map filters fail. Off preserves fidelity by failing instead of saving washed-out crops."
         )
         self.hdr_sdr_bad_fallback_check.stateChanged.connect(self._on_ui_change)
+
+        self.hdr_speckle_diag_check = QtWidgets.QCheckBox()
+        self.hdr_speckle_diag_check.setChecked(bool(getattr(self.cfg, "hdr_speckle_diag", False)))
+        self.hdr_speckle_diag_check.setToolTip(
+            "bool: hdr_speckle_diag. When enabled, each saved HDR crop writes controlled sibling "
+            "diagnostic artifacts and summary.json from the exact same source frame/crop. "
+            "Heavy; disable for normal extraction."
+        )
+        self.hdr_speckle_diag_check.stateChanged.connect(self._on_ui_change)
+        self.hdr_speckle_diag_dir_edit = QtWidgets.QLineEdit(str(getattr(self.cfg, "hdr_speckle_diag_dir", "") or ""))
+        self.hdr_speckle_diag_dir_edit.setPlaceholderText("blank = next to saved crop")
+        self.hdr_speckle_diag_dir_edit.setToolTip(
+            "str: hdr_speckle_diag_dir. Optional root folder for HDR speckle diagnostics. "
+            "Blank writes to <crop-folder>/hdr_speckle_diag/."
+        )
+        self.hdr_speckle_diag_dir_edit.editingFinished.connect(self._on_ui_change)
+        self.hdr_speckle_diag_dir_btn = QtWidgets.QPushButton("Browse…")
+        self.hdr_speckle_diag_dir_btn.setAutoDefault(False)
+        self.hdr_speckle_diag_dir_btn.clicked.connect(self._browse_hdr_speckle_diag_dir)
+        self.hdr_speckle_diag_dir_widget = QtWidgets.QWidget()
+        _diag_dir_layout = QtWidgets.QHBoxLayout(self.hdr_speckle_diag_dir_widget)
+        _diag_dir_layout.setContentsMargins(0, 0, 0, 0)
+        _diag_dir_layout.addWidget(self.hdr_speckle_diag_dir_edit, 1)
+        _diag_dir_layout.addWidget(self.hdr_speckle_diag_dir_btn)
+
         self.hwaccel_combo = QtWidgets.QComboBox()
         self.hwaccel_combo.addItem("CPU decode (no hwaccel)", "off")
         self.hwaccel_combo.addItem("CUDA / NVDEC (GPU decode)", "cuda")
@@ -8894,6 +9258,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ("HDR contrast recovery", self.hdr_sdr_contrast_spin),
             ("HDR peak detect", self.hdr_sdr_peak_check),
             ("Allow inaccurate HDR fallback", self.hdr_sdr_bad_fallback_check),
+            ("HDR speckle diagnostics", self.hdr_speckle_diag_check),
+            ("HDR speckle diag dir", self.hdr_speckle_diag_dir_widget),
             ("FFmpeg hardware decode", self.hwaccel_combo),
             ("HDR archive format", self.hdr_crop_format_combo),
             ("Frame stride", self.stride_spin),
@@ -9366,6 +9732,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Note: if processing is currently running, the new FFmpeg will be used next time you open a video."
             )
         QtWidgets.QMessageBox.information(self, "FFmpeg configured", "\n".join(message))
+
+    @QtCore.Slot()
+    def _browse_hdr_speckle_diag_dir(self):
+        start = ""
+        try:
+            start = self.hdr_speckle_diag_dir_edit.text().strip()
+        except Exception:
+            start = ""
+        if not start:
+            try:
+                start = self.out_edit.text().strip() or os.getcwd()
+            except Exception:
+                start = os.getcwd()
+        directory = QtWidgets.QFileDialog.getExistingDirectory(self, "Select HDR speckle diagnostic folder", start)
+        if directory:
+            self.hdr_speckle_diag_dir_edit.setText(directory)
+            self._on_ui_change()
 
     @property
     def processor(self) -> Processor:
@@ -10170,6 +10553,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "hdr_sdr_contrast_recovery",
             "hdr_sdr_peak_detect",
             "hdr_sdr_allow_inaccurate_fallback",
+            "hdr_speckle_diag",
+            "hdr_speckle_diag_dir",
         }
         live |= {
             "lambda_facefrac",
@@ -10402,6 +10787,8 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg.hdr_sdr_contrast_recovery = float(self.hdr_sdr_contrast_spin.value()) if hasattr(self, "hdr_sdr_contrast_spin") else 0.30
         cfg.hdr_sdr_peak_detect = bool(self.hdr_sdr_peak_check.isChecked()) if hasattr(self, "hdr_sdr_peak_check") else True
         cfg.hdr_sdr_allow_inaccurate_fallback = bool(self.hdr_sdr_bad_fallback_check.isChecked()) if hasattr(self, "hdr_sdr_bad_fallback_check") else False
+        cfg.hdr_speckle_diag = bool(self.hdr_speckle_diag_check.isChecked()) if hasattr(self, "hdr_speckle_diag_check") else bool(getattr(self.cfg, "hdr_speckle_diag", False))
+        cfg.hdr_speckle_diag_dir = self.hdr_speckle_diag_dir_edit.text().strip() if hasattr(self, "hdr_speckle_diag_dir_edit") else str(getattr(self.cfg, "hdr_speckle_diag_dir", "") or "")
         return cfg
 
     def _apply_cfg(self, cfg: SessionConfig):
@@ -10513,6 +10900,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.hdr_sdr_peak_check.setChecked(bool(getattr(cfg, "hdr_sdr_peak_detect", True)))
         if hasattr(self, "hdr_sdr_bad_fallback_check"):
             self.hdr_sdr_bad_fallback_check.setChecked(bool(getattr(cfg, "hdr_sdr_allow_inaccurate_fallback", False)))
+        self.cfg.hdr_speckle_diag = bool(getattr(cfg, "hdr_speckle_diag", False))
+        self.cfg.hdr_speckle_diag_dir = str(getattr(cfg, "hdr_speckle_diag_dir", "") or "")
+        if hasattr(self, "hdr_speckle_diag_check"):
+            self.hdr_speckle_diag_check.setChecked(self.cfg.hdr_speckle_diag)
+        if hasattr(self, "hdr_speckle_diag_dir_edit"):
+            self.hdr_speckle_diag_dir_edit.setText(self.cfg.hdr_speckle_diag_dir)
         self.ratio_edit.setText(cfg.ratio)
         try:
             self.sdr_nits_spin.setValue(float(getattr(cfg, "sdr_nits", SessionConfig.sdr_nits)))
@@ -11531,6 +11924,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 s.value("hdr_sdr_allow_inaccurate_fallback", getattr(self.cfg, "hdr_sdr_allow_inaccurate_fallback", False), type=bool)
             )
             self.cfg.hdr_sdr_allow_inaccurate_fallback = bool(self.hdr_sdr_bad_fallback_check.isChecked())
+        if hasattr(self, "hdr_speckle_diag_check"):
+            self.hdr_speckle_diag_check.setChecked(
+                s.value("hdr_speckle_diag", getattr(self.cfg, "hdr_speckle_diag", False), type=bool)
+            )
+            self.cfg.hdr_speckle_diag = bool(self.hdr_speckle_diag_check.isChecked())
+        if hasattr(self, "hdr_speckle_diag_dir_edit"):
+            self.hdr_speckle_diag_dir_edit.setText(
+                str(s.value("hdr_speckle_diag_dir", getattr(self.cfg, "hdr_speckle_diag_dir", "")) or "")
+            )
+            self.cfg.hdr_speckle_diag_dir = self.hdr_speckle_diag_dir_edit.text().strip()
         try:
             self.cfg.hdr_export_timeout_sec = max(
                 5,
