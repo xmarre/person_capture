@@ -7129,7 +7129,24 @@ class Processor(QtCore.QObject):
             if n_labels <= 1:
                 break
             areas = stats[:, cv2.CC_STAT_AREA]
-            repair_mask = spike & (areas[labels] <= 80)
+            widths = stats[:, cv2.CC_STAT_WIDTH]
+            heights = stats[:, cv2.CC_STAT_HEIGHT]
+            bbox_area = np.maximum(1, widths * heights)
+            fill_ratio = areas.astype(np.float32) / bbox_area.astype(np.float32)
+
+            tiny_salt = (areas >= 2) & (areas <= 4)
+            isolated_medium = (
+                (areas > 4)
+                & (areas <= 80)
+                & (widths <= 8)
+                & (heights <= 8)
+                & (bbox_area <= 40)
+                & (fill_ratio <= 0.60)
+            )
+            repair_components = tiny_salt | isolated_medium
+            repair_components[0] = False
+
+            repair_mask = spike & repair_components[labels]
             changed = int(np.count_nonzero(repair_mask))
             if changed <= 0:
                 break
