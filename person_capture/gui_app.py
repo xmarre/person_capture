@@ -7093,6 +7093,11 @@ try {{
             if cp.returncode != 0:
                 tail = (cp.stderr or cp.stdout or "").splitlines()[-4:]
                 why = " | ".join(tail) if tail else f"powershell_rc={cp.returncode}"
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
                 return False, f"windows_wic_failed:{why}"
             valid, invalid_why = self._validate_hdr_sdr_export_image(tmp, None)
             if not valid:
