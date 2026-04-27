@@ -4663,6 +4663,7 @@ class Processor(QtCore.QObject):
                             "hdr_crop_format",
                             "hdr_sdr_output_format",
                             "hdr_sdr_conversion",
+                            "hdr_avif_chroma_denoise",
                             "hdr_archive_timeout_sec",
                             "hdr_sdr_quality",
                             "hdr_sdr_tonemap",
@@ -7509,6 +7510,7 @@ try {{
                 tmp_hdr,
                 quiet=True,
                 avif_chroma_denoise=False,
+                avif_force_lossless=True,
             )
             if not ok_hdr:
                 return False, f"windows_wic_hdr_source_failed:{why_hdr}"
@@ -7584,6 +7586,7 @@ try {{
         *,
         quiet: bool = False,
         avif_chroma_denoise: Optional[bool] = None,
+        avif_force_lossless: bool = False,
     ) -> tuple[bool, str]:
         """Use ffmpeg directly to export an HDR crop from the original source."""
 
@@ -7673,26 +7676,6 @@ try {{
                 "0",
                 "-row-mt",
                 "1",
-                "-cpu-used",
-                "8",
-                "-lag-in-frames",
-                "0",
-                "-arnr-max-frames",
-                "0",
-                "-enable-cdef",
-                "0",
-                "-enable-restoration",
-                "0",
-                # Do not use libaom's -lossless path here. On some builds it can
-                # block for a long time or interact badly with AVIF still output.
-                # The frame is chroma-sanitized before encode; CRF 0 with AQ/in-loop
-                # restoration disabled is the safer high-quality HDR AVIF path.
-                "-crf",
-                "0",
-                "-b:v",
-                "0",
-                "-aq-mode",
-                "0",
                 # Preserve HDR10 signaling and 4:2:0 chroma siting in the AVIF
                 # container.  Without an explicit chroma sample location, ffprobe
                 # reports "unspecified" and some Windows viewers can show colored
@@ -7714,6 +7697,37 @@ try {{
                 "-loop",
                 "1",
             ]
+            if avif_force_lossless:
+                # WIC temporary HDR intermediates should remain bit-exact.
+                cmd += [
+                    "-cpu-used",
+                    "5",
+                    "-lossless",
+                    "1",
+                    "-aq-mode",
+                    "0",
+                ]
+            else:
+                # Archive AVIF path uses chroma-only sanitization plus high
+                # quality CRF-0 encode with AQ/in-loop restoration disabled.
+                cmd += [
+                    "-cpu-used",
+                    "8",
+                    "-lag-in-frames",
+                    "0",
+                    "-arnr-max-frames",
+                    "0",
+                    "-enable-cdef",
+                    "0",
+                    "-enable-restoration",
+                    "0",
+                    "-crf",
+                    "0",
+                    "-b:v",
+                    "0",
+                    "-aq-mode",
+                    "0",
+                ]
         else:
             # Lossless 10-bit HDR in Matroska via FFV1.
             # Decoded pixels in the crop match the original decode bit-for-bit.
