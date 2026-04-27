@@ -6894,7 +6894,7 @@ class Processor(QtCore.QObject):
         return None
 
     def _hdr_source_range(self) -> str:
-        """Return normalized HDR source range for archive export decisions."""
+        """Return normalized HDR source range: 'limited', 'full', or '' when unknown."""
         cached = str(getattr(self, "_hdr_source_range_cached", "") or "").lower()
         if cached in {"limited", "full"}:
             return cached
@@ -6925,9 +6925,8 @@ class Processor(QtCore.QObject):
                     rng = _normalize(probe_range(str(getattr(self.cfg, "video", "") or "")))
             except Exception:
                 rng = ""
-        if not rng:
-            rng = "limited"
-        self._hdr_source_range_cached = rng
+        if rng in {"limited", "full"}:
+            self._hdr_source_range_cached = rng
         return rng
 
     def _capture_source_size(self, cap, frame_shape: tuple[int, int]) -> tuple[int, int]:
@@ -8000,10 +7999,13 @@ try {{
         # Preserve HDR source metadata explicitly before cropping.  The archive
         # path must stay HDR; it is not the SDR dataset still path.
         src_range = self._hdr_source_range()
+        src_range_known = src_range in {"limited", "full"}
+        src_range_setparams = src_range if src_range_known else "limited"
         vf = (
             "setparams=color_trc=smpte2084:color_primaries=bt2020:"
-            f"colorspace=bt2020nc:range={src_range},crop={w}:{h}:{int(x1)}:{int(y1)}"
+            f"colorspace=bt2020nc:range={src_range_setparams},crop={w}:{h}:{int(x1)}:{int(y1)}"
         )
+        # Keep FFV1 tagging conservative when source range is unknown.
         ffv1_color_range = "2" if src_range == "full" else "1"
         seek_sec: Optional[float] = None
         try:
@@ -8026,6 +8028,7 @@ try {{
             # limited-range changes at most one code value from rounding in the
             # diagnostic sample, so this is not a tone-map, denoise, gamut, or
             # chroma-quality change.
+            # Only expand when we explicitly probed limited-range source.
             if src_range == "limited":
                 vf = f"{vf},zscale=rangein=limited:range=full"
             vf = (
