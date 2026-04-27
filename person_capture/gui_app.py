@@ -7654,14 +7654,7 @@ try {{
                     os.remove(tmp_hdr)
             except Exception:
                 pass
-            ok_hdr, why_hdr = self._save_hdr_crop_p010(
-                frame_idx,
-                frame_pts_sec,
-                crop_xyxy,
-                tmp_hdr,
-                quiet=True,
-                apply_avif_chroma_prefilter=True,
-            )
+            ok_hdr, why_hdr = self._save_hdr_crop_p010(frame_idx, frame_pts_sec, crop_xyxy, tmp_hdr, quiet=True)
             if not ok_hdr:
                 return False, f"windows_wic_hdr_source_failed:{why_hdr}"
             try:
@@ -7735,7 +7728,6 @@ try {{
         out_path: str,
         *,
         quiet: bool = False,
-        apply_avif_chroma_prefilter: bool = False,
     ) -> tuple[bool, str]:
         """Use ffmpeg directly to export an HDR crop from the original source."""
 
@@ -7788,10 +7780,11 @@ try {{
             # labels the frame as limited range; it does not remove illegal U/V
             # excursions from the decoded source. Windows' HDR AVIF path can map
             # those dark chroma excursions to saturated blue/red/magenta pixels.
-            vf = f"{vf},format=yuv420p10le"
-            if apply_avif_chroma_prefilter:
-                vf = f"{vf},median=planes=6:radius=1:radiusV=1"
-            vf = f"{vf},limiter=min=64:max=960:planes=6"
+            vf = (
+                f"{vf},format=yuv420p10le,"
+                "median=planes=6:radius=1:radiusV=1,"
+                "limiter=min=64:max=960:planes=6"
+            )
 
         pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(seek_sec)
         cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
