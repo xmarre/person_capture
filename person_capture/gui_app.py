@@ -331,6 +331,12 @@ class SessionConfig:
     # Windows Imaging Component, then write a PNG. "ffmpeg" keeps the internal
     # libplacebo/zscale SDR renderer used by the preview.
     hdr_sdr_conversion: str = "windows_wic"  # windows_wic | ffmpeg
+    # AVIF archive crops stay HDR 4:2:0 for viewer compatibility. Some Windows/HDR
+    # AVIF display paths show isolated red/blue chroma speckles in very dark areas;
+    # this applies a tiny chroma-only median before high-quality AV1 archive encoding.
+    # The Paint/WIC primary PNG path disables this for its temporary HDR source so
+    # the currently-good SDR PNG output remains unchanged.
+    hdr_avif_chroma_denoise: bool = True
     # Full-resolution HDR->SDR still-render quality controls. These affect only
     # primary crops/f*.png/f*.jpg source export, not pre-scan/detection preview.
     hdr_sdr_quality: str = "madvr_like"  # madvr_like | resolve_like | balanced | fast
@@ -7496,7 +7502,14 @@ try {{
                     os.remove(tmp_hdr)
             except Exception:
                 pass
-            ok_hdr, why_hdr = self._save_hdr_crop_p010(frame_idx, frame_pts_sec, crop_xyxy, tmp_hdr, quiet=True)
+            ok_hdr, why_hdr = self._save_hdr_crop_p010(
+                frame_idx,
+                frame_pts_sec,
+                crop_xyxy,
+                tmp_hdr,
+                quiet=True,
+                avif_chroma_denoise=False,
+            )
             if not ok_hdr:
                 return False, f"windows_wic_hdr_source_failed:{why_hdr}"
             try:
@@ -7570,6 +7583,7 @@ try {{
         out_path: str,
         *,
         quiet: bool = False,
+        avif_chroma_denoise: Optional[bool] = None,
     ) -> tuple[bool, str]:
         """Use ffmpeg directly to export an HDR crop from the original source."""
 
@@ -7592,11 +7606,14 @@ try {{
             pass
 
         # Preserve HDR source metadata explicitly before cropping.  The archive
-        # path must stay HDR; it is not the SDR dataset still path.
-        vf = (
+        # path must stay HDR; it is not the SDR dataset still path.  Force the
+        # chroma sample location into the frame metadata before/after crop so the
+        # AVIF muxer/decoder path does not inherit an unspecified siting state.
+        hdr_setparams = (
             "setparams=color_trc=smpte2084:color_primaries=bt2020:"
-            f"colorspace=bt2020nc:range=limited,crop={w}:{h}:{int(x1)}:{int(y1)}"
+            "colorspace=bt2020nc:range=limited:chroma_location=left"
         )
+        vf = f"{hdr_setparams},crop={w}:{h}:{int(x1)}:{int(y1)}"
         seek_sec: Optional[float] = None
         try:
             if frame_pts_sec is not None and math.isfinite(float(frame_pts_sec)):
@@ -7609,15 +7626,20 @@ try {{
                 seek_sec = max(0.0, float(frame_idx) / fps)
 
         is_avif = out_path.lower().endswith(".avif")
+        if avif_chroma_denoise is None:
+            avif_chroma_denoise = bool(getattr(self.cfg, "hdr_avif_chroma_denoise", True))
         if is_avif:
             # AVIF HDR stills need a broadly compatible 10-bit 4:2:0 AV1 profile.
-            # Keep 4:2:0 for Windows/Paint/HDR viewer compatibility, but make the
-            # AV1 encode itself lossless.  CRF-0 is still an AV1 quantized encode
-            # and can create isolated red/blue chroma speckles in very dark HDR
-            # regions.  The source is already 4:2:0, and the crop coordinates are
-            # legalized before this call, so lossless 4:2:0 preserves the decoded
-            # source crop without reintroducing the previous incompatible 4:4:4 path.
+            # The remaining red/blue speckles are not fixed by CRF/lossless changes,
+            # so they are not just AV1 quantization artifacts. They are isolated
+            # chroma outliers in very dark HDR presentation paths. Keep the compatible
+            # 4:2:0 HDR AVIF path, but optionally apply a tiny chroma-only median
+            # before AV1 encoding. Luma is untouched; the primary WIC PNG
+            # path disables this for its temporary HDR source to preserve that output.
             vf = f"{vf},format=yuv420p10le"
+            if avif_chroma_denoise:
+                vf = f"{vf},median=radius=1:radiusV=1:planes=6"
+            vf = f"{vf},{hdr_setparams}"
 
         pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(seek_sec)
         cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
@@ -7633,8 +7655,9 @@ try {{
             "1",
         ]
         if is_avif:
-            # High-quality / effectively lossless AVIF still, 10-bit HDR (BT.2020 + PQ).
+            # High-quality AVIF still, 10-bit HDR (BT.2020 + PQ).
             cmd += [
+                "-shortest",
                 "-an",
                 "-c:v",
                 "libaom-av1",
@@ -7651,14 +7674,19 @@ try {{
                 "-row-mt",
                 "1",
                 "-cpu-used",
-                "5",
-                # CRF 0 by itself is not a strict no-artifact guarantee for AV1.
-                # Keep the compatible 4:2:0 pixel format but force libaom's true
-                # lossless path so dark HDR chroma is not quantized into red/blue
-                # speckles.  AQ stays disabled because it can redistribute error
-                # into flat/dark regions.
-                "-lossless",
-                "1",
+                "8",
+                "-lag-in-frames",
+                "0",
+                "-arnr-max-frames",
+                "0",
+                "-enable-cdef",
+                "0",
+                "-enable-restoration",
+                "0",
+                # Do not use libaom's -lossless path here. On some builds it can
+                # block for a long time or interact badly with AVIF still output.
+                # The frame is chroma-sanitized before encode; CRF 0 with AQ/in-loop
+                # restoration disabled is the safer high-quality HDR AVIF path.
                 "-crf",
                 "0",
                 "-b:v",
@@ -7679,6 +7707,12 @@ try {{
                 "smpte2084",
                 "-chroma_sample_location",
                 "left",
+                "-f",
+                "avif",
+                # AVIF muxer option. Make the file an explicit single-play still
+                # instead of inheriting the muxer's animated-AVIF infinite-loop default.
+                "-loop",
+                "1",
             ]
         else:
             # Lossless 10-bit HDR in Matroska via FFV1.
@@ -9996,6 +10030,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "hdr_crop_format",
             "hdr_sdr_output_format",
             "hdr_sdr_conversion",
+            "hdr_avif_chroma_denoise",
             "hdr_archive_timeout_sec",
             "hdr_sdr_quality",
             "hdr_sdr_tonemap",
@@ -10215,6 +10250,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             cfg.hdr_crop_format = "avif"
         cfg.hdr_sdr_output_format = str(getattr(self.cfg, "hdr_sdr_output_format", "png") or "png").lower()
+        cfg.hdr_avif_chroma_denoise = bool(getattr(self.cfg, "hdr_avif_chroma_denoise", True))
         cfg.hdr_archive_timeout_sec = int(getattr(self.cfg, "hdr_archive_timeout_sec", 90) or 90)
         try:
             cfg.hdr_sdr_conversion = self.hdr_sdr_conversion_combo.currentData() or "windows_wic"
@@ -10285,6 +10321,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if sys.platform != "win32" and hdr_sdr_conversion == "windows_wic":
             hdr_sdr_conversion = "ffmpeg"
         self.cfg.hdr_sdr_conversion = hdr_sdr_conversion
+        self.cfg.hdr_avif_chroma_denoise = bool(getattr(cfg, "hdr_avif_chroma_denoise", True))
         self.cfg.compose_crop_enable = bool(getattr(cfg, "compose_crop_enable", True))
         self.cfg.compose_detect_person_for_face = bool(getattr(cfg, "compose_detect_person_for_face", True))
         try:
@@ -11312,6 +11349,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.hdr_sdr_conversion = str(
                 self.hdr_sdr_conversion_combo.currentData() or ("windows_wic" if sys.platform == "win32" else "ffmpeg")
             )
+        self.cfg.hdr_avif_chroma_denoise = s.value(
+            "hdr_avif_chroma_denoise",
+            getattr(self.cfg, "hdr_avif_chroma_denoise", True),
+            type=bool,
+        )
         if hasattr(self, "hdr_sdr_quality_combo"):
             val = str(s.value("hdr_sdr_quality", getattr(self.cfg, "hdr_sdr_quality", "madvr_like")) or "madvr_like")
             idx = self.hdr_sdr_quality_combo.findData(val)

@@ -182,5 +182,6 @@
   "prescan_hdr_preview": false,
   "hdr_sdr_output_format": "png",
   "hdr_archive_timeout_sec": 90,
-  "hdr_sdr_conversion": "windows_wic"
+  "hdr_sdr_conversion": "windows_wic",
+  "hdr_avif_chroma_denoise": true
 }
