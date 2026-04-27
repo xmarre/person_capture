@@ -326,6 +326,11 @@ class SessionConfig:
     hdr_archive_crops: bool = False      # additionally write source HDR crops to hdr_crops/
     hdr_crop_format: str = "avif"       # avif (HDR still) | mkv (FFV1 lossless)
     hdr_sdr_output_format: str = "png"  # png | jpg; PNG avoids dark-gradient JPEG artifacts
+    # Primary HDR->SDR crop conversion backend. "windows_wic" mirrors the
+    # Windows/Paint-style path: export the exact HDR crop, decode it through
+    # Windows Imaging Component, then write a PNG. "ffmpeg" keeps the internal
+    # libplacebo/zscale SDR renderer used by the preview.
+    hdr_sdr_conversion: str = "windows_wic"  # windows_wic | ffmpeg
     # Full-resolution HDR->SDR still-render quality controls. These affect only
     # primary crops/f*.png/f*.jpg source export, not pre-scan/detection preview.
     hdr_sdr_quality: str = "madvr_like"  # madvr_like | resolve_like | balanced | fast
@@ -4651,6 +4656,7 @@ class Processor(QtCore.QObject):
                             "hdr_archive_crops",
                             "hdr_crop_format",
                             "hdr_sdr_output_format",
+                            "hdr_sdr_conversion",
                             "hdr_archive_timeout_sec",
                             "hdr_sdr_quality",
                             "hdr_sdr_tonemap",
@@ -7011,6 +7017,113 @@ class Processor(QtCore.QObject):
         opts.append(f"{name}={value}")
         return True
 
+    @staticmethod
+    def _resolve_powershell_bin() -> Optional[str]:
+        """Return a Windows PowerShell executable usable for WIC image conversion."""
+        for exe in ("powershell.exe", "pwsh.exe", "powershell", "pwsh"):
+            path = shutil.which(exe)
+            if path:
+                return path
+        return None
+
+    @staticmethod
+    def _quote_ps_single(value: str) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def _save_wic_png_from_hdr_image(self, hdr_path: str, out_path: str) -> tuple[bool, str]:
+        """Convert an HDR still to SDR PNG using Windows Imaging Component.
+
+        This intentionally follows the user's manual workflow more closely than
+        the internal FFmpeg preview renderer: create the HDR crop first, then let
+        Windows' image stack decode/color-convert it and encode PNG. If WIC or
+        the AVIF/HEIF codec is unavailable, fail explicitly; do not silently
+        fall back to the washed-out preview path when this backend is selected.
+        """
+        ps = self._resolve_powershell_bin()
+        if not ps:
+            return False, "windows_wic_unavailable:powershell_not_found"
+        if not hdr_path or not os.path.exists(hdr_path):
+            return False, "windows_wic_unavailable:hdr_source_missing"
+        tmp = out_path + ".tmp.png"
+        try:
+            ensure_dir(os.path.dirname(out_path))
+        except Exception:
+            pass
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        script = f"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName PresentationCore,WindowsBase
+$src = {self._quote_ps_single(hdr_path)}
+$dst = {self._quote_ps_single(tmp)}
+$stream = [System.IO.File]::Open($src, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+try {{
+    $decoder = [System.Windows.Media.Imaging.BitmapDecoder]::Create($stream, [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat, [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
+}} finally {{
+    $stream.Close()
+}}
+if ($decoder.Frames.Count -lt 1) {{ throw 'WIC decoder returned no frames' }}
+$frame = $decoder.Frames[0]
+$converted = New-Object System.Windows.Media.Imaging.FormatConvertedBitmap
+$converted.BeginInit()
+$converted.Source = $frame
+$converted.DestinationFormat = [System.Windows.Media.PixelFormats]::Bgr32
+$converted.EndInit()
+$encoder = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
+$encoder.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($converted))
+$out = [System.IO.File]::Open($dst, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+try {{
+    $encoder.Save($out)
+}} finally {{
+    $out.Close()
+}}
+"""
+        timeout_sec = max(5, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
+        try:
+            cp = subprocess.run(
+                [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=timeout_sec,
+            )
+            if cp.returncode != 0:
+                tail = (cp.stderr or cp.stdout or "").splitlines()[-4:]
+                why = " | ".join(tail) if tail else f"powershell_rc={cp.returncode}"
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+                return False, f"windows_wic_failed:{why}"
+            valid, invalid_why = self._validate_hdr_sdr_export_image(tmp, None)
+            if not valid:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+                return False, f"windows_wic_invalid:{invalid_why}"
+            os.replace(tmp, out_path)
+            return True, ""
+        except subprocess.TimeoutExpired as exc:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            return False, f"windows_wic_timeout_{timeout_sec}s:{exc}"
+        except Exception as exc:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            return False, f"windows_wic_failed:{type(exc).__name__}:{exc}"
+
     def _ffmpeg_still_seek_args_and_filter(self, seek_sec: Optional[float]) -> tuple[list[str], str]:
         """Return FFmpeg input seek args and a filter-prefix for exact still export.
 
@@ -7371,6 +7484,31 @@ class Processor(QtCore.QObject):
             ensure_dir(os.path.dirname(out_path))
         except Exception:
             pass
+        conversion = str(getattr(self.cfg, "hdr_sdr_conversion", "windows_wic") or "windows_wic").strip().lower()
+        use_windows_wic = sys.platform == "win32" and conversion in {"windows_wic", "wic", "paint", "paint_wic"}
+        if use_windows_wic and tmp_ext == ".png":
+            # Paint-like path: exact HDR crop -> WIC color-managed PNG. This is
+            # deliberately not a fallback to the preview renderer; if WIC cannot
+            # decode/convert the HDR still, report that as the save failure.
+            tmp_hdr = out_path + ".tmp_hdr.avif"
+            try:
+                if os.path.exists(tmp_hdr):
+                    os.remove(tmp_hdr)
+            except Exception:
+                pass
+            ok_hdr, why_hdr = self._save_hdr_crop_p010(frame_idx, frame_pts_sec, crop_xyxy, tmp_hdr, quiet=True)
+            if not ok_hdr:
+                return False, f"windows_wic_hdr_source_failed:{why_hdr}"
+            try:
+                ok_wic, why_wic = self._save_wic_png_from_hdr_image(tmp_hdr, out_path)
+                return ok_wic, why_wic
+            finally:
+                try:
+                    if os.path.exists(tmp_hdr):
+                        os.remove(tmp_hdr)
+                except Exception:
+                    pass
+
         timeout_sec = max(5, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
         deadline = time.monotonic() + float(timeout_sec)
         for cmd in self._hdr_tonemap_filter_cmds(ffmpeg_bin, frame_idx, frame_pts_sec, crop_xyxy, tmp):
@@ -7425,18 +7563,25 @@ class Processor(QtCore.QObject):
         return False, "all_hdr_export_filters_failed"
 
     def _save_hdr_crop_p010(
-        self, frame_idx: int, frame_pts_sec: Optional[float], crop_xyxy: tuple[int, int, int, int], out_path: str
-    ) -> None:
+        self,
+        frame_idx: int,
+        frame_pts_sec: Optional[float],
+        crop_xyxy: tuple[int, int, int, int],
+        out_path: str,
+        *,
+        quiet: bool = False,
+    ) -> tuple[bool, str]:
         """Use ffmpeg directly to export an HDR crop from the original source."""
 
         ffmpeg_bin = self._resolve_ffmpeg_bin()
         if not ffmpeg_bin:
-            self._status(
-                "HDR crop export skipped: ffmpeg unavailable",
-                key="hdr_crop_export",
-                interval=30.0,
-            )
-            return
+            if not quiet:
+                self._status(
+                    "HDR crop export skipped: ffmpeg unavailable",
+                    key="hdr_crop_export",
+                    interval=30.0,
+                )
+            return False, "ffmpeg_unavailable"
 
         x1, y1, x2, y2 = crop_xyxy
         w = max(1, int(x2 - x1))
@@ -7466,10 +7611,12 @@ class Processor(QtCore.QObject):
         is_avif = out_path.lower().endswith(".avif")
         if is_avif:
             # AVIF HDR stills need a broadly compatible 10-bit 4:2:0 AV1 profile.
-            # The previous yuv444/lossless AVIF path looked correct in fewer
-            # Windows viewers and could lose the expected HDR presentation.
-            # Chroma artifacts are handled by even crop coordinates above plus
-            # CRF-0/no-AQ encoding, not by switching to incompatible 4:4:4.
+            # Keep 4:2:0 for Windows/Paint/HDR viewer compatibility, but make the
+            # AV1 encode itself lossless.  CRF-0 is still an AV1 quantized encode
+            # and can create isolated red/blue chroma speckles in very dark HDR
+            # regions.  The source is already 4:2:0, and the crop coordinates are
+            # legalized before this call, so lossless 4:2:0 preserves the decoded
+            # source crop without reintroducing the previous incompatible 4:4:4 path.
             vf = f"{vf},format=yuv420p10le"
 
         pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(seek_sec)
@@ -7505,16 +7652,23 @@ class Processor(QtCore.QObject):
                 "1",
                 "-cpu-used",
                 "5",
-                # CRF 0 with AQ disabled keeps the previous broadly-compatible
-                # HDR AVIF behavior while avoiding very dark chroma blotches and
-                # the multi-minute stalls of libaom lossless 4:4:4.
+                # CRF 0 by itself is not a strict no-artifact guarantee for AV1.
+                # Keep the compatible 4:2:0 pixel format but force libaom's true
+                # lossless path so dark HDR chroma is not quantized into red/blue
+                # speckles.  AQ stays disabled because it can redistribute error
+                # into flat/dark regions.
+                "-lossless",
+                "1",
                 "-crf",
                 "0",
                 "-b:v",
                 "0",
                 "-aq-mode",
                 "0",
-                # Preserve HDR10 signaling in the AVIF container.
+                # Preserve HDR10 signaling and 4:2:0 chroma siting in the AVIF
+                # container.  Without an explicit chroma sample location, ffprobe
+                # reports "unspecified" and some Windows viewers can show colored
+                # dark-edge/chroma artifacts.
                 "-color_range",
                 "1",
                 "-colorspace",
@@ -7523,6 +7677,8 @@ class Processor(QtCore.QObject):
                 "bt2020",
                 "-color_trc",
                 "smpte2084",
+                "-chroma_sample_location",
+                "left",
             ]
         else:
             # Lossless 10-bit HDR in Matroska via FFV1.
@@ -7559,7 +7715,7 @@ class Processor(QtCore.QObject):
             )
             if cp.returncode == 0 and os.path.exists(tmp_out) and os.path.getsize(tmp_out) > 0:
                 os.replace(tmp_out, out_path)
-                return
+                return True, ""
             try:
                 if os.path.exists(tmp_out):
                     os.remove(tmp_out)
@@ -7568,40 +7724,51 @@ class Processor(QtCore.QObject):
             if cp.returncode != 0:
                 tail = (cp.stderr or cp.stdout or "").splitlines()[-4:]
                 why = " | ".join(tail) if tail else f"ffmpeg_rc={cp.returncode}"
-                self._status(
-                    f"HDR crop export failed: {why}",
-                    key="hdr_crop_export",
-                    interval=10.0,
-                )
+                if not quiet:
+                    self._status(
+                        f"HDR crop export failed: {why}",
+                        key="hdr_crop_export",
+                        interval=10.0,
+                    )
+                return False, why
             else:
+                why = f"invalid output file ({out_path})"
+                if not quiet:
+                    self._status(
+                        f"HDR crop export failed: {why}",
+                        key="hdr_crop_export",
+                        interval=10.0,
+                    )
+                return False, why
+        except subprocess.TimeoutExpired as exc:
+            why = f"timeout after {timeout_sec}s: {exc}"
+            if not quiet:
                 self._status(
-                    f"HDR crop export failed: invalid output file ({out_path})",
+                    f"HDR crop export timeout after {timeout_sec}s: {exc}",
                     key="hdr_crop_export",
                     interval=10.0,
                 )
-        except subprocess.TimeoutExpired as exc:
-            self._status(
-                f"HDR crop export timeout after {timeout_sec}s: {exc}",
-                key="hdr_crop_export",
-                interval=10.0,
-            )
             try:
                 if os.path.exists(tmp_out):
                     os.remove(tmp_out)
             except Exception:
                 pass
+            return False, why
         except Exception as exc:
             try:
                 if os.path.exists(tmp_out):
                     os.remove(tmp_out)
             except Exception:
                 pass
-            self._status(
-                f"HDR crop export failed: {exc}",
-                key="hdr_crop_export",
-                interval=10.0,
-            )
-        
+            if not quiet:
+                self._status(
+                    f"HDR crop export failed: {exc}",
+                    key="hdr_crop_export",
+                    interval=10.0,
+                )
+            return False, f"{type(exc).__name__}: {exc}"
+        return False, "unknown_hdr_crop_export_failure"
+
     def _hdr_preview_enabled(self, reader=None) -> bool:
         if reader is None:
             reader = self._hdr_preview_reader
@@ -8004,6 +8171,21 @@ class MainWindow(QtWidgets.QMainWindow):
             "Quality preset for full-res HDR->SDR screencap export. Does not affect pre-scan."
         )
         self.hdr_sdr_quality_combo.currentIndexChanged.connect(self._on_ui_change)
+
+        self.hdr_sdr_conversion_combo = QtWidgets.QComboBox()
+        if sys.platform == "win32":
+            self.hdr_sdr_conversion_combo.addItem("Windows/Paint WIC PNG", "windows_wic")
+        self.hdr_sdr_conversion_combo.addItem("FFmpeg/libplacebo SDR", "ffmpeg")
+        _hdrconv = str(getattr(self.cfg, "hdr_sdr_conversion", "windows_wic") or "windows_wic").strip().lower()
+        if sys.platform != "win32" and _hdrconv in {"windows_wic", "wic", "paint", "paint_wic"}:
+            _hdrconv = "ffmpeg"
+        _hdrconv_idx = self.hdr_sdr_conversion_combo.findData(_hdrconv)
+        self.hdr_sdr_conversion_combo.setCurrentIndex(_hdrconv_idx if _hdrconv_idx >= 0 else 0)
+        self.hdr_sdr_conversion_combo.setToolTip(
+            "Primary HDR PNG conversion backend. Windows/Paint WIC first exports the HDR crop, "
+            "then lets Windows convert it to PNG, matching the manual Paint path more closely (Windows only)."
+        )
+        self.hdr_sdr_conversion_combo.currentIndexChanged.connect(self._on_ui_change)
 
         self.hdr_sdr_tonemap_combo = QtWidgets.QComboBox()
         for _label, _data in (
@@ -8539,6 +8721,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Tonemap Mobius param", self.tm_param_spin),
             ("Tonemap backend", self.tonemap_pref_combo),
             ("HDR SDR quality", self.hdr_sdr_quality_combo),
+            ("HDR SDR conversion", self.hdr_sdr_conversion_combo),
             ("HDR SDR tone curve", self.hdr_sdr_tonemap_combo),
             ("HDR SDR gamut", self.hdr_sdr_gamut_combo),
             ("HDR contrast recovery", self.hdr_sdr_contrast_spin),
@@ -9812,6 +9995,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "hdr_archive_crops",
             "hdr_crop_format",
             "hdr_sdr_output_format",
+            "hdr_sdr_conversion",
             "hdr_archive_timeout_sec",
             "hdr_sdr_quality",
             "hdr_sdr_tonemap",
@@ -10033,6 +10217,10 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg.hdr_sdr_output_format = str(getattr(self.cfg, "hdr_sdr_output_format", "png") or "png").lower()
         cfg.hdr_archive_timeout_sec = int(getattr(self.cfg, "hdr_archive_timeout_sec", 90) or 90)
         try:
+            cfg.hdr_sdr_conversion = self.hdr_sdr_conversion_combo.currentData() or "windows_wic"
+        except Exception:
+            cfg.hdr_sdr_conversion = "windows_wic"
+        try:
             cfg.hdr_sdr_quality = self.hdr_sdr_quality_combo.currentData() or "madvr_like"
         except Exception:
             cfg.hdr_sdr_quality = "madvr_like"
@@ -10089,6 +10277,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cfg.hdr_sdr_output_format = str(getattr(cfg, "hdr_sdr_output_format", "png") or "png").lower()
         if self.cfg.hdr_sdr_output_format not in {"png", "jpg", "jpeg"}:
             self.cfg.hdr_sdr_output_format = "png"
+        hdr_sdr_conversion = str(getattr(cfg, "hdr_sdr_conversion", "windows_wic") or "windows_wic").strip().lower()
+        if hdr_sdr_conversion in {"wic", "paint", "paint_wic"}:
+            hdr_sdr_conversion = "windows_wic"
+        if hdr_sdr_conversion not in {"windows_wic", "ffmpeg"}:
+            hdr_sdr_conversion = "windows_wic"
+        if sys.platform != "win32" and hdr_sdr_conversion == "windows_wic":
+            hdr_sdr_conversion = "ffmpeg"
+        self.cfg.hdr_sdr_conversion = hdr_sdr_conversion
         self.cfg.compose_crop_enable = bool(getattr(cfg, "compose_crop_enable", True))
         self.cfg.compose_detect_person_for_face = bool(getattr(cfg, "compose_detect_person_for_face", True))
         try:
@@ -10129,6 +10325,10 @@ class MainWindow(QtWidgets.QMainWindow):
             val = str(getattr(cfg, "hdr_sdr_quality", "madvr_like") or "madvr_like")
             idx = self.hdr_sdr_quality_combo.findData(val)
             self.hdr_sdr_quality_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        if hasattr(self, "hdr_sdr_conversion_combo"):
+            val = self.cfg.hdr_sdr_conversion
+            idx = self.hdr_sdr_conversion_combo.findData(val)
+            self.hdr_sdr_conversion_combo.setCurrentIndex(idx if idx >= 0 else 0)
         if hasattr(self, "hdr_sdr_tonemap_combo"):
             val = str(getattr(cfg, "hdr_sdr_tonemap", "auto") or "auto")
             idx = self.hdr_sdr_tonemap_combo.findData(val)
@@ -11101,6 +11301,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 s.value("hdr_archive_crops", self.cfg.hdr_archive_crops, type=bool)
             )
             self.cfg.hdr_archive_crops = bool(self.chk_hdr_archive_crops.isChecked())
+        if hasattr(self, "hdr_sdr_conversion_combo"):
+            val = str(s.value("hdr_sdr_conversion", getattr(self.cfg, "hdr_sdr_conversion", "windows_wic")) or "windows_wic").strip().lower()
+            if val in {"wic", "paint", "paint_wic"}:
+                val = "windows_wic"
+            if sys.platform != "win32" and val == "windows_wic":
+                val = "ffmpeg"
+            idx = self.hdr_sdr_conversion_combo.findData(val)
+            self.hdr_sdr_conversion_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self.cfg.hdr_sdr_conversion = str(
+                self.hdr_sdr_conversion_combo.currentData() or ("windows_wic" if sys.platform == "win32" else "ffmpeg")
+            )
         if hasattr(self, "hdr_sdr_quality_combo"):
             val = str(s.value("hdr_sdr_quality", getattr(self.cfg, "hdr_sdr_quality", "madvr_like")) or "madvr_like")
             idx = self.hdr_sdr_quality_combo.findData(val)
