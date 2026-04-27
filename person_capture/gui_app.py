@@ -671,7 +671,10 @@ class Processor(QtCore.QObject):
             ])
         except Exception:
             pass
-        digest = hashlib.sha1(chr(0).join(parts).encode("utf-8", "surrogatepass")).hexdigest()[:10]
+        digest = hashlib.blake2s(
+            chr(0).join(parts).encode("utf-8", "surrogatepass"),
+            digest_size=8,
+        ).hexdigest()
         return f"{stem}-{digest}"
 
     def _prescan_cache_root(self, cfg: SessionConfig) -> Path:
