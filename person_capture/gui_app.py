@@ -6039,14 +6039,14 @@ class Processor(QtCore.QObject):
                                 "crop_xyxy": hdr_crop_xyxy,
                             }
                             try:
-                                archive_q.put(archive_item, timeout=max(5.0, float(getattr(self.cfg, "hdr_archive_timeout_sec", 90) or 90)))
+                                archive_q.put_nowait(archive_item)
                             except queue.Full:
                                 self._status(
                                     f"HDR archive queue blocked too long: {hdr_out_path}",
                                     key="save_backpressure",
                                     interval=0.5,
                                 )
-                                return False
+                                logger.warning("Dropping optional HDR archive crop after primary save: %s", hdr_out_path)
                         else:
                             self._save_hdr_crop_p010(idx, frame_pts_sec, hdr_crop_xyxy, hdr_out_path)
                     reasons_list = c.get("reasons") or []
@@ -9811,6 +9811,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "hdr_screencap_fullres",
             "hdr_archive_crops",
             "hdr_crop_format",
+            "hdr_sdr_output_format",
+            "hdr_archive_timeout_sec",
             "hdr_sdr_quality",
             "hdr_sdr_tonemap",
             "hdr_sdr_gamut_mapping",
@@ -11076,7 +11078,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # The previous shipped preset briefly defaulted HDR archive crops to MKV.
             # Preserve explicit non-default settings after this one-time migration,
             # but restore the solid HDR still workflow: AVIF archive + PNG SDR crops.
-            if fmt == "mkv":
+            stored_hdr_crop_format = str(s.value("hdr_crop_format", "") or "").strip().lower()
+            if not s.contains("hdr_crop_format") or not stored_hdr_crop_format:
                 fmt = "avif"
                 s.setValue("hdr_crop_format", fmt)
             if not str(s.value("hdr_sdr_output_format", "") or "").strip():
