@@ -3113,15 +3113,27 @@ class FfmpegPipeReader:
             try:
                 buf = self._proc.stdout.read(need)
             except Exception:
+                if self._mode != "p010_passthrough" and not self._at_soft_eof():
+                    if self.try_fallback_chain():
+                        return advanced + self.skip_frames(remaining - advanced)
                 break
             if not buf:
+                if self._mode != "p010_passthrough" and not self._at_soft_eof():
+                    if self.try_fallback_chain():
+                        return advanced + self.skip_frames(remaining - advanced)
                 break
             got = len(buf) // frame_bytes
             if got <= 0:
+                if self._mode != "p010_passthrough" and not self._at_soft_eof():
+                    if self.try_fallback_chain():
+                        return advanced + self.skip_frames(remaining - advanced)
                 break
             self._pos += got
             advanced += got
             if len(buf) < need:
+                if self._mode != "p010_passthrough" and not self._at_soft_eof():
+                    if self.try_fallback_chain():
+                        return advanced + self.skip_frames(remaining - advanced)
                 break
         return advanced
 

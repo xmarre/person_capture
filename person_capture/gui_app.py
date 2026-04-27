@@ -6046,6 +6046,10 @@ class Processor(QtCore.QObject):
                     primary_saved_or_enqueued = False
                     if save_q is not None:
                         wait_for_save = bool(getattr(self.cfg, "async_save_wait", False))
+                        if hdr_primary_fullres:
+                            # HDR primary saves must be ack-gated so failed exports are
+                            # never counted as successful before optional archive enqueue.
+                            wait_for_save = True
                         ack_q: Optional[queue.Queue] = queue.Queue(maxsize=1) if wait_for_save else None
                         try:
                             if hdr_primary_fullres:
@@ -11002,6 +11006,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # speed / I/O
             skip_yolo_when_faceonly=bool(self.skip_yolo_faceonly_check.isChecked()) if hasattr(self, "skip_yolo_faceonly_check") else True,
             async_save=bool(self.async_save_check.isChecked()) if hasattr(self, "async_save_check") else True,
+            async_save_wait=bool(getattr(self.cfg, "async_save_wait", False)),
+            save_fsync=bool(getattr(self.cfg, "save_fsync", False)),
             jpg_quality=int(self.jpg_quality_spin.value()) if hasattr(self, "jpg_quality_spin") else 85,
             rot_adaptive=bool(self.rot_adaptive_check.isChecked()) if hasattr(self, "rot_adaptive_check") else True,
             rot_every_n=int(self.rot_every_spin.value()) if hasattr(self, "rot_every_spin") else 12,
@@ -11286,6 +11292,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.skip_yolo_faceonly_check.setChecked(bool(getattr(cfg, 'skip_yolo_when_faceonly', True)))
         if hasattr(self, 'async_save_check'):
             self.async_save_check.setChecked(bool(getattr(cfg, 'async_save', True)))
+        self.cfg.async_save_wait = bool(getattr(cfg, "async_save_wait", False))
+        self.cfg.save_fsync = bool(getattr(cfg, "save_fsync", False))
         if hasattr(self, 'jpg_quality_spin'):
             self.jpg_quality_spin.setValue(int(getattr(cfg, 'jpg_quality', 85)))
         self.only_best_check.setChecked(cfg.only_best)
@@ -12281,6 +12289,20 @@ class MainWindow(QtWidgets.QMainWindow):
             s.value(
                 "hdr_avif_wic_display_compat",
                 getattr(self.cfg, "hdr_avif_wic_display_compat", True),
+                type=bool,
+            )
+        )
+        self.cfg.async_save_wait = bool(
+            s.value(
+                "async_save_wait",
+                getattr(self.cfg, "async_save_wait", False),
+                type=bool,
+            )
+        )
+        self.cfg.save_fsync = bool(
+            s.value(
+                "save_fsync",
+                getattr(self.cfg, "save_fsync", False),
                 type=bool,
             )
         )
