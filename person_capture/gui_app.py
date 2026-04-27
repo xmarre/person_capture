@@ -325,10 +325,6 @@ class SessionConfig:
     hdr_screencap_fullres: bool = True   # write primary crops from original-resolution source frames
     hdr_archive_crops: bool = False      # additionally write source HDR crops to hdr_crops/
     hdr_crop_format: str = "avif"       # avif (HDR still) | mkv (FFV1 lossless)
-    # Archive AVIF storage. 4:4:4 prevents viewer-dependent 4:2:0 chroma
-    # upsampling artifacts in very dark HDR regions. The Windows/WIC SDR-PNG
-    # path still uses a separate 4:2:0-compatible temporary AVIF.
-    hdr_avif_pix_fmt: str = "yuv444p10le"  # yuv444p10le | yuv420p10le
     hdr_sdr_output_format: str = "png"  # png | jpg; PNG avoids dark-gradient JPEG artifacts
     # Primary HDR->SDR crop conversion backend. "windows_wic" mirrors the
     # Windows/Paint-style path: export the exact HDR crop, decode it through
@@ -4661,7 +4657,6 @@ class Processor(QtCore.QObject):
                             "hdr_crop_format",
                             "hdr_sdr_output_format",
                             "hdr_sdr_conversion",
-                            "hdr_avif_pix_fmt",
                             "hdr_archive_timeout_sec",
                             "hdr_sdr_quality",
                             "hdr_sdr_tonemap",
@@ -7501,15 +7496,7 @@ try {{
                     os.remove(tmp_hdr)
             except Exception:
                 pass
-            ok_hdr, why_hdr = self._save_hdr_crop_p010(
-                frame_idx,
-                frame_pts_sec,
-                crop_xyxy,
-                tmp_hdr,
-                quiet=True,
-                avif_compat_420=True,
-                avif_force_lossless=True,
-            )
+            ok_hdr, why_hdr = self._save_hdr_crop_p010(frame_idx, frame_pts_sec, crop_xyxy, tmp_hdr, quiet=True)
             if not ok_hdr:
                 return False, f"windows_wic_hdr_source_failed:{why_hdr}"
             try:
@@ -7583,8 +7570,6 @@ try {{
         out_path: str,
         *,
         quiet: bool = False,
-        avif_compat_420: bool = False,
-        avif_force_lossless: bool = False,
     ) -> tuple[bool, str]:
         """Use ffmpeg directly to export an HDR crop from the original source."""
 
@@ -7607,14 +7592,11 @@ try {{
             pass
 
         # Preserve HDR source metadata explicitly before cropping.  The archive
-        # path must stay HDR; it is not the SDR dataset still path.  Force the
-        # chroma sample location into the frame metadata before/after crop so the
-        # AVIF muxer/decoder path does not inherit an unspecified siting state.
-        hdr_setparams = (
+        # path must stay HDR; it is not the SDR dataset still path.
+        vf = (
             "setparams=color_trc=smpte2084:color_primaries=bt2020:"
-            "colorspace=bt2020nc:range=limited:chroma_location=left"
+            f"colorspace=bt2020nc:range=limited,crop={w}:{h}:{int(x1)}:{int(y1)}"
         )
-        vf = f"{hdr_setparams},crop={w}:{h}:{int(x1)}:{int(y1)}"
         seek_sec: Optional[float] = None
         try:
             if frame_pts_sec is not None and math.isfinite(float(frame_pts_sec)):
@@ -7627,25 +7609,15 @@ try {{
                 seek_sec = max(0.0, float(frame_idx) / fps)
 
         is_avif = out_path.lower().endswith(".avif")
-        avif_pix_fmt = "yuv420p10le"
         if is_avif:
-            # The visible red/blue dots were not a crop-selection problem. They
-            # come from storing HDR archive stills as 4:2:0 AVIF and leaving final
-            # chroma reconstruction to the AVIF viewer. In very dark PQ material,
-            # tiny chroma errors/up-sampling differences become obvious colored
-            # speckles. Do not hide that with a chroma denoiser. For archive AVIF,
-            # up-sample chroma once in our controlled export path and store 4:4:4.
-            #
-            # The Windows/WIC SDR PNG backend still asks for a separate temporary
-            # 4:2:0-compatible AVIF because Windows' AVIF codec compatibility is
-            # better there and that temporary file is not the user-facing HDR crop.
-            if avif_compat_420:
-                avif_pix_fmt = "yuv420p10le"
-            else:
-                avif_pix_fmt = str(getattr(self.cfg, "hdr_avif_pix_fmt", "yuv444p10le") or "yuv444p10le").strip().lower()
-                if avif_pix_fmt not in {"yuv444p10le", "yuv420p10le"}:
-                    avif_pix_fmt = "yuv444p10le"
-            vf = f"{vf},format={avif_pix_fmt}"
+            # AVIF HDR stills need a broadly compatible 10-bit 4:2:0 AV1 profile.
+            # Keep 4:2:0 for Windows/Paint/HDR viewer compatibility, but make the
+            # AV1 encode itself lossless.  CRF-0 is still an AV1 quantized encode
+            # and can create isolated red/blue chroma speckles in very dark HDR
+            # regions.  The source is already 4:2:0, and the crop coordinates are
+            # legalized before this call, so lossless 4:2:0 preserves the decoded
+            # source crop without reintroducing the previous incompatible 4:4:4 path.
+            vf = f"{vf},format=yuv420p10le"
 
         pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(seek_sec)
         cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
@@ -7661,20 +7633,15 @@ try {{
             "1",
         ]
         if is_avif:
-            # High-quality HDR AVIF still, BT.2020 + PQ. Archive AVIF defaults to
-            # 4:4:4 to remove the root 4:2:0 chroma-upsample artifact path. The
-            # 4:2:0 path is kept only for compatibility temporaries and explicit
-            # user override. CDEF/restoration/AQ are disabled so the one-frame
-            # still encoder does not redistribute error into flat dark regions.
+            # High-quality / effectively lossless AVIF still, 10-bit HDR (BT.2020 + PQ).
             cmd += [
-                "-shortest",
                 "-an",
                 "-c:v",
                 "libaom-av1",
                 "-still-picture",
                 "1",
                 "-pix_fmt",
-                avif_pix_fmt,
+                "yuv420p10le",
                 "-g",
                 "1",
                 "-tile-columns",
@@ -7683,6 +7650,25 @@ try {{
                 "0",
                 "-row-mt",
                 "1",
+                "-cpu-used",
+                "5",
+                # CRF 0 by itself is not a strict no-artifact guarantee for AV1.
+                # Keep the compatible 4:2:0 pixel format but force libaom's true
+                # lossless path so dark HDR chroma is not quantized into red/blue
+                # speckles.  AQ stays disabled because it can redistribute error
+                # into flat/dark regions.
+                "-lossless",
+                "1",
+                "-crf",
+                "0",
+                "-b:v",
+                "0",
+                "-aq-mode",
+                "0",
+                # Preserve HDR10 signaling and 4:2:0 chroma siting in the AVIF
+                # container.  Without an explicit chroma sample location, ffprobe
+                # reports "unspecified" and some Windows viewers can show colored
+                # dark-edge/chroma artifacts.
                 "-color_range",
                 "1",
                 "-colorspace",
@@ -7691,36 +7677,9 @@ try {{
                 "bt2020",
                 "-color_trc",
                 "smpte2084",
-                "-f",
-                "avif",
+                "-chroma_sample_location",
+                "left",
             ]
-            if avif_force_lossless:
-                # Temporary WIC HDR intermediates should stay bit-exact.
-                cmd += [
-                    "-cpu-used",
-                    "5",
-                    "-lossless",
-                    "1",
-                    "-aq-mode",
-                    "0",
-                ]
-            else:
-                cmd += [
-                    "-cpu-used",
-                    "5",
-                    "-crf",
-                    "0",
-                    "-b:v",
-                    "0",
-                    "-aq-mode",
-                    "0",
-                    "-enable-cdef",
-                    "0",
-                    "-enable-restoration",
-                    "0",
-                ]
-            if avif_pix_fmt == "yuv420p10le":
-                cmd += ["-chroma_sample_location", "left"]
         else:
             # Lossless 10-bit HDR in Matroska via FFV1.
             # Decoded pixels in the crop match the original decode bit-for-bit.
@@ -10035,7 +9994,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "hdr_screencap_fullres",
             "hdr_archive_crops",
             "hdr_crop_format",
-            "hdr_avif_pix_fmt",
             "hdr_sdr_output_format",
             "hdr_sdr_conversion",
             "hdr_archive_timeout_sec",
@@ -10256,9 +10214,6 @@ class MainWindow(QtWidgets.QMainWindow):
             cfg.hdr_crop_format = self.hdr_crop_format_combo.currentText().lower()
         except Exception:
             cfg.hdr_crop_format = "avif"
-        cfg.hdr_avif_pix_fmt = str(getattr(self.cfg, "hdr_avif_pix_fmt", "yuv444p10le") or "yuv444p10le").strip().lower()
-        if cfg.hdr_avif_pix_fmt not in {"yuv444p10le", "yuv420p10le"}:
-            cfg.hdr_avif_pix_fmt = "yuv444p10le"
         cfg.hdr_sdr_output_format = str(getattr(self.cfg, "hdr_sdr_output_format", "png") or "png").lower()
         cfg.hdr_archive_timeout_sec = int(getattr(self.cfg, "hdr_archive_timeout_sec", 90) or 90)
         try:
@@ -10319,9 +10274,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.hdr_archive_timeout_sec = max(5, int(getattr(cfg, "hdr_archive_timeout_sec", 90) or 90))
         except Exception:
             self.cfg.hdr_archive_timeout_sec = 90
-        self.cfg.hdr_avif_pix_fmt = str(getattr(cfg, "hdr_avif_pix_fmt", "yuv444p10le") or "yuv444p10le").strip().lower()
-        if self.cfg.hdr_avif_pix_fmt not in {"yuv444p10le", "yuv420p10le"}:
-            self.cfg.hdr_avif_pix_fmt = "yuv444p10le"
         self.cfg.hdr_sdr_output_format = str(getattr(cfg, "hdr_sdr_output_format", "png") or "png").lower()
         if self.cfg.hdr_sdr_output_format not in {"png", "jpg", "jpeg"}:
             self.cfg.hdr_sdr_output_format = "png"
@@ -11426,11 +11378,6 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         except Exception:
             self.cfg.hdr_archive_timeout_sec = 90
-        self.cfg.hdr_avif_pix_fmt = str(
-            s.value("hdr_avif_pix_fmt", getattr(self.cfg, "hdr_avif_pix_fmt", "yuv444p10le")) or "yuv444p10le"
-        ).strip().lower()
-        if self.cfg.hdr_avif_pix_fmt not in {"yuv444p10le", "yuv420p10le"}:
-            self.cfg.hdr_avif_pix_fmt = "yuv444p10le"
         self.cfg.hdr_sdr_output_format = str(
             s.value("hdr_sdr_output_format", getattr(self.cfg, "hdr_sdr_output_format", "png")) or "png"
         ).lower()
