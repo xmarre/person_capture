@@ -7498,7 +7498,23 @@ class Processor(QtCore.QObject):
             keep = np.zeros_like(mask, dtype=np.uint8)
             for i in range(1, n):
                 area = int(stats[i, cv2.CC_STAT_AREA])
-                if 1 <= area <= 96:
+                if area <= 0:
+                    continue
+                if 1 <= area <= 4:
+                    keep[labels == i] = 255
+                    continue
+                if not (5 <= area <= 80):
+                    continue
+                bbox_w = int(stats[i, cv2.CC_STAT_WIDTH])
+                bbox_h = int(stats[i, cv2.CC_STAT_HEIGHT])
+                if bbox_w <= 0 or bbox_h <= 0:
+                    continue
+                long_edge = max(bbox_w, bbox_h)
+                short_edge = max(1, min(bbox_w, bbox_h))
+                fill_ratio = float(area) / float(bbox_w * bbox_h)
+                # Preserve tiny compact blobs, but reject thin/elongated regions
+                # that are more likely real scene detail than WIC salt speckles.
+                if long_edge <= 12 and (long_edge / short_edge) <= 3.0 and fill_ratio >= 0.40:
                     keep[labels == i] = 255
             changed = int(np.count_nonzero(keep))
             if changed <= 0:
@@ -7733,25 +7749,30 @@ try {{
                 except Exception:
                     pass
                 return False, f"windows_wic_invalid:{invalid_why}"
-            valid, invalid_why = self._validate_hdr_sdr_export_image(tmp, None)
-            if valid:
-                changed = 0
-                if repair:
-                    changed = self._repair_wic_saturated_rgb_speckles(tmp)
-                    if changed > 0:
+            changed = 0
+            if repair:
+                changed = self._repair_wic_saturated_rgb_speckles(tmp)
+                if changed > 0:
+                    self._status(
+                        f"HDR WIC saturated speckle cleanup: {changed} px",
+                        key="hdr_wic_speckle_cleanup",
+                        interval=5.0,
+                    )
+                    valid, invalid_why = self._validate_hdr_sdr_export_image(tmp, None)
+                    if not valid:
                         self._status(
-                            f"HDR WIC saturated speckle cleanup: {changed} px",
+                            f"HDR WIC repair output invalid: {invalid_why}",
                             key="hdr_wic_speckle_cleanup",
                             interval=5.0,
                         )
-                os.replace(tmp, out_path)
-                return True, ""
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except Exception:
-                pass
-            return False, f"windows_wic_invalid:{invalid_why}"
+                        try:
+                            if os.path.exists(tmp):
+                                os.remove(tmp)
+                        except Exception:
+                            pass
+                        return False, f"windows_wic_invalid_post_repair:{invalid_why}"
+            os.replace(tmp, out_path)
+            return True, ""
         except subprocess.TimeoutExpired as exc:
             try:
                 if os.path.exists(tmp):
@@ -8264,14 +8285,19 @@ try {{
                 seek_sec = max(0.0, float(frame_idx) / fps)
 
         is_avif = out_path.lower().endswith(".avif")
+        avif_color_range = "2"
         if is_avif:
-            # Store source HDR AVIF with the source range metadata. The visible
-            # blue/magenta speckles were isolated to Windows' HDR AVIF render
-            # boundary, not to libaom lossless encode/decode. Do not range-shift,
-            # denoise, or tone-map the source-HDR temporary here; WIC/display
-            # compatibility is handled after WIC conversion when a display AVIF is
-            # requested.
-            vf = f"{vf},format=yuv420p10le"
+            # Keep AVIF on the same full-range signaling used by the historical
+            # HDR path. WIC's problematic path is limited-range HDR AVIF; expand
+            # only when source was explicitly limited.
+            if src_range == "limited":
+                vf = f"{vf},zscale=rangein=limited:range=full"
+            vf = (
+                f"{vf},"
+                "format=yuv420p10le,"
+                "setparams=color_trc=smpte2084:color_primaries=bt2020:"
+                "colorspace=bt2020nc:range=full"
+            )
 
         pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(seek_sec)
         cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
@@ -8322,7 +8348,7 @@ try {{
                 # Preserve HDR10 signaling and source range/chroma siting in
                 # the AVIF container.
                 "-color_range",
-                "2" if src_range == "full" else "1",
+                avif_color_range,
                 "-colorspace",
                 "bt2020nc",
                 "-color_primaries",
@@ -10692,6 +10718,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "hdr_crop_format",
             "hdr_sdr_output_format",
             "hdr_sdr_conversion",
+            "hdr_wic_speckle_cleanup",
+            "hdr_avif_wic_display_compat",
             "hdr_archive_timeout_sec",
             "hdr_sdr_quality",
             "hdr_sdr_tonemap",
@@ -10893,6 +10921,8 @@ class MainWindow(QtWidgets.QMainWindow):
             compose_landscape_face_penalty=float(self.compose_landscape_face_penalty_spin.value()) if hasattr(self, "compose_landscape_face_penalty_spin") else float(getattr(self.cfg, "compose_landscape_face_penalty", 5.0)),
             compose_body_every_n=int(self.compose_body_every_n_spin.value()) if hasattr(self, "compose_body_every_n_spin") else int(getattr(self.cfg, "compose_body_every_n", 6)),
             compose_person_detect_cadence=int(self.compose_person_detect_cadence_spin.value()) if hasattr(self, "compose_person_detect_cadence_spin") else int(getattr(self.cfg, "compose_person_detect_cadence", 6)),
+            hdr_wic_speckle_cleanup=bool(getattr(self.cfg, "hdr_wic_speckle_cleanup", True)),
+            hdr_avif_wic_display_compat=bool(getattr(self.cfg, "hdr_avif_wic_display_compat", True)),
             hdr_export_timeout_sec=int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300),
         )
         cfg.hdr_passthrough = (
@@ -10985,6 +11015,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if sys.platform != "win32" and hdr_sdr_conversion == "windows_wic":
             hdr_sdr_conversion = "ffmpeg"
         self.cfg.hdr_sdr_conversion = hdr_sdr_conversion
+        self.cfg.hdr_wic_speckle_cleanup = bool(getattr(cfg, "hdr_wic_speckle_cleanup", True))
+        self.cfg.hdr_avif_wic_display_compat = bool(getattr(cfg, "hdr_avif_wic_display_compat", True))
         self.cfg.compose_crop_enable = bool(getattr(cfg, "compose_crop_enable", True))
         self.cfg.compose_detect_person_for_face = bool(getattr(cfg, "compose_detect_person_for_face", True))
         try:
@@ -12099,6 +12131,20 @@ class MainWindow(QtWidgets.QMainWindow):
         ).lower()
         if self.cfg.hdr_sdr_output_format not in {"png", "jpg", "jpeg"}:
             self.cfg.hdr_sdr_output_format = "png"
+        self.cfg.hdr_wic_speckle_cleanup = bool(
+            s.value(
+                "hdr_wic_speckle_cleanup",
+                getattr(self.cfg, "hdr_wic_speckle_cleanup", True),
+                type=bool,
+            )
+        )
+        self.cfg.hdr_avif_wic_display_compat = bool(
+            s.value(
+                "hdr_avif_wic_display_compat",
+                getattr(self.cfg, "hdr_avif_wic_display_compat", True),
+                type=bool,
+            )
+        )
         self.cfg.seek_fast = s.value("seek_fast", True, type=bool)
         try:
             self.cfg.seek_max_grabs = int(s.value("seek_max_grabs", 12))
