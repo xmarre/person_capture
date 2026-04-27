@@ -4656,6 +4656,7 @@ class Processor(QtCore.QObject):
                             "hdr_archive_crops",
                             "hdr_crop_format",
                             "hdr_sdr_output_format",
+                            "hdr_sdr_conversion",
                             "hdr_archive_timeout_sec",
                             "hdr_sdr_quality",
                             "hdr_sdr_tonemap",
@@ -7479,7 +7480,8 @@ try {{
         except Exception:
             pass
         conversion = str(getattr(self.cfg, "hdr_sdr_conversion", "windows_wic") or "windows_wic").strip().lower()
-        if conversion in {"windows_wic", "wic", "paint", "paint_wic"} and tmp_ext == ".png":
+        use_windows_wic = sys.platform == "win32" and conversion in {"windows_wic", "wic", "paint", "paint_wic"}
+        if use_windows_wic and tmp_ext == ".png":
             # Paint-like path: exact HDR crop -> WIC color-managed PNG. This is
             # deliberately not a fallback to the preview renderer; if WIC cannot
             # decode/convert the HDR still, report that as the save failure.
@@ -8155,14 +8157,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hdr_sdr_quality_combo.currentIndexChanged.connect(self._on_ui_change)
 
         self.hdr_sdr_conversion_combo = QtWidgets.QComboBox()
-        self.hdr_sdr_conversion_combo.addItem("Windows/Paint WIC PNG", "windows_wic")
+        if sys.platform == "win32":
+            self.hdr_sdr_conversion_combo.addItem("Windows/Paint WIC PNG", "windows_wic")
         self.hdr_sdr_conversion_combo.addItem("FFmpeg/libplacebo SDR", "ffmpeg")
-        _hdrconv = str(getattr(self.cfg, "hdr_sdr_conversion", "windows_wic") or "windows_wic")
+        _hdrconv = str(getattr(self.cfg, "hdr_sdr_conversion", "windows_wic") or "windows_wic").strip().lower()
+        if sys.platform != "win32" and _hdrconv in {"windows_wic", "wic", "paint", "paint_wic"}:
+            _hdrconv = "ffmpeg"
         _hdrconv_idx = self.hdr_sdr_conversion_combo.findData(_hdrconv)
         self.hdr_sdr_conversion_combo.setCurrentIndex(_hdrconv_idx if _hdrconv_idx >= 0 else 0)
         self.hdr_sdr_conversion_combo.setToolTip(
             "Primary HDR PNG conversion backend. Windows/Paint WIC first exports the HDR crop, "
-            "then lets Windows convert it to PNG, matching the manual Paint path more closely."
+            "then lets Windows convert it to PNG, matching the manual Paint path more closely (Windows only)."
         )
         self.hdr_sdr_conversion_combo.currentIndexChanged.connect(self._on_ui_change)
 
@@ -11275,6 +11280,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 s.value("hdr_archive_crops", self.cfg.hdr_archive_crops, type=bool)
             )
             self.cfg.hdr_archive_crops = bool(self.chk_hdr_archive_crops.isChecked())
+        if hasattr(self, "hdr_sdr_conversion_combo"):
+            val = str(s.value("hdr_sdr_conversion", getattr(self.cfg, "hdr_sdr_conversion", "windows_wic")) or "windows_wic").strip().lower()
+            if val in {"wic", "paint", "paint_wic"}:
+                val = "windows_wic"
+            if sys.platform != "win32" and val == "windows_wic":
+                val = "ffmpeg"
+            idx = self.hdr_sdr_conversion_combo.findData(val)
+            self.hdr_sdr_conversion_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self.cfg.hdr_sdr_conversion = str(
+                self.hdr_sdr_conversion_combo.currentData() or ("windows_wic" if sys.platform == "win32" else "ffmpeg")
+            )
         if hasattr(self, "hdr_sdr_quality_combo"):
             val = str(s.value("hdr_sdr_quality", getattr(self.cfg, "hdr_sdr_quality", "madvr_like")) or "madvr_like")
             idx = self.hdr_sdr_quality_combo.findData(val)
