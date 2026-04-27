@@ -16,6 +16,7 @@
   "auto_crop_borders": true,
   "hdr_passthrough": true,
   "hdr_crop_format": "avif",
+  "hdr_avif_pix_fmt": "yuv444p10le",
   "log_interval_sec": 0.2,
   "lock_after_hits": 1,
   "lock_face_thresh": 0.26,
@@ -182,6 +183,5 @@
   "prescan_hdr_preview": false,
   "hdr_sdr_output_format": "png",
   "hdr_archive_timeout_sec": 90,
-  "hdr_sdr_conversion": "windows_wic",
-  "hdr_avif_chroma_denoise": true
+  "hdr_sdr_conversion": "windows_wic"
 }
