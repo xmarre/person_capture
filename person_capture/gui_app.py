@@ -7048,13 +7048,13 @@ class Processor(QtCore.QObject):
 
     @staticmethod
     def _repair_wic_hdr_sdr_chroma_speckles(path: str) -> tuple[int, str]:
-        """Repair isolated WIC HDR->SDR saturated chroma spikes in-place.
+        """Repair WIC HDR->SDR saturated chroma salt pixels in-place.
 
-        The Windows WIC/WPF AVIF HDR conversion path can emit salt-pixel channel
-        overflows after converting the temporary HDR still to 8-bit Bgr32. These
-        defects are isolated, fully saturated red/blue/magenta pixels in otherwise
-        dark local neighborhoods. Do not re-tonemap or blur the image globally:
-        replace only small connected outlier components with the local median.
+        WIC's HDR AVIF conversion can turn legal dark 4:2:0 chroma salt into
+        literal saturated RGB pixels after PQ/wide-gamut conversion. Repair only
+        tiny red/blue/magenta chroma outlier components and fill them from
+        neighboring non-outlier pixels; do not re-tonemap, blur, or recolor the
+        image globally.
         """
         try:
             img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
@@ -7064,22 +7064,18 @@ class Processor(QtCore.QObject):
             return 0, "read_failed"
         if img.ndim != 3 or img.shape[2] not in (3, 4) or img.dtype != np.uint8:
             return 0, "unsupported_image"
+        if min(img.shape[:2]) < 7:
+            return 0, "unsupported_size"
 
         out = img.copy()
         total_changed = 0
-        # Bounded passes handle single-pixel defects and small connected
-        # outlier islands. The matcher is intentionally local: it only touches
-        # saturated red/blue/magenta pixels that disagree strongly with the
-        # surrounding median inside a dark/low-chroma neighborhood.
         for _ in range(3):
             bgr = out[:, :, :3]
-            if min(bgr.shape[:2]) < 7:
-                break
             med = cv2.medianBlur(bgr, 7)
             pix_i = bgr.astype(np.int16, copy=False)
             med_i = med.astype(np.int16, copy=False)
 
-            # BGR order.
+            # OpenCV stores PNG as BGR/BGRA.
             blue = pix_i[:, :, 0]
             green = pix_i[:, :, 1]
             red = pix_i[:, :, 2]
@@ -7110,15 +7106,13 @@ class Processor(QtCore.QObject):
                 & (blue >= 50)
                 & ((np.minimum(red, blue) - green) >= 50)
             )
-            color_spike = blue_spike | red_spike | magenta_spike
-
             spike = (
-                (local_luma <= 130.0)
-                & (med_span <= 120)
-                & color_spike
+                (local_luma <= 140.0)
+                & (med_span <= 190)
+                & (blue_spike | red_spike | magenta_spike)
                 & (sat_span >= 45)
-                & (dev >= 25)
-                & (chroma_dev >= 40)
+                & (dev >= 8)
+                & (chroma_dev >= 8)
             )
             if not bool(np.any(spike)):
                 break
@@ -7128,29 +7122,33 @@ class Processor(QtCore.QObject):
             )
             if n_labels <= 1:
                 break
+
             areas = stats[:, cv2.CC_STAT_AREA]
             widths = stats[:, cv2.CC_STAT_WIDTH]
             heights = stats[:, cv2.CC_STAT_HEIGHT]
-            bbox_area = np.maximum(1, widths * heights)
-            fill_ratio = areas.astype(np.float32) / bbox_area.astype(np.float32)
-
-            tiny_salt = (areas >= 2) & (areas <= 4)
-            isolated_medium = (
-                (areas > 4)
-                & (areas <= 80)
-                & (widths <= 8)
-                & (heights <= 8)
-                & (bbox_area <= 40)
-                & ((fill_ratio <= 0.60) | (fill_ratio >= 0.90))
+            # Include single-pixel defects. The previous repair skipped them,
+            # although the actual WIC failure is frequently one-pixel salt. Keep
+            # the component gate small so legitimate colored regions are not
+            # inpainted.
+            repair_components = (
+                (areas >= 1)
+                & (areas <= 128)
+                & (widths <= 20)
+                & (heights <= 20)
             )
-            repair_components = tiny_salt | isolated_medium
             repair_components[0] = False
 
             repair_mask = spike & repair_components[labels]
             changed = int(np.count_nonzero(repair_mask))
             if changed <= 0:
                 break
-            bgr[repair_mask] = med[repair_mask]
+
+            # Do not replace with the local median: dense speckle clusters can
+            # make the median blue/red as well. Inpaint from pixels outside the
+            # detected component instead.
+            mask_u8 = repair_mask.astype(np.uint8) * 255
+            repaired = cv2.inpaint(bgr, mask_u8, 3, cv2.INPAINT_TELEA)
+            bgr[repair_mask] = repaired[repair_mask]
             total_changed += changed
 
         if total_changed <= 0:
@@ -7162,6 +7160,7 @@ class Processor(QtCore.QObject):
         if not ok:
             return 0, "write_failed"
         return total_changed, ""
+
 
     def _save_wic_png_from_hdr_image(self, hdr_path: str, out_path: str) -> tuple[bool, str]:
         """Convert an HDR still to SDR PNG using Windows Imaging Component.
@@ -7776,7 +7775,11 @@ try {{
             # labels the frame as limited range; it does not remove illegal U/V
             # excursions from the decoded source. Windows' HDR AVIF path can map
             # those dark chroma excursions to saturated blue/red/magenta pixels.
-            vf = f"{vf},format=yuv420p10le,limiter=min=64:max=960:planes=6"
+            vf = (
+                f"{vf},format=yuv420p10le,"
+                "median=planes=6:radius=1:radiusV=1,"
+                "limiter=min=64:max=960:planes=6"
+            )
 
         pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(seek_sec)
         cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
