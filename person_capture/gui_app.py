@@ -7485,7 +7485,8 @@ class Processor(QtCore.QObject):
             # confined to hair/clothes/shadow regions.
             luma = np.clip((0.114 * b + 0.587 * g + 0.299 * r), 0, 255).astype(np.uint8)
             local_luma = cv2.medianBlur(luma, 5)
-            dark = local_luma <= 128
+            dark_blue = local_luma <= 128
+            dark_strict = local_luma <= 112
             # The remaining WIC failures are not always a one-pixel core. They
             # can leave a short, lower-intensity blue halo around the saturated
             # pixel, and 4:2:0 AVIF chroma subsampling makes that halo visible
@@ -7494,19 +7495,20 @@ class Processor(QtCore.QObject):
             # nearby low-intensity blue contamination. Keep red/magenta on the
             # original strict thresholds so normal warm shadow detail is not
             # pulled into the repair mask.
-            blue_seed = dark & (
+            blue_seed = dark_blue & (
                 ((b >= 145) & ((b - max_rg) >= 45) & (r <= 112) & (g <= 112))
                 | ((b >= 88) & ((b - max_rg) >= 60) & (r <= 40) & (g <= 40))
             )
-            blue_halo = dark & (b >= 70) & ((b - max_rg) >= 22) & (r <= 128) & (g <= 128)
-            magenta = dark & (r >= 160) & (b >= 160) & ((min_rb - g) >= 50) & (g <= 96)
-            red = dark & (r >= 180) & ((r - max_bg) >= 70) & (b <= 80) & (g <= 80)
+            blue_halo = dark_blue & (b >= 70) & ((b - max_rg) >= 22) & (r <= 128) & (g <= 128)
+            magenta = dark_strict & (r >= 160) & (b >= 160) & ((min_rb - g) >= 50) & (g <= 96)
+            red = dark_strict & (r >= 180) & ((r - max_bg) >= 70) & (b <= 80) & (g <= 80)
             blue_near_seed = cv2.dilate(
                 blue_seed.astype(np.uint8),
                 np.ones((5, 5), dtype=np.uint8),
                 iterations=1,
             ).astype(bool)
-            seed = blue_seed | magenta | red
+            strict_seed = magenta | red
+            seed = blue_seed | strict_seed
             mask = (seed | (blue_halo & blue_near_seed)).astype(np.uint8)
             if int(mask.sum()) <= 0:
                 return 0
@@ -7525,7 +7527,9 @@ class Processor(QtCore.QObject):
                 if bbox_w <= 0 or bbox_h <= 0:
                     continue
                 component = labels == i
-                if bool(np.any(blue_seed[component])):
+                has_blue_seed = bool(np.any(blue_seed[component]))
+                has_strict_seed = bool(np.any(strict_seed[component]))
+                if has_blue_seed and not has_strict_seed:
                     if area <= 220 and bbox_w <= 32 and bbox_h <= 32:
                         keep[component] = 255
                     continue
