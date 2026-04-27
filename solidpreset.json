@@ -16,7 +16,6 @@
   "auto_crop_borders": true,
   "hdr_passthrough": true,
   "hdr_crop_format": "avif",
-  "hdr_avif_pix_fmt": "yuv444p10le",
   "log_interval_sec": 0.2,
   "lock_after_hits": 1,
   "lock_face_thresh": 0.26,
