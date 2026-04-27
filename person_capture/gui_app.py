@@ -6893,6 +6893,44 @@ class Processor(QtCore.QObject):
                 pass
         return None
 
+    def _hdr_source_range(self) -> str:
+        """Return normalized HDR source range: 'limited', 'full', or '' when unknown."""
+        cached = str(getattr(self, "_hdr_source_range_cached", "") or "").lower()
+        if cached in {"limited", "full"}:
+            return cached
+
+        def _normalize(value: object) -> str:
+            low = str(value or "").strip().lower()
+            if low in {"full", "pc", "jpeg"}:
+                return "full"
+            if low in {"limited", "tv", "mpeg"}:
+                return "limited"
+            return ""
+
+        rng = ""
+        try:
+            reader = getattr(self, "_hdr_preview_reader", None)
+            if reader is not None:
+                rng = _normalize(getattr(reader, "_range_in", ""))
+        except Exception:
+            rng = ""
+        if not rng:
+            try:
+                ffprobe_json = None
+                try:
+                    from .video_io import _ffprobe_json as ffprobe_json  # type: ignore
+                except Exception:
+                    from video_io import _ffprobe_json as ffprobe_json  # type: ignore
+                if ffprobe_json is not None:
+                    meta = ffprobe_json(str(getattr(self.cfg, "video", "") or ""))
+                    stream = (meta.get("streams") or [{}])[0]
+                    rng = _normalize(stream.get("color_range"))
+            except Exception:
+                rng = ""
+        if rng in {"limited", "full"}:
+            self._hdr_source_range_cached = rng
+        return rng
+
     def _capture_source_size(self, cap, frame_shape: tuple[int, int]) -> tuple[int, int]:
         """Return original source dimensions, not the possibly downscaled reader size."""
         try:
@@ -7384,127 +7422,6 @@ class Processor(QtCore.QObject):
         (diag_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
         self._status(f"HDR speckle diagnostics done: {diag_dir}", key="hdr_speckle_diag", interval=0.0)
 
-    @staticmethod
-    def _repair_wic_hdr_sdr_chroma_speckles(path: str) -> tuple[int, str]:
-        """Repair WIC HDR->SDR saturated chroma salt pixels in-place.
-
-        WIC's HDR AVIF conversion can turn legal dark 4:2:0 chroma salt into
-        literal saturated RGB pixels after PQ/wide-gamut conversion. Repair only
-        tiny red/blue/magenta chroma outlier components and fill them from
-        neighboring non-outlier pixels; do not re-tonemap, blur, or recolor the
-        image globally.
-        """
-        try:
-            img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-        except Exception as exc:
-            return 0, f"read_failed:{type(exc).__name__}:{exc}"
-        if img is None:
-            return 0, "read_failed"
-        if img.ndim != 3 or img.shape[2] not in (3, 4) or img.dtype != np.uint8:
-            return 0, "unsupported_image"
-        if min(img.shape[:2]) < 7:
-            return 0, "unsupported_size"
-
-        out = img.copy()
-        total_changed = 0
-        for _ in range(3):
-            bgr = out[:, :, :3]
-            med = cv2.medianBlur(bgr, 7)
-            pix_i = bgr.astype(np.int16, copy=False)
-            med_i = med.astype(np.int16, copy=False)
-
-            # OpenCV stores PNG as BGR/BGRA.
-            blue = pix_i[:, :, 0]
-            green = pix_i[:, :, 1]
-            red = pix_i[:, :, 2]
-            med_blue = med_i[:, :, 0]
-            med_green = med_i[:, :, 1]
-            med_red = med_i[:, :, 2]
-
-            max_ch = pix_i.max(axis=2)
-            min_ch = pix_i.min(axis=2)
-            sat_span = max_ch - min_ch
-            dev = np.max(np.abs(pix_i - med_i), axis=2)
-            chroma_dev = np.maximum.reduce((
-                np.abs((blue - green) - (med_blue - med_green)),
-                np.abs((red - green) - (med_red - med_green)),
-                np.abs((red - blue) - (med_red - med_blue)),
-            ))
-            local_luma = (
-                0.114 * med_blue
-                + 0.587 * med_green
-                + 0.299 * med_red
-            )
-            med_span = med_i.max(axis=2) - med_i.min(axis=2)
-
-            blue_spike = (blue >= 50) & ((blue - red) >= 50) & ((blue - green) >= 50)
-            red_spike = (red >= 50) & ((red - green) >= 50) & ((red - blue) >= 50)
-            magenta_spike = (
-                (red >= 50)
-                & (blue >= 50)
-                & ((np.minimum(red, blue) - green) >= 50)
-            )
-            spike = (
-                (local_luma <= 140.0)
-                & (med_span <= 190)
-                & (blue_spike | red_spike | magenta_spike)
-                & (sat_span >= 45)
-                & (dev >= 8)
-                & (chroma_dev >= 8)
-            )
-            if not bool(np.any(spike)):
-                break
-
-            n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-                spike.astype(np.uint8), 8
-            )
-            if n_labels <= 1:
-                break
-
-            areas = stats[:, cv2.CC_STAT_AREA]
-            widths = stats[:, cv2.CC_STAT_WIDTH]
-            heights = stats[:, cv2.CC_STAT_HEIGHT]
-            bbox_areas = widths * heights
-            fill_ratio = areas.astype(np.float32) / np.maximum(bbox_areas, 1).astype(np.float32)
-            # Include single-pixel defects, but keep a compactness gate for
-            # larger components so inpaint does not target legitimate details.
-            repair_components = (
-                ((areas >= 1) & (areas <= 4))
-                | (
-                    (areas >= 5)
-                    & (areas <= 80)
-                    & (widths <= 8)
-                    & (heights <= 8)
-                    & (bbox_areas <= 40)
-                    & ((fill_ratio <= 0.60) | (fill_ratio >= 0.90))
-                )
-            )
-            repair_components[0] = False
-
-            repair_mask = spike & repair_components[labels]
-            changed = int(np.count_nonzero(repair_mask))
-            if changed <= 0:
-                break
-
-            # Do not replace with the local median: dense speckle clusters can
-            # make the median blue/red as well. Inpaint from pixels outside the
-            # detected component instead.
-            mask_u8 = repair_mask.astype(np.uint8) * 255
-            repaired = cv2.inpaint(bgr, mask_u8, 3, cv2.INPAINT_TELEA)
-            bgr[repair_mask] = repaired[repair_mask]
-            total_changed += changed
-
-        if total_changed <= 0:
-            return 0, ""
-        try:
-            ok = cv2.imwrite(path, out)
-        except Exception as exc:
-            return 0, f"write_failed:{type(exc).__name__}:{exc}"
-        if not ok:
-            return 0, "write_failed"
-        return total_changed, ""
-
-
     def _save_wic_png_from_hdr_image(self, hdr_path: str, out_path: str, *, repair: bool = False) -> tuple[bool, str]:
         """Convert an HDR still to SDR PNG using Windows Imaging Component.
 
@@ -7582,24 +7499,6 @@ try {{
                 except Exception:
                     pass
                 return False, f"windows_wic_invalid:{invalid_why}"
-            # Do not mutate WIC output by default. Previous post-export
-            # "speckle repair" changed pixels without removing the visible
-            # artifact generator, which made the log misleading. Keep it only
-            # as an explicitly forced experiment.
-            if bool(repair) or self._truthy_env("PC_HDR_WIC_SPECKLE_REPAIR"):
-                cleaned, clean_why = self._repair_wic_hdr_sdr_chroma_speckles(tmp)
-                if clean_why:
-                    self._status(
-                        f"HDR WIC chroma speckle repair skipped: {clean_why}",
-                        key="hdr_wic_speckles",
-                        interval=30.0,
-                    )
-                elif cleaned > 0:
-                    self._status(
-                        f"HDR WIC chroma speckle repair: {cleaned} px",
-                        key="hdr_wic_speckles",
-                        interval=5.0,
-                    )
             valid, invalid_why = self._validate_hdr_sdr_export_image(tmp, None)
             if valid:
                 os.replace(tmp, out_path)
@@ -8101,10 +8000,15 @@ try {{
 
         # Preserve HDR source metadata explicitly before cropping.  The archive
         # path must stay HDR; it is not the SDR dataset still path.
+        src_range = self._hdr_source_range()
+        src_range_known = src_range in {"limited", "full"}
+        src_range_setparams = src_range if src_range_known else "limited"
         vf = (
             "setparams=color_trc=smpte2084:color_primaries=bt2020:"
-            f"colorspace=bt2020nc:range=limited,crop={w}:{h}:{int(x1)}:{int(y1)}"
+            f"colorspace=bt2020nc:range={src_range_setparams},crop={w}:{h}:{int(x1)}:{int(y1)}"
         )
+        # Keep FFV1 tagging conservative when source range is unknown.
+        ffv1_color_range = "2" if src_range == "full" else "1"
         seek_sec: Optional[float] = None
         try:
             if frame_pts_sec is not None and math.isfinite(float(frame_pts_sec)):
@@ -8118,12 +8022,23 @@ try {{
 
         is_avif = out_path.lower().endswith(".avif")
         if is_avif:
-            # Keep the AVIF path format-only here. Do not apply chroma repair,
-            # median filtering, limiter experiments, or 4:4:4 conversion in the
-            # writer; those attempts changed the export path without proving the
-            # first failing boundary. PC_HDR_SPECKLE_DIAG writes controlled
-            # sibling artifacts to identify the boundary instead.
-            vf = f"{vf},format=yuv420p10le"
+            # Windows/WIC's HDR AVIF path has shown saturated blue/magenta salt
+            # pixels when fed limited-range PQ/BT.2020 4:2:0 stills, even though
+            # libdav1d decodes the same AVIF bit-exactly. Avoid that broken WIC
+            # limited-range boundary by storing the AVIF as full-range YUV while
+            # preserving the same PQ/BT.2020 image values. A round-trip back to
+            # limited-range changes at most one code value from rounding in the
+            # diagnostic sample, so this is not a tone-map, denoise, gamut, or
+            # chroma-quality change.
+            # Only expand when we explicitly probed limited-range source.
+            if src_range == "limited":
+                vf = f"{vf},zscale=rangein=limited:range=full"
+            vf = (
+                f"{vf},"
+                "format=yuv420p10le,"
+                "setparams=color_trc=smpte2084:color_primaries=bt2020:"
+                "colorspace=bt2020nc:range=full"
+            )
 
         pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(seek_sec)
         cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
@@ -8172,11 +8087,11 @@ try {{
                 "-aq-mode",
                 "0",
                 # Preserve HDR10 signaling and 4:2:0 chroma siting in the AVIF
-                # container.  Without an explicit chroma sample location, ffprobe
-                # reports "unspecified" and some Windows viewers can show colored
-                # dark-edge/chroma artifacts.
+                # container. The pixel data is range-expanded above, so mark the
+                # AVIF as full-range instead of asking WIC to handle limited-range
+                # HDR stills.
                 "-color_range",
-                "1",
+                "2",
                 "-colorspace",
                 "bt2020nc",
                 "-color_primaries",
@@ -8196,7 +8111,7 @@ try {{
                 "-level", "3",
                 "-g", "1",
                 "-pix_fmt", "yuv420p10le",
-                "-color_range", "1",
+                "-color_range", ffv1_color_range,
                 "-colorspace", "bt2020nc",
                 "-color_primaries", "bt2020",
                 "-color_trc", "smpte2084",
