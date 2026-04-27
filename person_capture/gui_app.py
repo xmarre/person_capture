@@ -7141,7 +7141,7 @@ class Processor(QtCore.QObject):
                 & (widths <= 8)
                 & (heights <= 8)
                 & (bbox_area <= 40)
-                & (fill_ratio <= 0.60)
+                & ((fill_ratio <= 0.60) | (fill_ratio >= 0.90))
             )
             repair_components = tiny_salt | isolated_medium
             repair_components[0] = False
