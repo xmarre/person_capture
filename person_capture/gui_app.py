@@ -7508,6 +7508,7 @@ try {{
                 tmp_hdr,
                 quiet=True,
                 avif_compat_420=True,
+                avif_force_lossless=True,
             )
             if not ok_hdr:
                 return False, f"windows_wic_hdr_source_failed:{why_hdr}"
@@ -7583,6 +7584,7 @@ try {{
         *,
         quiet: bool = False,
         avif_compat_420: bool = False,
+        avif_force_lossless: bool = False,
     ) -> tuple[bool, str]:
         """Use ffmpeg directly to export an HDR crop from the original source."""
 
@@ -7681,18 +7683,6 @@ try {{
                 "0",
                 "-row-mt",
                 "1",
-                "-cpu-used",
-                "5",
-                "-crf",
-                "0",
-                "-b:v",
-                "0",
-                "-aq-mode",
-                "0",
-                "-enable-cdef",
-                "0",
-                "-enable-restoration",
-                "0",
                 "-color_range",
                 "1",
                 "-colorspace",
@@ -7704,6 +7694,31 @@ try {{
                 "-f",
                 "avif",
             ]
+            if avif_force_lossless:
+                # Temporary WIC HDR intermediates should stay bit-exact.
+                cmd += [
+                    "-cpu-used",
+                    "5",
+                    "-lossless",
+                    "1",
+                    "-aq-mode",
+                    "0",
+                ]
+            else:
+                cmd += [
+                    "-cpu-used",
+                    "5",
+                    "-crf",
+                    "0",
+                    "-b:v",
+                    "0",
+                    "-aq-mode",
+                    "0",
+                    "-enable-cdef",
+                    "0",
+                    "-enable-restoration",
+                    "0",
+                ]
             if avif_pix_fmt == "yuv420p10le":
                 cmd += ["-chroma_sample_location", "left"]
         else:
