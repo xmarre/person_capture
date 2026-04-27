@@ -1947,14 +1947,30 @@ class Processor(QtCore.QObject):
         y1 = ay - crop_h * 0.5
 
         # Shift to contain the protected box first, then clamp to content bounds.
-        if px1 < x1:
-            x1 = px1
-        if px2 > x1 + crop_w:
-            x1 = px2 - crop_w
-        if py1 < y1:
-            y1 = py1
-        if py2 > y1 + crop_h:
-            y1 = py2 - crop_h
+        # If the protected box is larger than the largest legal crop on an axis,
+        # full containment is impossible. The old sequential edge correction made
+        # the second edge win in that case (right/bottom bias), so face/portrait
+        # crops near the frame edge were dragged away from the face anchor. Keep
+        # exact legacy containment behavior when the box fits; otherwise keep the
+        # crop centered on the semantic anchor/protected center and clamp below.
+        if (px2 - px1) <= crop_w + 1.0e-6:
+            if px1 < x1:
+                x1 = px1
+            if px2 > x1 + crop_w:
+                x1 = px2 - crop_w
+        else:
+            x_anchor = ax if px1 <= ax <= px2 else (px1 + px2) * 0.5
+            x1 = x_anchor - crop_w * 0.5
+
+        if (py2 - py1) <= crop_h + 1.0e-6:
+            if py1 < y1:
+                y1 = py1
+            if py2 > y1 + crop_h:
+                y1 = py2 - crop_h
+        else:
+            y_anchor = ay if py1 <= ay <= py2 else (py1 + py2) * 0.5
+            y1 = y_anchor - crop_h * 0.5
+
         x1 = max(bx1, min(bx2 - crop_w, x1))
         y1 = max(by1, min(by2 - crop_h, y1))
         x2 = x1 + crop_w
@@ -7030,6 +7046,90 @@ class Processor(QtCore.QObject):
     def _quote_ps_single(value: str) -> str:
         return "'" + str(value).replace("'", "''") + "'"
 
+    @staticmethod
+    def _repair_wic_hdr_sdr_chroma_speckles(path: str) -> tuple[int, str]:
+        """Repair isolated WIC HDR->SDR saturated chroma spikes in-place.
+
+        The Windows WIC/WPF AVIF HDR conversion path can emit salt-pixel channel
+        overflows after converting the temporary HDR still to 8-bit Bgr32. These
+        defects are isolated, fully saturated red/blue/magenta pixels in otherwise
+        dark local neighborhoods. Do not re-tonemap or blur the image globally:
+        replace only small connected outlier components with the local median.
+        """
+        try:
+            img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        except Exception as exc:
+            return 0, f"read_failed:{type(exc).__name__}:{exc}"
+        if img is None:
+            return 0, "read_failed"
+        if img.ndim != 3 or img.shape[2] not in (3, 4) or img.dtype != np.uint8:
+            return 0, "unsupported_image"
+
+        out = img.copy()
+        total_changed = 0
+        # Two bounded passes handle tiny 2-4 px clusters without touching the
+        # surrounding tone curve or ordinary texture.
+        for _ in range(2):
+            bgr = out[:, :, :3]
+            if min(bgr.shape[:2]) < 7:
+                break
+            med = cv2.medianBlur(bgr, 7)
+            pix_i = bgr.astype(np.int16, copy=False)
+            med_i = med.astype(np.int16, copy=False)
+
+            max_ch = pix_i.max(axis=2)
+            min_ch = pix_i.min(axis=2)
+            sat_span = max_ch - min_ch
+            dev = np.max(np.abs(pix_i - med_i), axis=2)
+            # Chroma outlier relative to the local neighborhood. BGR order.
+            chroma_dev = np.maximum.reduce((
+                np.abs((pix_i[:, :, 0] - pix_i[:, :, 1]) - (med_i[:, :, 0] - med_i[:, :, 1])),
+                np.abs((pix_i[:, :, 2] - pix_i[:, :, 1]) - (med_i[:, :, 2] - med_i[:, :, 1])),
+                np.abs((pix_i[:, :, 2] - pix_i[:, :, 0]) - (med_i[:, :, 2] - med_i[:, :, 0])),
+            ))
+            local_luma = (
+                0.114 * med_i[:, :, 0]
+                + 0.587 * med_i[:, :, 1]
+                + 0.299 * med_i[:, :, 2]
+            )
+            med_span = med_i.max(axis=2) - med_i.min(axis=2)
+
+            spike = (
+                (local_luma <= 115.0)
+                & (med_span <= 90)
+                & (max_ch >= 60)
+                & (sat_span >= 50)
+                & (dev >= 35)
+                & (chroma_dev >= 45)
+            )
+            if not bool(np.any(spike)):
+                break
+
+            n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                spike.astype(np.uint8), 8
+            )
+            if n_labels <= 1:
+                break
+            areas = stats[:, cv2.CC_STAT_AREA]
+            # The observed defects are salt-like clusters; avoid removing real
+            # saturated objects, labels, lights, or large color edges.
+            repair_mask = spike & (areas[labels] <= 64)
+            changed = int(np.count_nonzero(repair_mask))
+            if changed <= 0:
+                break
+            bgr[repair_mask] = med[repair_mask]
+            total_changed += changed
+
+        if total_changed <= 0:
+            return 0, ""
+        try:
+            ok = cv2.imwrite(path, out)
+        except Exception as exc:
+            return 0, f"write_failed:{type(exc).__name__}:{exc}"
+        if not ok:
+            return 0, "write_failed"
+        return total_changed, ""
+
     def _save_wic_png_from_hdr_image(self, hdr_path: str, out_path: str) -> tuple[bool, str]:
         """Convert an HDR still to SDR PNG using Windows Imaging Component.
 
@@ -7108,7 +7208,23 @@ try {{
                     pass
                 return False, f"windows_wic_invalid:{invalid_why}"
             os.replace(tmp, out_path)
-            return True, ""
+            cleaned, clean_why = self._repair_wic_hdr_sdr_chroma_speckles(out_path)
+            if clean_why:
+                self._status(
+                    f"HDR WIC chroma speckle repair skipped: {clean_why}",
+                    key="hdr_wic_speckles",
+                    interval=30.0,
+                )
+            elif cleaned > 0:
+                self._status(
+                    f"HDR WIC chroma speckle repair: {cleaned} px",
+                    key="hdr_wic_speckles",
+                    interval=5.0,
+                )
+            valid, invalid_why = self._validate_hdr_sdr_export_image(out_path, None)
+            if valid:
+                return True, ""
+            return False, f"windows_wic_invalid:{invalid_why}"
         except subprocess.TimeoutExpired as exc:
             try:
                 if os.path.exists(tmp):
