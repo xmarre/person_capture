@@ -5916,7 +5916,7 @@ class Processor(QtCore.QObject):
                             (int(W), int(H)),
                             source_size,
                         )
-                        if hdr_primary_fullres:
+                        if hdr_primary_fullres and primary_fmt == "png":
                             source_crop_xyxy = self._even_hdr_crop_xyxy(source_crop_xyxy, source_size)
                     primary_row_crop = source_crop_xyxy if hdr_primary_fullres else processed_crop_xyxy
                     crop_img2 = frame[cy1:cy2, cx1:cx2]
