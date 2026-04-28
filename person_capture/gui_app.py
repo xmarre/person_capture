@@ -1087,14 +1087,24 @@ class Processor(QtCore.QObject):
             old_face_conf = getattr(face, "conf", 0.5)
             def _apply_prescan_face_runtime_cfg() -> None:
                 face.conf = self._prescan_face_conf_value(cfg)
-                try:
-                    face._probe_conf = float(getattr(cfg, "prescan_probe_conf", 0.03))
-                    face._prescan_period = int(getattr(cfg, "prescan_rot_probe_period", 3))
-                    face._prescan_probe_imgsz = int(getattr(cfg, "prescan_probe_imgsz", 512))
-                    face._high_90 = int(getattr(cfg, "prescan_heavy_90", 1536))
-                    face._high_180 = int(getattr(cfg, "prescan_heavy_180", 1280))
-                except Exception:
-                    pass
+                for attr_name, cfg_name, caster, default in (
+                    ("_probe_conf", "prescan_probe_conf", float, 0.03),
+                    ("_prescan_period", "prescan_rot_probe_period", int, 3),
+                    ("_prescan_probe_imgsz", "prescan_probe_imgsz", int, 512),
+                    ("_high_90", "prescan_heavy_90", int, 1536),
+                    ("_high_180", "prescan_heavy_180", int, 1280),
+                ):
+                    raw = getattr(cfg, cfg_name, default)
+                    try:
+                        setattr(face, attr_name, caster(raw))
+                    except Exception as exc:
+                        _log.warning(
+                            "Prescan runtime cfg update skipped for %s from %s=%r: %s",
+                            attr_name,
+                            cfg_name,
+                            raw,
+                            exc,
+                        )
             _apply_prescan_face_runtime_cfg()
             old_rot_adapt = getattr(face, "rot_adaptive", True)
             try:
@@ -12008,13 +12018,24 @@ class MainWindow(QtWidgets.QMainWindow):
         if not ref_paths:
             QtWidgets.QMessageBox.warning(self, "Missing", "Select at least one reference image")
             return
+        existing_refs = [path for path in ref_paths if os.path.isfile(path)]
         missing_refs = [path for path in ref_paths if not os.path.isfile(path)]
-        if missing_refs:
+        if not existing_refs:
             preview = "\n".join(missing_refs[:5])
             if len(missing_refs) > 5:
                 preview += f"\n... and {len(missing_refs) - 5} more"
             QtWidgets.QMessageBox.warning(self, "Missing", f"Reference image not found:\n{preview}")
             return
+        if missing_refs:
+            preview = "\n".join(missing_refs[:5])
+            if len(missing_refs) > 5:
+                preview += f"\n... and {len(missing_refs) - 5} more"
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Missing",
+                f"Some reference images were not found and will be ignored:\n{preview}",
+            )
+        cfg.ref = "; ".join(existing_refs)
         Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
 
         self.progress.setValue(0)
