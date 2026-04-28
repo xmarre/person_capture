@@ -4715,13 +4715,28 @@ class Processor(QtCore.QObject):
                                     frame_pts_sec = None
                             archive_path = str(item.get("path") or "")
                             archive_crop = tuple(item.get("crop_xyxy") or (0, 0, 2, 2))
-                            self._save_hdr_archive_crop(
-                                int(item.get("frame_idx", 0)),
+                            frame_idx = int(item.get("frame_idx", 0))
+                            primary_path = str(item.get("primary_path") or "")
+                            ok_archive, why_archive = self._save_hdr_archive_crop(
+                                frame_idx,
                                 frame_pts_sec,
                                 archive_crop,
                                 archive_path,
-                                primary_path=str(item.get("primary_path") or ""),
+                                primary_path=primary_path,
                             )
+                            if not ok_archive:
+                                self._status(
+                                    f"HDR archive save failed ({why_archive}): {archive_path}",
+                                    key="save_err_archive",
+                                    interval=0.5,
+                                )
+                                logger.error(
+                                    "HDR archive save failed frame_idx=%s primary=%s archive=%s why=%s",
+                                    frame_idx,
+                                    primary_path,
+                                    archive_path,
+                                    why_archive,
+                                )
                         finally:
                             archive_q.task_done()
 
@@ -6277,13 +6292,26 @@ class Processor(QtCore.QObject):
                                 )
                                 logger.warning("Dropping optional HDR archive crop after primary save: %s", hdr_out_path)
                         else:
-                            self._save_hdr_archive_crop(
+                            ok_archive, why_archive = self._save_hdr_archive_crop(
                                 int(idx),
                                 frame_pts_sec,
                                 hdr_crop_xyxy,
                                 hdr_out_path,
                                 primary_path=crop_img_path,
                             )
+                            if not ok_archive:
+                                self._status(
+                                    f"HDR archive save failed ({why_archive}): {hdr_out_path}",
+                                    key="save_err_archive",
+                                    interval=0.5,
+                                )
+                                logger.error(
+                                    "HDR archive save failed frame_idx=%s primary=%s archive=%s why=%s",
+                                    int(idx),
+                                    crop_img_path,
+                                    hdr_out_path,
+                                    why_archive,
+                                )
                     reasons_list = c.get("reasons") or []
                     reasons = "|".join(reasons_list)
                     bx1, by1, bx2, by2 = c["box"]
@@ -8092,14 +8120,23 @@ class Processor(QtCore.QObject):
                 ok, why = self._encode_sdr_avif_from_image(primary, out_path)
                 if ok:
                     return True, ""
-                self._status(
-                    f"Display AVIF encode from primary PNG failed; retrying WIC HDR render: {why}",
-                    key="hdr_archive_avif",
-                    interval=10.0,
+                if sys.platform == "win32":
+                    self._status(
+                        f"Display AVIF encode from primary PNG failed; retrying WIC HDR render: {why}",
+                        key="hdr_archive_avif",
+                        interval=10.0,
+                    )
+                else:
+                    self._status(
+                        f"Display AVIF encode from primary PNG failed; retrying source HDR archive: {why}",
+                        key="hdr_archive_avif",
+                        interval=10.0,
+                    )
+            if sys.platform == "win32":
+                return self._save_wic_display_avif_from_hdr_crop(
+                    frame_idx, frame_pts_sec, crop_xyxy, out_path
                 )
-            return self._save_wic_display_avif_from_hdr_crop(
-                frame_idx, frame_pts_sec, crop_xyxy, out_path
-            )
+            return self._save_hdr_crop_p010(frame_idx, frame_pts_sec, crop_xyxy, out_path)
         return self._save_hdr_crop_p010(frame_idx, frame_pts_sec, crop_xyxy, out_path)
 
     def _save_wic_png_from_hdr_image(self, hdr_path: str, out_path: str, *, repair: bool = True) -> tuple[bool, str]:
@@ -11661,6 +11698,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.chk_hdr_screencap_fullres.setChecked(bool(getattr(cfg, "hdr_screencap_fullres", True)))
         if hasattr(self, "chk_hdr_archive_crops"):
             self.chk_hdr_archive_crops.setChecked(bool(getattr(cfg, "hdr_archive_crops", False)))
+        if hasattr(self, "hdr_avif_display_compat_check"):
+            self.hdr_avif_display_compat_check.setChecked(
+                bool(getattr(cfg, "hdr_avif_wic_display_compat", True))
+            )
         if hasattr(self, "hdr_sdr_quality_combo"):
             val = str(getattr(cfg, "hdr_sdr_quality", "madvr_like") or "madvr_like")
             idx = self.hdr_sdr_quality_combo.findData(val)
