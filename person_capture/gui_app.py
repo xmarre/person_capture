@@ -10522,7 +10522,11 @@ class MainWindow(QtWidgets.QMainWindow):
             text = self.ref_list.item(i).text().strip()
             if text:
                 paths.append(text)
-        if not getattr(self, "_updating_refs", False) and hasattr(self, "ref_edit"):
+        if (
+            not paths
+            and not getattr(self, "_updating_refs", False)
+            and hasattr(self, "ref_edit")
+        ):
             raw = self.ref_edit.text().strip()
             if raw:
                 paths.extend(part.strip() for part in raw.split(";") if part.strip())
