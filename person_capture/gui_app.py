@@ -7796,10 +7796,9 @@ class Processor(QtCore.QObject):
             ).astype(np.uint8)
             if int(mask.sum()) <= 0:
                 return 0
-            # Reject broad regions. Blue WIC faults can be short streaks after
-            # display conversion, so accept slightly larger/longer blue-seeded
-            # components; keep the previous compact-component rule for strict
-            # red/magenta seeds.
+            # Reject broad regions. Keep the compactness/fill guard consistent
+            # across strict, blue/cyan, and generic chroma branches so expanded
+            # hue coverage does not broaden inpaint acceptance semantics.
             n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
             keep = np.zeros_like(mask, dtype=np.uint8)
             for i in range(1, n):
@@ -7810,13 +7809,28 @@ class Processor(QtCore.QObject):
                 bbox_h = int(stats[i, cv2.CC_STAT_HEIGHT])
                 if bbox_w <= 0 or bbox_h <= 0:
                     continue
+                long_edge = max(bbox_w, bbox_h)
+                short_edge = max(1, min(bbox_w, bbox_h))
+                fill_ratio = float(area) / float(bbox_w * bbox_h)
+                is_tiny_speckle = 1 <= area <= 4
+                is_compact_speckle = (
+                    5 <= area <= 80
+                    and long_edge <= 12
+                    and (long_edge / short_edge) <= 3.0
+                    and fill_ratio >= 0.40
+                )
                 component = labels == i
                 has_blue_seed = bool(np.any(blue_seed[component]))
                 has_cyan_seed = bool(np.any(cyan_seed[component]))
                 has_strict_seed = bool(np.any(strict_seed[component]))
                 has_generic_chroma_seed = bool(np.any(generic_chroma_seed[component]))
                 if (has_blue_seed or has_cyan_seed) and not has_strict_seed:
-                    if area <= BLUE_CYAN_MAX_AREA and bbox_w <= BLUE_CYAN_MAX_BBOX and bbox_h <= BLUE_CYAN_MAX_BBOX:
+                    if (
+                        area <= BLUE_CYAN_MAX_AREA
+                        and bbox_w <= BLUE_CYAN_MAX_BBOX
+                        and bbox_h <= BLUE_CYAN_MAX_BBOX
+                        and (is_tiny_speckle or is_compact_speckle)
+                    ):
                         keep[component] = 255
                     continue
                 if has_generic_chroma_seed and not (has_blue_seed or has_cyan_seed or has_strict_seed):
@@ -7824,20 +7838,16 @@ class Processor(QtCore.QObject):
                         area <= GENERIC_CHROMA_MAX_AREA
                         and bbox_w <= GENERIC_CHROMA_MAX_BBOX
                         and bbox_h <= GENERIC_CHROMA_MAX_BBOX
+                        and (is_tiny_speckle or is_compact_speckle)
                     ):
                         keep[component] = 255
                     continue
-                if 1 <= area <= 4:
+                if is_tiny_speckle:
                     keep[component] = 255
                     continue
-                if not (5 <= area <= 80):
-                    continue
-                long_edge = max(bbox_w, bbox_h)
-                short_edge = max(1, min(bbox_w, bbox_h))
-                fill_ratio = float(area) / float(bbox_w * bbox_h)
                 # Preserve tiny compact blobs, but reject thin/elongated regions
                 # that are more likely real scene detail than WIC salt speckles.
-                if long_edge <= 12 and (long_edge / short_edge) <= 3.0 and fill_ratio >= 0.40:
+                if is_compact_speckle:
                     keep[component] = 255
             changed = int(np.count_nonzero(keep))
             if changed <= 0:
