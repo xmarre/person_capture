@@ -4717,12 +4717,14 @@ class Processor(QtCore.QObject):
                             archive_crop = tuple(item.get("crop_xyxy") or (0, 0, 2, 2))
                             frame_idx = int(item.get("frame_idx", 0))
                             primary_path = str(item.get("primary_path") or "")
+                            display_compat = item.get("display_compat", None)
                             ok_archive, why_archive = self._save_hdr_archive_crop(
                                 frame_idx,
                                 frame_pts_sec,
                                 archive_crop,
                                 archive_path,
                                 primary_path=primary_path,
+                                display_compat=display_compat,
                             )
                             if not ok_archive:
                                 self._status(
@@ -6154,6 +6156,7 @@ class Processor(QtCore.QObject):
                         str(ratio_str),
                     ]
                     archive_item = None
+                    archive_display_compat = bool(getattr(self.cfg, "hdr_avif_wic_display_compat", True))
                     if hdr_out_path:
                         hdr_crop_xyxy = self._even_hdr_crop_xyxy(source_crop_xyxy, source_size)
                         archive_item = {
@@ -6163,6 +6166,7 @@ class Processor(QtCore.QObject):
                             "frame_pts_sec": frame_pts_sec,
                             "crop_xyxy": hdr_crop_xyxy,
                             "primary_path": crop_img_path,
+                            "display_compat": archive_display_compat,
                         }
                     primary_saved_or_enqueued = False
                     if save_q is not None:
@@ -6281,6 +6285,7 @@ class Processor(QtCore.QObject):
                                 "frame_pts_sec": frame_pts_sec,
                                 "crop_xyxy": hdr_crop_xyxy,
                                 "primary_path": crop_img_path,
+                                "display_compat": archive_display_compat,
                             }
                             try:
                                 archive_q.put_nowait(archive_item)
@@ -6298,6 +6303,7 @@ class Processor(QtCore.QObject):
                                 hdr_crop_xyxy,
                                 hdr_out_path,
                                 primary_path=crop_img_path,
+                                display_compat=archive_display_compat,
                             )
                             if not ok_archive:
                                 self._status(
@@ -8100,6 +8106,7 @@ class Processor(QtCore.QObject):
         out_path: str,
         *,
         primary_path: str | None = None,
+        display_compat: bool | None = None,
     ) -> tuple[bool, str]:
         """Save an optional HDR/archive crop without changing the primary PNG path.
 
@@ -8113,7 +8120,10 @@ class Processor(QtCore.QObject):
         """
         is_avif = str(out_path).lower().endswith(".avif")
         force_source_avif = self._truthy_env("PC_HDR_AVIF_SOURCE_ARCHIVE")
-        display_compat = bool(getattr(self.cfg, "hdr_avif_wic_display_compat", True))
+        if display_compat is None:
+            display_compat = bool(getattr(self.cfg, "hdr_avif_wic_display_compat", True))
+        else:
+            display_compat = bool(display_compat)
         if is_avif and display_compat and not force_source_avif:
             primary = str(primary_path or "").strip()
             if primary and os.path.exists(primary) and Path(primary).suffix.lower() == ".png":
