@@ -6126,9 +6126,14 @@ class Processor(QtCore.QObject):
                     if save_q is not None:
                         wait_for_save = bool(getattr(self.cfg, "async_save_wait", False))
                         if hdr_primary_fullres:
-                            # HDR primary saves must be ack-gated so failed exports are
-                            # never counted as successful before optional archive enqueue.
-                            wait_for_save = True
+                            # The HDR/WIC primary export is intentionally expensive
+                            # (source seek + lossless HDR still + WIC conversion +
+                            # speckle repair). Blocking the capture loop here makes
+                            # every accepted crop stall detection for several seconds,
+                            # which is exactly the lag seen between crop@... and
+                            # CAPTURE... in normal runs. Keep the old synchronous
+                            # behavior only when explicitly requested for debugging.
+                            wait_for_save = wait_for_save or self._truthy_env("PC_HDR_PRIMARY_SYNC_SAVE")
                         ack_q: Optional[queue.Queue] = queue.Queue(maxsize=1) if wait_for_save else None
                         save_cancel_evt: Optional[threading.Event] = threading.Event() if wait_for_save else None
                         try:
@@ -7792,26 +7797,39 @@ class Processor(QtCore.QObject):
             # are limited to tiny components only.
             n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
             keep = np.zeros_like(mask, dtype=np.uint8)
+            repair_rois = []
             for i in range(1, n):
                 area = int(stats[i, cv2.CC_STAT_AREA])
                 if area <= 0:
                     continue
+                comp_x = int(stats[i, cv2.CC_STAT_LEFT])
+                comp_y = int(stats[i, cv2.CC_STAT_TOP])
                 bbox_w = int(stats[i, cv2.CC_STAT_WIDTH])
                 bbox_h = int(stats[i, cv2.CC_STAT_HEIGHT])
                 if bbox_w <= 0 or bbox_h <= 0:
                     continue
-                component = labels == i
-                has_blue_seed = bool(np.any(blue_seed[component]))
-                has_cyan_seed = bool(np.any(cyan_seed[component]))
-                has_strict_seed = bool(np.any(strict_seed[component]))
-                has_residual_hue_seed = bool(np.any(residual_hue_seed[component]))
 
-                if (has_blue_seed or has_cyan_seed) and not has_strict_seed:
-                    if area <= BLUE_CYAN_MAX_AREA and bbox_w <= BLUE_CYAN_MAX_BBOX and bbox_h <= BLUE_CYAN_MAX_BBOX:
-                        keep[component] = 255
+                # Work inside the component bbox.  The old labels == i check
+                # allocated a full-frame boolean array for every component, which
+                # is unnecessarily expensive on 4K crops.
+                y2 = comp_y + bbox_h
+                x2 = comp_x + bbox_w
+                component = labels[comp_y:y2, comp_x:x2] == i
+                if not bool(np.any(component)):
                     continue
+                has_blue_seed = bool(np.any(blue_seed[comp_y:y2, comp_x:x2][component]))
+                has_cyan_seed = bool(np.any(cyan_seed[comp_y:y2, comp_x:x2][component]))
+                has_strict_seed = bool(np.any(strict_seed[comp_y:y2, comp_x:x2][component]))
+                has_residual_hue_seed = bool(np.any(residual_hue_seed[comp_y:y2, comp_x:x2][component]))
 
-                if has_strict_seed:
+                accept_component = False
+                if (has_blue_seed or has_cyan_seed) and not has_strict_seed:
+                    accept_component = (
+                        area <= BLUE_CYAN_MAX_AREA
+                        and bbox_w <= BLUE_CYAN_MAX_BBOX
+                        and bbox_h <= BLUE_CYAN_MAX_BBOX
+                    )
+                elif has_strict_seed:
                     long_edge = max(bbox_w, bbox_h)
                     short_edge = max(1, min(bbox_w, bbox_h))
                     fill_ratio = float(area) / float(bbox_w * bbox_h)
@@ -7828,35 +7846,53 @@ class Processor(QtCore.QObject):
                         and bbox_h <= STRICT_HUE_MAX_BBOX
                         and fill_ratio >= 0.18
                     )
-                    if is_tiny_speckle or is_compact_speckle or is_strict_hue_blob:
-                        keep[component] = 255
-                    continue
+                    accept_component = is_tiny_speckle or is_compact_speckle or is_strict_hue_blob
+                elif has_residual_hue_seed:
+                    accept_component = (
+                        area <= RESIDUAL_HUE_MAX_AREA
+                        and bbox_w <= RESIDUAL_HUE_MAX_BBOX
+                        and bbox_h <= RESIDUAL_HUE_MAX_BBOX
+                    )
+                elif 1 <= area <= 4:
+                    accept_component = True
+                elif 5 <= area <= 80:
+                    long_edge = max(bbox_w, bbox_h)
+                    short_edge = max(1, min(bbox_w, bbox_h))
+                    fill_ratio = float(area) / float(bbox_w * bbox_h)
+                    # Preserve tiny compact blobs, but reject thin/elongated regions
+                    # that are more likely real scene detail than WIC salt speckles.
+                    accept_component = (
+                        long_edge <= 12
+                        and (long_edge / short_edge) <= 3.0
+                        and fill_ratio >= 0.40
+                    )
 
-                if has_residual_hue_seed:
-                    if area <= RESIDUAL_HUE_MAX_AREA and bbox_w <= RESIDUAL_HUE_MAX_BBOX and bbox_h <= RESIDUAL_HUE_MAX_BBOX:
-                        keep[component] = 255
-                    continue
-
-                if 1 <= area <= 4:
-                    keep[component] = 255
-                    continue
-                if not (5 <= area <= 80):
-                    continue
-                long_edge = max(bbox_w, bbox_h)
-                short_edge = max(1, min(bbox_w, bbox_h))
-                fill_ratio = float(area) / float(bbox_w * bbox_h)
-                # Preserve tiny compact blobs, but reject thin/elongated regions
-                # that are more likely real scene detail than WIC salt speckles.
-                if long_edge <= 12 and (long_edge / short_edge) <= 3.0 and fill_ratio >= 0.40:
-                    keep[component] = 255
+                if accept_component:
+                    keep_roi = keep[comp_y:y2, comp_x:x2]
+                    keep_roi[component] = 255
+                    repair_rois.append((comp_x, comp_y, bbox_w, bbox_h))
             changed = int(np.count_nonzero(keep))
             if changed <= 0:
                 return 0
-            # Inpaint only the connected defective component from surrounding
-            # good WIC-rendered pixels. Do not globally blur or denoise.
-            repaired = cv2.inpaint(bgr, keep, 2.0, cv2.INPAINT_TELEA)
+            # Inpaint only the kept local defect regions from surrounding
+            # good WIC-rendered pixels.  The old code inpainted the complete
+            # multi-megapixel crop for a few hundred/thousand bad pixels.
             out = img.copy()
-            out[:, :, :3] = repaired
+            repaired_bgr = out[:, :, :3]
+            pad = 4
+            for rx, ry, rw, rh in repair_rois:
+                x1 = max(0, int(rx) - pad)
+                y1 = max(0, int(ry) - pad)
+                x2 = min(repaired_bgr.shape[1], int(rx) + int(rw) + pad)
+                y2 = min(repaired_bgr.shape[0], int(ry) + int(rh) + pad)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                roi_mask = keep[y1:y2, x1:x2]
+                if int(np.count_nonzero(roi_mask)) <= 0:
+                    continue
+                roi_src = repaired_bgr[y1:y2, x1:x2]
+                roi_fixed = cv2.inpaint(roi_src, roi_mask, 2.0, cv2.INPAINT_TELEA)
+                roi_src[roi_mask > 0] = roi_fixed[roi_mask > 0]
             ok = cv2.imwrite(str(path), out)
             if not ok:
                 return 0
