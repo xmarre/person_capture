@@ -925,6 +925,15 @@ class Processor(QtCore.QObject):
             # OpenCV usually reports the next frame index.
             return pos >= total
 
+        def _at_soft_eof() -> bool:
+            reader_soft_eof = getattr(cap, "_at_soft_eof", None)
+            if callable(reader_soft_eof):
+                try:
+                    return bool(reader_soft_eof())
+                except Exception:
+                    pass
+            return _at_known_eof()
+
         advanced = 0
         remaining = max(0, int(count))
         fast_skip = getattr(cap, "skip_frames", None)
@@ -932,7 +941,15 @@ class Processor(QtCore.QObject):
             try:
                 skipped = int(fast_skip(remaining))
             except Exception as exc:
-                if _at_known_eof():
+                startup_exc = getattr(cap, "_last_startup_error", None)
+                if startup_exc is not None:
+                    self._status(
+                        f"Pre-scan fast skip failed: {startup_exc}",
+                        key="prescan_skip_error",
+                        interval=0.5,
+                    )
+                    raise RuntimeError("Pre-scan reader failed during fast skip") from startup_exc
+                if _at_known_eof() or _at_soft_eof():
                     return advanced
                 self._status(
                     f"Pre-scan fast skip failed: {exc}",
@@ -950,14 +967,7 @@ class Processor(QtCore.QObject):
                         interval=0.5,
                     )
                     raise RuntimeError("Pre-scan reader failed during fast skip") from startup_exc
-                at_soft_eof = False
-                reader_soft_eof = getattr(cap, "_at_soft_eof", None)
-                if callable(reader_soft_eof):
-                    try:
-                        at_soft_eof = bool(reader_soft_eof())
-                    except Exception:
-                        at_soft_eof = False
-                if (not _at_known_eof()) and (not at_soft_eof):
+                if (not _at_known_eof()) and (not _at_soft_eof()):
                     self._status(
                         f"Pre-scan fast skip incomplete: requested={remaining} got={skipped}",
                         key="prescan_skip_error",
@@ -4487,7 +4497,6 @@ class Processor(QtCore.QObject):
 
             def _atomic_jpeg_write(img: np.ndarray, out_path: str, q: int) -> tuple[bool, str]:
                 tmp = out_path + ".tmp"
-                published = False
                 try:
                     params: list[int] = []
                     try:
@@ -4505,7 +4514,6 @@ class Processor(QtCore.QObject):
                             fh.flush()
                             os.fsync(fh.fileno())
                     os.replace(tmp, out_path)
-                    published = True
                     if bool(getattr(self.cfg, "save_fsync", False)):
                         # On POSIX, fsync the containing directory so the rename
                         # itself is durable, not just the file contents.
@@ -4530,8 +4538,6 @@ class Processor(QtCore.QObject):
                     return True, ""
                 except Exception as e:
                     try:
-                        if published and os.path.exists(out_path):
-                            os.remove(out_path)
                         if os.path.exists(tmp):
                             os.remove(tmp)
                     except Exception:
@@ -6096,7 +6102,7 @@ class Processor(QtCore.QObject):
                     primary_saved_or_enqueued = False
                     if save_q is not None:
                         wait_for_save = bool(getattr(self.cfg, "async_save_wait", False))
-                        if hdr_primary_fullres:
+                        if hdr_primary_fullres or hdr_out_path:
                             # HDR primary saves must be ack-gated so failed exports are
                             # never counted as successful before optional archive enqueue.
                             wait_for_save = True
