@@ -7660,21 +7660,24 @@ class Processor(QtCore.QObject):
             b = pix[:, :, 0]
             g = pix[:, :, 1]
             r = pix[:, :, 2]
-            max_ch = np.maximum(np.maximum(b, g), r)
-            min_ch = np.minimum(np.minimum(b, g), r)
             max_rg = np.maximum(r, g)
             max_bg = np.maximum(b, g)
             min_bg = np.minimum(b, g)
             min_rb = np.minimum(r, b)
+
             # Repair tuning. Keep these local to the WIC-only cleanup path so
-            # normal FFmpeg/libplacebo exports are unaffected.
+            # normal FFmpeg/libplacebo exports are unaffected. Blue/cyan keeps
+            # the PR #328 short-streak allowance; residual red/magenta additions
+            # are separately bounded so they cannot shrink that accepted path.
             BLUE_CYAN_SEED_DILATE = 7
             BLUE_CYAN_MAX_AREA = 420
             BLUE_CYAN_MAX_BBOX = 48
             STRICT_HUE_SEED_DILATE = 5
-            GENERIC_CHROMA_SEED_DILATE = 5
-            GENERIC_CHROMA_MAX_AREA = 96
-            GENERIC_CHROMA_MAX_BBOX = 24
+            STRICT_HUE_MAX_AREA = 160
+            STRICT_HUE_MAX_BBOX = 24
+            RESIDUAL_HUE_MAX_AREA = 12
+            RESIDUAL_HUE_MAX_BBOX = 6
+
             # Use a local luma gate so real bright colored content such as
             # candles/fire is never treated as a defect. The observed WIC bug is
             # confined to hair/clothes/shadow regions.
@@ -7682,54 +7685,40 @@ class Processor(QtCore.QObject):
             local_luma = cv2.medianBlur(luma, 5)
             dark_blue = local_luma <= 128
             dark_strict = local_luma <= 112
-            # The remaining WIC failures are not always a one-pixel core. They
-            # can leave a short, lower-intensity blue halo around the saturated
-            # pixel, and 4:2:0 AVIF chroma subsampling makes that halo visible
-            # even after the old exact-pixel mask removed the brightest center.
-            # Use a strict seed for impossible blue pixels, then grow only into
-            # nearby low-intensity blue contamination. Keep red/magenta on the
-            # original strict thresholds so normal warm shadow detail is not
-            # pulled into the repair mask.
+
+            # The WIC failures are not always a one-pixel saturated core. They
+            # can leave a short, lower-intensity blue/cyan halo around the
+            # saturated pixel, and 4:2:0 AVIF chroma subsampling makes that halo
+            # visible after the old exact-pixel mask removed the brightest center.
+            # Use strict hue seeds, then grow only into nearby same-hue local
+            # outliers.
             local_b = cv2.medianBlur(bgr[:, :, 0], 5).astype(np.int16, copy=False)
             local_g = cv2.medianBlur(bgr[:, :, 1], 5).astype(np.int16, copy=False)
             local_r = cv2.medianBlur(bgr[:, :, 2], 5).astype(np.int16, copy=False)
-            wide_b = cv2.medianBlur(bgr[:, :, 0], 11).astype(np.int16, copy=False)
-            wide_g = cv2.medianBlur(bgr[:, :, 1], 11).astype(np.int16, copy=False)
-            wide_r = cv2.medianBlur(bgr[:, :, 2], 11).astype(np.int16, copy=False)
             b_jump = b - local_b
             g_jump = g - local_g
             r_jump = r - local_r
-            b_jump_wide = b - wide_b
-            g_jump_wide = g - wide_g
-            r_jump_wide = r - wide_r
-            max_pos_jump = np.maximum(np.maximum(b_jump, g_jump), r_jump)
-            max_pos_jump_wide = np.maximum(np.maximum(b_jump_wide, g_jump_wide), r_jump_wide)
-            local_max = np.maximum(np.maximum(local_b, local_g), local_r)
-            local_min = np.minimum(np.minimum(local_b, local_g), local_r)
-            wide_max = np.maximum(np.maximum(wide_b, wide_g), wide_r)
-            wide_min = np.minimum(np.minimum(wide_b, wide_g), wide_r)
-            chroma_spread = max_ch - min_ch
-            local_chroma_jump = chroma_spread - (local_max - local_min)
-            wide_chroma_jump = chroma_spread - (wide_max - wide_min)
+
             blue_seed = dark_blue & (
                 ((b >= 145) & ((b - max_rg) >= 45) & (r <= 112) & (g <= 112))
                 | ((b >= 88) & ((b - max_rg) >= 60) & (r <= 40) & (g <= 40))
-                | ((b >= 92) & ((b - max_rg) >= 34) & (r <= 80) & (g <= 120) & ((b_jump >= 28) | (b_jump_wide >= 28)))
+                | ((b >= 92) & ((b - max_rg) >= 34) & (r <= 80) & (g <= 120) & (b_jump >= 28))
             )
             blue_halo = dark_blue & (b >= 70) & ((b - max_rg) >= 22) & (r <= 128) & (g <= 128)
-            # Some WIC defects are turquoise rather than pure blue: both B and G
-            # jump above the local neighborhood while red remains suppressed.
-            # Check both a tight and a wider median reference. The wider reference
-            # catches small blobs whose 5x5 median has already been contaminated
-            # by the bad pixels themselves.
+
+            # Turquoise/cyan WIC defects have both B and G elevated while red is
+            # locally suppressed. Keep this hue-specific instead of using a
+            # generic chroma-spread detector, which can merge unrelated dark
+            # texture into the component and make the repair less predictable.
             cyan_seed = (
                 dark_blue
                 & (b >= 95)
                 & (g >= 80)
                 & (r <= 96)
                 & ((min_bg - r) >= 38)
-                & (((b_jump >= 22) & (g_jump >= 16)) | ((b_jump_wide >= 22) & (g_jump_wide >= 16)))
-                & ((r_jump <= 24) | (r_jump_wide <= 24))
+                & (b_jump >= 22)
+                & (g_jump >= 16)
+                & (r_jump <= 24)
             )
             cyan_halo = (
                 dark_blue
@@ -7737,68 +7726,70 @@ class Processor(QtCore.QObject):
                 & (g >= 56)
                 & (r <= 112)
                 & ((min_bg - r) >= 26)
-                & (((b_jump >= 14) & (g_jump >= 10)) | ((b_jump_wide >= 14) & (g_jump_wide >= 10)))
+                & (b_jump >= 14)
+                & (g_jump >= 10)
             )
+
             magenta = dark_strict & (r >= 160) & (b >= 160) & ((min_rb - g) >= 50) & (g <= 96)
             red = dark_strict & (r >= 180) & ((r - max_bg) >= 70) & (b <= 80) & (g <= 80)
+            strict_seed = magenta | red
+
+            # Red/magenta residuals are handled as same-hue local outliers near a
+            # strict red/magenta seed. This extends the old strict branch without
+            # falling back to a broad hue-agnostic chroma cleanup.
             red_halo = (
                 dark_strict
-                & (r >= 92)
-                & ((r - max_bg) >= 34)
+                & (r >= 104)
+                & ((r - max_bg) >= 40)
                 & (b <= 128)
                 & (g <= 128)
-                & ((r_jump >= 22) | (r_jump_wide >= 22))
+                & (r_jump >= 20)
             )
             magenta_halo = (
                 dark_strict
-                & (r >= 90)
-                & (b >= 90)
-                & ((min_rb - g) >= 28)
+                & (r >= 104)
+                & (b >= 104)
+                & ((min_rb - g) >= 34)
                 & (g <= 128)
-                & (((r_jump >= 18) & (b_jump >= 18)) | ((r_jump_wide >= 18) & (b_jump_wide >= 18)))
+                & (r_jump >= 16)
+                & (b_jump >= 16)
             )
-            # Final guardrail for rare residual colors: a dark-pixel chroma spike
-            # that is locally impossible, regardless of whether the hue is blue,
-            # cyan, red, or magenta. This is only accepted later when the connected
-            # component remains small, so legitimate broad colored content is not
-            # pulled into the repair mask.
-            generic_chroma_seed = dark_strict & (max_ch >= 86) & (chroma_spread >= 46) & (
-                ((max_pos_jump >= 24) & (local_chroma_jump >= 18))
-                | ((max_pos_jump_wide >= 24) & (wide_chroma_jump >= 18))
-            )
-            generic_chroma_halo = dark_strict & (max_ch >= 70) & (chroma_spread >= 28) & (
-                ((max_pos_jump >= 14) & (local_chroma_jump >= 10))
-                | ((max_pos_jump_wide >= 14) & (wide_chroma_jump >= 10))
-            )
+
+            # Last-resort singleton/small-blob residual seeds. These are still
+            # hue-specific and locally impossible, but they are accepted only as
+            # very small components below, so they can remove leftover dots
+            # without changing the broad-streak blue/cyan behavior.
+            residual_blue = dark_blue & (b >= 86) & ((b - max_rg) >= 30) & (r <= 96) & (g <= 132) & (b_jump >= 24)
+            residual_cyan = dark_blue & (b >= 82) & (g >= 70) & (r <= 104) & ((min_bg - r) >= 30) & (b_jump >= 16) & (g_jump >= 12)
+            residual_red = dark_strict & (r >= 112) & ((r - max_bg) >= 42) & (b <= 128) & (g <= 128) & (r_jump >= 24)
+            residual_magenta = dark_strict & (r >= 112) & (b >= 112) & ((min_rb - g) >= 34) & (g <= 128) & (r_jump >= 18) & (b_jump >= 18)
+            residual_hue_seed = (residual_blue | residual_cyan | residual_red | residual_magenta) & ~strict_seed & ~(blue_seed | cyan_seed)
+
             blue_or_cyan_seed = blue_seed | cyan_seed
             blue_near_seed = cv2.dilate(
                 blue_or_cyan_seed.astype(np.uint8),
                 np.ones((BLUE_CYAN_SEED_DILATE, BLUE_CYAN_SEED_DILATE), dtype=np.uint8),
                 iterations=1,
             ).astype(bool)
-            strict_seed = magenta | red
             strict_near_seed = cv2.dilate(
                 strict_seed.astype(np.uint8),
                 np.ones((STRICT_HUE_SEED_DILATE, STRICT_HUE_SEED_DILATE), dtype=np.uint8),
                 iterations=1,
             ).astype(bool)
-            generic_near_seed = cv2.dilate(
-                generic_chroma_seed.astype(np.uint8),
-                np.ones((GENERIC_CHROMA_SEED_DILATE, GENERIC_CHROMA_SEED_DILATE), dtype=np.uint8),
-                iterations=1,
-            ).astype(bool)
-            seed = blue_or_cyan_seed | strict_seed | generic_chroma_seed
+
+            seed = blue_or_cyan_seed | strict_seed | residual_hue_seed
             mask = (
                 seed
                 | ((blue_halo | cyan_halo) & blue_near_seed)
                 | ((red_halo | magenta_halo) & strict_near_seed)
-                | (generic_chroma_halo & generic_near_seed)
             ).astype(np.uint8)
             if int(mask.sum()) <= 0:
                 return 0
-            # Reject broad regions. Keep the compactness/fill guard consistent
-            # across strict, blue/cyan, and generic chroma branches so expanded
-            # hue coverage does not broaden inpaint acceptance semantics.
+
+            # Reject broad regions. Blue/cyan WIC faults can be short streaks, so
+            # preserve the PR #328 48x48/420px allowance. Strict red/magenta
+            # halos get a smaller hue-specific bound. Standalone residual seeds
+            # are limited to tiny components only.
             n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
             keep = np.zeros_like(mask, dtype=np.uint8)
             for i in range(1, n):
@@ -7809,45 +7800,54 @@ class Processor(QtCore.QObject):
                 bbox_h = int(stats[i, cv2.CC_STAT_HEIGHT])
                 if bbox_w <= 0 or bbox_h <= 0:
                     continue
-                long_edge = max(bbox_w, bbox_h)
-                short_edge = max(1, min(bbox_w, bbox_h))
-                fill_ratio = float(area) / float(bbox_w * bbox_h)
-                is_tiny_speckle = 1 <= area <= 4
-                is_compact_speckle = (
-                    5 <= area <= 80
-                    and long_edge <= 12
-                    and (long_edge / short_edge) <= 3.0
-                    and fill_ratio >= 0.40
-                )
                 component = labels == i
                 has_blue_seed = bool(np.any(blue_seed[component]))
                 has_cyan_seed = bool(np.any(cyan_seed[component]))
                 has_strict_seed = bool(np.any(strict_seed[component]))
-                has_generic_chroma_seed = bool(np.any(generic_chroma_seed[component]))
+                has_residual_hue_seed = bool(np.any(residual_hue_seed[component]))
+
                 if (has_blue_seed or has_cyan_seed) and not has_strict_seed:
-                    if (
-                        area <= BLUE_CYAN_MAX_AREA
-                        and bbox_w <= BLUE_CYAN_MAX_BBOX
-                        and bbox_h <= BLUE_CYAN_MAX_BBOX
-                        and (is_tiny_speckle or is_compact_speckle)
-                    ):
+                    if area <= BLUE_CYAN_MAX_AREA and bbox_w <= BLUE_CYAN_MAX_BBOX and bbox_h <= BLUE_CYAN_MAX_BBOX:
                         keep[component] = 255
                     continue
-                if has_generic_chroma_seed and not (has_blue_seed or has_cyan_seed or has_strict_seed):
-                    if (
-                        area <= GENERIC_CHROMA_MAX_AREA
-                        and bbox_w <= GENERIC_CHROMA_MAX_BBOX
-                        and bbox_h <= GENERIC_CHROMA_MAX_BBOX
-                        and (is_tiny_speckle or is_compact_speckle)
-                    ):
+
+                if has_strict_seed:
+                    long_edge = max(bbox_w, bbox_h)
+                    short_edge = max(1, min(bbox_w, bbox_h))
+                    fill_ratio = float(area) / float(bbox_w * bbox_h)
+                    is_tiny_speckle = 1 <= area <= 4
+                    is_compact_speckle = (
+                        5 <= area <= 80
+                        and long_edge <= 12
+                        and (long_edge / short_edge) <= 3.0
+                        and fill_ratio >= 0.40
+                    )
+                    is_strict_hue_blob = (
+                        area <= STRICT_HUE_MAX_AREA
+                        and bbox_w <= STRICT_HUE_MAX_BBOX
+                        and bbox_h <= STRICT_HUE_MAX_BBOX
+                        and fill_ratio >= 0.18
+                    )
+                    if is_tiny_speckle or is_compact_speckle or is_strict_hue_blob:
                         keep[component] = 255
                     continue
-                if is_tiny_speckle:
+
+                if has_residual_hue_seed:
+                    if area <= RESIDUAL_HUE_MAX_AREA and bbox_w <= RESIDUAL_HUE_MAX_BBOX and bbox_h <= RESIDUAL_HUE_MAX_BBOX:
+                        keep[component] = 255
+                    continue
+
+                if 1 <= area <= 4:
                     keep[component] = 255
                     continue
+                if not (5 <= area <= 80):
+                    continue
+                long_edge = max(bbox_w, bbox_h)
+                short_edge = max(1, min(bbox_w, bbox_h))
+                fill_ratio = float(area) / float(bbox_w * bbox_h)
                 # Preserve tiny compact blobs, but reject thin/elongated regions
                 # that are more likely real scene detail than WIC salt speckles.
-                if is_compact_speckle:
+                if long_edge <= 12 and (long_edge / short_edge) <= 3.0 and fill_ratio >= 0.40:
                     keep[component] = 255
             changed = int(np.count_nonzero(keep))
             if changed <= 0:
