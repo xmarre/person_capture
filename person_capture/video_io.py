@@ -3027,6 +3027,116 @@ class FfmpegPipeReader:
             self._pos = next_pos
             return True
 
+    def skip_frames(self, count: int) -> int:
+        """Discard decoded pipe frames without materializing NumPy arrays.
+
+        Pre-scan samples sparsely but the old caller advanced to the next sample
+        by calling ``grab()`` once for every skipped frame.  For the ffmpeg pipe
+        that still avoided ``retrieve()``, but it crossed Python once per frame
+        and kept all the normal grab/fallback bookkeeping in the hot path.  This
+        method reads whole rawvideo frame blocks from stdout and advances the
+        source-frame counter directly.  It preserves the same sequential decode
+        semantics; it only removes per-frame Python overhead for discarded
+        frames.
+        """
+
+        try:
+            remaining = max(0, int(count))
+        except Exception:
+            remaining = 0
+        if remaining <= 0:
+            return 0
+
+        # If a seek preroll is active, keep using grab() so drop_until handling
+        # remains identical to the existing path.
+        if getattr(self, "_drop_until", None) is not None:
+            advanced = 0
+            while advanced < remaining and self.grab():
+                self._arr = None
+                self._pipe_buf = None
+                advanced += 1
+            return advanced
+
+        if self._at_known_eof():
+            self._last_startup_error = None
+            return 0
+
+        try:
+            started = self._ensure_started()
+            self._last_startup_error = None
+        except Exception as exc:
+            self._last_startup_error = exc
+            if self._mode != "p010_passthrough" and not self._at_soft_eof():
+                self._log.warning(
+                    "HDR pipe startup failed during skip; trying fallback: %s",
+                    exc,
+                )
+                if self.try_fallback_chain():
+                    return self.skip_frames(remaining)
+            self._log.error("HDR pipe startup failed during skip", exc_info=True)
+            return 0
+
+        if not started or not self._proc or not self._proc.stdout:
+            if (
+                self._mode != "p010_passthrough"
+                and not self._at_soft_eof()
+                and self.try_fallback_chain()
+            ):
+                return self.skip_frames(remaining)
+            return 0
+
+        if self._pix_fmt in {"bgr24", "nv12", "p010le"}:
+            frame_bytes = int(self._pipe_frame_bytes)
+        else:
+            frame_bytes = int(getattr(self, "_frame_bytes_f32", 0) or 0)
+        if frame_bytes <= 0:
+            advanced = 0
+            while advanced < remaining and self.grab():
+                self._arr = None
+                self._pipe_buf = None
+                advanced += 1
+            return advanced
+
+        # Bound each read so sparse pre-scan on full-resolution pipes does not
+        # allocate a huge temporary buffer.  Make the chunk an integer number of
+        # frames so partial-frame accounting stays exact.
+        max_chunk_bytes = 16 * 1024 * 1024
+        max_chunk_frames = max(1, max_chunk_bytes // frame_bytes)
+        advanced = 0
+        self._arr = None
+        self._pipe_buf = None
+        while advanced < remaining:
+            if self._at_known_eof():
+                break
+            nframes = min(remaining - advanced, max_chunk_frames)
+            need = nframes * frame_bytes
+            try:
+                buf = self._proc.stdout.read(need)
+            except Exception:
+                if self._mode != "p010_passthrough" and not self._at_soft_eof():
+                    if self.try_fallback_chain():
+                        return advanced + self.skip_frames(remaining - advanced)
+                break
+            if not buf:
+                if self._mode != "p010_passthrough" and not self._at_soft_eof():
+                    if self.try_fallback_chain():
+                        return advanced + self.skip_frames(remaining - advanced)
+                break
+            got = len(buf) // frame_bytes
+            if got <= 0:
+                if self._mode != "p010_passthrough" and not self._at_soft_eof():
+                    if self.try_fallback_chain():
+                        return advanced + self.skip_frames(remaining - advanced)
+                break
+            self._pos += got
+            advanced += got
+            if len(buf) < need:
+                if self._mode != "p010_passthrough" and not self._at_soft_eof():
+                    if self.try_fallback_chain():
+                        return advanced + self.skip_frames(remaining - advanced)
+                break
+        return advanced
+
     def retrieve(self):
         if self._pix_fmt in {"bgr24", "nv12"}:
             raw, self._pipe_buf = self._pipe_buf, None

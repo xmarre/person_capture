@@ -393,6 +393,11 @@ class SessionConfig:
     preview_every: int = 3
     # I/O
     async_save: bool = True                # write crops/CSV on a background thread
+    # When async_save is enabled, do not wait for each crop to finish writing.
+    # The saver thread still flushes before run completion.  Enable this only
+    # for debugging old synchronous failure behavior.
+    async_save_wait: bool = False
+    save_fsync: bool = False               # fsync every JPEG temp file; safer but much slower
     jpg_quality: int = 85                  # JPEG quality (lower = faster, smaller)
     # Face full-frame fallback cadence (frames). 0 disables.
     face_fullframe_cadence: int = 12
@@ -920,8 +925,56 @@ class Processor(QtCore.QObject):
             # OpenCV usually reports the next frame index.
             return pos >= total
 
+        def _at_soft_eof() -> bool:
+            reader_soft_eof = getattr(cap, "_at_soft_eof", None)
+            if callable(reader_soft_eof):
+                try:
+                    return bool(reader_soft_eof())
+                except Exception:
+                    pass
+            return _at_known_eof()
+
         advanced = 0
         remaining = max(0, int(count))
+        fast_skip = getattr(cap, "skip_frames", None)
+        if callable(fast_skip) and remaining > 0:
+            try:
+                skipped = int(fast_skip(remaining))
+            except Exception as exc:
+                startup_exc = getattr(cap, "_last_startup_error", None)
+                if startup_exc is not None:
+                    self._status(
+                        f"Pre-scan fast skip failed: {startup_exc}",
+                        key="prescan_skip_error",
+                        interval=0.5,
+                    )
+                    raise RuntimeError("Pre-scan reader failed during fast skip") from startup_exc
+                if _at_known_eof() or _at_soft_eof():
+                    return advanced
+                self._status(
+                    f"Pre-scan fast skip failed: {exc}",
+                    key="prescan_skip_error",
+                    interval=0.5,
+                )
+                raise
+            skipped = max(0, min(remaining, skipped))
+            if skipped < remaining:
+                startup_exc = getattr(cap, "_last_startup_error", None)
+                if startup_exc is not None:
+                    self._status(
+                        f"Pre-scan fast skip failed: {startup_exc}",
+                        key="prescan_skip_error",
+                        interval=0.5,
+                    )
+                    raise RuntimeError("Pre-scan reader failed during fast skip") from startup_exc
+                if (not _at_known_eof()) and (not _at_soft_eof()):
+                    self._status(
+                        f"Pre-scan fast skip incomplete: requested={remaining} got={skipped}",
+                        key="prescan_skip_error",
+                        interval=0.5,
+                    )
+                    raise RuntimeError("Pre-scan fast skip returned short result before EOF")
+            return skipped
         for _ in range(remaining):
             if self._abort or _at_known_eof():
                 break
@@ -1391,14 +1444,12 @@ class Processor(QtCore.QObject):
                         self._status(
                             f"Pre-scan fd9 cadence skip={fd9_skip_samples} probe={fd9_probe_samples} period={fd9_gate_period}",
                             key="prescan_skip_cadence",
-                            interval=5.0,
                         )
 
                     if fd9_gate_active and not skip_extract:
                         self._status(
                             f"Pre-scan fd9 cadence probe skip={fd9_skip_samples} probe={fd9_probe_samples} period={fd9_gate_period}",
                             key="prescan_skip_probe",
-                            interval=5.0,
                         )
 
                     if best >= 8.99:
@@ -1410,7 +1461,6 @@ class Processor(QtCore.QObject):
                         self._status(
                             f"Pre-scan {pct:.1f}% ({idx}/{total_frames})",
                             key="prescan_progress",
-                            interval=0.25,
                         )
                         try:
                             self.progress.emit(int(min(idx, max(total_frames - 1, 0))))
@@ -4446,8 +4496,8 @@ class Processor(QtCore.QObject):
             jpg_q = int(getattr(cfg, "jpg_quality", 85))
 
             def _atomic_jpeg_write(img: np.ndarray, out_path: str, q: int) -> tuple[bool, str]:
+                tmp = out_path + ".tmp"
                 try:
-                    tmp = out_path + ".tmp"
                     params: list[int] = []
                     try:
                         qi = int(q)
@@ -4460,20 +4510,36 @@ class Processor(QtCore.QObject):
                         return False, "imencode_failed"
                     with open(tmp, "wb") as fh:
                         fh.write(buf.tobytes())
-                        fh.flush()
-                        try:
+                        if bool(getattr(self.cfg, "save_fsync", False)):
+                            fh.flush()
                             os.fsync(fh.fileno())
+                    os.replace(tmp, out_path)
+                    if bool(getattr(self.cfg, "save_fsync", False)):
+                        # On POSIX, fsync the containing directory so the rename
+                        # itself is durable, not just the file contents.
+                        o_directory = getattr(os, "O_DIRECTORY", None)
+                        if o_directory is not None:
+                            dir_path = os.path.dirname(out_path) or "."
+                            dir_fd = os.open(dir_path, os.O_RDONLY | int(o_directory))
+                            try:
+                                os.fsync(dir_fd)
+                            finally:
+                                os.close(dir_fd)
+                    if not os.path.exists(out_path):
+                        return False, "file_missing_after_replace"
+                    expected_size = int(getattr(buf, "nbytes", len(buf)))
+                    actual_size = int(os.path.getsize(out_path))
+                    if actual_size != expected_size:
+                        try:
+                            os.remove(out_path)
                         except Exception:
                             pass
-                    os.replace(tmp, out_path)
-                    if not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
-                        return False, "file_too_small"
+                        return False, f"file_size_mismatch:{actual_size}!={expected_size}"
                     return True, ""
                 except Exception as e:
                     try:
-                        tmp_path = out_path + ".tmp"
-                        if os.path.exists(tmp_path):
-                            os.remove(tmp_path)
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
                     except Exception:
                         pass
                     return False, f"{type(e).__name__}: {e}"
@@ -4502,14 +4568,21 @@ class Processor(QtCore.QObject):
                             break
 
                         ack_q = None
+                        cancel_evt: Optional[threading.Event] = None
                         ok = False
                         why = "save_not_attempted"
                         img_path = ""
                         row = None
                         kind = ""
+                        archive_item = None
                         if isinstance(item, dict):
                             ack_q = item.get("ack_q")
+                            cancel_evt = item.get("cancel_evt")
                             kind = str(item.get("type") or "")
+                            archive_item = item.get("archive_item")
+                            cancelled = bool(cancel_evt is not None and cancel_evt.is_set())
+                            if cancelled:
+                                ok, why = False, "save_cancelled"
                             if kind == "hdr_sdr":
                                 img_path = str(item.get("path") or "")
                                 row = item.get("row")
@@ -4519,20 +4592,22 @@ class Processor(QtCore.QObject):
                                         frame_pts_sec = float(frame_pts_sec)
                                     except Exception:
                                         frame_pts_sec = None
-                                ok, why = self._save_hdr_sdr_screencap(
-                                    int(item.get("frame_idx", 0)),
-                                    frame_pts_sec,
-                                    tuple(item.get("crop_xyxy") or (0, 0, 1, 1)),
-                                    img_path,
-                                )
+                                if not cancelled:
+                                    ok, why = self._save_hdr_sdr_screencap(
+                                        int(item.get("frame_idx", 0)),
+                                        frame_pts_sec,
+                                        tuple(item.get("crop_xyxy") or (0, 0, 1, 1)),
+                                        img_path,
+                                    )
                             elif kind == "jpeg":
                                 img_path = str(item.get("path") or "")
                                 row = item.get("row")
                                 img = item.get("img")
-                                if isinstance(img, np.ndarray):
-                                    ok, why = _atomic_jpeg_write(img, img_path, jpg_q)
-                                else:
-                                    ok, why = False, "invalid_jpeg_payload"
+                                if not cancelled:
+                                    if isinstance(img, np.ndarray):
+                                        ok, why = _atomic_jpeg_write(img, img_path, jpg_q)
+                                    else:
+                                        ok, why = False, "invalid_jpeg_payload"
                             else:
                                 ok, why = False, f"unknown_save_item_type:{kind or 'none'}"
                         else:
@@ -4549,7 +4624,19 @@ class Processor(QtCore.QObject):
                                 ack_q.put_nowait((bool(ok), str(why or "")))
                             except Exception:
                                 pass
-                        if ok:
+                        cancelled_after_save = bool(cancel_evt is not None and cancel_evt.is_set())
+                        if ok and not cancelled_after_save:
+                            if archive_item is not None and archive_q is not None:
+                                try:
+                                    archive_q.put_nowait(archive_item)
+                                except queue.Full:
+                                    archive_path = str(archive_item.get("path") or "")
+                                    self._status(
+                                        f"HDR archive queue blocked too long: {archive_path}",
+                                        key="save_backpressure",
+                                        interval=0.5,
+                                    )
+                                    logger.warning("Dropping optional HDR archive crop after primary save: %s", archive_path)
                             # hand off to worker thread for emitting
                             try:
                                 hit_q.put_nowait(img_path)
@@ -4563,8 +4650,7 @@ class Processor(QtCore.QObject):
                                     f.flush()
                             except Exception:
                                 logger.exception("CSV write failed for %s", img_path)
-
-                        else:
+                        elif not cancelled_after_save:
                             logger.error("Failed to save crop %s (%s)", img_path, why)
                             self._status(
                                 f"Save failed ({why}): {img_path}",
@@ -5752,7 +5838,6 @@ class Processor(QtCore.QObject):
                             self._status(
                                 f"side_guard repair L={left_margin:.1f} R={right_margin:.1f} req={required:.1f} fw={fw:.1f} fd={fd_val:.3f}",
                                 key="side_guard_dbg",
-                                interval=0.8,
                             )
                         except Exception:
                             pass
@@ -5973,13 +6058,12 @@ class Processor(QtCore.QObject):
                         self._status(
                             f"final_aspect={asp:.5f} target={targ:.5f} ratio={ratio_str}",
                             key="aspect",
-                            interval=2.0,
                         )
                     except Exception:
                         pass
 
                     self._status(
-                        f"crop@{idx}: face_box={c.get('face_box')}", key="cropface", interval=2.0
+                        f"crop@{idx}: face_box={c.get('face_box')}", key="cropface"
                     )
 
                     processed_crop_xyxy = (int(cx1), int(cy1), int(cx2), int(cy2))
@@ -6028,9 +6112,25 @@ class Processor(QtCore.QObject):
                         c.get("sharp"),
                         str(ratio_str),
                     ]
+                    archive_item = None
+                    if hdr_out_path:
+                        hdr_crop_xyxy = self._even_hdr_crop_xyxy(source_crop_xyxy, source_size)
+                        archive_item = {
+                            "type": "hdr_archive",
+                            "path": hdr_out_path,
+                            "frame_idx": int(idx),
+                            "frame_pts_sec": frame_pts_sec,
+                            "crop_xyxy": hdr_crop_xyxy,
+                        }
                     primary_saved_or_enqueued = False
                     if save_q is not None:
-                        ack_q: queue.Queue = queue.Queue(maxsize=1)
+                        wait_for_save = bool(getattr(self.cfg, "async_save_wait", False))
+                        if hdr_primary_fullres:
+                            # HDR primary saves must be ack-gated so failed exports are
+                            # never counted as successful before optional archive enqueue.
+                            wait_for_save = True
+                        ack_q: Optional[queue.Queue] = queue.Queue(maxsize=1) if wait_for_save else None
+                        save_cancel_evt: Optional[threading.Event] = threading.Event() if wait_for_save else None
                         try:
                             if hdr_primary_fullres:
                                 save_q.put_nowait({
@@ -6041,6 +6141,8 @@ class Processor(QtCore.QObject):
                                     "frame_pts_sec": frame_pts_sec,
                                     "crop_xyxy": source_crop_xyxy,
                                     "ack_q": ack_q,
+                                    "cancel_evt": save_cancel_evt,
+                                    "archive_item": archive_item,
                                 })
                             else:
                                 # enqueue a contiguous copy; slices are views into `frame`
@@ -6053,6 +6155,8 @@ class Processor(QtCore.QObject):
                                     "row": row,
                                     "img": buf,
                                     "ack_q": ack_q,
+                                    "cancel_evt": save_cancel_evt,
+                                    "archive_item": archive_item,
                                 })
                         except queue.Full:
                             self._status(
@@ -6061,29 +6165,31 @@ class Processor(QtCore.QObject):
                                 interval=0.5,
                             )
                             return False
-                        save_timeout_sec = max(5, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
-                        try:
-                            ok, why = ack_q.get(timeout=float(save_timeout_sec))
-                        except queue.Empty:
-                            self._status(
-                                f"Save ack timeout after {save_timeout_sec}s: {crop_img_path}",
-                                key="save_timeout",
-                                interval=0.5,
-                            )
-                            return False
-                        ack_why = str(why or "")
-                        if not ok:
-                            self._status(
-                                f"Save failed ({why}): {crop_img_path}",
-                                key="save_err",
-                                interval=0.5,
-                            )
-                            return False
-                        if hdr_primary_fullres and isinstance(row, list) and len(row) > 10:
+                        if wait_for_save and ack_q is not None:
+                            save_timeout_sec = max(5, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
                             try:
-                                c["sharp"] = float(row[10])
-                            except Exception:
-                                pass
+                                ok, why = ack_q.get(timeout=float(save_timeout_sec))
+                            except queue.Empty:
+                                if save_cancel_evt is not None:
+                                    save_cancel_evt.set()
+                                self._status(
+                                    f"Save ack timeout after {save_timeout_sec}s: {crop_img_path}",
+                                    key="save_timeout",
+                                    interval=0.5,
+                                )
+                                return False
+                            if not ok:
+                                self._status(
+                                    f"Save failed ({why}): {crop_img_path}",
+                                    key="save_err",
+                                    interval=0.5,
+                                )
+                                return False
+                            if hdr_primary_fullres and isinstance(row, list) and len(row) > 10:
+                                try:
+                                    c["sharp"] = float(row[10])
+                                except Exception:
+                                    pass
                         primary_saved_or_enqueued = True
                     else:
                         if hdr_primary_fullres:
@@ -6119,11 +6225,11 @@ class Processor(QtCore.QObject):
                             )
                             return False
                         primary_saved_or_enqueued = True
-                    if primary_saved_or_enqueued and hdr_out_path:
+                    if primary_saved_or_enqueued and hdr_out_path and save_q is None:
                         # HDR archive crops are encoded from 4:2:0/10-bit source video.
                         # Keep x/y/w/h even for AVIF and MKV; odd crop origins can shift
                         # chroma and show up as blue/purple blotches in dark regions.
-                        hdr_crop_xyxy = self._even_hdr_crop_xyxy(source_crop_xyxy, source_size)
+                        hdr_crop_xyxy = archive_item["crop_xyxy"] if archive_item is not None else self._even_hdr_crop_xyxy(source_crop_xyxy, source_size)
                         if archive_q is not None:
                             archive_item = {
                                 "type": "hdr_archive",
@@ -6486,7 +6592,6 @@ class Processor(QtCore.QObject):
                         self._status(
                             f"reject_reasons={reasons_to_log}",
                             key="rej_reasons",
-                            interval=1.0,
                         )
                     extra_note = " (face-only mode; faceless fallback disabled)" if face_only_pipeline else ""
                     self._status(
@@ -6495,7 +6600,6 @@ class Processor(QtCore.QObject):
                         f"best_fd_qonly={best_face_dist if best_face_dist is not None else 'n/a'} "
                         f"min_fd_all={min_fd_all if min_fd_all is not None else 'n/a'}{extra_note}",
                         key="no_match",
-                        interval=1.0,
                     )
                 chosen = None
                 if candidates:
@@ -6515,7 +6619,6 @@ class Processor(QtCore.QObject):
                                 self._status(
                                     f"reject_reasons={last_reject_reasons[:6]}",
                                     key="rej_reasons",
-                                    interval=1.0,
                                 )
                                 candidates = []
                     def eff_score(c):
@@ -6928,12 +7031,38 @@ class Processor(QtCore.QObject):
         """
         k = key or "_global"
         now = time.time()
-        iv = float(interval if interval is not None else getattr(self.cfg, 'log_interval_sec', 1.0))
+        try:
+            iv = float(interval if interval is not None else getattr(self.cfg, 'log_interval_sec', 1.0))
+        except Exception:
+            iv = 1.0
+        if not math.isfinite(iv):
+            iv = 1.0
+        iv = max(0.0, iv)
         last_t = self._status_last_time.get(k, 0.0)
         last_txt = self._status_last_text.get(k, None)
-        if (now - last_t) >= iv or msg != last_txt:
+        # Progress/debug channels often include frame numbers, percentages, or
+        # score text that changes every sample.  The old condition emitted every
+        # text change, so cfg.log_interval_sec could not throttle those logs.
+        # Keep phase/state transitions immediate, but throttle noisy channels by
+        # key even when the formatted message changes.
+        immediate_on_change = k in {
+            "phase",
+            "hdr_state",
+            "hdr_passthrough",
+            "prescan_cache",
+            "curate_done",
+        }
+        should_emit = (
+            iv <= 0.0
+            or last_txt is None
+            or (immediate_on_change and msg != last_txt)
+            or (now - last_t) >= iv
+        )
+        if should_emit:
             self.status.emit(msg)
             self._status_last_time[k] = now
+            self._status_last_text[k] = msg
+        else:
             self._status_last_text[k] = msg
 
     def _resolve_ffmpeg_bin(self) -> Optional[str]:
@@ -10963,6 +11092,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # speed / I/O
             skip_yolo_when_faceonly=bool(self.skip_yolo_faceonly_check.isChecked()) if hasattr(self, "skip_yolo_faceonly_check") else True,
             async_save=bool(self.async_save_check.isChecked()) if hasattr(self, "async_save_check") else True,
+            async_save_wait=bool(getattr(self.cfg, "async_save_wait", False)),
+            save_fsync=bool(getattr(self.cfg, "save_fsync", False)),
             jpg_quality=int(self.jpg_quality_spin.value()) if hasattr(self, "jpg_quality_spin") else 85,
             rot_adaptive=bool(self.rot_adaptive_check.isChecked()) if hasattr(self, "rot_adaptive_check") else True,
             rot_every_n=int(self.rot_every_spin.value()) if hasattr(self, "rot_every_spin") else 12,
@@ -11247,6 +11378,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.skip_yolo_faceonly_check.setChecked(bool(getattr(cfg, 'skip_yolo_when_faceonly', True)))
         if hasattr(self, 'async_save_check'):
             self.async_save_check.setChecked(bool(getattr(cfg, 'async_save', True)))
+        self.cfg.async_save_wait = bool(getattr(cfg, "async_save_wait", False))
+        self.cfg.save_fsync = bool(getattr(cfg, "save_fsync", False))
         if hasattr(self, 'jpg_quality_spin'):
             self.jpg_quality_spin.setValue(int(getattr(cfg, 'jpg_quality', 85)))
         self.only_best_check.setChecked(cfg.only_best)
@@ -12242,6 +12375,20 @@ class MainWindow(QtWidgets.QMainWindow):
             s.value(
                 "hdr_avif_wic_display_compat",
                 getattr(self.cfg, "hdr_avif_wic_display_compat", True),
+                type=bool,
+            )
+        )
+        self.cfg.async_save_wait = bool(
+            s.value(
+                "async_save_wait",
+                getattr(self.cfg, "async_save_wait", False),
+                type=bool,
+            )
+        )
+        self.cfg.save_fsync = bool(
+            s.value(
+                "save_fsync",
+                getattr(self.cfg, "save_fsync", False),
                 type=bool,
             )
         )
