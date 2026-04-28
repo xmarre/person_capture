@@ -483,6 +483,7 @@ class FaceEmbedder:
         self._high_180: int = 1280
         self._prescan_period: int = 3       # rotate every N prescan samples when empty
         self._prescan_probe_imgsz: int = 384
+        self._prescan_no_upscale_det: bool = True  # do not upscale already downscaled prescan frames for 0° detect
         self._heavy_cap: int = 2048
         # --- adaptive rotation controls (speed-up on empty scenes) ---
         self._frame_idx: int = 0
@@ -2093,14 +2094,11 @@ class FaceEmbedder:
 
     def _extract_with_scrfd(self, bgr_img: np.ndarray, *, imgsz: Optional[int] = None):
         self._frame_idx += 1
-        # prescan throttle for both SCRFD and insight_app backends
-        if self._fast_prescan:
-            period = max(1, int(getattr(self, "_prescan_period", 3)))
-            if not (
-                self._prescan_escalate
-                or ((self._frame_idx + self._prescan_rr) % period) == 0
-            ):
-                return []
+        # Do not gate the whole pre-scan extractor here. prescan_rot_probe_period
+        # is only a rotated-fallback cadence; the caller-level fd9 gate is the
+        # only deliberate whole-sample skip. Returning [] here makes a skipped
+        # detector pass indistinguishable from “no face”, which corrupts the
+        # fd9 streak and causes delayed/missed target re-entry.
         if self.scrfd is not None:
             return self._extract_with_scrfd_raw(bgr_img, imgsz=imgsz)
         if self.insight_app is not None:
@@ -2194,9 +2192,14 @@ class FaceEmbedder:
         # speed-up: during a no-face streak, use a smaller first-pass size
         if self._no_face_streak >= 3:
             dyn = min(dyn, self.fast_no_face_imgsz)
-        # in fast pre-scan, cap upright pass to probe size for empty scenes
+        # In fast pre-scan, cap the upright pass to the probe size. If the
+        # pre-scan reader already decoded/downscaled to a smaller frame, avoid
+        # upscaling it back to 512+ just for SCRFD input. Upscaling cannot add
+        # face detail, but it increases detector cost quadratically.
         if self._fast_prescan:
             dyn = min(dyn, int(getattr(self, "_prescan_probe_imgsz", 384)))
+            if bool(getattr(self, "_prescan_no_upscale_det", True)):
+                dyn = min(dyn, _round32(max(H0, W0)))
         dyn = _round32(max(320, dyn))
         L = max(H0, W0)
         heavy_cap = max(int(getattr(self, "_heavy_cap", 2048)), dyn)  # optional safety cap
