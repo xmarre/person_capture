@@ -24,6 +24,7 @@ import json
 import csv
 import traceback
 import logging
+import ast
 
 # Ensure logs also go to stdout (console), not only to the Qt log widget.
 logging.basicConfig(
@@ -484,7 +485,7 @@ class SessionConfig:
     # Decoder-level prescan downscale (open a separate low-res reader only for prescan).
     prescan_decode_max_w: int = 384
     prescan_hdr_preview: bool = False      # drive Vulkan HDR preview during pre-scan; off avoids duplicate decode/seek work
-    prescan_face_conf: float = 0.5         # face detector confidence during prescan
+    prescan_face_conf: float = 0.5         # detector candidate threshold during prescan (not identity chance)
     prescan_fd_enter: float = 0.45         # ArcFace dist to ENTER (looser)
     prescan_fd_add: float = 0.22           # ArcFace dist to add to bank (tighter)
     prescan_fd_exit: float = 0.52          # ArcFace dist to EXIT  (hysteresis)
@@ -510,9 +511,9 @@ class SessionConfig:
     prescan_diversity_dedup_cos: float = 0.968 # ≥ skip as duplicate
     prescan_replace_margin: float = 0.010      # new score must beat worst by this
     # Early-out on empty frames: skip heavy work when last best fd≈9.00
-    prescan_fd9_skip: bool = True               # re-enable skip-gate to avoid misses
+    prescan_fd9_skip: bool = True               # skip some idle no-match samples for speed; can delay re-entry
     prescan_fd9_grace: int = 1                  # start skipping after this many consecutive fd≈9 samples
-    prescan_fd9_probe_period: int = 3           # while skipping, run a real probe every Nth sample
+    prescan_fd9_probe_period: int = 2           # while skipping, run a real probe every Nth sample
     prescan_weights: Tuple[float, float, float] = (0.70, 0.25, 0.05)  # (anchor, diversity, quality)
     # Persistent pre-scan reuse. Keyed only by video/ref identity and pre-scan-affecting settings,
     # so HDR/export-only changes do not invalidate it.
@@ -602,6 +603,16 @@ class Processor(QtCore.QObject):
     @staticmethod
     def _prescan_weights(cfg) -> Tuple[float, float, float]:
         weights = getattr(cfg, "prescan_weights", (0.70, 0.25, 0.05))
+        if isinstance(weights, str):
+            raw = weights.strip()
+            if raw:
+                try:
+                    weights = json.loads(raw)
+                except Exception:
+                    try:
+                        weights = ast.literal_eval(raw)
+                    except Exception:
+                        weights = (0.70, 0.25, 0.05)
         if not isinstance(weights, (list, tuple)) or len(weights) < 3:
             return 0.70, 0.25, 0.05
         try:
@@ -609,6 +620,17 @@ class Processor(QtCore.QObject):
         except Exception:
             return 0.70, 0.25, 0.05
         return wa, wd, wq
+
+    @staticmethod
+    def _prescan_face_conf_value(cfg) -> float:
+        # Detector confidence is only a candidate-face gate. Values at 1.0 are
+        # practically unreachable for SCRFD and values near 0.0 admit noisy boxes
+        # that make identity matching unreliable, so keep the runtime range sane
+        # even when old presets/QSettings contain extreme values.
+        try:
+            return min(0.95, max(0.01, float(getattr(cfg, "prescan_face_conf", 0.5))))
+        except Exception:
+            return 0.5
 
     @staticmethod
     def _cache_file_identity(path: str) -> dict:
@@ -1063,7 +1085,7 @@ class Processor(QtCore.QObject):
             enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
             fd_add = float(getattr(cfg, "prescan_fd_add", enter))
             old_face_conf = getattr(face, "conf", 0.5)
-            face.conf = float(cfg.prescan_face_conf)
+            face.conf = self._prescan_face_conf_value(cfg)
             old_rot_adapt = getattr(face, "rot_adaptive", True)
             try:
                 # freeze legacy rotation gating; rely on pre-scan throttle
@@ -1151,7 +1173,7 @@ class Processor(QtCore.QObject):
                                     fd_add = float(getattr(cfg, "prescan_fd_add", enter))
                                     Wmax = int(cfg.prescan_max_width)
                                     prescan_hdr_preview = bool(getattr(cfg, "prescan_hdr_preview", False))
-                                    face.conf = float(cfg.prescan_face_conf)
+                                    face.conf = self._prescan_face_conf_value(cfg)
                                     add_cooldown_samples = int(
                                         getattr(
                                             cfg,
@@ -1247,7 +1269,7 @@ class Processor(QtCore.QObject):
                                     fd_add = float(getattr(cfg, "prescan_fd_add", enter))
                                     Wmax = int(cfg.prescan_max_width)
                                     prescan_hdr_preview = bool(getattr(cfg, "prescan_hdr_preview", False))
-                                    face.conf = float(cfg.prescan_face_conf)
+                                    face.conf = self._prescan_face_conf_value(cfg)
                                     add_cooldown_samples = int(
                                         getattr(
                                             cfg,
@@ -1369,7 +1391,7 @@ class Processor(QtCore.QObject):
                     try:
                         if (not active) and bool(getattr(cfg, "prescan_fd9_skip", True)):
                             grace = max(0, int(getattr(cfg, "prescan_fd9_grace", 1)))
-                            period = max(1, int(getattr(cfg, "prescan_fd9_probe_period", 3)))
+                            period = max(1, int(getattr(cfg, "prescan_fd9_probe_period", 2)))
                             if fd9_streak >= grace:
                                 fd9_gate_active = True
                                 fd9_gate_period = period
@@ -9410,10 +9432,13 @@ class MainWindow(QtWidgets.QMainWindow):
         _pc_lay.addWidget(self.prescan_cache_clear_btn, 0)
         self.spin_prescan_face_conf = QtWidgets.QDoubleSpinBox()
         self.spin_prescan_face_conf.setDecimals(3)
-        self.spin_prescan_face_conf.setRange(0.0, 1.0)
+        self.spin_prescan_face_conf.setRange(0.01, 0.95)
         self.spin_prescan_face_conf.setSingleStep(0.01)
         self.spin_prescan_face_conf.setValue(float(self.cfg.prescan_face_conf))
-        self.spin_prescan_face_conf.setToolTip("float: prescan_face_conf")
+        self.spin_prescan_face_conf.setToolTip(
+            "float: prescan_face_conf. Candidate face detector threshold only; "
+            "raise/lower ENTER/EXIT distances to change target identity acceptance."
+        )
         self.spin_prescan_face_conf.valueChanged.connect(self._on_ui_change)
         self.spin_prescan_fd_enter = QtWidgets.QDoubleSpinBox()
         self.spin_prescan_fd_enter.setDecimals(3)
@@ -9497,6 +9522,102 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_prescan_margin.setValue(float(self.cfg.prescan_replace_margin))
         self.spin_prescan_margin.setToolTip("float: prescan_replace_margin")
         self.spin_prescan_margin.valueChanged.connect(self._on_ui_change)
+
+        self.spin_prescan_rot_probe_period = QtWidgets.QSpinBox()
+        self.spin_prescan_rot_probe_period.setRange(1, 120)
+        self.spin_prescan_rot_probe_period.setValue(int(getattr(self.cfg, "prescan_rot_probe_period", 3)))
+        self.spin_prescan_rot_probe_period.setToolTip(
+            "int: prescan_rot_probe_period. Upright pass runs every probe; rotated probes run every N samples."
+        )
+        self.spin_prescan_rot_probe_period.valueChanged.connect(self._on_ui_change)
+
+        self.spin_prescan_probe_imgsz = QtWidgets.QSpinBox()
+        self.spin_prescan_probe_imgsz.setRange(0, 4096)
+        self.spin_prescan_probe_imgsz.setSingleStep(32)
+        self.spin_prescan_probe_imgsz.setValue(int(getattr(self.cfg, "prescan_probe_imgsz", 512)))
+        self.spin_prescan_probe_imgsz.setToolTip("int: prescan_probe_imgsz (0 = detector default)")
+        self.spin_prescan_probe_imgsz.valueChanged.connect(self._on_ui_change)
+
+        self.spin_prescan_probe_conf = QtWidgets.QDoubleSpinBox()
+        self.spin_prescan_probe_conf.setDecimals(3)
+        self.spin_prescan_probe_conf.setRange(0.001, 0.95)
+        self.spin_prescan_probe_conf.setSingleStep(0.005)
+        self.spin_prescan_probe_conf.setValue(float(getattr(self.cfg, "prescan_probe_conf", 0.03)))
+        self.spin_prescan_probe_conf.setToolTip("float: prescan_probe_conf for rotated/escalated detector probes")
+        self.spin_prescan_probe_conf.valueChanged.connect(self._on_ui_change)
+
+        self.spin_prescan_heavy_90 = QtWidgets.QSpinBox()
+        self.spin_prescan_heavy_90.setRange(0, 4096)
+        self.spin_prescan_heavy_90.setSingleStep(32)
+        self.spin_prescan_heavy_90.setValue(int(getattr(self.cfg, "prescan_heavy_90", 1536)))
+        self.spin_prescan_heavy_90.setToolTip("int: prescan_heavy_90 heavy rotated 90° probe size (0 = detector default)")
+        self.spin_prescan_heavy_90.valueChanged.connect(self._on_ui_change)
+
+        self.spin_prescan_heavy_180 = QtWidgets.QSpinBox()
+        self.spin_prescan_heavy_180.setRange(0, 4096)
+        self.spin_prescan_heavy_180.setSingleStep(32)
+        self.spin_prescan_heavy_180.setValue(int(getattr(self.cfg, "prescan_heavy_180", 1280)))
+        self.spin_prescan_heavy_180.setToolTip("int: prescan_heavy_180 heavy rotated 180° probe size (0 = detector default)")
+        self.spin_prescan_heavy_180.valueChanged.connect(self._on_ui_change)
+
+        self.chk_prescan_skip_trailing_refine = QtWidgets.QCheckBox()
+        self.chk_prescan_skip_trailing_refine.setChecked(bool(getattr(self.cfg, "prescan_skip_trailing_refine", True)))
+        self.chk_prescan_skip_trailing_refine.setToolTip("bool: prescan_skip_trailing_refine")
+        self.chk_prescan_skip_trailing_refine.stateChanged.connect(self._on_ui_change)
+
+        self.spin_prescan_refine_budget = QtWidgets.QDoubleSpinBox()
+        self.spin_prescan_refine_budget.setDecimals(2)
+        self.spin_prescan_refine_budget.setRange(0.0, 120.0)
+        self.spin_prescan_refine_budget.setSingleStep(0.1)
+        self.spin_prescan_refine_budget.setValue(float(getattr(self.cfg, "prescan_refine_budget_sec", 1.5)))
+        self.spin_prescan_refine_budget.setToolTip("float: prescan_refine_budget_sec; 0 disables the wall-time cap")
+        self.spin_prescan_refine_budget.valueChanged.connect(self._on_ui_change)
+
+        self.chk_prescan_fd9_skip = QtWidgets.QCheckBox()
+        self.chk_prescan_fd9_skip.setChecked(bool(getattr(self.cfg, "prescan_fd9_skip", True)))
+        self.chk_prescan_fd9_skip.setToolTip(
+            "bool: prescan_fd9_skip. Faster idle pre-scan; can delay target re-entry by skipped samples."
+        )
+        self.chk_prescan_fd9_skip.stateChanged.connect(self._on_ui_change)
+
+        self.spin_prescan_fd9_grace = QtWidgets.QSpinBox()
+        self.spin_prescan_fd9_grace.setRange(0, 120)
+        self.spin_prescan_fd9_grace.setValue(int(getattr(self.cfg, "prescan_fd9_grace", 1)))
+        self.spin_prescan_fd9_grace.setToolTip("int: prescan_fd9_grace; no-match samples before fd≈9 skip starts")
+        self.spin_prescan_fd9_grace.valueChanged.connect(self._on_ui_change)
+
+        self.spin_prescan_fd9_probe_period = QtWidgets.QSpinBox()
+        self.spin_prescan_fd9_probe_period.setRange(1, 120)
+        self.spin_prescan_fd9_probe_period.setValue(int(getattr(self.cfg, "prescan_fd9_probe_period", 2)))
+        self.spin_prescan_fd9_probe_period.setToolTip(
+            "int: prescan_fd9_probe_period. While idle-skipping, run a real detector probe every N sampled frames."
+        )
+        self.spin_prescan_fd9_probe_period.valueChanged.connect(self._on_ui_change)
+
+        _w_anchor, _w_div, _w_q = Processor._prescan_weights(self.cfg)
+        self.spin_prescan_weight_anchor = QtWidgets.QDoubleSpinBox()
+        self.spin_prescan_weight_anchor.setDecimals(3)
+        self.spin_prescan_weight_anchor.setRange(0.0, 10.0)
+        self.spin_prescan_weight_anchor.setSingleStep(0.05)
+        self.spin_prescan_weight_anchor.setValue(float(_w_anchor))
+        self.spin_prescan_weight_anchor.setToolTip("prescan_weights[0]: anchor/reference score weight")
+        self.spin_prescan_weight_anchor.valueChanged.connect(self._on_ui_change)
+
+        self.spin_prescan_weight_diversity = QtWidgets.QDoubleSpinBox()
+        self.spin_prescan_weight_diversity.setDecimals(3)
+        self.spin_prescan_weight_diversity.setRange(0.0, 10.0)
+        self.spin_prescan_weight_diversity.setSingleStep(0.05)
+        self.spin_prescan_weight_diversity.setValue(float(_w_div))
+        self.spin_prescan_weight_diversity.setToolTip("prescan_weights[1]: diversity weight")
+        self.spin_prescan_weight_diversity.valueChanged.connect(self._on_ui_change)
+
+        self.spin_prescan_weight_quality = QtWidgets.QDoubleSpinBox()
+        self.spin_prescan_weight_quality.setDecimals(3)
+        self.spin_prescan_weight_quality.setRange(0.0, 10.0)
+        self.spin_prescan_weight_quality.setSingleStep(0.05)
+        self.spin_prescan_weight_quality.setValue(float(_w_q))
+        self.spin_prescan_weight_quality.setToolTip("prescan_weights[2]: face-quality weight")
+        self.spin_prescan_weight_quality.valueChanged.connect(self._on_ui_change)
         # TensorRT path controls
         self.trt_edit = QtWidgets.QLineEdit(self.cfg.trt_lib_dir or r"D:\\tensorrt\\TensorRT-10.13.3.9")
         self.trt_btn = QtWidgets.QPushButton("Browse…")
@@ -9824,9 +9945,9 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Pre-scan decode max width (px)", self.spin_prescan_decode_max_w),
             ("Pre-scan HDR preview", self.chk_prescan_hdr_preview),
             ("Pre-scan cache", self.prescan_cache_widget),
-            ("Pre-scan face det conf", self.spin_prescan_face_conf),
-            ("Pre-scan ENTER dist ≤", self.spin_prescan_fd_enter),
-            ("Pre-scan EXIT dist ≥", self.spin_prescan_fd_exit),
+            ("Pre-scan candidate face conf", self.spin_prescan_face_conf),
+            ("Pre-scan ENTER identity dist ≤", self.spin_prescan_fd_enter),
+            ("Pre-scan EXIT identity dist ≥", self.spin_prescan_fd_exit),
             ("Pre-scan add cooldown (samples)", self.spin_prescan_add_cooldown),
             ("Pre-scan min segment sec", self.spin_prescan_min_segment),
             ("Pre-scan pad sec", self.spin_prescan_pad),
@@ -9838,6 +9959,19 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Pre-scan bank max", self.spin_prescan_bank_max),
             ("Pre-scan dedup cos ≥", self.spin_prescan_dedup),
             ("Pre-scan replace margin", self.spin_prescan_margin),
+            ("Pre-scan rotated probe period", self.spin_prescan_rot_probe_period),
+            ("Pre-scan probe imgsz", self.spin_prescan_probe_imgsz),
+            ("Pre-scan probe conf", self.spin_prescan_probe_conf),
+            ("Pre-scan heavy 90° imgsz", self.spin_prescan_heavy_90),
+            ("Pre-scan heavy 180° imgsz", self.spin_prescan_heavy_180),
+            ("Pre-scan skip trailing refine", self.chk_prescan_skip_trailing_refine),
+            ("Pre-scan refine budget sec", self.spin_prescan_refine_budget),
+            ("Pre-scan fd9 idle skip", self.chk_prescan_fd9_skip),
+            ("Pre-scan fd9 skip grace", self.spin_prescan_fd9_grace),
+            ("Pre-scan fd9 probe period", self.spin_prescan_fd9_probe_period),
+            ("Pre-scan weight: anchor", self.spin_prescan_weight_anchor),
+            ("Pre-scan weight: diversity", self.spin_prescan_weight_diversity),
+            ("Pre-scan weight: quality", self.spin_prescan_weight_quality),
             ("TensorRT lib dir", self._trt_row_widget),
             ("", self.trt_box),
             ("Min sharpness", self.min_sharp_spin),
@@ -10383,7 +10517,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sync_ref_edit_from_list()
 
     def _get_ref_paths(self) -> list[str]:
-        return [self.ref_list.item(i).text().strip() for i in range(self.ref_list.count())]
+        paths: list[str] = []
+        for i in range(self.ref_list.count()):
+            text = self.ref_list.item(i).text().strip()
+            if text:
+                paths.append(text)
+        if not getattr(self, "_updating_refs", False) and hasattr(self, "ref_edit"):
+            raw = self.ref_edit.text().strip()
+            if raw:
+                paths.extend(part.strip() for part in raw.split(";") if part.strip())
+
+        unique: list[str] = []
+        seen: set[str] = set()
+        for path in paths:
+            try:
+                display_path = os.path.normpath(os.path.abspath(path))
+                key = os.path.normcase(display_path)
+            except Exception:
+                display_path = path
+                key = path
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(display_path)
+        return unique
 
     def _get_selected_ref_paths(self) -> list[str]:
         return [item.text().strip() for item in self.ref_list.selectedItems() if item.text().strip()]
@@ -10995,6 +11152,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "prescan_fd_add",
             "prescan_fd_exit",
             "prescan_add_cooldown_samples",
+            "prescan_rot_probe_period",
+            "prescan_probe_imgsz",
+            "prescan_probe_conf",
+            "prescan_heavy_90",
+            "prescan_heavy_180",
             "prescan_min_segment_sec",
             "prescan_pad_sec",
             "prescan_bridge_gap_sec",
@@ -11002,12 +11164,15 @@ class MainWindow(QtWidgets.QMainWindow):
             "prescan_boundary_refine_sec",
             "prescan_refine_stride_min",
             "prescan_trim_pad",
+            "prescan_skip_trailing_refine",
+            "prescan_refine_budget_sec",
             "prescan_bank_max",
             "prescan_diversity_dedup_cos",
             "prescan_replace_margin",
             "prescan_fd9_skip",
             "prescan_fd9_grace",
             "prescan_fd9_probe_period",
+            "prescan_weights",
         }
         live = {
             "frame_stride",
@@ -11134,7 +11299,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._save_qsettings()
 
     def _collect_cfg(self) -> SessionConfig:
-        ref_join = "; ".join(self._get_ref_paths()) or self.ref_edit.text().strip()
+        ref_join = "; ".join(self._get_ref_paths())
         cfg = SessionConfig(
             video=self.video_edit.text().strip(),
             ref=ref_join,
@@ -11172,6 +11337,11 @@ class MainWindow(QtWidgets.QMainWindow):
             prescan_fd_enter=float(self.spin_prescan_fd_enter.value()) if hasattr(self, "spin_prescan_fd_enter") else 0.45,
             prescan_fd_exit=float(self.spin_prescan_fd_exit.value()) if hasattr(self, "spin_prescan_fd_exit") else 0.52,
             prescan_add_cooldown_samples=int(self.spin_prescan_add_cooldown.value()) if hasattr(self, "spin_prescan_add_cooldown") else 5,
+            prescan_rot_probe_period=int(self.spin_prescan_rot_probe_period.value()) if hasattr(self, "spin_prescan_rot_probe_period") else int(getattr(self.cfg, "prescan_rot_probe_period", 3)),
+            prescan_probe_imgsz=int(self.spin_prescan_probe_imgsz.value()) if hasattr(self, "spin_prescan_probe_imgsz") else int(getattr(self.cfg, "prescan_probe_imgsz", 512)),
+            prescan_probe_conf=float(self.spin_prescan_probe_conf.value()) if hasattr(self, "spin_prescan_probe_conf") else float(getattr(self.cfg, "prescan_probe_conf", 0.03)),
+            prescan_heavy_90=int(self.spin_prescan_heavy_90.value()) if hasattr(self, "spin_prescan_heavy_90") else int(getattr(self.cfg, "prescan_heavy_90", 1536)),
+            prescan_heavy_180=int(self.spin_prescan_heavy_180.value()) if hasattr(self, "spin_prescan_heavy_180") else int(getattr(self.cfg, "prescan_heavy_180", 1280)),
             prescan_min_segment_sec=float(self.spin_prescan_min_segment.value()) if hasattr(self, "spin_prescan_min_segment") else 1.0,
             prescan_pad_sec=float(self.spin_prescan_pad.value()) if hasattr(self, "spin_prescan_pad") else 1.5,
             prescan_bridge_gap_sec=float(self.spin_prescan_bridge.value()) if hasattr(self, "spin_prescan_bridge") else 1.0,
@@ -11179,9 +11349,19 @@ class MainWindow(QtWidgets.QMainWindow):
             prescan_boundary_refine_sec=float(self.spin_prescan_refine_window.value()) if hasattr(self, "spin_prescan_refine_window") else 0.75,
             prescan_refine_stride_min=int(self.spin_prescan_refine_stride.value()) if hasattr(self, "spin_prescan_refine_stride") else 3,
             prescan_trim_pad=bool(self.chk_prescan_trim_pad.isChecked()) if hasattr(self, "chk_prescan_trim_pad") else True,
+            prescan_skip_trailing_refine=bool(self.chk_prescan_skip_trailing_refine.isChecked()) if hasattr(self, "chk_prescan_skip_trailing_refine") else bool(getattr(self.cfg, "prescan_skip_trailing_refine", True)),
+            prescan_refine_budget_sec=float(self.spin_prescan_refine_budget.value()) if hasattr(self, "spin_prescan_refine_budget") else float(getattr(self.cfg, "prescan_refine_budget_sec", 1.5)),
             prescan_bank_max=int(self.spin_prescan_bank_max.value()) if hasattr(self, "spin_prescan_bank_max") else 64,
             prescan_diversity_dedup_cos=float(self.spin_prescan_dedup.value()) if hasattr(self, "spin_prescan_dedup") else 0.968,
             prescan_replace_margin=float(self.spin_prescan_margin.value()) if hasattr(self, "spin_prescan_margin") else 0.01,
+            prescan_fd9_skip=bool(self.chk_prescan_fd9_skip.isChecked()) if hasattr(self, "chk_prescan_fd9_skip") else bool(getattr(self.cfg, "prescan_fd9_skip", True)),
+            prescan_fd9_grace=int(self.spin_prescan_fd9_grace.value()) if hasattr(self, "spin_prescan_fd9_grace") else int(getattr(self.cfg, "prescan_fd9_grace", 1)),
+            prescan_fd9_probe_period=int(self.spin_prescan_fd9_probe_period.value()) if hasattr(self, "spin_prescan_fd9_probe_period") else int(getattr(self.cfg, "prescan_fd9_probe_period", 2)),
+            prescan_weights=(
+                float(self.spin_prescan_weight_anchor.value()) if hasattr(self, "spin_prescan_weight_anchor") else Processor._prescan_weights(self.cfg)[0],
+                float(self.spin_prescan_weight_diversity.value()) if hasattr(self, "spin_prescan_weight_diversity") else Processor._prescan_weights(self.cfg)[1],
+                float(self.spin_prescan_weight_quality.value()) if hasattr(self, "spin_prescan_weight_quality") else Processor._prescan_weights(self.cfg)[2],
+            ),
             trt_lib_dir=self.trt_edit.text().strip() if hasattr(self, "trt_edit") else "",
             # TensorRT/ORT advanced
             trt_fp16_enable=bool(self.chk_trt_fp16.isChecked()) if hasattr(self, "chk_trt_fp16") else True,
@@ -11565,6 +11745,33 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spin_prescan_dedup.setValue(float(cfg.prescan_diversity_dedup_cos))
         if hasattr(self, 'spin_prescan_margin'):
             self.spin_prescan_margin.setValue(float(cfg.prescan_replace_margin))
+        if hasattr(self, 'spin_prescan_rot_probe_period'):
+            self.spin_prescan_rot_probe_period.setValue(int(getattr(cfg, 'prescan_rot_probe_period', 3)))
+        if hasattr(self, 'spin_prescan_probe_imgsz'):
+            self.spin_prescan_probe_imgsz.setValue(int(getattr(cfg, 'prescan_probe_imgsz', 512)))
+        if hasattr(self, 'spin_prescan_probe_conf'):
+            self.spin_prescan_probe_conf.setValue(float(getattr(cfg, 'prescan_probe_conf', 0.03)))
+        if hasattr(self, 'spin_prescan_heavy_90'):
+            self.spin_prescan_heavy_90.setValue(int(getattr(cfg, 'prescan_heavy_90', 1536)))
+        if hasattr(self, 'spin_prescan_heavy_180'):
+            self.spin_prescan_heavy_180.setValue(int(getattr(cfg, 'prescan_heavy_180', 1280)))
+        if hasattr(self, 'chk_prescan_skip_trailing_refine'):
+            self.chk_prescan_skip_trailing_refine.setChecked(bool(getattr(cfg, 'prescan_skip_trailing_refine', True)))
+        if hasattr(self, 'spin_prescan_refine_budget'):
+            self.spin_prescan_refine_budget.setValue(float(getattr(cfg, 'prescan_refine_budget_sec', 1.5)))
+        if hasattr(self, 'chk_prescan_fd9_skip'):
+            self.chk_prescan_fd9_skip.setChecked(bool(getattr(cfg, 'prescan_fd9_skip', True)))
+        if hasattr(self, 'spin_prescan_fd9_grace'):
+            self.spin_prescan_fd9_grace.setValue(int(getattr(cfg, 'prescan_fd9_grace', 1)))
+        if hasattr(self, 'spin_prescan_fd9_probe_period'):
+            self.spin_prescan_fd9_probe_period.setValue(int(getattr(cfg, 'prescan_fd9_probe_period', 2)))
+        _w_anchor, _w_div, _w_q = Processor._prescan_weights(cfg)
+        if hasattr(self, 'spin_prescan_weight_anchor'):
+            self.spin_prescan_weight_anchor.setValue(float(_w_anchor))
+        if hasattr(self, 'spin_prescan_weight_diversity'):
+            self.spin_prescan_weight_diversity.setValue(float(_w_div))
+        if hasattr(self, 'spin_prescan_weight_quality'):
+            self.spin_prescan_weight_quality.setValue(float(_w_q))
         if hasattr(self, 'trt_edit'):
             self.trt_edit.setText(cfg.trt_lib_dir or r"D:\\tensorrt\\TensorRT-10.13.3.9")
         if hasattr(self, 'chk_trt_fp16'):
@@ -11787,8 +11994,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if not os.path.isfile(cfg.video):
             QtWidgets.QMessageBox.warning(self, "Missing", "Select a video file")
             return
-        if not os.path.isfile(cfg.ref):
-            QtWidgets.QMessageBox.warning(self, "Missing", "Select a reference image")
+        ref_paths = [part.strip() for part in str(cfg.ref or "").split(";") if part.strip()]
+        if not ref_paths:
+            QtWidgets.QMessageBox.warning(self, "Missing", "Select at least one reference image")
+            return
+        missing_refs = [path for path in ref_paths if not os.path.isfile(path)]
+        if missing_refs:
+            preview = "\n".join(missing_refs[:5])
+            if len(missing_refs) > 5:
+                preview += f"\n... and {len(missing_refs) - 5} more"
+            QtWidgets.QMessageBox.warning(self, "Missing", f"Reference image not found:\n{preview}")
             return
         Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
 
@@ -12639,6 +12854,36 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spin_prescan_dedup.setValue(float(s.value("prescan_diversity_dedup_cos", self.cfg.prescan_diversity_dedup_cos)))
         if hasattr(self, 'spin_prescan_margin'):
             self.spin_prescan_margin.setValue(float(s.value("prescan_replace_margin", self.cfg.prescan_replace_margin)))
+        if hasattr(self, 'spin_prescan_rot_probe_period'):
+            self.spin_prescan_rot_probe_period.setValue(int(s.value("prescan_rot_probe_period", getattr(self.cfg, "prescan_rot_probe_period", 3))))
+        if hasattr(self, 'spin_prescan_probe_imgsz'):
+            self.spin_prescan_probe_imgsz.setValue(int(s.value("prescan_probe_imgsz", getattr(self.cfg, "prescan_probe_imgsz", 512))))
+        if hasattr(self, 'spin_prescan_probe_conf'):
+            self.spin_prescan_probe_conf.setValue(float(s.value("prescan_probe_conf", getattr(self.cfg, "prescan_probe_conf", 0.03))))
+        if hasattr(self, 'spin_prescan_heavy_90'):
+            self.spin_prescan_heavy_90.setValue(int(s.value("prescan_heavy_90", getattr(self.cfg, "prescan_heavy_90", 1536))))
+        if hasattr(self, 'spin_prescan_heavy_180'):
+            self.spin_prescan_heavy_180.setValue(int(s.value("prescan_heavy_180", getattr(self.cfg, "prescan_heavy_180", 1280))))
+        if hasattr(self, 'chk_prescan_skip_trailing_refine'):
+            self.chk_prescan_skip_trailing_refine.setChecked(s.value("prescan_skip_trailing_refine", getattr(self.cfg, "prescan_skip_trailing_refine", True), type=bool))
+        if hasattr(self, 'spin_prescan_refine_budget'):
+            self.spin_prescan_refine_budget.setValue(float(s.value("prescan_refine_budget_sec", getattr(self.cfg, "prescan_refine_budget_sec", 1.5))))
+        if hasattr(self, 'chk_prescan_fd9_skip'):
+            self.chk_prescan_fd9_skip.setChecked(s.value("prescan_fd9_skip", getattr(self.cfg, "prescan_fd9_skip", True), type=bool))
+        if hasattr(self, 'spin_prescan_fd9_grace'):
+            self.spin_prescan_fd9_grace.setValue(int(s.value("prescan_fd9_grace", getattr(self.cfg, "prescan_fd9_grace", 1))))
+        if hasattr(self, 'spin_prescan_fd9_probe_period'):
+            self.spin_prescan_fd9_probe_period.setValue(int(s.value("prescan_fd9_probe_period", getattr(self.cfg, "prescan_fd9_probe_period", 2))))
+        _raw_prescan_weights = s.value("prescan_weights", getattr(self.cfg, "prescan_weights", (0.70, 0.25, 0.05)))
+        _tmp_cfg = SessionConfig()
+        _tmp_cfg.prescan_weights = _raw_prescan_weights
+        _w_anchor, _w_div, _w_q = Processor._prescan_weights(_tmp_cfg)
+        if hasattr(self, 'spin_prescan_weight_anchor'):
+            self.spin_prescan_weight_anchor.setValue(float(_w_anchor))
+        if hasattr(self, 'spin_prescan_weight_diversity'):
+            self.spin_prescan_weight_diversity.setValue(float(_w_div))
+        if hasattr(self, 'spin_prescan_weight_quality'):
+            self.spin_prescan_weight_quality.setValue(float(_w_q))
         self.min_sharp_spin.setValue(float(s.value("min_sharpness", 0.0)))
         self.min_gap_spin.setValue(float(s.value("min_gap_sec", 1.5)))
         self.min_box_pix_spin.setValue(int(s.value("min_box_pixels", 5000)))
