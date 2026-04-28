@@ -213,34 +213,53 @@ def _ensure_from_zip(out_path: str, zip_urls, want_suffix="glintr100.onnx", prog
 
 
 def _import_scrfd_class():
-    """Import InsightFace SCRFD without poisoning its ORT base classes.
+    """Load InsightFace's SCRFD implementation without importing insightface.app.
 
-    PersonCapture monkey-patches onnxruntime.InferenceSession so SCRFD sessions
-    created for our detector model use the configured TRT/CUDA provider chain.
-    InsightFace defines PickableInferenceSession by subclassing
-    onnxruntime.InferenceSession at import time. If InsightFace is imported after
-    our monkey patch, it tries to subclass a Python function and fails with
-    "function() argument 'code' must be code, not str". Temporarily restore the
-    original ORT class for the import, then put the PersonCapture hook back.
+    `from insightface.model_zoo.scrfd import SCRFD` executes
+    `insightface/__init__.py` first. Current dependency combinations make that
+    top-level import pull `insightface.app -> mask_renderer -> face3d ->
+    matplotlib -> dateutil -> six` through PySide/shiboken's import hook, which
+    can fail before SCRFD is even used.
+
+    We only need `model_zoo/scrfd.py`. That file is self-contained for the
+    `SCRFD(model_file=...)` path used here, so load it directly from the installed
+    package directory and avoid the optional InsightFace app stack entirely.
     """
+    import importlib.util
 
-    import onnxruntime as ort  # type: ignore
+    module_name = "_person_capture_insightface_scrfd_direct"
+    cached = sys.modules.get(module_name)
+    if cached is not None:
+        cls = getattr(cached, "SCRFD", None)
+        if cls is not None:
+            return cls
 
-    current_inference_session = getattr(ort, "InferenceSession", None)
-    original_inference_session = getattr(ort, "_pc_orig_InferenceSession", None)
-    restore_patched_session = (
-        original_inference_session is not None
-        and current_inference_session is not None
-        and current_inference_session is not original_inference_session
-    )
-    if restore_patched_session:
-        ort.InferenceSession = original_inference_session  # type: ignore[attr-defined]
+    package_spec = importlib.util.find_spec("insightface")
+    if package_spec is None:
+        raise ModuleNotFoundError("No module named 'insightface'")
+    search_locations = getattr(package_spec, "submodule_search_locations", None)
+    if not search_locations:
+        raise ModuleNotFoundError("Could not locate installed insightface package directory")
+
+    scrfd_path = Path(next(iter(search_locations))) / "model_zoo" / "scrfd.py"
+    if not scrfd_path.exists():
+        raise ModuleNotFoundError(f"Could not locate InsightFace SCRFD module at {scrfd_path}")
+
+    spec = importlib.util.spec_from_file_location(module_name, scrfd_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not create import spec for {scrfd_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
     try:
-        from insightface.model_zoo.scrfd import SCRFD as _SCRFD  # type: ignore
-        return _SCRFD
-    finally:
-        if restore_patched_session:
-            ort.InferenceSession = current_inference_session  # type: ignore[attr-defined]
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+
+    cls = getattr(module, "SCRFD", None)
+    if cls is None:
+        raise ImportError(f"{scrfd_path} did not define SCRFD")
+    return cls
 
 
 def _ensure_scrfd_trt_friendly(model_path: str, progress: Optional[Callable[[str], None]] = None) -> str:
