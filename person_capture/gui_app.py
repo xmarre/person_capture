@@ -4574,10 +4574,12 @@ class Processor(QtCore.QObject):
                         img_path = ""
                         row = None
                         kind = ""
+                        archive_item = None
                         if isinstance(item, dict):
                             ack_q = item.get("ack_q")
                             cancel_evt = item.get("cancel_evt")
                             kind = str(item.get("type") or "")
+                            archive_item = item.get("archive_item")
                             cancelled = bool(cancel_evt is not None and cancel_evt.is_set())
                             if cancelled:
                                 ok, why = False, "save_cancelled"
@@ -4624,6 +4626,17 @@ class Processor(QtCore.QObject):
                                 pass
                         cancelled_after_save = bool(cancel_evt is not None and cancel_evt.is_set())
                         if ok and not cancelled_after_save:
+                            if archive_item is not None and archive_q is not None:
+                                try:
+                                    archive_q.put_nowait(archive_item)
+                                except queue.Full:
+                                    archive_path = str(archive_item.get("path") or "")
+                                    self._status(
+                                        f"HDR archive queue blocked too long: {archive_path}",
+                                        key="save_backpressure",
+                                        interval=0.5,
+                                    )
+                                    logger.warning("Dropping optional HDR archive crop after primary save: %s", archive_path)
                             # hand off to worker thread for emitting
                             try:
                                 hit_q.put_nowait(img_path)
@@ -6099,10 +6112,20 @@ class Processor(QtCore.QObject):
                         c.get("sharp"),
                         str(ratio_str),
                     ]
+                    archive_item = None
+                    if hdr_out_path:
+                        hdr_crop_xyxy = self._even_hdr_crop_xyxy(source_crop_xyxy, source_size)
+                        archive_item = {
+                            "type": "hdr_archive",
+                            "path": hdr_out_path,
+                            "frame_idx": int(idx),
+                            "frame_pts_sec": frame_pts_sec,
+                            "crop_xyxy": hdr_crop_xyxy,
+                        }
                     primary_saved_or_enqueued = False
                     if save_q is not None:
                         wait_for_save = bool(getattr(self.cfg, "async_save_wait", False))
-                        if hdr_primary_fullres or hdr_out_path:
+                        if hdr_primary_fullres:
                             # HDR primary saves must be ack-gated so failed exports are
                             # never counted as successful before optional archive enqueue.
                             wait_for_save = True
@@ -6119,6 +6142,7 @@ class Processor(QtCore.QObject):
                                     "crop_xyxy": source_crop_xyxy,
                                     "ack_q": ack_q,
                                     "cancel_evt": save_cancel_evt,
+                                    "archive_item": archive_item,
                                 })
                             else:
                                 # enqueue a contiguous copy; slices are views into `frame`
@@ -6132,6 +6156,7 @@ class Processor(QtCore.QObject):
                                     "img": buf,
                                     "ack_q": ack_q,
                                     "cancel_evt": save_cancel_evt,
+                                    "archive_item": archive_item,
                                 })
                         except queue.Full:
                             self._status(
@@ -6200,11 +6225,11 @@ class Processor(QtCore.QObject):
                             )
                             return False
                         primary_saved_or_enqueued = True
-                    if primary_saved_or_enqueued and hdr_out_path:
+                    if primary_saved_or_enqueued and hdr_out_path and save_q is None:
                         # HDR archive crops are encoded from 4:2:0/10-bit source video.
                         # Keep x/y/w/h even for AVIF and MKV; odd crop origins can shift
                         # chroma and show up as blue/purple blotches in dark regions.
-                        hdr_crop_xyxy = self._even_hdr_crop_xyxy(source_crop_xyxy, source_size)
+                        hdr_crop_xyxy = archive_item["crop_xyxy"] if archive_item is not None else self._even_hdr_crop_xyxy(source_crop_xyxy, source_size)
                         if archive_q is not None:
                             archive_item = {
                                 "type": "hdr_archive",
