@@ -940,7 +940,31 @@ class Processor(QtCore.QObject):
                     interval=0.5,
                 )
                 raise
-            return max(0, min(remaining, skipped))
+            skipped = max(0, min(remaining, skipped))
+            if skipped < remaining:
+                startup_exc = getattr(cap, "_last_startup_error", None)
+                if startup_exc is not None:
+                    self._status(
+                        f"Pre-scan fast skip failed: {startup_exc}",
+                        key="prescan_skip_error",
+                        interval=0.5,
+                    )
+                    raise RuntimeError("Pre-scan reader failed during fast skip") from startup_exc
+                at_soft_eof = False
+                reader_soft_eof = getattr(cap, "_at_soft_eof", None)
+                if callable(reader_soft_eof):
+                    try:
+                        at_soft_eof = bool(reader_soft_eof())
+                    except Exception:
+                        at_soft_eof = False
+                if (not _at_known_eof()) and (not at_soft_eof):
+                    self._status(
+                        f"Pre-scan fast skip incomplete: requested={remaining} got={skipped}",
+                        key="prescan_skip_error",
+                        interval=0.5,
+                    )
+                    raise RuntimeError("Pre-scan fast skip returned short result before EOF")
+            return skipped
         for _ in range(remaining):
             if self._abort or _at_known_eof():
                 break
@@ -4463,6 +4487,7 @@ class Processor(QtCore.QObject):
 
             def _atomic_jpeg_write(img: np.ndarray, out_path: str, q: int) -> tuple[bool, str]:
                 tmp = out_path + ".tmp"
+                published = False
                 try:
                     params: list[int] = []
                     try:
@@ -4480,6 +4505,7 @@ class Processor(QtCore.QObject):
                             fh.flush()
                             os.fsync(fh.fileno())
                     os.replace(tmp, out_path)
+                    published = True
                     if bool(getattr(self.cfg, "save_fsync", False)):
                         # On POSIX, fsync the containing directory so the rename
                         # itself is durable, not just the file contents.
@@ -4504,6 +4530,8 @@ class Processor(QtCore.QObject):
                     return True, ""
                 except Exception as e:
                     try:
+                        if published and os.path.exists(out_path):
+                            os.remove(out_path)
                         if os.path.exists(tmp):
                             os.remove(tmp)
                     except Exception:
