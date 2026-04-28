@@ -7660,10 +7660,21 @@ class Processor(QtCore.QObject):
             b = pix[:, :, 0]
             g = pix[:, :, 1]
             r = pix[:, :, 2]
+            max_ch = np.maximum(np.maximum(b, g), r)
+            min_ch = np.minimum(np.minimum(b, g), r)
             max_rg = np.maximum(r, g)
             max_bg = np.maximum(b, g)
             min_bg = np.minimum(b, g)
             min_rb = np.minimum(r, b)
+            # Repair tuning. Keep these local to the WIC-only cleanup path so
+            # normal FFmpeg/libplacebo exports are unaffected.
+            BLUE_CYAN_SEED_DILATE = 7
+            BLUE_CYAN_MAX_AREA = 420
+            BLUE_CYAN_MAX_BBOX = 48
+            STRICT_HUE_SEED_DILATE = 5
+            GENERIC_CHROMA_SEED_DILATE = 5
+            GENERIC_CHROMA_MAX_AREA = 96
+            GENERIC_CHROMA_MAX_BBOX = 24
             # Use a local luma gate so real bright colored content such as
             # candles/fire is never treated as a defect. The observed WIC bug is
             # confined to hair/clothes/shadow regions.
@@ -7682,33 +7693,107 @@ class Processor(QtCore.QObject):
             local_b = cv2.medianBlur(bgr[:, :, 0], 5).astype(np.int16, copy=False)
             local_g = cv2.medianBlur(bgr[:, :, 1], 5).astype(np.int16, copy=False)
             local_r = cv2.medianBlur(bgr[:, :, 2], 5).astype(np.int16, copy=False)
+            wide_b = cv2.medianBlur(bgr[:, :, 0], 11).astype(np.int16, copy=False)
+            wide_g = cv2.medianBlur(bgr[:, :, 1], 11).astype(np.int16, copy=False)
+            wide_r = cv2.medianBlur(bgr[:, :, 2], 11).astype(np.int16, copy=False)
             b_jump = b - local_b
             g_jump = g - local_g
             r_jump = r - local_r
+            b_jump_wide = b - wide_b
+            g_jump_wide = g - wide_g
+            r_jump_wide = r - wide_r
+            max_pos_jump = np.maximum(np.maximum(b_jump, g_jump), r_jump)
+            max_pos_jump_wide = np.maximum(np.maximum(b_jump_wide, g_jump_wide), r_jump_wide)
+            local_max = np.maximum(np.maximum(local_b, local_g), local_r)
+            local_min = np.minimum(np.minimum(local_b, local_g), local_r)
+            wide_max = np.maximum(np.maximum(wide_b, wide_g), wide_r)
+            wide_min = np.minimum(np.minimum(wide_b, wide_g), wide_r)
+            chroma_spread = max_ch - min_ch
+            local_chroma_jump = chroma_spread - (local_max - local_min)
+            wide_chroma_jump = chroma_spread - (wide_max - wide_min)
             blue_seed = dark_blue & (
                 ((b >= 145) & ((b - max_rg) >= 45) & (r <= 112) & (g <= 112))
                 | ((b >= 88) & ((b - max_rg) >= 60) & (r <= 40) & (g <= 40))
-                | ((b >= 92) & ((b - max_rg) >= 34) & (r <= 80) & (g <= 120) & (b_jump >= 28))
+                | ((b >= 92) & ((b - max_rg) >= 34) & (r <= 80) & (g <= 120) & ((b_jump >= 28) | (b_jump_wide >= 28)))
             )
             blue_halo = dark_blue & (b >= 70) & ((b - max_rg) >= 22) & (r <= 128) & (g <= 128)
-            # Some remaining WIC defects are turquoise rather than pure blue:
-            # both B and G jump above the local neighborhood while red remains
-            # suppressed. These fail the old blue-vs-green seed test, so handle
-            # them as isolated local outliers rather than by loosening the blue
-            # threshold globally.
-            cyan_seed = dark_blue & (b >= 95) & (g >= 80) & (r <= 96) & ((min_bg - r) >= 38) & (b_jump >= 22) & (g_jump >= 16) & (r_jump <= 24)
-            cyan_halo = dark_blue & (b >= 74) & (g >= 56) & (r <= 112) & ((min_bg - r) >= 26) & (b_jump >= 14) & (g_jump >= 10)
+            # Some WIC defects are turquoise rather than pure blue: both B and G
+            # jump above the local neighborhood while red remains suppressed.
+            # Check both a tight and a wider median reference. The wider reference
+            # catches small blobs whose 5x5 median has already been contaminated
+            # by the bad pixels themselves.
+            cyan_seed = (
+                dark_blue
+                & (b >= 95)
+                & (g >= 80)
+                & (r <= 96)
+                & ((min_bg - r) >= 38)
+                & (((b_jump >= 22) & (g_jump >= 16)) | ((b_jump_wide >= 22) & (g_jump_wide >= 16)))
+                & ((r_jump <= 24) | (r_jump_wide <= 24))
+            )
+            cyan_halo = (
+                dark_blue
+                & (b >= 74)
+                & (g >= 56)
+                & (r <= 112)
+                & ((min_bg - r) >= 26)
+                & (((b_jump >= 14) & (g_jump >= 10)) | ((b_jump_wide >= 14) & (g_jump_wide >= 10)))
+            )
             magenta = dark_strict & (r >= 160) & (b >= 160) & ((min_rb - g) >= 50) & (g <= 96)
             red = dark_strict & (r >= 180) & ((r - max_bg) >= 70) & (b <= 80) & (g <= 80)
+            red_halo = (
+                dark_strict
+                & (r >= 92)
+                & ((r - max_bg) >= 34)
+                & (b <= 128)
+                & (g <= 128)
+                & ((r_jump >= 22) | (r_jump_wide >= 22))
+            )
+            magenta_halo = (
+                dark_strict
+                & (r >= 90)
+                & (b >= 90)
+                & ((min_rb - g) >= 28)
+                & (g <= 128)
+                & (((r_jump >= 18) & (b_jump >= 18)) | ((r_jump_wide >= 18) & (b_jump_wide >= 18)))
+            )
+            # Final guardrail for rare residual colors: a dark-pixel chroma spike
+            # that is locally impossible, regardless of whether the hue is blue,
+            # cyan, red, or magenta. This is only accepted later when the connected
+            # component remains small, so legitimate broad colored content is not
+            # pulled into the repair mask.
+            generic_chroma_seed = dark_strict & (max_ch >= 86) & (chroma_spread >= 46) & (
+                ((max_pos_jump >= 24) & (local_chroma_jump >= 18))
+                | ((max_pos_jump_wide >= 24) & (wide_chroma_jump >= 18))
+            )
+            generic_chroma_halo = dark_strict & (max_ch >= 70) & (chroma_spread >= 28) & (
+                ((max_pos_jump >= 14) & (local_chroma_jump >= 10))
+                | ((max_pos_jump_wide >= 14) & (wide_chroma_jump >= 10))
+            )
             blue_or_cyan_seed = blue_seed | cyan_seed
             blue_near_seed = cv2.dilate(
                 blue_or_cyan_seed.astype(np.uint8),
-                np.ones((7, 7), dtype=np.uint8),
+                np.ones((BLUE_CYAN_SEED_DILATE, BLUE_CYAN_SEED_DILATE), dtype=np.uint8),
                 iterations=1,
             ).astype(bool)
             strict_seed = magenta | red
-            seed = blue_or_cyan_seed | strict_seed
-            mask = (seed | ((blue_halo | cyan_halo) & blue_near_seed)).astype(np.uint8)
+            strict_near_seed = cv2.dilate(
+                strict_seed.astype(np.uint8),
+                np.ones((STRICT_HUE_SEED_DILATE, STRICT_HUE_SEED_DILATE), dtype=np.uint8),
+                iterations=1,
+            ).astype(bool)
+            generic_near_seed = cv2.dilate(
+                generic_chroma_seed.astype(np.uint8),
+                np.ones((GENERIC_CHROMA_SEED_DILATE, GENERIC_CHROMA_SEED_DILATE), dtype=np.uint8),
+                iterations=1,
+            ).astype(bool)
+            seed = blue_or_cyan_seed | strict_seed | generic_chroma_seed
+            mask = (
+                seed
+                | ((blue_halo | cyan_halo) & blue_near_seed)
+                | ((red_halo | magenta_halo) & strict_near_seed)
+                | (generic_chroma_halo & generic_near_seed)
+            ).astype(np.uint8)
             if int(mask.sum()) <= 0:
                 return 0
             # Reject broad regions. Blue WIC faults can be short streaks after
@@ -7729,8 +7814,17 @@ class Processor(QtCore.QObject):
                 has_blue_seed = bool(np.any(blue_seed[component]))
                 has_cyan_seed = bool(np.any(cyan_seed[component]))
                 has_strict_seed = bool(np.any(strict_seed[component]))
+                has_generic_chroma_seed = bool(np.any(generic_chroma_seed[component]))
                 if (has_blue_seed or has_cyan_seed) and not has_strict_seed:
-                    if area <= 420 and bbox_w <= 48 and bbox_h <= 48:
+                    if area <= BLUE_CYAN_MAX_AREA and bbox_w <= BLUE_CYAN_MAX_BBOX and bbox_h <= BLUE_CYAN_MAX_BBOX:
+                        keep[component] = 255
+                    continue
+                if has_generic_chroma_seed and not (has_blue_seed or has_cyan_seed or has_strict_seed):
+                    if (
+                        area <= GENERIC_CHROMA_MAX_AREA
+                        and bbox_w <= GENERIC_CHROMA_MAX_BBOX
+                        and bbox_h <= GENERIC_CHROMA_MAX_BBOX
+                    ):
                         keep[component] = 255
                     continue
                 if 1 <= area <= 4:
