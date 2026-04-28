@@ -439,7 +439,9 @@ class FaceEmbedder:
             self.det = _YOLO(yolo_path)
         else:
             try:
-                from insightface.model_zoo.scrfd import SCRFD as _SCRFD  # noqa: F401
+                import importlib.util as _importlib_util
+                if _importlib_util.find_spec("insightface") is None:
+                    raise ModuleNotFoundError("No module named 'insightface'")
             except Exception as e:
                 raise RuntimeError(
                     "SCRFD backend requires 'insightface'. Install or update the package and retry."
