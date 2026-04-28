@@ -6126,14 +6126,10 @@ class Processor(QtCore.QObject):
                     if save_q is not None:
                         wait_for_save = bool(getattr(self.cfg, "async_save_wait", False))
                         if hdr_primary_fullres:
-                            # The HDR/WIC primary export is intentionally expensive
-                            # (source seek + lossless HDR still + WIC conversion +
-                            # speckle repair). Blocking the capture loop here makes
-                            # every accepted crop stall detection for several seconds,
-                            # which is exactly the lag seen between crop@... and
-                            # CAPTURE... in normal runs. Keep the old synchronous
-                            # behavior only when explicitly requested for debugging.
-                            wait_for_save = wait_for_save or self._truthy_env("PC_HDR_PRIMARY_SYNC_SAVE")
+                            # Full-res HDR primary export must stay ack-gated so
+                            # save_hit() only returns after save result and sharpness
+                            # metadata are finalized.
+                            wait_for_save = True
                         ack_q: Optional[queue.Queue] = queue.Queue(maxsize=1) if wait_for_save else None
                         save_cancel_evt: Optional[threading.Event] = threading.Event() if wait_for_save else None
                         try:
