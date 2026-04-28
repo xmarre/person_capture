@@ -18,6 +18,15 @@ from typing import Optional, Tuple, Dict, Callable
 
 from PIL import Image
 
+# PySide/shiboken installs an import hook later in the GUI process. Recent
+# dependency combinations can make InsightFace's optional matplotlib import
+# crash while resolving six.moves._thread through that hook. Preload the six
+# alias while face_embedder is imported early, before the Qt layer is active.
+try:  # pragma: no cover - environment compatibility guard
+    from six.moves import _thread as _pc_six_thread  # noqa: F401
+except Exception:  # six is optional for the non-SCRFD path
+    _pc_six_thread = None  # type: ignore
+
 if TYPE_CHECKING:  # pragma: no cover - import only for type checking
     pass
 
@@ -201,6 +210,37 @@ def _ensure_from_zip(out_path: str, zip_urls, want_suffix="glintr100.onnx", prog
     raise FileNotFoundError(
         f"Could not extract '{out_path}' from ZIPs. Tried: {', '.join(zip_urls)}. Last error: {last_err}"
     )
+
+
+def _import_scrfd_class():
+    """Import InsightFace SCRFD without poisoning its ORT base classes.
+
+    PersonCapture monkey-patches onnxruntime.InferenceSession so SCRFD sessions
+    created for our detector model use the configured TRT/CUDA provider chain.
+    InsightFace defines PickableInferenceSession by subclassing
+    onnxruntime.InferenceSession at import time. If InsightFace is imported after
+    our monkey patch, it tries to subclass a Python function and fails with
+    "function() argument 'code' must be code, not str". Temporarily restore the
+    original ORT class for the import, then put the PersonCapture hook back.
+    """
+
+    import onnxruntime as ort  # type: ignore
+
+    current_inference_session = getattr(ort, "InferenceSession", None)
+    original_inference_session = getattr(ort, "_pc_orig_InferenceSession", None)
+    restore_patched_session = (
+        original_inference_session is not None
+        and current_inference_session is not None
+        and current_inference_session is not original_inference_session
+    )
+    if restore_patched_session:
+        ort.InferenceSession = original_inference_session  # type: ignore[attr-defined]
+    try:
+        from insightface.model_zoo.scrfd import SCRFD as _SCRFD  # type: ignore
+        return _SCRFD
+    finally:
+        if restore_patched_session:
+            ort.InferenceSession = current_inference_session  # type: ignore[attr-defined]
 
 
 def _ensure_scrfd_trt_friendly(model_path: str, progress: Optional[Callable[[str], None]] = None) -> str:
@@ -439,13 +479,13 @@ class FaceEmbedder:
             self.det = _YOLO(yolo_path)
         else:
             try:
-                import importlib.util as _importlib_util
-                if _importlib_util.find_spec("insightface") is None:
-                    raise ModuleNotFoundError("No module named 'insightface'")
-            except Exception as e:
+                self._SCRFD_cls = _import_scrfd_class()
+            except ModuleNotFoundError as e:
                 raise RuntimeError(
                     "SCRFD backend requires 'insightface'. Install or update the package and retry."
                 ) from e
+            except Exception as e:
+                raise RuntimeError(f"SCRFD backend import failed: {e!r}") from e
             # --- Force TensorRT for SCRFD (GPU-only) ---
             if not ctx.startswith('cuda'):
                 raise RuntimeError("SCRFD requires a CUDA device (use device='cuda' or 'cuda:N').")
@@ -566,6 +606,7 @@ class FaceEmbedder:
             key = os.path.normcase(os.path.abspath(os.fspath(mdl)))
             if not hasattr(ort, "_pc_trt_patched"):
                 _orig_IS = ort.InferenceSession
+                ort._pc_orig_InferenceSession = _orig_IS
                 # path -> (providers, provider_options, session_options)
                 ort._pc_provider_registry = {key: (_providers, _prov_opts, _default_so)}
 
@@ -906,7 +947,7 @@ class FaceEmbedder:
     def _get_scrfd_trt(self, shape: Tuple[int, int]):
         """Return SCRFD detector with an explicitly built TRT session. Avoid registry races."""
         import onnxruntime as ort  # type: ignore
-        from insightface.model_zoo.scrfd import SCRFD as _SCRFD
+        _SCRFD = getattr(self, "_SCRFD_cls", None) or _import_scrfd_class()
 
         if hasattr(self, "_scrfd_trt_singleton") and self._scrfd_trt_singleton is not None:
             try:
