@@ -1085,7 +1085,17 @@ class Processor(QtCore.QObject):
             enter, exit_ = float(cfg.prescan_fd_enter), float(cfg.prescan_fd_exit)
             fd_add = float(getattr(cfg, "prescan_fd_add", enter))
             old_face_conf = getattr(face, "conf", 0.5)
-            face.conf = self._prescan_face_conf_value(cfg)
+            def _apply_prescan_face_runtime_cfg() -> None:
+                face.conf = self._prescan_face_conf_value(cfg)
+                try:
+                    face._probe_conf = float(getattr(cfg, "prescan_probe_conf", 0.03))
+                    face._prescan_period = int(getattr(cfg, "prescan_rot_probe_period", 3))
+                    face._prescan_probe_imgsz = int(getattr(cfg, "prescan_probe_imgsz", 512))
+                    face._high_90 = int(getattr(cfg, "prescan_heavy_90", 1536))
+                    face._high_180 = int(getattr(cfg, "prescan_heavy_180", 1280))
+                except Exception:
+                    pass
+            _apply_prescan_face_runtime_cfg()
             old_rot_adapt = getattr(face, "rot_adaptive", True)
             try:
                 # freeze legacy rotation gating; rely on pre-scan throttle
@@ -1096,11 +1106,7 @@ class Processor(QtCore.QObject):
                 try:
                     face.set_prescan_fast(True, mode="rr")
                     face.set_prescan_hint(escalate=False)
-                    face._probe_conf = float(getattr(cfg, "prescan_probe_conf", 0.03))
-                    face._prescan_period = int(getattr(cfg, "prescan_rot_probe_period", 3))
-                    face._prescan_probe_imgsz = int(getattr(cfg, "prescan_probe_imgsz", 512))
-                    face._high_90  = int(getattr(cfg, "prescan_heavy_90", 1536))
-                    face._high_180 = int(getattr(cfg, "prescan_heavy_180", 1280))
+                    _apply_prescan_face_runtime_cfg()
                 except Exception:
                     pass
                 add_cooldown_samples = int(
@@ -1173,7 +1179,7 @@ class Processor(QtCore.QObject):
                                     fd_add = float(getattr(cfg, "prescan_fd_add", enter))
                                     Wmax = int(cfg.prescan_max_width)
                                     prescan_hdr_preview = bool(getattr(cfg, "prescan_hdr_preview", False))
-                                    face.conf = self._prescan_face_conf_value(cfg)
+                                    _apply_prescan_face_runtime_cfg()
                                     add_cooldown_samples = int(
                                         getattr(
                                             cfg,
@@ -1269,7 +1275,7 @@ class Processor(QtCore.QObject):
                                     fd_add = float(getattr(cfg, "prescan_fd_add", enter))
                                     Wmax = int(cfg.prescan_max_width)
                                     prescan_hdr_preview = bool(getattr(cfg, "prescan_hdr_preview", False))
-                                    face.conf = self._prescan_face_conf_value(cfg)
+                                    _apply_prescan_face_runtime_cfg()
                                     add_cooldown_samples = int(
                                         getattr(
                                             cfg,
