@@ -353,9 +353,15 @@ class SessionConfig:
     # When disabled, primary WIC PNGs stay fixed to yuv420/full regardless of
     # PC_HDR_WIC_AVIF_PIXFMT/PC_HDR_WIC_AVIF_RANGE.
     hdr_wic_experimental_primary: bool = False
-    # Render an extra limited-yuv444 WIC guide for artifact localization only,
-    # while keeping yuv420/full as the sole primary color/tone source.
-    hdr_wic_yuv444_guide_cleanup: bool = True
+    # Render an extra limited-yuv444 WIC still and color-match it back to the
+    # accepted yuv420/full WIC/Paint look. This avoids using WIC's defective
+    # yuv420 display pixels as final shadow texture while preserving its color
+    # response.
+    hdr_wic_yuv444_color_match: bool = True
+    hdr_wic_yuv444_color_match_strength: float = 1.0
+    # Older diagnostic cleanup that only used yuv444 as an artifact mask. It was
+    # too conservative for broad shadow blobs, so keep it opt-in/fallback only.
+    hdr_wic_yuv444_guide_cleanup: bool = False
     hdr_avif_wic_display_compat: bool = True
     # Full-resolution HDR->SDR still-render quality controls. These affect only
     # primary crops/f*.png/f*.jpg source export, not pre-scan/detection preview.
@@ -4900,6 +4906,8 @@ class Processor(QtCore.QObject):
                             "hdr_sdr_allow_inaccurate_fallback",
                             "wic_shadow_deblob_strength",
                             "hdr_wic_experimental_primary",
+                            "hdr_wic_yuv444_color_match",
+                            "hdr_wic_yuv444_color_match_strength",
                             "hdr_wic_yuv444_guide_cleanup",
                             "hdr_speckle_diag",
                             "hdr_speckle_diag_dir",
@@ -8085,6 +8093,233 @@ class Processor(QtCore.QObject):
         bgr[:, :, :] = fixed_bgr
         return True, changed
 
+    def _repair_wic_with_yuv444_color_match(self, base_path: str, clean_path: str) -> tuple[int, str]:
+        """Use artifact-free WIC yuv444 pixels, remapped to the yuv420 WIC look.
+
+        The guide-mask cleanup was intentionally conservative and therefore did
+        not move broad shadow blobs.  Diagnostics showed a stricter invariant:
+        WIC yuv420/full has the accepted color response but can create bad final
+        display pixels; WIC yuv444/limited has clean final pixels but a washed
+        global response.  This pass therefore does not try to detect individual
+        blobs.  It uses the yuv444 WIC render as the final texture source and
+        maps its display-referred Y/Cr/Cb distributions back to the already
+        accepted yuv420 WIC PNG.  The yuv420 image is only the color reference.
+        """
+        if self._truthy_env("PC_DISABLE_WIC_YUV444_COLOR_MATCH"):
+            return 0, ""
+        if not bool(getattr(self.cfg, "hdr_wic_yuv444_color_match", True)):
+            return 0, ""
+        try:
+            default_strength = float(getattr(self.cfg, "hdr_wic_yuv444_color_match_strength", 1.0))
+        except Exception:
+            default_strength = 1.0
+        strength = self._float_env("PC_WIC_YUV444_COLOR_MATCH_STRENGTH", default_strength, min_value=0.0, max_value=1.0)
+        if strength <= 0.0:
+            return 0, ""
+        try:
+            base = cv2.imread(str(base_path), cv2.IMREAD_UNCHANGED)
+            clean = cv2.imread(str(clean_path), cv2.IMREAD_UNCHANGED)
+            if base is None or clean is None:
+                return 0, ""
+            if base.ndim != 3 or clean.ndim != 3 or base.shape[:2] != clean.shape[:2]:
+                return 0, ""
+            base_bgr = base[:, :, :3]
+            clean_bgr = clean[:, :, :3]
+            base_ycc = cv2.cvtColor(base_bgr, cv2.COLOR_BGR2YCrCb)
+            clean_ycc = cv2.cvtColor(clean_bgr, cv2.COLOR_BGR2YCrCb)
+
+            by = base_ycc[:, :, 0]
+            cy = clean_ycc[:, :, 0]
+            bp = base_bgr.astype(np.int16, copy=False)
+            bmax = np.max(bp, axis=2)
+            bmin = np.min(bp, axis=2)
+            # Exclude invalid/clipped pixels and the exact false-color salt class
+            # from the reference statistics.  Keep dark pixels; the whole point is
+            # to recover the accepted WIC shadow response.
+            spike = ((bmax - bmin) >= 90) & (by <= 132)
+            fit_mask = (by >= 2) & (by <= 252) & (cy >= 2) & (cy <= 252) & (~spike)
+            if int(np.count_nonzero(fit_mask)) < 2048:
+                fit_mask = (cy >= 2) & (cy <= 252)
+            if int(np.count_nonzero(fit_mask)) < 2048:
+                return 0, ""
+
+            def _quantile_lut(src_ch: np.ndarray, dst_ch: np.ndarray, mask: np.ndarray) -> Optional[np.ndarray]:
+                src_vals = src_ch[mask].astype(np.float32, copy=False)
+                dst_vals = dst_ch[mask].astype(np.float32, copy=False)
+                if src_vals.size < 2048 or dst_vals.size < 2048:
+                    return None
+                q = np.array(
+                    [0.05, 0.10, 0.20, 0.35, 0.50, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0,
+                     8.0, 12.0, 18.0, 25.0, 35.0, 50.0, 65.0, 75.0, 82.0, 88.0,
+                     92.0, 95.0, 97.0, 98.0, 98.5, 99.0, 99.25, 99.5, 99.65,
+                     99.80, 99.90, 99.95],
+                    dtype=np.float32,
+                )
+                xp = np.percentile(src_vals, q).astype(np.float32, copy=False)
+                fp = np.percentile(dst_vals, q).astype(np.float32, copy=False)
+                order = np.argsort(xp, kind="mergesort")
+                xp = xp[order]
+                fp = fp[order]
+                keep = np.ones_like(xp, dtype=bool)
+                keep[1:] = np.diff(xp) >= 0.25
+                xp = xp[keep]
+                fp = fp[keep]
+                if xp.size < 4:
+                    return None
+                xp = np.concatenate(([0.0], xp, [255.0])).astype(np.float32, copy=False)
+                fp = np.concatenate(([fp[0]], fp, [fp[-1]])).astype(np.float32, copy=False)
+                lut = np.interp(np.arange(256, dtype=np.float32), xp, fp)
+                return np.clip(np.rint(lut), 0, 255).astype(np.uint8)
+
+            mapped_ycc = clean_ycc.copy()
+            for c in range(3):
+                lut = _quantile_lut(clean_ycc[:, :, c], base_ycc[:, :, c], fit_mask)
+                if lut is None:
+                    return 0, ""
+                mapped_ycc[:, :, c] = cv2.LUT(clean_ycc[:, :, c], lut)
+
+            # Add only very-low-frequency residual from the yuv420 reference.  This
+            # improves local color-grade matching without copying the high-frequency
+            # WIC yuv420 shadow crawl/salt defects back into the output.
+            try:
+                lowfreq = self._float_env("PC_WIC_YUV444_COLOR_MATCH_LOWFREQ", 0.22, min_value=0.0, max_value=1.0)
+            except Exception:
+                lowfreq = 0.22
+            if lowfreq > 0.0:
+                safe = fit_mask.astype(np.float32, copy=False)
+                # Strong blur: intentional.  Smaller kernels reintroduce the blocky
+                # shadow texture this path is meant to avoid.
+                denom = cv2.GaussianBlur(safe, (0, 0), 48.0)
+                denom = np.maximum(denom, 1.0e-4)
+                mapped_f = mapped_ycc.astype(np.float32, copy=False)
+                base_f = base_ycc.astype(np.float32, copy=False)
+                for c in range(3):
+                    residual = (base_f[:, :, c] - mapped_f[:, :, c]) * safe
+                    residual_lp = cv2.GaussianBlur(residual, (0, 0), 48.0) / denom
+                    mapped_f[:, :, c] = np.clip(mapped_f[:, :, c] + residual_lp * float(lowfreq), 0.0, 255.0)
+                mapped_ycc = np.clip(np.rint(mapped_f), 0, 255).astype(np.uint8)
+
+            matched_bgr = cv2.cvtColor(mapped_ycc, cv2.COLOR_YCrCb2BGR)
+            if strength < 1.0:
+                out_bgr = np.clip(
+                    np.rint((clean_bgr.astype(np.float32) * (1.0 - strength)) + (matched_bgr.astype(np.float32) * strength)),
+                    0,
+                    255,
+                ).astype(np.uint8)
+            else:
+                out_bgr = matched_bgr
+
+            out = base.copy()
+            out[:, :, :3] = out_bgr
+            diff = np.max(np.abs(out[:, :, :3].astype(np.int16, copy=False) - base_bgr.astype(np.int16, copy=False)), axis=2)
+            changed = int(np.count_nonzero(diff > 0))
+            if changed <= 0:
+                return 0, ""
+            tmp_out = base_path + ".tmp_yuv444_color_match.png"
+            try:
+                if os.path.exists(tmp_out):
+                    os.remove(tmp_out)
+            except Exception:
+                pass
+            if not cv2.imwrite(str(tmp_out), out):
+                try:
+                    if os.path.exists(tmp_out):
+                        os.remove(tmp_out)
+                except Exception:
+                    pass
+                return 0, ""
+            return changed, tmp_out
+        except Exception as exc:
+            try:
+                self._status(
+                    f"HDR WIC yuv444 color-match failed: {type(exc).__name__}: {exc}",
+                    key="hdr_wic_yuv444_color_match",
+                    interval=10.0,
+                )
+            except Exception:
+                pass
+            return 0, ""
+
+    def _maybe_apply_wic_yuv444_color_match(
+        self,
+        frame_idx: int,
+        frame_pts_sec: Optional[float],
+        crop_xyxy: tuple[int, int, int, int],
+        out_path: str,
+    ) -> int:
+        """Replace yuv420 WIC pixels with yuv444 WIC pixels matched to yuv420 color."""
+        if self._truthy_env("PC_DISABLE_WIC_YUV444_COLOR_MATCH"):
+            return 0
+        if not bool(getattr(self.cfg, "hdr_wic_yuv444_color_match", True)):
+            return 0
+        try:
+            default_strength = float(getattr(self.cfg, "hdr_wic_yuv444_color_match_strength", 1.0))
+        except Exception:
+            default_strength = 1.0
+        strength = self._float_env(
+            "PC_WIC_YUV444_COLOR_MATCH_STRENGTH",
+            default_strength,
+            min_value=0.0,
+            max_value=1.0,
+        )
+        if strength <= 0.0:
+            return 0
+        guide_base = out_path + ".tmp_yuv444_match"
+        guide_hdr = guide_base + ".avif"
+        guide_png = guide_base + ".png"
+        repaired_tmp = ""
+        try:
+            for pth in (guide_hdr, guide_png):
+                if os.path.exists(pth):
+                    os.remove(pth)
+        except Exception:
+            pass
+        try:
+            ok_hdr, why_hdr = self._save_hdr_wic_specific_intermediate_avif(
+                frame_idx,
+                frame_pts_sec,
+                crop_xyxy,
+                guide_hdr,
+                pix_fmt="yuv444p10le",
+                avif_range="limited",
+            )
+            if not ok_hdr:
+                self._status(
+                    f"HDR WIC yuv444 color-match source skipped: {why_hdr}",
+                    key="hdr_wic_yuv444_color_match",
+                    interval=10.0,
+                )
+                return 0
+            ok_wic, why_wic = self._save_wic_png_from_hdr_image(guide_hdr, guide_png, repair=False)
+            if not ok_wic:
+                self._status(
+                    f"HDR WIC yuv444 color-match render skipped: {why_wic}",
+                    key="hdr_wic_yuv444_color_match",
+                    interval=10.0,
+                )
+                return 0
+            changed, repaired_tmp = self._repair_wic_with_yuv444_color_match(out_path, guide_png)
+            if changed <= 0 or not repaired_tmp:
+                return 0
+            valid, invalid_why = self._validate_hdr_sdr_export_image(repaired_tmp, None)
+            if not valid:
+                self._status(
+                    f"HDR WIC yuv444 color-match output invalid: {invalid_why}",
+                    key="hdr_wic_yuv444_color_match",
+                    interval=5.0,
+                )
+                return 0
+            os.replace(repaired_tmp, out_path)
+            repaired_tmp = ""
+            return changed
+        finally:
+            for pth in (guide_hdr, guide_png, repaired_tmp):
+                try:
+                    if pth and os.path.exists(pth):
+                        os.remove(pth)
+                except Exception:
+                    pass
+
     def _repair_wic_with_yuv444_guide(self, base_path: str, guide_path: str) -> tuple[int, str]:
         """Use a clean WIC yuv444 render as an artifact mask, not as color source.
 
@@ -9457,18 +9692,31 @@ try {{
             try:
                 ok_wic, why_wic = self._save_wic_png_from_hdr_image(tmp_hdr, out_path)
                 if ok_wic:
-                    guide_changed = self._maybe_apply_wic_yuv444_guided_cleanup(
+                    color_match_changed = self._maybe_apply_wic_yuv444_color_match(
                         frame_idx, frame_pts_sec, crop_xyxy, out_path
                     )
-                    if guide_changed > 0:
+                    if color_match_changed > 0:
                         self._status(
-                            f"HDR WIC yuv444-guided shadow cleanup: {guide_changed} px",
-                            key="hdr_wic_guide_cleanup",
+                            f"HDR WIC yuv444 color-match output: {color_match_changed} px",
+                            key="hdr_wic_yuv444_color_match",
                             interval=5.0,
                         )
                         valid, invalid_why = self._validate_hdr_sdr_export_image(out_path, None)
                         if not valid:
-                            return False, f"windows_wic_invalid_post_guide_cleanup:{invalid_why}"
+                            return False, f"windows_wic_invalid_post_yuv444_color_match:{invalid_why}"
+                    elif bool(getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", False)):
+                        guide_changed = self._maybe_apply_wic_yuv444_guided_cleanup(
+                            frame_idx, frame_pts_sec, crop_xyxy, out_path
+                        )
+                        if guide_changed > 0:
+                            self._status(
+                                f"HDR WIC yuv444-guided shadow cleanup: {guide_changed} px",
+                                key="hdr_wic_guide_cleanup",
+                                interval=5.0,
+                            )
+                            valid, invalid_why = self._validate_hdr_sdr_export_image(out_path, None)
+                            if not valid:
+                                return False, f"windows_wic_invalid_post_guide_cleanup:{invalid_why}"
                     self._maybe_run_hdr_speckle_diagnostics(
                         ffmpeg_bin, frame_idx, frame_pts_sec, crop_xyxy, out_path
                     )
@@ -10270,11 +10518,30 @@ class MainWindow(QtWidgets.QMainWindow):
             "On allows PC_HDR_WIC_AVIF_PIXFMT/PC_HDR_WIC_AVIF_RANGE and the UI pixfmt/range knobs to override."
         )
         self.hdr_wic_experimental_primary_check.stateChanged.connect(self._on_ui_change)
+        self.hdr_wic_yuv444_color_match_check = QtWidgets.QCheckBox()
+        self.hdr_wic_yuv444_color_match_check.setChecked(bool(getattr(self.cfg, "hdr_wic_yuv444_color_match", True)))
+        self.hdr_wic_yuv444_color_match_check.setToolTip(
+            "bool: hdr_wic_yuv444_color_match. Render limited-yuv444 through WIC, then histogram/color-match "
+            "it to the yuv420/full WIC PNG. This uses clean yuv444 pixels as final texture while preserving the "
+            "accepted WIC/Paint color response. Kill switch: PC_DISABLE_WIC_YUV444_COLOR_MATCH."
+        )
+        self.hdr_wic_yuv444_color_match_check.stateChanged.connect(self._on_ui_change)
+        self.hdr_wic_yuv444_color_match_strength_spin = _mk_fspin(
+            0.0,
+            1.0,
+            0.05,
+            2,
+            "float: hdr_wic_yuv444_color_match_strength (PC_WIC_YUV444_COLOR_MATCH_STRENGTH)",
+        )
+        self.hdr_wic_yuv444_color_match_strength_spin.setValue(
+            float(getattr(self.cfg, "hdr_wic_yuv444_color_match_strength", 1.0))
+        )
+        self.hdr_wic_yuv444_color_match_strength_spin.valueChanged.connect(self._on_ui_change)
         self.hdr_wic_yuv444_guide_cleanup_check = QtWidgets.QCheckBox()
-        self.hdr_wic_yuv444_guide_cleanup_check.setChecked(bool(getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", True)))
+        self.hdr_wic_yuv444_guide_cleanup_check.setChecked(bool(getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", False)))
         self.hdr_wic_yuv444_guide_cleanup_check.setToolTip(
-            "bool: hdr_wic_yuv444_guide_cleanup. Use limited-yuv444 WIC render only as an artifact guide while "
-            "keeping yuv420/full as the primary color/tone source. Env kill switch: PC_DISABLE_WIC_YUV444_GUIDE_CLEANUP."
+            "bool: hdr_wic_yuv444_guide_cleanup. Old conservative mask-only cleanup. Disabled by default because "
+            "it does not move broad WIC shadow artifacts. Env kill switch: PC_DISABLE_WIC_YUV444_GUIDE_CLEANUP."
         )
         self.hdr_wic_yuv444_guide_cleanup_check.stateChanged.connect(self._on_ui_change)
 
@@ -10915,6 +11182,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ("WIC intermediate AVIF pixfmt", self.hdr_wic_avif_pixfmt_combo),
             ("WIC intermediate AVIF range", self.hdr_wic_avif_range_combo),
             ("WIC experimental primary override", self.hdr_wic_experimental_primary_check),
+            ("WIC yuv444 color match", self.hdr_wic_yuv444_color_match_check),
+            ("WIC yuv444 color match strength", self.hdr_wic_yuv444_color_match_strength_spin),
             ("WIC yuv444 guide cleanup", self.hdr_wic_yuv444_guide_cleanup_check),
             ("HDR speckle diagnostics", self.hdr_speckle_diag_check),
             ("HDR speckle diag dir", self.hdr_speckle_diag_dir_widget),
@@ -12268,6 +12537,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "hdr_wic_avif_pixfmt",
             "hdr_wic_avif_range",
             "hdr_wic_experimental_primary",
+            "hdr_wic_yuv444_color_match",
+            "hdr_wic_yuv444_color_match_strength",
             "hdr_wic_yuv444_guide_cleanup",
             "hdr_speckle_diag",
             "hdr_speckle_diag_dir",
@@ -12502,10 +12773,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 if hasattr(self, "hdr_wic_experimental_primary_check")
                 else bool(getattr(self.cfg, "hdr_wic_experimental_primary", False))
             ),
+            hdr_wic_yuv444_color_match=(
+                bool(self.hdr_wic_yuv444_color_match_check.isChecked())
+                if hasattr(self, "hdr_wic_yuv444_color_match_check")
+                else bool(getattr(self.cfg, "hdr_wic_yuv444_color_match", True))
+            ),
+            hdr_wic_yuv444_color_match_strength=(
+                float(self.hdr_wic_yuv444_color_match_strength_spin.value())
+                if hasattr(self, "hdr_wic_yuv444_color_match_strength_spin")
+                else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_strength", 1.0))
+            ),
             hdr_wic_yuv444_guide_cleanup=(
                 bool(self.hdr_wic_yuv444_guide_cleanup_check.isChecked())
                 if hasattr(self, "hdr_wic_yuv444_guide_cleanup_check")
-                else bool(getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", True))
+                else bool(getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", False))
             ),
             hdr_avif_wic_display_compat=(
                 bool(self.hdr_avif_display_compat_check.isChecked())
@@ -12572,10 +12853,20 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(self, "hdr_wic_experimental_primary_check")
             else bool(getattr(self.cfg, "hdr_wic_experimental_primary", False))
         )
+        cfg.hdr_wic_yuv444_color_match = (
+            bool(self.hdr_wic_yuv444_color_match_check.isChecked())
+            if hasattr(self, "hdr_wic_yuv444_color_match_check")
+            else bool(getattr(self.cfg, "hdr_wic_yuv444_color_match", True))
+        )
+        cfg.hdr_wic_yuv444_color_match_strength = (
+            float(self.hdr_wic_yuv444_color_match_strength_spin.value())
+            if hasattr(self, "hdr_wic_yuv444_color_match_strength_spin")
+            else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_strength", 1.0))
+        )
         cfg.hdr_wic_yuv444_guide_cleanup = (
             bool(self.hdr_wic_yuv444_guide_cleanup_check.isChecked())
             if hasattr(self, "hdr_wic_yuv444_guide_cleanup_check")
-            else bool(getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", True))
+            else bool(getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", False))
         )
         cfg.hdr_speckle_diag = bool(self.hdr_speckle_diag_check.isChecked()) if hasattr(self, "hdr_speckle_diag_check") else bool(getattr(self.cfg, "hdr_speckle_diag", False))
         cfg.hdr_speckle_diag_dir = self.hdr_speckle_diag_dir_edit.text().strip() if hasattr(self, "hdr_speckle_diag_dir_edit") else str(getattr(self.cfg, "hdr_speckle_diag_dir", "") or "")
@@ -12646,7 +12937,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.cfg.hdr_wic_avif_range not in {"full", "limited"}:
             self.cfg.hdr_wic_avif_range = "full"
         self.cfg.hdr_wic_experimental_primary = bool(getattr(cfg, "hdr_wic_experimental_primary", False))
-        self.cfg.hdr_wic_yuv444_guide_cleanup = bool(getattr(cfg, "hdr_wic_yuv444_guide_cleanup", True))
+        self.cfg.hdr_wic_yuv444_color_match = bool(getattr(cfg, "hdr_wic_yuv444_color_match", True))
+        try:
+            self.cfg.hdr_wic_yuv444_color_match_strength = min(
+                1.0, max(0.0, float(getattr(cfg, "hdr_wic_yuv444_color_match_strength", 1.0)))
+            )
+        except Exception:
+            self.cfg.hdr_wic_yuv444_color_match_strength = 1.0
+        self.cfg.hdr_wic_yuv444_guide_cleanup = bool(getattr(cfg, "hdr_wic_yuv444_guide_cleanup", False))
         self.cfg.hdr_avif_wic_display_compat = bool(getattr(cfg, "hdr_avif_wic_display_compat", True))
         self.cfg.compose_crop_enable = bool(getattr(cfg, "compose_crop_enable", True))
         self.cfg.compose_detect_person_for_face = bool(getattr(cfg, "compose_detect_person_for_face", True))
@@ -12723,6 +13021,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.hdr_wic_avif_range_combo.setCurrentIndex(idx if idx >= 0 else 0)
         if hasattr(self, "hdr_wic_experimental_primary_check"):
             self.hdr_wic_experimental_primary_check.setChecked(self.cfg.hdr_wic_experimental_primary)
+        self.cfg.hdr_wic_yuv444_color_match = bool(getattr(cfg, "hdr_wic_yuv444_color_match", True))
+        try:
+            self.cfg.hdr_wic_yuv444_color_match_strength = min(
+                1.0, max(0.0, float(getattr(cfg, "hdr_wic_yuv444_color_match_strength", 1.0)))
+            )
+        except Exception:
+            self.cfg.hdr_wic_yuv444_color_match_strength = 1.0
+        if hasattr(self, "hdr_wic_yuv444_color_match_check"):
+            self.hdr_wic_yuv444_color_match_check.setChecked(self.cfg.hdr_wic_yuv444_color_match)
+        if hasattr(self, "hdr_wic_yuv444_color_match_strength_spin"):
+            self.hdr_wic_yuv444_color_match_strength_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_strength)
         if hasattr(self, "hdr_wic_yuv444_guide_cleanup_check"):
             self.hdr_wic_yuv444_guide_cleanup_check.setChecked(self.cfg.hdr_wic_yuv444_guide_cleanup)
         self.cfg.hdr_speckle_diag = bool(getattr(cfg, "hdr_speckle_diag", False))
@@ -13854,10 +14163,36 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if hasattr(self, "hdr_wic_experimental_primary_check"):
             self.hdr_wic_experimental_primary_check.setChecked(self.cfg.hdr_wic_experimental_primary)
+        self.cfg.hdr_wic_yuv444_color_match = bool(
+            s.value(
+                "hdr_wic_yuv444_color_match",
+                getattr(self.cfg, "hdr_wic_yuv444_color_match", True),
+                type=bool,
+            )
+        )
+        try:
+            self.cfg.hdr_wic_yuv444_color_match_strength = min(
+                1.0,
+                max(
+                    0.0,
+                    float(
+                        s.value(
+                            "hdr_wic_yuv444_color_match_strength",
+                            getattr(self.cfg, "hdr_wic_yuv444_color_match_strength", 1.0),
+                        )
+                    ),
+                ),
+            )
+        except Exception:
+            self.cfg.hdr_wic_yuv444_color_match_strength = 1.0
+        if hasattr(self, "hdr_wic_yuv444_color_match_check"):
+            self.hdr_wic_yuv444_color_match_check.setChecked(self.cfg.hdr_wic_yuv444_color_match)
+        if hasattr(self, "hdr_wic_yuv444_color_match_strength_spin"):
+            self.hdr_wic_yuv444_color_match_strength_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_strength)
         self.cfg.hdr_wic_yuv444_guide_cleanup = bool(
             s.value(
                 "hdr_wic_yuv444_guide_cleanup",
-                getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", True),
+                getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", False),
                 type=bool,
             )
         )
