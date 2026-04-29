@@ -8718,6 +8718,14 @@ class Processor(QtCore.QObject):
             ok_clean_wic, why_clean_wic = self._save_wic_png_from_hdr_image(clean_hdr, clean_png, repair=False)
             if not ok_clean_wic:
                 return False, f"clean_wic_failed:{why_clean_wic}", 0
+            block_bad, block_why = self._detect_wic_block_corruption(clean_png)
+            if block_bad:
+                self._status(
+                    f"HDR WIC yuv444 clean render rejected: {block_why}",
+                    key="hdr_wic_yuv444_color_match",
+                    interval=0.0,
+                )
+                return False, f"clean_wic_block_corrupt:{block_why}", 0
 
             changed, repaired_tmp = self._repair_wic_with_yuv444_color_match(ref_png, clean_png)
             if changed <= 0:
@@ -8727,6 +8735,14 @@ class Processor(QtCore.QObject):
             valid, invalid_why = self._validate_hdr_sdr_export_image(repaired_tmp, None)
             if not valid:
                 return False, f"color_match_invalid:{invalid_why}", 0
+            block_bad, block_why = self._detect_wic_block_corruption(repaired_tmp)
+            if block_bad:
+                self._status(
+                    f"HDR WIC yuv444 color-match output rejected: {block_why}",
+                    key="hdr_wic_yuv444_color_match",
+                    interval=0.0,
+                )
+                return False, f"color_match_block_corrupt:{block_why}", 0
             os.replace(repaired_tmp, out_path)
             return True, "", changed
         except Exception as exc:
@@ -8814,6 +8830,14 @@ class Processor(QtCore.QObject):
                     interval=10.0,
                 )
                 return 0
+            block_bad, block_why = self._detect_wic_block_corruption(guide_png)
+            if block_bad:
+                self._status(
+                    f"HDR WIC yuv444 color-match render rejected: {block_why}",
+                    key="hdr_wic_yuv444_color_match",
+                    interval=0.0,
+                )
+                return 0
             changed, repaired_tmp = self._repair_wic_with_yuv444_color_match(out_path, guide_png)
             if changed <= 0:
                 self._status(
@@ -8835,6 +8859,14 @@ class Processor(QtCore.QObject):
                     f"HDR WIC yuv444 color-match output invalid: {invalid_why}",
                     key="hdr_wic_yuv444_color_match",
                     interval=5.0,
+                )
+                return 0
+            block_bad, block_why = self._detect_wic_block_corruption(repaired_tmp)
+            if block_bad:
+                self._status(
+                    f"HDR WIC yuv444 color-match output rejected: {block_why}",
+                    key="hdr_wic_yuv444_color_match",
+                    interval=0.0,
                 )
                 return 0
             os.replace(repaired_tmp, out_path)
@@ -9912,6 +9944,84 @@ try {{
             return True, ""
         except Exception as exc:
             return False, f"validate_failed:{exc}"
+
+    @staticmethod
+    def _detect_wic_block_corruption(path: str) -> tuple[bool, str]:
+        """Detect valid PNGs that contain WIC/AVIF block-dropout corruption.
+
+        This is intentionally not a general denoiser or visual-quality metric.
+        It catches the catastrophic one-frame failure mode where the yuv444 WIC
+        render is a syntactically valid PNG but contains many hard-edged black
+        rectangular dropouts in dark regions. Those pixels must not be used as
+        the final yuv444 texture for color matching.
+        """
+        if str(os.getenv("PC_DISABLE_WIC_BLOCK_CORRUPTION_GUARD", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return False, ""
+        try:
+            if not path or not os.path.exists(path):
+                return False, ""
+            data = np.fromfile(path, dtype=np.uint8)
+            if data.size <= 16:
+                return False, ""
+            img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+            if img is None or img.ndim != 3 or img.shape[2] < 3:
+                return False, ""
+            bgr = img[:, :, :3]
+            h, w = bgr.shape[:2]
+            if h < 64 or w < 64:
+                return False, ""
+
+            ycc = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+            y = ycc[:, :, 0].astype(np.int16, copy=False)
+            y_med = cv2.medianBlur(ycc[:, :, 0], 17).astype(np.int16, copy=False)
+
+            # Valid dark scenes can be globally near-black. The bad case is
+            # different: many small hard-edged pixels/blocks are much darker than
+            # their local dark neighborhood.
+            drop = (y <= 52) & (y_med >= 12) & ((y_med - y) >= 12)
+            drop_count = int(np.count_nonzero(drop))
+            if drop_count < 2500:
+                return False, ""
+
+            n, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+                drop.astype(np.uint8),
+                8,
+            )
+            rect_count = 0
+            rect_area = 0
+            for i in range(1, n):
+                x = int(stats[i, cv2.CC_STAT_LEFT])
+                y0 = int(stats[i, cv2.CC_STAT_TOP])
+                cw = int(stats[i, cv2.CC_STAT_WIDTH])
+                ch = int(stats[i, cv2.CC_STAT_HEIGHT])
+                area = int(stats[i, cv2.CC_STAT_AREA])
+                if area < 12:
+                    continue
+                if cw < 3 or ch < 3 or cw > 80 or ch > 80:
+                    continue
+                fill = float(area) / float(max(1, cw * ch))
+                if fill < 0.15:
+                    continue
+                rect_count += 1
+                rect_area += area
+
+            bad = (
+                (rect_count >= 80 and rect_area >= 5000)
+                or (rect_count >= 50 and drop_count >= 12000)
+            )
+            if not bad:
+                return False, ""
+            return True, (
+                f"dark_block_dropouts pixels={drop_count} "
+                f"components={rect_count} area={rect_area}"
+            )
+        except Exception as exc:
+            return False, f"block_guard_failed:{type(exc).__name__}:{exc}"
 
     def _hdr_tonemap_filter_cmds(
         self,
