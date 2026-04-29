@@ -7362,6 +7362,18 @@ class Processor(QtCore.QObject):
         val = os.getenv(name, "")
         return str(val).strip().lower() in {"1", "true", "yes", "on"}
 
+    @staticmethod
+    def _float_env(name: str, default: float, *, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
+        try:
+            value = float(str(os.getenv(name, "")).strip() or float(default))
+        except Exception:
+            value = float(default)
+        if min_value is not None:
+            value = max(float(min_value), value)
+        if max_value is not None:
+            value = min(float(max_value), value)
+        return value
+
     def _hdr_speckle_diag_enabled(self) -> bool:
         """Return true when heavy HDR speckle diagnostics should be written.
 
@@ -7702,20 +7714,26 @@ class Processor(QtCore.QObject):
         self._status(f"HDR speckle diagnostics done: {diag_dir}", key="hdr_speckle_diag", interval=0.0)
 
     def _stabilize_wic_dark_chroma_blotches(self, img: np.ndarray) -> tuple[bool, int]:
-        """Suppress WIC-only dark chroma blotches without changing luma.
+        """Suppress WIC-only shadow blotches without changing the HDR/WIC tone map.
 
-        The saturated speckle repair handles impossible RGB salt pixels.  The
-        remaining defect is a lower-amplitude dark chroma crawl/blotch pattern:
-        black cloth and hair pick up green/cyan/magenta patches after the WIC
-        HDR AVIF render, while the accepted WIC/Paint tone response is otherwise
-        correct.  Do this after WIC, in display-referred YCrCb, and preserve the
-        rendered luma channel exactly so this cannot become another tone-map or
-        washed-color path.
+        PR #339 only stabilized display chroma and preserved WIC luma exactly.
+        The remaining visible defect is not just chroma salt: in very dark cloth,
+        hair, and background gradients WIC expands the HDR AVIF handoff into a
+        coupled low-end luma/chroma crawl.  Chroma-only cleanup leaves the visible
+        blocky/pixel-gradient pattern intact.  This pass is still WIC-only and
+        display-referred, but it now applies a bounded shadow deblob to both Y and
+        Cr/Cb inside near-black, non-skin regions.  The accepted WIC/Paint color
+        rendering is preserved by keeping the mask narrow, edge-protected, and by
+        clamping per-pixel changes to a few display code values.
         """
         if self._truthy_env("PC_DISABLE_WIC_DARK_CHROMA_CLEANUP"):
             return False, 0
         if img is None or img.ndim != 3 or img.shape[2] < 3:
             return False, 0
+        strength = self._float_env("PC_WIC_SHADOW_DEBLOB_STRENGTH", 1.0, min_value=0.0, max_value=2.0)
+        if strength <= 0.0:
+            return False, 0
+
         bgr = img[:, :, :3]
         try:
             ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
@@ -7725,57 +7743,82 @@ class Processor(QtCore.QObject):
         y = ycrcb[:, :, 0].astype(np.float32, copy=False)
         cr = ycrcb[:, :, 1].astype(np.float32, copy=False)
         cb = ycrcb[:, :, 2].astype(np.float32, copy=False)
+        pix = bgr.astype(np.int16, copy=False)
+        b = pix[:, :, 0].astype(np.float32, copy=False)
+        g = pix[:, :, 1].astype(np.float32, copy=False)
+        r = pix[:, :, 2].astype(np.float32, copy=False)
+        max_ch = np.maximum(np.maximum(r, g), b)
 
-        # Use small odd kernels.  The target is block/chroma crawl in dark
-        # regions, not photographic denoising.  Luma remains untouched.
-        y_med = cv2.medianBlur(ycrcb[:, :, 0], 5).astype(np.float32, copy=False)
-        cr_med = cv2.medianBlur(ycrcb[:, :, 1], 9).astype(np.float32, copy=False)
-        cb_med = cv2.medianBlur(ycrcb[:, :, 2], 9).astype(np.float32, copy=False)
+        y_med5 = cv2.medianBlur(ycrcb[:, :, 0], 5).astype(np.float32, copy=False)
+        y_med9 = cv2.medianBlur(ycrcb[:, :, 0], 9).astype(np.float32, copy=False)
+        cr_med = cv2.medianBlur(ycrcb[:, :, 1], 11).astype(np.float32, copy=False)
+        cb_med = cv2.medianBlur(ycrcb[:, :, 2], 11).astype(np.float32, copy=False)
 
-        bgr16 = bgr.astype(np.int16, copy=False)
-        max_ch = bgr16.max(axis=2).astype(np.float32, copy=False)
-        cr_delta = np.abs(cr - cr_med)
-        cb_delta = np.abs(cb - cb_med)
-        chroma_delta = np.maximum(cr_delta, cb_delta)
+        # Protect the part of the WIC/Paint look that the previous fix restored:
+        # warm face/candle shadows and visible midtones must not be neutralized.
+        warm_protect = (r >= (g + 6.0)) & (r >= (b + 12.0)) & (max_ch >= 34.0) & (y_med5 >= 24.0)
 
-        # Constrain this to shadows/black textures.  This protects candle/fire,
-        # visible skin, and normal colored detail while still covering the coat
-        # and hair regions where WIC creates the green dark-gradient blobs.
-        dark_gate = (y_med <= 96.0) & (y <= 112.0) & (max_ch <= 154.0)
-        if int(np.count_nonzero(dark_gate)) <= 0:
+        # The visible defect lives in near-black materials/gradients.  A separate
+        # greenish branch catches dark green/teal blotches that are not saturated
+        # enough to be accepted by the existing speckle component filter.
+        black_shadow = (y_med9 <= 72.0) & (y <= 104.0) & (max_ch <= 118.0)
+        near_black = (y_med9 <= 44.0) & (y <= 80.0) & (max_ch <= 142.0)
+        greenish_shadow = ((g - np.maximum(r, b)) >= 2.0) & (y_med9 <= 92.0) & (y <= 124.0) & (max_ch <= 136.0)
+        shadow_gate = (black_shadow | near_black | greenish_shadow) & ~warm_protect
+        if int(np.count_nonzero(shadow_gate)) <= 0:
             return False, 0
 
-        # Blend dark chroma toward its local median to remove crawl.  Add a
-        # stronger term only for local chroma outliers.  For near-black pixels,
-        # add a small neutral pull because broad low-frequency chroma blotches
-        # can have no sharp local outlier center.
-        base_alpha = np.clip((96.0 - y_med) / 80.0, 0.0, 1.0) * 0.20
-        outlier_alpha = np.clip((chroma_delta - 3.0) / 20.0, 0.0, 1.0) * 0.55
-        alpha = np.maximum(base_alpha, outlier_alpha)
-        alpha = np.where(dark_gate, alpha, 0.0).astype(np.float32, copy=False)
-        if float(np.max(alpha)) <= 0.0:
-            return False, 0
+        # Do not smear real edges such as face contours, hair outlines, hands, or
+        # candle geometry.  Sobel is evaluated on rendered WIC luma so this also
+        # protects the accepted crop composition and visible detail.
+        grad_x = cv2.Sobel(ycrcb[:, :, 0], cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(ycrcb[:, :, 0], cv2.CV_32F, 0, 1, ksize=3)
+        grad = np.sqrt((grad_x * grad_x) + (grad_y * grad_y))
+        edge_alpha = np.clip((30.0 - grad) / 30.0, 0.0, 1.0)
+        dark_alpha = np.clip((86.0 - y_med9) / 74.0, 0.0, 1.0)
 
-        neutral_alpha = np.clip((60.0 - y_med) / 52.0, 0.0, 1.0) * 0.28
-        neutral_alpha = np.where(dark_gate, neutral_alpha, 0.0).astype(np.float32, copy=False)
+        # Luma is now stabilized too.  This is the missing part: preserving luma
+        # exactly leaves the dark pixel-gradient blobs visible even if chroma is
+        # cleaned.  Clamp the applied luma delta so this cannot become a blur or
+        # a new tone mapper.
+        y_target = cv2.bilateralFilter(ycrcb[:, :, 0], 7, 7, 5).astype(np.float32, copy=False)
+        luma_roughness = np.abs(y - y_med5)
+        y_alpha = np.maximum(
+            dark_alpha * 0.22,
+            np.clip((luma_roughness - 1.0) / 8.0, 0.0, 1.0) * 0.35,
+        ) * edge_alpha * float(strength)
+        y_alpha = np.where(shadow_gate, np.clip(y_alpha, 0.0, 0.55), 0.0).astype(np.float32, copy=False)
+        y_delta = np.clip((y_target - y) * y_alpha, -3.0 * strength, 3.0 * strength)
 
-        target_cr = cr_med * (1.0 - neutral_alpha) + 128.0 * neutral_alpha
-        target_cb = cb_med * (1.0 - neutral_alpha) + 128.0 * neutral_alpha
-        cr_new = cr * (1.0 - alpha) + target_cr * alpha
-        cb_new = cb * (1.0 - alpha) + target_cb * alpha
+        chroma_delta = np.maximum(np.abs(cr - cr_med), np.abs(cb - cb_med))
+        chroma_alpha = (
+            dark_alpha * 0.62
+            + np.clip((chroma_delta - 1.0) / 14.0, 0.0, 1.0) * 0.35
+        ) * edge_alpha * float(strength)
+        chroma_alpha = np.where(shadow_gate, np.clip(chroma_alpha, 0.0, 0.88), 0.0).astype(np.float32, copy=False)
+
+        # Near black, real cloth/hair/background chroma should be close to local
+        # chroma or neutral.  Pull only through the shadow mask and clamp the
+        # final chroma movement so saturated/intentional scene color survives.
+        neutral_alpha = np.clip((64.0 - y_med9) / 56.0, 0.0, 1.0) * 0.48 * float(strength)
+        neutral_alpha = np.where(shadow_gate, np.clip(neutral_alpha, 0.0, 0.58), 0.0).astype(np.float32, copy=False)
+        target_cr = (cr_med * (1.0 - neutral_alpha)) + (128.0 * neutral_alpha)
+        target_cb = (cb_med * (1.0 - neutral_alpha)) + (128.0 * neutral_alpha)
+        cr_delta = np.clip((target_cr - cr) * chroma_alpha, -10.0 * strength, 10.0 * strength)
+        cb_delta = np.clip((target_cb - cb) * chroma_alpha, -10.0 * strength, 10.0 * strength)
 
         fixed_ycrcb = ycrcb.copy()
-        fixed_ycrcb[:, :, 1] = np.clip(np.rint(cr_new), 0, 255).astype(np.uint8)
-        fixed_ycrcb[:, :, 2] = np.clip(np.rint(cb_new), 0, 255).astype(np.uint8)
+        fixed_ycrcb[:, :, 0] = np.clip(np.rint(y + y_delta), 0, 255).astype(np.uint8)
+        fixed_ycrcb[:, :, 1] = np.clip(np.rint(cr + cr_delta), 0, 255).astype(np.uint8)
+        fixed_ycrcb[:, :, 2] = np.clip(np.rint(cb + cb_delta), 0, 255).astype(np.uint8)
         fixed_bgr = cv2.cvtColor(fixed_ycrcb, cv2.COLOR_YCrCb2BGR)
 
         diff = np.max(np.abs(fixed_bgr.astype(np.int16, copy=False) - bgr.astype(np.int16, copy=False)), axis=2)
-        if int(np.count_nonzero(diff)) <= 0:
+        changed = int(np.count_nonzero(diff > 1))
+        if changed <= 0:
             return False, 0
         bgr[:, :, :] = fixed_bgr
-
-        # Report significant chroma fixes, not every one-code rounding change.
-        return True, int(np.count_nonzero(diff > 2))
+        return True, changed
 
     def _repair_wic_saturated_rgb_speckles(self, path: str) -> int:
         """Remove WIC/Windows HDR-AVIF salt pixels from an already-rendered SDR image.
