@@ -7737,6 +7737,9 @@ class Processor(QtCore.QObject):
             BLUE_CYAN_SEED_DILATE = 7
             BLUE_CYAN_MAX_AREA = 420
             BLUE_CYAN_MAX_BBOX = 48
+            GREEN_SEED_DILATE = 7
+            GREEN_MAX_AREA = 260
+            GREEN_MAX_BBOX = 36
             STRICT_HUE_SEED_DILATE = 5
             STRICT_HUE_MAX_AREA = 160
             STRICT_HUE_MAX_BBOX = 24
@@ -7799,6 +7802,30 @@ class Processor(QtCore.QObject):
             red = dark_strict & (r >= 180) & ((r - max_bg) >= 70) & (b <= 80) & (g <= 80)
             strict_seed = magenta | red
 
+            # Green WIC defects are the same class of dark-scene chroma impulse
+            # as the blue/cyan/red/magenta defects, but they are less saturated
+            # and therefore were missed by the older impossible-primary masks.
+            # Keep them local-outlier-gated and component-bounded so real dark
+            # green scene content is not globally desaturated or blurred.
+            green_seed = (
+                dark_blue
+                & (g >= 48)
+                & ((g - np.maximum(r, b)) >= 16)
+                & (g_jump >= 12)
+                & (r <= 128)
+                & (b <= 128)
+                & (r_jump <= 18)
+                & (b_jump <= 18)
+            )
+            green_halo = (
+                dark_blue
+                & (g >= 34)
+                & ((g - np.maximum(r, b)) >= 8)
+                & (g_jump >= 8)
+                & (r <= 136)
+                & (b <= 136)
+            )
+
             # Red/magenta residuals are handled as same-hue local outliers near a
             # strict red/magenta seed. This extends the old strict branch without
             # falling back to a broad hue-agnostic chroma cleanup.
@@ -7826,14 +7853,20 @@ class Processor(QtCore.QObject):
             # without changing the broad-streak blue/cyan behavior.
             residual_blue = dark_blue & (b >= 86) & ((b - max_rg) >= 30) & (r <= 96) & (g <= 132) & (b_jump >= 24)
             residual_cyan = dark_blue & (b >= 82) & (g >= 70) & (r <= 104) & ((min_bg - r) >= 30) & (b_jump >= 16) & (g_jump >= 12)
+            residual_green = dark_blue & (g >= 38) & ((g - np.maximum(r, b)) >= 12) & (r <= 128) & (b <= 128) & (g_jump >= 12)
             residual_red = dark_strict & (r >= 112) & ((r - max_bg) >= 42) & (b <= 128) & (g <= 128) & (r_jump >= 24)
             residual_magenta = dark_strict & (r >= 112) & (b >= 112) & ((min_rb - g) >= 34) & (g <= 128) & (r_jump >= 18) & (b_jump >= 18)
-            residual_hue_seed = (residual_blue | residual_cyan | residual_red | residual_magenta) & ~strict_seed & ~(blue_seed | cyan_seed)
+            residual_hue_seed = (residual_blue | residual_cyan | residual_green | residual_red | residual_magenta) & ~strict_seed & ~(blue_seed | cyan_seed | green_seed)
 
             blue_or_cyan_seed = blue_seed | cyan_seed
             blue_near_seed = cv2.dilate(
                 blue_or_cyan_seed.astype(np.uint8),
                 np.ones((BLUE_CYAN_SEED_DILATE, BLUE_CYAN_SEED_DILATE), dtype=np.uint8),
+                iterations=1,
+            ).astype(bool)
+            green_near_seed = cv2.dilate(
+                green_seed.astype(np.uint8),
+                np.ones((GREEN_SEED_DILATE, GREEN_SEED_DILATE), dtype=np.uint8),
                 iterations=1,
             ).astype(bool)
             strict_near_seed = cv2.dilate(
@@ -7842,10 +7875,11 @@ class Processor(QtCore.QObject):
                 iterations=1,
             ).astype(bool)
 
-            seed = blue_or_cyan_seed | strict_seed | residual_hue_seed
+            seed = blue_or_cyan_seed | green_seed | strict_seed | residual_hue_seed
             mask = (
                 seed
                 | ((blue_halo | cyan_halo) & blue_near_seed)
+                | (green_halo & green_near_seed)
                 | ((red_halo | magenta_halo) & strict_near_seed)
             ).astype(np.uint8)
             if int(mask.sum()) <= 0:
@@ -7879,6 +7913,7 @@ class Processor(QtCore.QObject):
                     continue
                 has_blue_seed = bool(np.any(blue_seed[comp_y:y2, comp_x:x2][component]))
                 has_cyan_seed = bool(np.any(cyan_seed[comp_y:y2, comp_x:x2][component]))
+                has_green_seed = bool(np.any(green_seed[comp_y:y2, comp_x:x2][component]))
                 has_strict_seed = bool(np.any(strict_seed[comp_y:y2, comp_x:x2][component]))
                 has_residual_hue_seed = bool(np.any(residual_hue_seed[comp_y:y2, comp_x:x2][component]))
 
@@ -7888,6 +7923,12 @@ class Processor(QtCore.QObject):
                         area <= BLUE_CYAN_MAX_AREA
                         and bbox_w <= BLUE_CYAN_MAX_BBOX
                         and bbox_h <= BLUE_CYAN_MAX_BBOX
+                    )
+                elif has_green_seed and not has_strict_seed:
+                    accept_component = (
+                        area <= GREEN_MAX_AREA
+                        and bbox_w <= GREEN_MAX_BBOX
+                        and bbox_h <= GREEN_MAX_BBOX
                     )
                 elif has_strict_seed:
                     long_edge = max(bbox_w, bbox_h)
@@ -8065,22 +8106,24 @@ class Processor(QtCore.QObject):
         """Return AVIF pixel formats to try for the temporary WIC HDR still.
 
         The WIC/Paint-style primary PNG path is intentionally routed through
-        Windows' HDR still renderer, but feeding that renderer a 4:2:0 HDR AVIF
-        leaves Windows responsible for dark-region chroma reconstruction.  That
-        is the failure boundary that shows up as green blotches and sporadic
-        blue/cyan/magenta salt pixels.  Prefer a lossless 4:4:4 AVIF intermediate
-        so FFmpeg performs the chroma reconstruction once, deterministically,
-        before WIC tone maps the still.  Keep 4:2:0 as a compatibility fallback
-        for Windows installs whose AVIF WIC codec rejects 4:4:4 AVIF.
+        Windows' HDR still renderer.  Keep its temporary HDR AVIF on the
+        historical 4:2:0 input by default, because Windows' WIC renderer takes a
+        visibly different color-management path for 4:4:4 AVIF on some systems
+        and produces washed-out PNGs.  Chroma defects from the WIC render path
+        are handled after WIC on the display image, where the accepted WIC/Paint
+        tone map is already fixed.
+
+        PC_HDR_WIC_AVIF_PIXFMT remains available for local diagnostics or codec
+        experiments, for example "yuv444p10le,yuv420p10le".
         """
-        raw = os.getenv("PC_HDR_WIC_AVIF_PIXFMT", "yuv444p10le,yuv420p10le")
+        raw = os.getenv("PC_HDR_WIC_AVIF_PIXFMT", "yuv420p10le")
         out: list[str] = []
         for part in str(raw or "").replace(";", ",").split(","):
             pix = part.strip().lower()
-            if pix in {"yuv444p10le", "yuv420p10le"} and pix not in out:
+            if pix in {"yuv420p10le", "yuv444p10le"} and pix not in out:
                 out.append(pix)
         if not out:
-            out = ["yuv444p10le", "yuv420p10le"]
+            out = ["yuv420p10le"]
         return out
 
     def _save_hdr_wic_intermediate_avif(
@@ -8105,9 +8148,9 @@ class Processor(QtCore.QObject):
                 avif_pix_fmt=pix_fmt,
             )
             if ok:
-                if pix_fmt != "yuv444p10le":
+                if pix_fmt != "yuv420p10le":
                     self._status(
-                        f"HDR WIC intermediate used fallback {pix_fmt}",
+                        f"HDR WIC intermediate used requested {pix_fmt}",
                         key="hdr_wic_intermediate",
                         interval=10.0,
                     )
