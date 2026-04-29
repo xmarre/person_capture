@@ -7868,6 +7868,7 @@ class Processor(QtCore.QObject):
             b = pix[:, :, 0]
             g = pix[:, :, 1]
             r = pix[:, :, 2]
+            max_ch = np.maximum(np.maximum(r, g), b)
             max_rg = np.maximum(r, g)
             max_bg = np.maximum(b, g)
             min_bg = np.minimum(b, g)
@@ -8016,6 +8017,7 @@ class Processor(QtCore.QObject):
                 min_ch = np.minimum(np.minimum(r, g), b)
                 hsv_tiny_seed = (
                     (local_luma <= 136)
+                    & (dark_blue | dark_strict)
                     & (sat >= 72)
                     & (val >= 42)
                     & ((max_ch - min_ch) >= 34)
