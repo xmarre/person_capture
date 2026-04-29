@@ -2366,6 +2366,13 @@ class Processor(QtCore.QObject):
                     aspect = float(rw) / max(1e-6, float(rh))
                 except Exception:
                     return
+                if portrait_close_eligible and profile == "close" and rs == "1:1":
+                    # Medium-close portrait-eligible shots are exactly the case
+                    # where square close crops keep winning over portrait_close.
+                    # Treat this as an invariant, not a score preference; otherwise
+                    # close/1:1 can bypass the portrait_close hard gate entirely and
+                    # still log as profile=close ratio=1:1.
+                    return
                 if aspect > 1.05 and not allow_landscape:
                     return
                 if rs not in out:
@@ -2579,11 +2586,11 @@ class Processor(QtCore.QObject):
                     profile_prior = 0.00
                     ratio_prior += 0.00 if rs == "1:1" else 0.08
                     if portrait_close_eligible:
-                        # Medium-close with usable lower context is not a square
-                        # close-up. Demote close/1:1 so portrait_close/2:3 can win.
+                        # _ratio_list_for_profile already removes close/1:1 here.
+                        # Keep only a mild profile nudge so close/2:3 or close/3:4
+                        # can still win when they genuinely compose better than
+                        # portrait_close, without allowing a square bypass.
                         profile_prior += 0.26
-                        if rs == "1:1":
-                            ratio_prior += 0.10
                 elif profile == "portrait_close":
                     # Prefer medium-close faces with usable lower context.
                     if portrait_close_eligible:
@@ -2692,7 +2699,9 @@ class Processor(QtCore.QObject):
             fallback_ratio = rs
             break
         if fallback_ratio is None:
-            if face_hard_protect is not None and face_frame_frac >= 0.16:
+            if portrait_close_eligible:
+                preferred_fallbacks = ("2:3", "3:4", "1:1")
+            elif face_hard_protect is not None and face_frame_frac >= 0.16:
                 preferred_fallbacks = ("1:1", "2:3", "3:4")
             elif face_hard_protect is not None:
                 preferred_fallbacks = ("2:3", "3:4", "1:1")
