@@ -11876,7 +11876,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'spin_prescan_probe_imgsz'):
             self.spin_prescan_probe_imgsz.setValue(int(getattr(cfg, 'prescan_probe_imgsz', 512)))
         if hasattr(self, 'chk_prescan_no_upscale_det'):
-            self.chk_prescan_no_upscale_det.setChecked(bool(getattr(cfg, 'prescan_no_upscale_det', True)))
+            _prescan_no_upscale_det = bool(getattr(cfg, 'prescan_no_upscale_det', True))
+            self.chk_prescan_no_upscale_det.setChecked(_prescan_no_upscale_det)
+            self.cfg.prescan_no_upscale_det = _prescan_no_upscale_det
         if hasattr(self, 'spin_prescan_probe_conf'):
             self.spin_prescan_probe_conf.setValue(float(getattr(cfg, 'prescan_probe_conf', 0.03)))
         if hasattr(self, 'spin_prescan_heavy_90'):
@@ -13007,7 +13009,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'spin_prescan_probe_imgsz'):
             self.spin_prescan_probe_imgsz.setValue(int(s.value("prescan_probe_imgsz", getattr(self.cfg, "prescan_probe_imgsz", 512))))
         if hasattr(self, 'chk_prescan_no_upscale_det'):
-            self.chk_prescan_no_upscale_det.setChecked(s.value("prescan_no_upscale_det", getattr(self.cfg, "prescan_no_upscale_det", True), type=bool))
+            _prescan_no_upscale_det = bool(s.value("prescan_no_upscale_det", getattr(self.cfg, "prescan_no_upscale_det", True), type=bool))
+            self.chk_prescan_no_upscale_det.setChecked(_prescan_no_upscale_det)
+            self.cfg.prescan_no_upscale_det = _prescan_no_upscale_det
         if hasattr(self, 'spin_prescan_probe_conf'):
             self.spin_prescan_probe_conf.setValue(float(s.value("prescan_probe_conf", getattr(self.cfg, "prescan_probe_conf", 0.03))))
         if hasattr(self, 'spin_prescan_heavy_90'):

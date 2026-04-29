@@ -2199,7 +2199,8 @@ class FaceEmbedder:
         if self._fast_prescan:
             dyn = min(dyn, int(getattr(self, "_prescan_probe_imgsz", 384)))
             if bool(getattr(self, "_prescan_no_upscale_det", True)):
-                dyn = min(dyn, _round32(max(H0, W0)))
+                src_cap = max(320, (max(H0, W0) // 32) * 32)
+                dyn = min(dyn, src_cap)
         dyn = _round32(max(320, dyn))
         L = max(H0, W0)
         heavy_cap = max(int(getattr(self, "_heavy_cap", 2048)), dyn)  # optional safety cap
