@@ -2341,7 +2341,11 @@ class Processor(QtCore.QObject):
         def _ratio_list_for_profile(profile: str) -> list[str]:
             preferred = {
                 "close": ["1:1", "2:3", "3:4"],
-                "portrait_close": ["2:3", "3:4", "1:1"],
+                # portrait_close is a semantic portrait profile. Do not offer
+                # 1:1 here; square medium-close crops are exactly the repeated
+                # failure mode this profile exists to avoid. If 2:3/3:4 cannot
+                # fit, the independent close/fallback paths can still choose 1:1.
+                "portrait_close": ["2:3", "3:4"],
                 "upper": ["2:3", "3:4", "1:1"],
                 "body": ["2:3", "3:4", "1:1", "3:2"],
                 "base": ["1:1", "2:3"],
@@ -2525,6 +2529,12 @@ class Processor(QtCore.QObject):
                 is_landscape = aspect > 1.05
                 if profile in {"close", "portrait_close", "upper", "base"} and is_landscape:
                     continue
+                if profile == "portrait_close" and rs == "1:1" and portrait_close_eligible:
+                    # Hard gate, not another soft score nudge. Otherwise a 1:1
+                    # candidate can still win inside the portrait_close profile
+                    # due to smaller area/containment score, producing:
+                    # profile=portrait_close ratio=1:1.
+                    continue
                 if profile == "body" and is_landscape:
                     # Landscape is a rare context/body sample, not a normal face
                     # framing choice. Eligibility requires an associated subject
@@ -2581,11 +2591,11 @@ class Processor(QtCore.QObject):
                     else:
                         profile_prior = 0.30
                     if rs == "2:3":
-                        ratio_prior -= 0.12 if portrait_close_eligible else -0.02
+                        ratio_prior -= 0.16 if portrait_close_eligible else -0.02
                     elif rs == "3:4":
-                        ratio_prior += 0.00 if portrait_close_eligible else 0.04
+                        ratio_prior += 0.02 if portrait_close_eligible else 0.04
                     elif rs == "1:1":
-                        ratio_prior += 0.72
+                        ratio_prior += 1.25
                     else:
                         ratio_prior += 0.24
                 elif profile == "upper":
@@ -6490,7 +6500,15 @@ class Processor(QtCore.QObject):
                                         protect_box_clamped,
                                     ) or hard_face_padded
                                     best_fix = None
-                                    for fix_ratio in ("1:1", "2:3", "3:4"):
+                                    # Preserve portrait profile semantics during
+                                    # final containment repair. This repair used
+                                    # to be able to turn a good portrait_close
+                                    # candidate back into 1:1 because it evaluated
+                                    # square first and treated ratio as a soft
+                                    # score. Try true portrait ratios first;
+                                    # square is only a last-resort fallback.
+                                    fix_ratios = ("2:3", "3:4", "1:1") if crop_profile_for_guard == "portrait_close" else ("1:1", "2:3", "3:4")
+                                    for fix_ratio in fix_ratios:
                                         try:
                                             fixed = self._ratio_crop_containing_box(
                                                 full_guard_box,
@@ -6513,7 +6531,14 @@ class Processor(QtCore.QObject):
                                                 target_frac = 0.24
                                             score = abs(face_h_frac2 - target_frac)
                                             if crop_profile_for_guard == "portrait_close":
-                                                score += -0.03 if fix_ratio == "2:3" else (0.02 if fix_ratio == "3:4" else 0.08)
+                                                if fix_ratio == "2:3":
+                                                    score -= 0.12
+                                                elif fix_ratio == "3:4":
+                                                    score += 0.02
+                                                else:
+                                                    # Last-resort only. If this wins,
+                                                    # 2:3/3:4 could not satisfy guards.
+                                                    score += 0.60
                                             else:
                                                 score += 0.02 if fix_ratio == "2:3" else (0.04 if fix_ratio == "3:4" else 0.0)
                                             score += 0.04 * ((fw2 * fh2) / max(1.0, float((repair_bx2 - repair_bx1) * (repair_by2 - repair_by1))))
@@ -6526,6 +6551,12 @@ class Processor(QtCore.QObject):
                                         cx1, cy1, cx2, cy2 = fixed
                                         ratio_str = fixed_ratio
                                         c["ratio"] = fixed_ratio
+                                        if crop_profile_for_guard == "portrait_close" and fixed_ratio == "1:1":
+                                            self._status(
+                                                "portrait_close repair fell back to 1:1; 2:3/3:4 could not satisfy hard face guard",
+                                                key="crop_portrait_close_repair",
+                                                interval=5.0,
+                                            )
                                         if crop_profile_for_guard == "body" and was_landscape and fixed_ratio in {"1:1", "2:3", "3:4"}:
                                             c["crop_profile"] = "upper"
                                             crop_profile_for_guard = "upper"
