@@ -3615,6 +3615,8 @@ class Processor(QtCore.QObject):
 
     def _set_lock_face_box(self, face_box_xyxy: Optional[Tuple[int, int, int, int]]) -> None:
         if face_box_xyxy is None:
+            self._lock_last_face_box = None
+            self._lock_face_track_misses = 0
             return
         try:
             x1, y1, x2, y2 = [int(round(v)) for v in face_box_xyxy]
@@ -6708,6 +6710,8 @@ class Processor(QtCore.QObject):
                     face_box = c.get("face_box")
                     if face_box is not None and len(face_box) == 4:
                         self._set_lock_face_box(tuple(face_box))
+                    else:
+                        self._set_lock_face_box(None)
                     if locked_reid is not None:
                         self._locked_reid_feat = locked_reid
                     elif c.get("reid_feat") is not None:
@@ -7050,6 +7054,8 @@ class Processor(QtCore.QObject):
                         face_box_sel = chosen.get("face_box")
                         if face_box_sel is not None and len(face_box_sel) == 4:
                             self._set_lock_face_box(tuple(face_box_sel))
+                        else:
+                            self._set_lock_face_box(None)
                         if chosen.get("reid_feat") is not None:
                             try:
                                 self._locked_reid_feat = np.asarray(chosen["reid_feat"], dtype=np.float32)
@@ -8564,19 +8570,21 @@ class Processor(QtCore.QObject):
                 pass
             return 0, ""
 
-    def _wic_yuv444_color_match_ref_max_side(self) -> int:
+    @staticmethod
+    def _normalize_wic_yuv444_color_match_ref_max_side(value: object, default: int = 960) -> int:
         try:
-            default_ref = int(getattr(self.cfg, "hdr_wic_yuv444_color_match_ref_max_side", 960) or 0)
+            normalized = int(float(str(value).strip()))
         except Exception:
-            default_ref = 960
-        raw = os.getenv("PC_WIC_YUV444_COLOR_MATCH_REF_MAX_SIDE", str(default_ref))
-        try:
-            value = int(float(str(raw).strip()))
-        except Exception:
-            value = default_ref
-        if value <= 0:
+            normalized = int(default)
+        if normalized <= 0:
             return 0
-        return max(128, min(4096, value))
+        return max(128, min(4096, normalized))
+
+    def _wic_yuv444_color_match_ref_max_side(self) -> int:
+        raw_default = getattr(self.cfg, "hdr_wic_yuv444_color_match_ref_max_side", 960)
+        default_ref = self._normalize_wic_yuv444_color_match_ref_max_side(raw_default, default=960)
+        raw = os.getenv("PC_WIC_YUV444_COLOR_MATCH_REF_MAX_SIDE", str(default_ref))
+        return self._normalize_wic_yuv444_color_match_ref_max_side(raw, default=default_ref)
 
     @staticmethod
     def _scaled_even_dims_for_max_side(w: int, h: int, max_side: int) -> tuple[int, int]:
@@ -11092,8 +11100,11 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.hdr_wic_yuv444_color_match_ref_max_side_spin.setKeyboardTracking(False)
         self.hdr_wic_yuv444_color_match_ref_max_side_spin.setValue(
-            int(getattr(self.cfg, "hdr_wic_yuv444_color_match_ref_max_side", 960) or 0)
+            self._normalize_wic_ref_max_side_value(
+                getattr(self.cfg, "hdr_wic_yuv444_color_match_ref_max_side", 960)
+            )
         )
+        self.hdr_wic_yuv444_color_match_ref_max_side_spin.valueChanged.connect(self._normalize_wic_ref_max_side_spin)
         self.hdr_wic_yuv444_color_match_ref_max_side_spin.valueChanged.connect(self._on_ui_change)
         self.hdr_wic_yuv444_guide_cleanup_check = QtWidgets.QCheckBox()
         self.hdr_wic_yuv444_guide_cleanup_check.setChecked(bool(getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", False)))
@@ -12959,6 +12970,24 @@ class MainWindow(QtWidgets.QMainWindow):
             f.write(cfg.to_json())
         self._log(f"Preset saved: {path}")
 
+    @staticmethod
+    def _normalize_wic_ref_max_side_value(value: object, default: int = 960) -> int:
+        return Processor._normalize_wic_yuv444_color_match_ref_max_side(value, default=default)
+
+    def _normalize_wic_ref_max_side_spin(self, *_args) -> None:
+        if not hasattr(self, "hdr_wic_yuv444_color_match_ref_max_side_spin"):
+            return
+        spin = self.hdr_wic_yuv444_color_match_ref_max_side_spin
+        raw_value = int(spin.value())
+        normalized = self._normalize_wic_ref_max_side_value(raw_value)
+        if raw_value == normalized:
+            return
+        prev = spin.blockSignals(True)
+        try:
+            spin.setValue(normalized)
+        finally:
+            spin.blockSignals(prev)
+
     def _load_preset(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load preset", "", "JSON (*.json)")
         if not path:
@@ -13375,9 +13404,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_lowfreq", 0.0))
             ),
             hdr_wic_yuv444_color_match_ref_max_side=(
-                int(self.hdr_wic_yuv444_color_match_ref_max_side_spin.value())
+                self._normalize_wic_ref_max_side_value(
+                    self.hdr_wic_yuv444_color_match_ref_max_side_spin.value()
+                )
                 if hasattr(self, "hdr_wic_yuv444_color_match_ref_max_side_spin")
-                else int(getattr(self.cfg, "hdr_wic_yuv444_color_match_ref_max_side", 960) or 0)
+                else self._normalize_wic_ref_max_side_value(
+                    getattr(self.cfg, "hdr_wic_yuv444_color_match_ref_max_side", 960)
+                )
             ),
             hdr_wic_yuv444_guide_cleanup=(
                 bool(self.hdr_wic_yuv444_guide_cleanup_check.isChecked())
@@ -13475,9 +13508,13 @@ class MainWindow(QtWidgets.QMainWindow):
             else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_lowfreq", 0.0))
         )
         cfg.hdr_wic_yuv444_color_match_ref_max_side = (
-            int(self.hdr_wic_yuv444_color_match_ref_max_side_spin.value())
+            self._normalize_wic_ref_max_side_value(
+                self.hdr_wic_yuv444_color_match_ref_max_side_spin.value()
+            )
             if hasattr(self, "hdr_wic_yuv444_color_match_ref_max_side_spin")
-            else int(getattr(self.cfg, "hdr_wic_yuv444_color_match_ref_max_side", 960) or 0)
+            else self._normalize_wic_ref_max_side_value(
+                getattr(self.cfg, "hdr_wic_yuv444_color_match_ref_max_side", 960)
+            )
         )
         cfg.hdr_wic_yuv444_guide_cleanup = (
             bool(self.hdr_wic_yuv444_guide_cleanup_check.isChecked())
@@ -13590,8 +13627,8 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             self.cfg.hdr_wic_yuv444_color_match_lowfreq = 0.0
         try:
-            self.cfg.hdr_wic_yuv444_color_match_ref_max_side = max(
-                0, int(getattr(cfg, "hdr_wic_yuv444_color_match_ref_max_side", 960) or 0)
+            self.cfg.hdr_wic_yuv444_color_match_ref_max_side = self._normalize_wic_ref_max_side_value(
+                getattr(cfg, "hdr_wic_yuv444_color_match_ref_max_side", 960)
             )
         except Exception:
             self.cfg.hdr_wic_yuv444_color_match_ref_max_side = 960
@@ -13690,7 +13727,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "hdr_wic_yuv444_color_match_lowfreq_spin"):
             self.hdr_wic_yuv444_color_match_lowfreq_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_lowfreq)
         if hasattr(self, "hdr_wic_yuv444_color_match_ref_max_side_spin"):
-            self.hdr_wic_yuv444_color_match_ref_max_side_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_ref_max_side)
+            self.hdr_wic_yuv444_color_match_ref_max_side_spin.setValue(
+                self._normalize_wic_ref_max_side_value(self.cfg.hdr_wic_yuv444_color_match_ref_max_side)
+            )
         if hasattr(self, "hdr_wic_yuv444_guide_cleanup_check"):
             self.hdr_wic_yuv444_guide_cleanup_check.setChecked(self.cfg.hdr_wic_yuv444_guide_cleanup)
         self.cfg.hdr_speckle_diag = bool(getattr(cfg, "hdr_speckle_diag", False))
@@ -14894,15 +14933,11 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             self.cfg.hdr_wic_yuv444_color_match_lowfreq = 0.0
         try:
-            self.cfg.hdr_wic_yuv444_color_match_ref_max_side = max(
-                0,
-                int(
-                    s.value(
-                        "hdr_wic_yuv444_color_match_ref_max_side",
-                        getattr(self.cfg, "hdr_wic_yuv444_color_match_ref_max_side", 960),
-                    )
-                    or 0
-                ),
+            self.cfg.hdr_wic_yuv444_color_match_ref_max_side = self._normalize_wic_ref_max_side_value(
+                s.value(
+                    "hdr_wic_yuv444_color_match_ref_max_side",
+                    getattr(self.cfg, "hdr_wic_yuv444_color_match_ref_max_side", 960),
+                )
             )
         except Exception:
             self.cfg.hdr_wic_yuv444_color_match_ref_max_side = 960
@@ -14913,7 +14948,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "hdr_wic_yuv444_color_match_lowfreq_spin"):
             self.hdr_wic_yuv444_color_match_lowfreq_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_lowfreq)
         if hasattr(self, "hdr_wic_yuv444_color_match_ref_max_side_spin"):
-            self.hdr_wic_yuv444_color_match_ref_max_side_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_ref_max_side)
+            self.hdr_wic_yuv444_color_match_ref_max_side_spin.setValue(
+                self._normalize_wic_ref_max_side_value(self.cfg.hdr_wic_yuv444_color_match_ref_max_side)
+            )
         self.cfg.hdr_wic_yuv444_guide_cleanup = bool(
             s.value(
                 "hdr_wic_yuv444_guide_cleanup",
