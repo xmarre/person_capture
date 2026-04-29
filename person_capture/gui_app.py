@@ -491,7 +491,8 @@ class SessionConfig:
     prescan_fd_exit: float = 0.52          # ArcFace dist to EXIT  (hysteresis)
     prescan_add_cooldown_samples: int = 5  # add at most every N prescan samples
     prescan_rot_probe_period: int = 3      # probe rotations every N samples; upright pass still runs every sample
-    prescan_probe_imgsz: int = 512         # slightly stronger probe
+    prescan_probe_imgsz: int = 512         # max SCRFD 0° probe size during pre-scan
+    prescan_no_upscale_det: bool = True    # don't upscale low-res pre-scan frames only to run SCRFD
     prescan_probe_conf: float = 0.03
     prescan_heavy_90: int = 1536
     prescan_heavy_180: int = 1280
@@ -725,6 +726,7 @@ class Processor(QtCore.QObject):
             "prescan_add_cooldown_samples",
             "prescan_rot_probe_period",
             "prescan_probe_imgsz",
+            "prescan_no_upscale_det",
             "prescan_probe_conf",
             "prescan_heavy_90",
             "prescan_heavy_180",
@@ -1091,6 +1093,7 @@ class Processor(QtCore.QObject):
                     ("_probe_conf", "prescan_probe_conf", float, 0.03),
                     ("_prescan_period", "prescan_rot_probe_period", int, 3),
                     ("_prescan_probe_imgsz", "prescan_probe_imgsz", int, 512),
+                    ("_prescan_no_upscale_det", "prescan_no_upscale_det", bool, True),
                     ("_high_90", "prescan_heavy_90", int, 1536),
                     ("_high_180", "prescan_heavy_180", int, 1280),
                 ):
@@ -9634,8 +9637,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_prescan_probe_imgsz.setRange(0, 4096)
         self.spin_prescan_probe_imgsz.setSingleStep(32)
         self.spin_prescan_probe_imgsz.setValue(int(getattr(self.cfg, "prescan_probe_imgsz", 512)))
-        self.spin_prescan_probe_imgsz.setToolTip("int: prescan_probe_imgsz (0 = detector default)")
+        self.spin_prescan_probe_imgsz.setToolTip("int: prescan_probe_imgsz; maximum SCRFD 0° probe size during pre-scan")
         self.spin_prescan_probe_imgsz.valueChanged.connect(self._on_ui_change)
+
+        self.chk_prescan_no_upscale_det = QtWidgets.QCheckBox()
+        self.chk_prescan_no_upscale_det.setChecked(bool(getattr(self.cfg, "prescan_no_upscale_det", True)))
+        self.chk_prescan_no_upscale_det.setToolTip(
+            "bool: prescan_no_upscale_det. Avoid upscaling low-res pre-scan frames before SCRFD; "
+            "faster and usually equivalent when prescan_decode_max_w/prescan_max_width already reduced the frame."
+        )
+        self.chk_prescan_no_upscale_det.stateChanged.connect(self._on_ui_change)
 
         self.spin_prescan_probe_conf = QtWidgets.QDoubleSpinBox()
         self.spin_prescan_probe_conf.setDecimals(3)
@@ -10061,6 +10072,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("Pre-scan replace margin", self.spin_prescan_margin),
             ("Pre-scan rotated probe period", self.spin_prescan_rot_probe_period),
             ("Pre-scan probe imgsz", self.spin_prescan_probe_imgsz),
+            ("Pre-scan no detector upscale", self.chk_prescan_no_upscale_det),
             ("Pre-scan probe conf", self.spin_prescan_probe_conf),
             ("Pre-scan heavy 90° imgsz", self.spin_prescan_heavy_90),
             ("Pre-scan heavy 180° imgsz", self.spin_prescan_heavy_180),
@@ -11258,6 +11270,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "prescan_add_cooldown_samples",
             "prescan_rot_probe_period",
             "prescan_probe_imgsz",
+            "prescan_no_upscale_det",
             "prescan_probe_conf",
             "prescan_heavy_90",
             "prescan_heavy_180",
@@ -11443,6 +11456,7 @@ class MainWindow(QtWidgets.QMainWindow):
             prescan_add_cooldown_samples=int(self.spin_prescan_add_cooldown.value()) if hasattr(self, "spin_prescan_add_cooldown") else 5,
             prescan_rot_probe_period=int(self.spin_prescan_rot_probe_period.value()) if hasattr(self, "spin_prescan_rot_probe_period") else int(getattr(self.cfg, "prescan_rot_probe_period", 3)),
             prescan_probe_imgsz=int(self.spin_prescan_probe_imgsz.value()) if hasattr(self, "spin_prescan_probe_imgsz") else int(getattr(self.cfg, "prescan_probe_imgsz", 512)),
+            prescan_no_upscale_det=bool(self.chk_prescan_no_upscale_det.isChecked()) if hasattr(self, "chk_prescan_no_upscale_det") else bool(getattr(self.cfg, "prescan_no_upscale_det", True)),
             prescan_probe_conf=float(self.spin_prescan_probe_conf.value()) if hasattr(self, "spin_prescan_probe_conf") else float(getattr(self.cfg, "prescan_probe_conf", 0.03)),
             prescan_heavy_90=int(self.spin_prescan_heavy_90.value()) if hasattr(self, "spin_prescan_heavy_90") else int(getattr(self.cfg, "prescan_heavy_90", 1536)),
             prescan_heavy_180=int(self.spin_prescan_heavy_180.value()) if hasattr(self, "spin_prescan_heavy_180") else int(getattr(self.cfg, "prescan_heavy_180", 1280)),
@@ -11861,6 +11875,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spin_prescan_rot_probe_period.setValue(int(getattr(cfg, 'prescan_rot_probe_period', 3)))
         if hasattr(self, 'spin_prescan_probe_imgsz'):
             self.spin_prescan_probe_imgsz.setValue(int(getattr(cfg, 'prescan_probe_imgsz', 512)))
+        if hasattr(self, 'chk_prescan_no_upscale_det'):
+            _prescan_no_upscale_det = bool(getattr(cfg, 'prescan_no_upscale_det', True))
+            self.chk_prescan_no_upscale_det.setChecked(_prescan_no_upscale_det)
+            self.cfg.prescan_no_upscale_det = _prescan_no_upscale_det
         if hasattr(self, 'spin_prescan_probe_conf'):
             self.spin_prescan_probe_conf.setValue(float(getattr(cfg, 'prescan_probe_conf', 0.03)))
         if hasattr(self, 'spin_prescan_heavy_90'):
@@ -12990,6 +13008,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.spin_prescan_rot_probe_period.setValue(int(s.value("prescan_rot_probe_period", getattr(self.cfg, "prescan_rot_probe_period", 3))))
         if hasattr(self, 'spin_prescan_probe_imgsz'):
             self.spin_prescan_probe_imgsz.setValue(int(s.value("prescan_probe_imgsz", getattr(self.cfg, "prescan_probe_imgsz", 512))))
+        if hasattr(self, 'chk_prescan_no_upscale_det'):
+            _prescan_no_upscale_det = bool(s.value("prescan_no_upscale_det", getattr(self.cfg, "prescan_no_upscale_det", True), type=bool))
+            self.chk_prescan_no_upscale_det.setChecked(_prescan_no_upscale_det)
+            self.cfg.prescan_no_upscale_det = _prescan_no_upscale_det
         if hasattr(self, 'spin_prescan_probe_conf'):
             self.spin_prescan_probe_conf.setValue(float(s.value("prescan_probe_conf", getattr(self.cfg, "prescan_probe_conf", 0.03))))
         if hasattr(self, 'spin_prescan_heavy_90'):
