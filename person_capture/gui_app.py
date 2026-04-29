@@ -6733,8 +6733,9 @@ class Processor(QtCore.QObject):
                     if (
                         face_only_pipeline
                         and getattr(cfg, "face_fullframe_when_missed", True)
-                        and faces_detected == 0
+                        and not candidates
                         and ref_face_feat is not None
+                        and face is not None
                     ):
                         gfaces = face.extract(frame_for_det, imgsz=fullframe_imgsz)
                         quality_min = float(cfg.face_quality_min)
@@ -8440,15 +8441,36 @@ class Processor(QtCore.QObject):
             clean = cv2.imread(str(clean_path), cv2.IMREAD_UNCHANGED)
             if base is None or clean is None:
                 return 0, ""
-            if base.ndim != 3 or clean.ndim != 3 or base.shape[:2] != clean.shape[:2]:
+            if base.ndim != 3 or clean.ndim != 3 or base.shape[2] < 3 or clean.shape[2] < 3:
                 return 0, ""
             base_bgr = base[:, :, :3]
             clean_bgr = clean[:, :, :3]
+            base_h, base_w = base_bgr.shape[:2]
+            clean_h, clean_w = clean_bgr.shape[:2]
+            if base_h < 2 or base_w < 2 or clean_h < 2 or clean_w < 2:
+                return 0, ""
+
+            same_size = base_h == clean_h and base_w == clean_w
+            if same_size:
+                clean_fit_bgr = clean_bgr
+                out = base.copy()
+                diff_ref_bgr = base_bgr
+            else:
+                # Fast-reference mode: the yuv420/full WIC render is intentionally
+                # smaller and is used only to fit color statistics.  The final
+                # output must stay full-resolution from the yuv444/limited clean
+                # render, otherwise the fast path either no-ops or softens crops.
+                interp = cv2.INTER_AREA if (clean_h >= base_h or clean_w >= base_w) else cv2.INTER_LANCZOS4
+                clean_fit_bgr = cv2.resize(clean_bgr, (base_w, base_h), interpolation=interp)
+                out = clean.copy()
+                diff_ref_bgr = clean_bgr
+
             base_ycc = cv2.cvtColor(base_bgr, cv2.COLOR_BGR2YCrCb)
             clean_ycc = cv2.cvtColor(clean_bgr, cv2.COLOR_BGR2YCrCb)
+            clean_fit_ycc = clean_ycc if same_size else cv2.cvtColor(clean_fit_bgr, cv2.COLOR_BGR2YCrCb)
 
             by = base_ycc[:, :, 0]
-            cy = clean_ycc[:, :, 0]
+            cy = clean_fit_ycc[:, :, 0]
             bp = base_bgr.astype(np.int16, copy=False)
             bmax = np.max(bp, axis=2)
             bmin = np.min(bp, axis=2)
@@ -8501,7 +8523,7 @@ class Processor(QtCore.QObject):
                 float(strength) * float(chroma_strength),
             )
             for c, c_strength in enumerate(channel_strengths):
-                lut = _quantile_lut(clean_ycc[:, :, c], base_ycc[:, :, c], fit_mask)
+                lut = _quantile_lut(clean_fit_ycc[:, :, c], base_ycc[:, :, c], fit_mask)
                 if lut is None:
                     return 0, ""
                 target = cv2.LUT(clean_ycc[:, :, c], lut).astype(np.float32, copy=False)
@@ -8522,13 +8544,28 @@ class Processor(QtCore.QObject):
             except Exception:
                 lowfreq = 0.0
             if lowfreq > 0.0:
-                safe = fit_mask.astype(np.float32, copy=False)
+                if same_size:
+                    safe = fit_mask.astype(np.float32, copy=False)
+                    base_f = base_ycc.astype(np.float32, copy=False)
+                else:
+                    fit_mask_u8 = fit_mask.astype(np.uint8) * 255
+                    safe = (
+                        cv2.resize(
+                            fit_mask_u8,
+                            (clean_w, clean_h),
+                            interpolation=cv2.INTER_NEAREST,
+                        ) > 0
+                    ).astype(np.float32, copy=False)
+                    base_f = cv2.resize(
+                        base_ycc,
+                        (clean_w, clean_h),
+                        interpolation=cv2.INTER_CUBIC,
+                    ).astype(np.float32, copy=False)
                 # Strong blur: intentional.  Smaller kernels reintroduce the blocky
                 # shadow texture this path is meant to avoid.
                 denom = cv2.GaussianBlur(safe, (0, 0), 48.0)
                 denom = np.maximum(denom, 1.0e-4)
                 mapped_f = mapped_ycc.astype(np.float32, copy=False)
-                base_f = base_ycc.astype(np.float32, copy=False)
                 # Apply the low-frequency residual to chroma only.  Luma residual is
                 # what made strong color-match settings crush/flatten dark detail.
                 for c in (1, 2):
@@ -8539,9 +8576,14 @@ class Processor(QtCore.QObject):
 
             out_bgr = cv2.cvtColor(mapped_ycc, cv2.COLOR_YCrCb2BGR)
 
-            out = base.copy()
             out[:, :, :3] = out_bgr
-            diff = np.max(np.abs(out[:, :, :3].astype(np.int16, copy=False) - base_bgr.astype(np.int16, copy=False)), axis=2)
+            diff = np.max(
+                np.abs(
+                    out[:, :, :3].astype(np.int16, copy=False)
+                    - diff_ref_bgr.astype(np.int16, copy=False)
+                ),
+                axis=2,
+            )
             changed = int(np.count_nonzero(diff > 0))
             if changed <= 0:
                 return 0, ""
