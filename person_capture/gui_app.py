@@ -4886,6 +4886,9 @@ class Processor(QtCore.QObject):
                             "lock_after_hits",
                             "lock_face_thresh",
                             "lock_reid_thresh",
+                            "lock_face_roi_enable",
+                            "lock_face_roi_pad",
+                            "lock_face_roi_max_misses",
                             "lock_momentum",
                             "allow_faceless_when_locked",
                             "learn_bank_runtime",
@@ -8654,11 +8657,6 @@ class Processor(QtCore.QObject):
             valid, invalid_why = self._validate_hdr_sdr_export_image(repaired_tmp, None)
             if not valid:
                 return False, f"color_match_invalid:{invalid_why}", 0
-            try:
-                if os.path.exists(out_path):
-                    os.remove(out_path)
-            except Exception:
-                pass
             os.replace(repaired_tmp, out_path)
             return True, "", changed
         except Exception as exc:
@@ -13036,6 +13034,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "lock_after_hits",
             "lock_face_thresh",
             "lock_reid_thresh",
+            "lock_face_roi_enable",
+            "lock_face_roi_pad",
+            "lock_face_roi_max_misses",
             "lock_momentum",
             "allow_faceless_when_locked",
             "learn_bank_runtime",
