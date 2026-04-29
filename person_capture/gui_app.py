@@ -2315,6 +2315,11 @@ class Processor(QtCore.QObject):
         head = self._face_head_proxy_box(face, bx2, by2) if face is not None else None
         head = self._coerce_box_xyxy(head, bounds)
         face_protect = self._union_boxes_xyxy(head, face) or face
+        # Hard containment is the actual detected face. The derived head/hair box
+        # is a soft composition hint only. Treating the proxy head box as hard made
+        # large close-ups impossible to satisfy at 1:1, so all candidates were
+        # rejected and the fallback blindly picked the first UI ratio, usually 2:3.
+        face_hard_protect = face
 
         profiles: list[tuple[str, Tuple[float, float, float, float], float, Tuple[float, float], Tuple[float, float]]] = []
         face_h = 0.0
@@ -2322,16 +2327,6 @@ class Processor(QtCore.QObject):
         subj_h_frac = ((subj[3] - subj[1]) / bound_h) if subj is not None else 0.0
         body_period = max(0, int(getattr(cfg, "compose_body_every_n", 6)))
         body_cadence = body_period > 0 and frame_idx is not None and (int(frame_idx) % body_period == 0)
-        # Coarse composition class from actual face size in the debarred content
-        # window. The previous scorer let the close profile pick portrait crops
-        # and let small/far faces fall back to square crops because profile/ratio
-        # priors were mostly static. Keep ratio selection tied to shot scale:
-        #   - prominent/full-face shots prefer square close-ups,
-        #   - smaller/farther shots prefer portrait/context crops,
-        # while still allowing the containment checks below to override when needed.
-        close_face_frame_frac = 0.16
-        far_face_frame_frac = 0.11
-
         if face is not None:
             fx1, fy1, fx2, fy2 = face
             fw = max(1.0, fx2 - fx1)
@@ -2441,55 +2436,34 @@ class Processor(QtCore.QObject):
                 crop_h = max(1.0, float(cy2 - cy1))
                 crop_area = crop_w * crop_h
 
-                face_deficit = self._containment_deficit_xyxy(crop, face_protect, margin_px=1.0) if face_protect is not None else 0.0
+                face_deficit = self._containment_deficit_xyxy(crop, face_hard_protect, margin_px=1.0) if face_hard_protect is not None else 0.0
+                head_deficit = self._containment_deficit_xyxy(crop, face_protect, margin_px=1.0) if face_protect is not None else 0.0
                 body_deficit = self._containment_deficit_xyxy(crop, subj, margin_px=1.0) if (profile == "body" and subj is not None) else 0.0
                 protect_deficit = self._containment_deficit_xyxy(crop, protect, margin_px=1.0)
-                # A crop candidate that cuts the identified face/head is invalid,
-                # not merely lower quality. Penalizing it was too weak and let
-                # wide/body candidates win after dark-scene repairs.
+                # A crop candidate that cuts the detected face is invalid. The
+                # derived head/hair proxy is allowed to be clipped when the face is
+                # already huge or near an edge; otherwise close-ups fall through to
+                # ratio fallback instead of selecting the valid 1:1 crop.
                 if face_deficit > 0.01:
                     continue
                 if body_deficit > 0.02:
                     continue
 
-                containment = 120.0 * face_deficit + 120.0 * body_deficit + 20.0 * protect_deficit
+                containment = 120.0 * face_deficit + 30.0 * head_deficit + 120.0 * body_deficit + 18.0 * protect_deficit
 
                 ratio_prior = 0.0
                 if profile == "close":
                     profile_prior = 0.00
-                    if face is not None and face_frame_frac >= close_face_frame_frac:
-                        # True close-ups should not be reframed as upper-body
-                        # portraits just because the 2:3 crop has a slightly
-                        # lower face-height loss.
-                        profile_prior -= 0.18
-                        if rs == "1:1":
-                            ratio_prior -= 0.08
-                        elif rs == "2:3":
-                            ratio_prior += 0.20
-                        else:
-                            ratio_prior += 0.26
-                    elif face is not None and face_frame_frac < far_face_frame_frac:
-                        # Small/far faces need context. A square close crop is
-                        # the wrong profile and was the source of repeated 1:1
-                        # farther-away samples.
-                        profile_prior += 0.95
-                        ratio_prior += 0.32 if rs == "1:1" else 0.12
-                    else:
-                        ratio_prior += 0.00 if rs == "1:1" else 0.08
+                    ratio_prior += 0.00 if rs == "1:1" else 0.08
                 elif profile == "upper":
                     profile_prior = 0.12
-                    if face is not None and face_frame_frac >= close_face_frame_frac:
-                        profile_prior += 0.34
-                    elif face is not None and face_frame_frac < far_face_frame_frac:
-                        profile_prior -= 0.18
-                    if rs == "2:3":
-                        ratio_prior += 0.00
-                    elif rs == "3:4":
-                        ratio_prior += 0.05
-                    elif rs == "1:1":
-                        ratio_prior += 0.28 if (face is not None and face_frame_frac < far_face_frame_frac) else 0.12
-                    else:
-                        ratio_prior += 0.16
+                    ratio_prior += 0.00 if rs == "2:3" else 0.06
+                    # Small/far faces need more surrounding context. This is a
+                    # narrow score nudge, not a hard ratio override.
+                    if face is not None and face_frame_frac < 0.12:
+                        profile_prior -= 0.10
+                        if rs == "1:1":
+                            ratio_prior += 0.16
                 elif profile == "body":
                     landscape_penalty = max(0.0, min(20.0, float(getattr(cfg, "compose_landscape_face_penalty", 5.0))))
                     profile_prior = 0.78
@@ -2517,17 +2491,10 @@ class Processor(QtCore.QObject):
                 if face is not None:
                     actual_face_h_frac = face_h / crop_h
                     face_loss = abs(actual_face_h_frac - max(1e-6, target_face_h_frac))
-                    if profile == "close" and face_frame_frac < 0.085:
-                        profile_prior += 0.65
-                    if profile == "upper" and face_frame_frac < 0.085:
+                    if profile == "close" and face_frame_frac < 0.12:
+                        profile_prior += 0.55
+                    if profile == "upper" and face_frame_frac < 0.12:
                         profile_prior -= 0.12
-                    if profile == "close" and face_frame_frac >= close_face_frame_frac and rs != "1:1":
-                        # Avoid portrait-only full-face closeups.
-                        face_loss *= 1.18
-                    if profile == "upper" and face_frame_frac < far_face_frame_frac and rs == "1:1":
-                        # Far shots should not collapse to square just because it
-                        # is geometrically compact.
-                        face_loss *= 1.25
                 else:
                     face_loss = 0.0
 
@@ -2553,7 +2520,7 @@ class Processor(QtCore.QObject):
             _, crop, rs, profile = best
             return crop, rs, profile
 
-        fallback_protect = face_protect or subj or base or (bx1, by1, bx2, by2)
+        fallback_protect = face_hard_protect or subj or base or (bx1, by1, bx2, by2)
         fallback_ratio = None
         fallback_profile = "fallback"
         for rs in validated_user_ratios:
@@ -2574,10 +2541,10 @@ class Processor(QtCore.QObject):
             fallback_ratio = rs
             break
         if fallback_ratio is None:
-            if face_protect is not None and face_frame_frac < far_face_frame_frac:
-                preferred_fallbacks = ("2:3", "3:4", "1:1")
-            elif face_protect is not None:
+            if face_hard_protect is not None and face_frame_frac >= 0.16:
                 preferred_fallbacks = ("1:1", "2:3", "3:4")
+            elif face_hard_protect is not None:
+                preferred_fallbacks = ("2:3", "3:4", "1:1")
             else:
                 preferred_fallbacks = ("2:3", "3:4", "1:1")
             available = validated_user_ratios or list(preferred_fallbacks)
@@ -6305,16 +6272,16 @@ class Processor(QtCore.QObject):
                                 hfx1, hfy1, hfx2, hfy2 = hf
                                 hfw = max(1.0, hfx2 - hfx1)
                                 hfh = max(1.0, hfy2 - hfy1)
-                                hard_head_box = self._coerce_box_xyxy(c.get("head_box"), (repair_bx1, repair_by1, repair_bx2, repair_by2))
-                                hard_face_padded = self._union_boxes_xyxy(
-                                    hard_head_box,
-                                    self._pad_box_xyxy(
-                                        hf,
-                                        pad_x=0.12 * hfw,
-                                        pad_y_top=0.18 * hfh,
-                                        pad_y_bottom=0.18 * hfh,
-                                        bounds_xyxy=(repair_bx1, repair_by1, repair_bx2, repair_by2),
-                                    ) or hf,
+                                # Hard final repair is allowed to enforce only
+                                # the detected face plus a modest local margin. The
+                                # full head proxy is too large for extreme close-ups
+                                # and made every square repair look invalid.
+                                hard_face_padded = self._pad_box_xyxy(
+                                    hf,
+                                    pad_x=0.12 * hfw,
+                                    pad_y_top=0.12 * hfh,
+                                    pad_y_bottom=0.18 * hfh,
+                                    bounds_xyxy=(repair_bx1, repair_by1, repair_bx2, repair_by2),
                                 ) or hf
                                 cur_crop = (float(cx1), float(cy1), float(cx2), float(cy2))
                                 cur_w = max(1.0, float(cx2 - cx1))
@@ -6360,7 +6327,6 @@ class Processor(QtCore.QObject):
                                         identity_guard = self._coerce_box_xyxy(
                                             self._union_boxes_xyxy(
                                                 c.get("subject_box"),
-                                                c.get("head_box"),
                                                 c.get("face_box"),
                                             ),
                                             (repair_bx1, repair_by1, repair_bx2, repair_by2),
