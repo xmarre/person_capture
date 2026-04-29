@@ -349,6 +349,13 @@ class SessionConfig:
     # Defaults keep the historical full-range yuv420 behavior.
     hdr_wic_avif_pixfmt: str = "yuv420p10le"  # yuv420p10le | yuv444p10le
     hdr_wic_avif_range: str = "full"          # full | limited
+    # Keep diagnostic env vars from silently overriding primary exports.
+    # When disabled, primary WIC PNGs stay fixed to yuv420/full regardless of
+    # PC_HDR_WIC_AVIF_PIXFMT/PC_HDR_WIC_AVIF_RANGE.
+    hdr_wic_experimental_primary: bool = False
+    # Render an extra limited-yuv444 WIC guide for artifact localization only,
+    # while keeping yuv420/full as the sole primary color/tone source.
+    hdr_wic_yuv444_guide_cleanup: bool = True
     hdr_avif_wic_display_compat: bool = True
     # Full-resolution HDR->SDR still-render quality controls. These affect only
     # primary crops/f*.png/f*.jpg source export, not pre-scan/detection preview.
@@ -4892,6 +4899,8 @@ class Processor(QtCore.QObject):
                             "hdr_sdr_peak_detect",
                             "hdr_sdr_allow_inaccurate_fallback",
                             "wic_shadow_deblob_strength",
+                            "hdr_wic_experimental_primary",
+                            "hdr_wic_yuv444_guide_cleanup",
                             "hdr_speckle_diag",
                             "hdr_speckle_diag_dir",
                             "compose_crop_enable",
@@ -8076,6 +8085,190 @@ class Processor(QtCore.QObject):
         bgr[:, :, :] = fixed_bgr
         return True, changed
 
+    def _repair_wic_with_yuv444_guide(self, base_path: str, guide_path: str) -> int:
+        """Use a clean WIC yuv444 render as an artifact mask, not as color source.
+
+        Diagnostics showed the WIC yuv420 HDR-AVIF path preserves the desired
+        Paint-like color response but introduces dark chroma speckles/blobs. The
+        WIC yuv444 path removes those artifacts but uses a washed-out global color
+        transform on this system. This pass therefore keeps the yuv420 PNG as the
+        only color/tone source and uses the yuv444 PNG only to localize regions
+        where yuv420 is rougher in dark shadows. Corrections are local-median
+        pulls in the yuv420 output; no pixel color is copied from the washed guide.
+        """
+        if self._truthy_env("PC_DISABLE_WIC_YUV444_GUIDE_CLEANUP"):
+            return 0
+        if not bool(getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", True)):
+            return 0
+        if not bool(getattr(self.cfg, "hdr_wic_speckle_cleanup", True)):
+            return 0
+        try:
+            base = cv2.imread(str(base_path), cv2.IMREAD_UNCHANGED)
+            guide = cv2.imread(str(guide_path), cv2.IMREAD_UNCHANGED)
+            if base is None or guide is None:
+                return 0
+            if base.ndim != 3 or guide.ndim != 3 or base.shape[:2] != guide.shape[:2]:
+                return 0
+            bgr = base[:, :, :3]
+            guide_bgr = guide[:, :, :3]
+            ycc = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+            gycc = cv2.cvtColor(guide_bgr, cv2.COLOR_BGR2YCrCb)
+
+            y = ycc[:, :, 0].astype(np.float32, copy=False)
+            cr = ycc[:, :, 1].astype(np.float32, copy=False)
+            cb = ycc[:, :, 2].astype(np.float32, copy=False)
+            gy = gycc[:, :, 0].astype(np.float32, copy=False)
+            gcr = gycc[:, :, 1].astype(np.float32, copy=False)
+            gcb = gycc[:, :, 2].astype(np.float32, copy=False)
+
+            pix = bgr.astype(np.int16, copy=False)
+            b = pix[:, :, 0].astype(np.float32, copy=False)
+            g = pix[:, :, 1].astype(np.float32, copy=False)
+            r = pix[:, :, 2].astype(np.float32, copy=False)
+            max_ch = np.maximum(np.maximum(r, g), b)
+
+            y_med5 = cv2.medianBlur(ycc[:, :, 0], 5).astype(np.float32, copy=False)
+            y_med9 = cv2.medianBlur(ycc[:, :, 0], 9).astype(np.float32, copy=False)
+            gy_med5 = cv2.medianBlur(gycc[:, :, 0], 5).astype(np.float32, copy=False)
+            cr_med = cv2.medianBlur(ycc[:, :, 1], 17).astype(np.float32, copy=False)
+            cb_med = cv2.medianBlur(ycc[:, :, 2], 17).astype(np.float32, copy=False)
+            gcr_med = cv2.medianBlur(gycc[:, :, 1], 17).astype(np.float32, copy=False)
+            gcb_med = cv2.medianBlur(gycc[:, :, 2], 17).astype(np.float32, copy=False)
+
+            base_chroma_rough = np.maximum(np.abs(cr - cr_med), np.abs(cb - cb_med))
+            guide_chroma_rough = np.maximum(np.abs(gcr - gcr_med), np.abs(gcb - gcb_med))
+            base_luma_rough = np.abs(y - y_med5)
+            guide_luma_rough = np.abs(gy - gy_med5)
+
+            # Compare roughness, not absolute colors. The guide render is washed,
+            # but its clean 4:4:4 WIC path still marks where the yuv420 render added
+            # dark chroma/luma structure that should not be treated as image detail.
+            dark = (y_med9 <= 112.0) & (y <= 142.0) & (max_ch <= 170.0)
+            chroma_bad = (base_chroma_rough >= 4.0) & ((base_chroma_rough - guide_chroma_rough) >= 2.0)
+            luma_bad = (base_luma_rough >= 4.0) & ((base_luma_rough - guide_luma_rough) >= 2.0)
+            green_bad = ((g - np.maximum(r, b)) >= 3.0) & (base_chroma_rough >= 2.0)
+            cool_bad = ((b - r) >= 4.0) & (base_chroma_rough >= 2.0)
+            artifact = dark & (chroma_bad | (luma_bad & (base_chroma_rough >= 2.0)) | green_bad | cool_bad)
+            if int(np.count_nonzero(artifact)) <= 0:
+                return 0
+
+            artifact_u8 = (artifact.astype(np.uint8) * 255)
+            artifact_u8 = cv2.morphologyEx(
+                artifact_u8,
+                cv2.MORPH_OPEN,
+                np.ones((3, 3), np.uint8),
+                iterations=1,
+            )
+            artifact_u8 = cv2.dilate(artifact_u8, np.ones((3, 3), np.uint8), iterations=1)
+            artifact = artifact_u8 > 0
+            if int(np.count_nonzero(artifact)) <= 0:
+                return 0
+
+            grad_x = cv2.Sobel(ycc[:, :, 0], cv2.CV_32F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(ycc[:, :, 0], cv2.CV_32F, 0, 1, ksize=3)
+            grad = np.sqrt((grad_x * grad_x) + (grad_y * grad_y))
+            edge_alpha = np.clip((42.0 - grad) / 42.0, 0.0, 1.0)
+            edge_alpha = (edge_alpha * edge_alpha).astype(np.float32, copy=False)
+            dark_alpha = np.clip((124.0 - y_med9) / 104.0, 0.0, 1.0).astype(np.float32, copy=False)
+
+            warm_shadow = (r >= (g + 5.0)) & (r >= (b + 10.0)) & (max_ch >= 32.0)
+            warm_scale = np.where(warm_shadow & ~(green_bad | cool_bad | chroma_bad), 0.22, 1.0).astype(np.float32, copy=False)
+
+            # Keep luma correction very small. The destructive failure mode from
+            # the old strength knob was global shadow color/contrast drift; here
+            # luma is only nudged where yuv420 is rougher than the yuv444 guide.
+            y_target = cv2.bilateralFilter(ycc[:, :, 0], 7, 7, 5).astype(np.float32, copy=False)
+            y_alpha = np.where(artifact & luma_bad, 0.22 * dark_alpha * edge_alpha * warm_scale, 0.0)
+            y_delta = np.clip((y_target - y) * y_alpha, -2.0, 2.0)
+
+            chroma_alpha = np.where(
+                artifact,
+                (0.42 + np.clip((base_chroma_rough - guide_chroma_rough) / 10.0, 0.0, 0.32))
+                * dark_alpha
+                * edge_alpha
+                * warm_scale,
+                0.0,
+            ).astype(np.float32, copy=False)
+            cr_delta = np.clip((cr_med - cr) * chroma_alpha, -8.0, 8.0)
+            cb_delta = np.clip((cb_med - cb) * chroma_alpha, -8.0, 8.0)
+
+            fixed_ycc = ycc.copy()
+            fixed_ycc[:, :, 0] = np.clip(np.rint(y + y_delta), 0, 255).astype(np.uint8)
+            fixed_ycc[:, :, 1] = np.clip(np.rint(cr + cr_delta), 0, 255).astype(np.uint8)
+            fixed_ycc[:, :, 2] = np.clip(np.rint(cb + cb_delta), 0, 255).astype(np.uint8)
+            fixed_bgr = cv2.cvtColor(fixed_ycc, cv2.COLOR_YCrCb2BGR)
+            diff = np.max(np.abs(fixed_bgr.astype(np.int16, copy=False) - bgr.astype(np.int16, copy=False)), axis=2)
+            changed = int(np.count_nonzero(diff > 0))
+            if changed <= 0:
+                return 0
+            bgr[:, :, :] = fixed_bgr
+            ok = cv2.imwrite(str(base_path), base)
+            return changed if ok else 0
+        except Exception as exc:
+            try:
+                self._status(
+                    f"HDR WIC yuv444-guide cleanup failed: {type(exc).__name__}: {exc}",
+                    key="hdr_wic_guide_cleanup",
+                    interval=10.0,
+                )
+            except Exception:
+                pass
+            return 0
+
+    def _maybe_apply_wic_yuv444_guided_cleanup(
+        self,
+        frame_idx: int,
+        frame_pts_sec: Optional[float],
+        crop_xyxy: tuple[int, int, int, int],
+        out_path: str,
+    ) -> int:
+        """Render a yuv444 WIC guide and use it only to localize yuv420 defects."""
+        if self._truthy_env("PC_DISABLE_WIC_YUV444_GUIDE_CLEANUP"):
+            return 0
+        if not bool(getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", True)):
+            return 0
+        guide_base = out_path + ".tmp_yuv444_guide"
+        guide_hdr = guide_base + ".avif"
+        guide_png = guide_base + ".png"
+        try:
+            for pth in (guide_hdr, guide_png):
+                if os.path.exists(pth):
+                    os.remove(pth)
+        except Exception:
+            pass
+        try:
+            ok_hdr, why_hdr = self._save_hdr_wic_specific_intermediate_avif(
+                frame_idx,
+                frame_pts_sec,
+                crop_xyxy,
+                guide_hdr,
+                pix_fmt="yuv444p10le",
+                avif_range="limited",
+            )
+            if not ok_hdr:
+                self._status(
+                    f"HDR WIC yuv444-guide source skipped: {why_hdr}",
+                    key="hdr_wic_guide_cleanup",
+                    interval=10.0,
+                )
+                return 0
+            ok_wic, why_wic = self._save_wic_png_from_hdr_image(guide_hdr, guide_png, repair=False)
+            if not ok_wic:
+                self._status(
+                    f"HDR WIC yuv444-guide render skipped: {why_wic}",
+                    key="hdr_wic_guide_cleanup",
+                    interval=10.0,
+                )
+                return 0
+            return self._repair_wic_with_yuv444_guide(out_path, guide_png)
+        finally:
+            for pth in (guide_hdr, guide_png):
+                try:
+                    if os.path.exists(pth):
+                        os.remove(pth)
+                except Exception:
+                    pass
+
     def _repair_wic_saturated_rgb_speckles(self, path: str) -> int:
         """Remove WIC/Windows HDR-AVIF salt pixels from an already-rendered SDR image.
 
@@ -8539,11 +8732,15 @@ class Processor(QtCore.QObject):
         are handled after WIC on the display image, where the accepted WIC/Paint
         tone map is already fixed.
 
-        PC_HDR_WIC_AVIF_PIXFMT remains available for local diagnostics or codec
-        experiments, for example "yuv444p10le,yuv420p10le".
+        PC_HDR_WIC_AVIF_PIXFMT remains available only when explicitly enabling
+        experimental primary overrides. This prevents a diagnostic env var from
+        silently switching dataset exports back to the washed-out WIC yuv444 path.
         """
-        default_pixfmt = str(getattr(self.cfg, "hdr_wic_avif_pixfmt", "yuv420p10le") or "yuv420p10le")
-        raw = os.getenv("PC_HDR_WIC_AVIF_PIXFMT", default_pixfmt)
+        experimental_primary = bool(getattr(self.cfg, "hdr_wic_experimental_primary", False)) or self._truthy_env("PC_HDR_WIC_EXPERIMENTAL_PRIMARY")
+        raw = "yuv420p10le"
+        if experimental_primary:
+            default_pixfmt = str(getattr(self.cfg, "hdr_wic_avif_pixfmt", "yuv420p10le") or "yuv420p10le")
+            raw = os.getenv("PC_HDR_WIC_AVIF_PIXFMT", default_pixfmt)
         out: list[str] = []
         for part in str(raw or "").replace(";", ",").split(","):
             pix = part.strip().lower()
@@ -8556,14 +8753,16 @@ class Processor(QtCore.QObject):
     def _hdr_wic_intermediate_range(self) -> str:
         """Return range signaling/conversion for the temporary WIC HDR still.
 
-        The current production WIC/Paint path keeps the historical full-range
-        handoff by default because that restored the accepted colors after the
-        yuv444 regression.  For root-cause testing, PC_HDR_WIC_AVIF_RANGE=limited
-        can be combined with PC_HDR_WIC_AVIF_PIXFMT=yuv444p10le to test the
-        missing limited-yuv444 case without changing code again.
+        The production WIC/Paint path keeps the historical full-range handoff.
+        Range overrides are honored only with PC_HDR_WIC_EXPERIMENTAL_PRIMARY=1
+        so a diagnostic shell environment cannot silently make primary crops use
+        the washed-out yuv444/limited path.
         """
-        default_range = str(getattr(self.cfg, "hdr_wic_avif_range", "full") or "full").strip().lower()
-        raw = str(os.getenv("PC_HDR_WIC_AVIF_RANGE", default_range) or default_range).strip().lower()
+        experimental_primary = bool(getattr(self.cfg, "hdr_wic_experimental_primary", False)) or self._truthy_env("PC_HDR_WIC_EXPERIMENTAL_PRIMARY")
+        raw = "full"
+        if experimental_primary:
+            default_range = str(getattr(self.cfg, "hdr_wic_avif_range", "full") or "full").strip().lower()
+            raw = str(os.getenv("PC_HDR_WIC_AVIF_RANGE", default_range) or default_range).strip().lower()
         if raw in {"limited", "tv", "mpeg"}:
             return "limited"
         return "full"
@@ -8606,6 +8805,33 @@ class Processor(QtCore.QObject):
             except Exception:
                 pass
         return False, "hdr_wic_intermediate_failed:" + " || ".join(failures)
+
+    def _save_hdr_wic_specific_intermediate_avif(
+        self,
+        frame_idx: int,
+        frame_pts_sec: Optional[float],
+        crop_xyxy: tuple[int, int, int, int],
+        out_path: str,
+        *,
+        pix_fmt: str,
+        avif_range: str,
+    ) -> tuple[bool, str]:
+        """Write a specific WIC diagnostic/guide HDR AVIF without env overrides."""
+        pix_fmt = str(pix_fmt or "yuv420p10le").strip().lower()
+        if pix_fmt not in {"yuv420p10le", "yuv444p10le"}:
+            return False, f"unsupported_pix_fmt:{pix_fmt}"
+        avif_range = str(avif_range or "full").strip().lower()
+        if avif_range not in {"full", "limited"}:
+            return False, f"unsupported_range:{avif_range}"
+        return self._save_hdr_crop_p010(
+            frame_idx,
+            frame_pts_sec,
+            crop_xyxy,
+            out_path,
+            quiet=True,
+            avif_pix_fmt=pix_fmt,
+            avif_range=avif_range,
+        )
 
     def _save_wic_display_avif_from_hdr_crop(
         self,
@@ -9202,6 +9428,18 @@ try {{
             try:
                 ok_wic, why_wic = self._save_wic_png_from_hdr_image(tmp_hdr, out_path)
                 if ok_wic:
+                    guide_changed = self._maybe_apply_wic_yuv444_guided_cleanup(
+                        frame_idx, frame_pts_sec, crop_xyxy, out_path
+                    )
+                    if guide_changed > 0:
+                        self._status(
+                            f"HDR WIC yuv444-guided shadow cleanup: {guide_changed} px",
+                            key="hdr_wic_guide_cleanup",
+                            interval=5.0,
+                        )
+                        valid, invalid_why = self._validate_hdr_sdr_export_image(out_path, None)
+                        if not valid:
+                            return False, f"windows_wic_invalid_post_guide_cleanup:{invalid_why}"
                     self._maybe_run_hdr_speckle_diagnostics(
                         ffmpeg_bin, frame_idx, frame_pts_sec, crop_xyxy, out_path
                     )
@@ -9996,6 +10234,20 @@ class MainWindow(QtWidgets.QMainWindow):
             "Key: hdr_wic_avif_range. Env override: PC_HDR_WIC_AVIF_RANGE."
         )
         self.hdr_wic_avif_range_combo.currentIndexChanged.connect(self._on_ui_change)
+        self.hdr_wic_experimental_primary_check = QtWidgets.QCheckBox()
+        self.hdr_wic_experimental_primary_check.setChecked(bool(getattr(self.cfg, "hdr_wic_experimental_primary", False)))
+        self.hdr_wic_experimental_primary_check.setToolTip(
+            "bool: hdr_wic_experimental_primary. Off keeps primary WIC PNG exports on fixed yuv420/full. "
+            "On allows PC_HDR_WIC_AVIF_PIXFMT/PC_HDR_WIC_AVIF_RANGE and the UI pixfmt/range knobs to override."
+        )
+        self.hdr_wic_experimental_primary_check.stateChanged.connect(self._on_ui_change)
+        self.hdr_wic_yuv444_guide_cleanup_check = QtWidgets.QCheckBox()
+        self.hdr_wic_yuv444_guide_cleanup_check.setChecked(bool(getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", True)))
+        self.hdr_wic_yuv444_guide_cleanup_check.setToolTip(
+            "bool: hdr_wic_yuv444_guide_cleanup. Use limited-yuv444 WIC render only as an artifact guide while "
+            "keeping yuv420/full as the primary color/tone source. Env kill switch: PC_DISABLE_WIC_YUV444_GUIDE_CLEANUP."
+        )
+        self.hdr_wic_yuv444_guide_cleanup_check.stateChanged.connect(self._on_ui_change)
 
         self.hdr_speckle_diag_check = QtWidgets.QCheckBox()
         self.hdr_speckle_diag_check.setChecked(bool(getattr(self.cfg, "hdr_speckle_diag", False)))
@@ -10633,6 +10885,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ("WIC shadow deblob strength", self.wic_shadow_deblob_strength_spin),
             ("WIC intermediate AVIF pixfmt", self.hdr_wic_avif_pixfmt_combo),
             ("WIC intermediate AVIF range", self.hdr_wic_avif_range_combo),
+            ("WIC experimental primary override", self.hdr_wic_experimental_primary_check),
+            ("WIC yuv444 guide cleanup", self.hdr_wic_yuv444_guide_cleanup_check),
             ("HDR speckle diagnostics", self.hdr_speckle_diag_check),
             ("HDR speckle diag dir", self.hdr_speckle_diag_dir_widget),
             ("FFmpeg hardware decode", self.hwaccel_combo),
@@ -11984,6 +12238,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "wic_shadow_deblob_strength",
             "hdr_wic_avif_pixfmt",
             "hdr_wic_avif_range",
+            "hdr_wic_experimental_primary",
+            "hdr_wic_yuv444_guide_cleanup",
             "hdr_speckle_diag",
             "hdr_speckle_diag_dir",
         }
@@ -12212,6 +12468,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 if hasattr(self, "hdr_wic_avif_range_combo")
                 else str(getattr(self.cfg, "hdr_wic_avif_range", "full") or "full")
             ),
+            hdr_wic_experimental_primary=(
+                bool(self.hdr_wic_experimental_primary_check.isChecked())
+                if hasattr(self, "hdr_wic_experimental_primary_check")
+                else bool(getattr(self.cfg, "hdr_wic_experimental_primary", False))
+            ),
+            hdr_wic_yuv444_guide_cleanup=(
+                bool(self.hdr_wic_yuv444_guide_cleanup_check.isChecked())
+                if hasattr(self, "hdr_wic_yuv444_guide_cleanup_check")
+                else bool(getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", True))
+            ),
             hdr_avif_wic_display_compat=(
                 bool(self.hdr_avif_display_compat_check.isChecked())
                 if hasattr(self, "hdr_avif_display_compat_check")
@@ -12271,6 +12537,16 @@ class MainWindow(QtWidgets.QMainWindow):
             (self.hdr_wic_avif_range_combo.currentData() or "full")
             if hasattr(self, "hdr_wic_avif_range_combo")
             else str(getattr(self.cfg, "hdr_wic_avif_range", "full") or "full")
+        )
+        cfg.hdr_wic_experimental_primary = (
+            bool(self.hdr_wic_experimental_primary_check.isChecked())
+            if hasattr(self, "hdr_wic_experimental_primary_check")
+            else bool(getattr(self.cfg, "hdr_wic_experimental_primary", False))
+        )
+        cfg.hdr_wic_yuv444_guide_cleanup = (
+            bool(self.hdr_wic_yuv444_guide_cleanup_check.isChecked())
+            if hasattr(self, "hdr_wic_yuv444_guide_cleanup_check")
+            else bool(getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", True))
         )
         cfg.hdr_speckle_diag = bool(self.hdr_speckle_diag_check.isChecked()) if hasattr(self, "hdr_speckle_diag_check") else bool(getattr(self.cfg, "hdr_speckle_diag", False))
         cfg.hdr_speckle_diag_dir = self.hdr_speckle_diag_dir_edit.text().strip() if hasattr(self, "hdr_speckle_diag_dir_edit") else str(getattr(self.cfg, "hdr_speckle_diag_dir", "") or "")
@@ -12340,6 +12616,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.hdr_wic_avif_range = "limited"
         if self.cfg.hdr_wic_avif_range not in {"full", "limited"}:
             self.cfg.hdr_wic_avif_range = "full"
+        self.cfg.hdr_wic_experimental_primary = bool(getattr(cfg, "hdr_wic_experimental_primary", False))
+        self.cfg.hdr_wic_yuv444_guide_cleanup = bool(getattr(cfg, "hdr_wic_yuv444_guide_cleanup", True))
         self.cfg.hdr_avif_wic_display_compat = bool(getattr(cfg, "hdr_avif_wic_display_compat", True))
         self.cfg.compose_crop_enable = bool(getattr(cfg, "compose_crop_enable", True))
         self.cfg.compose_detect_person_for_face = bool(getattr(cfg, "compose_detect_person_for_face", True))
@@ -12414,6 +12692,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "hdr_wic_avif_range_combo"):
             idx = self.hdr_wic_avif_range_combo.findData(self.cfg.hdr_wic_avif_range)
             self.hdr_wic_avif_range_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        if hasattr(self, "hdr_wic_experimental_primary_check"):
+            self.hdr_wic_experimental_primary_check.setChecked(self.cfg.hdr_wic_experimental_primary)
+        if hasattr(self, "hdr_wic_yuv444_guide_cleanup_check"):
+            self.hdr_wic_yuv444_guide_cleanup_check.setChecked(self.cfg.hdr_wic_yuv444_guide_cleanup)
         self.cfg.hdr_speckle_diag = bool(getattr(cfg, "hdr_speckle_diag", False))
         self.cfg.hdr_speckle_diag_dir = str(getattr(cfg, "hdr_speckle_diag_dir", "") or "")
         if hasattr(self, "hdr_speckle_diag_check"):
@@ -13534,6 +13816,24 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "hdr_wic_avif_range_combo"):
             idx = self.hdr_wic_avif_range_combo.findData(self.cfg.hdr_wic_avif_range)
             self.hdr_wic_avif_range_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.cfg.hdr_wic_experimental_primary = bool(
+            s.value(
+                "hdr_wic_experimental_primary",
+                getattr(self.cfg, "hdr_wic_experimental_primary", False),
+                type=bool,
+            )
+        )
+        if hasattr(self, "hdr_wic_experimental_primary_check"):
+            self.hdr_wic_experimental_primary_check.setChecked(self.cfg.hdr_wic_experimental_primary)
+        self.cfg.hdr_wic_yuv444_guide_cleanup = bool(
+            s.value(
+                "hdr_wic_yuv444_guide_cleanup",
+                getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", True),
+                type=bool,
+            )
+        )
+        if hasattr(self, "hdr_wic_yuv444_guide_cleanup_check"):
+            self.hdr_wic_yuv444_guide_cleanup_check.setChecked(self.cfg.hdr_wic_yuv444_guide_cleanup)
         if hasattr(self, "hdr_speckle_diag_check"):
             self.hdr_speckle_diag_check.setChecked(
                 s.value("hdr_speckle_diag", getattr(self.cfg, "hdr_speckle_diag", False), type=bool)
