@@ -63,3 +63,9 @@ Thumbs.db
 # Runtime output can be large and must survive updater operations.
 /person_capture/output/
 /person_capture/out/
+
+# Runtime output variants created by ad-hoc GUI runs.
+/output*/
+/person_capture/output*/
+/prescan_cache/
+/solidpreset[0-9]*.json

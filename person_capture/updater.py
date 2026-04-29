@@ -97,7 +97,11 @@ def _repo_root_for(path: Path) -> Path:
     return path
 
 def is_git_repo(repo: Path) -> bool:
-    return (repo / ".git").exists() and bool(_which("git"))
+    return is_git_checkout(repo) and bool(_which("git"))
+
+
+def is_git_checkout(repo: Path) -> bool:
+    return (repo / ".git").exists()
 
 def ensure_https_remote(repo: Path) -> None:
     try:
@@ -346,6 +350,8 @@ def stage_zip_update(repo: Path, branch: Optional[str] = None) -> Tuple[bool, st
     Download and stage the latest zipball of branch to repo/update_staged.
     Returns (ok, msg, staged_flag_file).
     """
+    if is_git_checkout(repo):
+        return False, "Zip update disabled inside git checkout; use git fast-forward update instead.", None
     try:
         branch = branch or _default_branch()
         sha = _latest_commit_sha(branch)
@@ -381,6 +387,31 @@ def stage_zip_update(repo: Path, branch: Optional[str] = None) -> Tuple[bool, st
         return True, f"Staged {sha[:7]} to {stage}", str(flag)
     except Exception as e:
         return False, f"stage error: {e}", None
+
+def _discard_pending_zip_update(repo: Path, flag: Optional[Path] = None, staged: Optional[Path] = None) -> None:
+    """Remove a staged zip update without touching source files."""
+    try:
+        if flag is None:
+            flag = repo / "update_pending.json"
+        if flag.exists():
+            flag.unlink()
+    except Exception:
+        pass
+    try:
+        if staged is None:
+            staged = repo / "update_staged"
+        # Only delete the updater-owned staging directory under the install root.
+        repo_resolved = repo.resolve()
+        expected_raw = repo_resolved / "update_staged"
+        if expected_raw.is_symlink() or staged.is_symlink():
+            return
+        staged_resolved = staged.resolve(strict=False)
+        expected_resolved = expected_raw.resolve(strict=False)
+        if staged_resolved == expected_resolved:
+            shutil.rmtree(expected_raw, ignore_errors=True)
+    except Exception:
+        pass
+
 
 def _remove_path_for_update_replace(path: Path) -> None:
     """Remove a path that is about to be replaced by an update payload."""
@@ -485,6 +516,9 @@ def apply_staged_update(repo: Path) -> Tuple[bool, str]:
         flag = repo / "update_pending.json"
         if not flag.exists():
             return False, "no pending update"
+        if is_git_checkout(repo):
+            _discard_pending_zip_update(repo, flag=flag)
+            return False, "ignored pending zip update inside git checkout"
         with open(flag, "r", encoding="utf-8") as f:
             info = json.load(f)
         sha_applied = str(info.get("sha") or "")
@@ -679,7 +713,12 @@ class UpdateManager(QtCore.QObject if QtCore else object):
                     return
                 self.info.emit("Checking for updates…")
                 # path 1: git
-                if is_git_repo(self.repo):
+                if is_git_checkout(self.repo):
+                    if not is_git_repo(self.repo):
+                        s.setValue("update_last_check_t", _now())
+                        s.sync()
+                        self.info.emit("Update check skipped: git checkout detected but git executable is unavailable.")
+                        return
                     need, local, remote = _git_need_updates(self.repo)
                     s.setValue("update_last_check_t", _now()); s.sync()
                     if need:
@@ -716,24 +755,25 @@ class UpdateManager(QtCore.QObject if QtCore else object):
             return
         def _run():
             try:
-                if prefer_git and is_git_repo(self.repo):
+                if is_git_checkout(self.repo):
+                    if not is_git_repo(self.repo):
+                        self.updateFailed.emit(
+                            "Git checkout detected but git executable is unavailable; cannot run fast-forward update."
+                        )
+                        return
+                    if not prefer_git:
+                        self.updateFailed.emit(
+                            "Zip update disabled inside git checkout; use git fast-forward update instead."
+                        )
+                        return
                     self.progress.emit("Updating via git…")
                     ok, msg = git_update(self.repo, autostash=False)
                     if ok:
                         self.updated.emit(msg)
-                        return
                     else:
-                        lower_msg = msg.lower()
-                        if (
-                            "update blocked:" in lower_msg
-                            or "unresolved merge conflicts" in lower_msg
-                            or "operation already in progress" in lower_msg
-                            or "tracked local changes present" in lower_msg
-                        ):
-                            self.updateFailed.emit(msg)
-                            return
-                        # Fall back to zip if git failed (e.g., conflicts)
-                        self.info.emit(f"git update failed, will try zip: {msg}")
+                        self.updateFailed.emit(msg)
+                    return
+
                 self.progress.emit("Staging zip update…")
                 ok, msg, flag = stage_zip_update(self.repo, branch=branch or _default_branch())
                 if ok:
