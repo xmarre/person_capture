@@ -5304,7 +5304,10 @@ class Processor(QtCore.QObject):
                             if bbox is None or len(bbox) != 4:
                                 continue
                             fx1, fy1, fx2, fy2 = [int(round(v)) for v in bbox]
-                            fx1 += rx1; fx2 += rx1; fy1 += ry1; fy2 += ry1
+                            fx1 += rx1
+                            fx2 += rx1
+                            fy1 += ry1
+                            fy2 += ry1
                             fx1 = max(0, min(W2 - 1, fx1))
                             fy1 = max(0, min(H2 - 1, fy1))
                             fx2 = max(fx1 + 1, min(W2, int(round(fx2))))
@@ -5336,7 +5339,10 @@ class Processor(QtCore.QObject):
                         ):
                             gbbox = gbest.get("bbox")
                             fx1, fy1, fx2, fy2 = [float(v) for v in gbbox]
-                            fx1 += float(rx1); fx2 += float(rx1); fy1 += float(ry1); fy2 += float(ry1)
+                            fx1 += float(rx1)
+                            fx2 += float(rx1)
+                            fy1 += float(ry1)
+                            fy2 += float(ry1)
                             fx1 = max(0.0, min(float(W2), fx1))
                             fy1 = max(0.0, min(float(H2), fy1))
                             fx2 = max(fx1 + 1.0, min(float(W2), fx2))
