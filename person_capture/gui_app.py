@@ -5998,6 +5998,18 @@ class Processor(QtCore.QObject):
                     if primary_fmt not in {"png", "jpg", "jpeg"}:
                         primary_fmt = "png"
                     primary_ext = ".png" if (hdr_primary_fullres and primary_fmt == "png") else ".jpg"
+                    if (
+                        bool(getattr(self.cfg, "hdr_wic_yuv444_color_match", True))
+                        and (not hdr_primary_fullres or primary_ext != ".png")
+                    ):
+                        self._status(
+                            "HDR WIC yuv444 color-match unreachable: "
+                            f"hdr_active={hdr_active} "
+                            f"hdr_screencap_fullres={bool(getattr(self.cfg, 'hdr_screencap_fullres', True))} "
+                            f"primary_fmt={primary_fmt} primary_ext={primary_ext}",
+                            key="hdr_wic_yuv444_color_match_unreachable",
+                            interval=10.0,
+                        )
                     crop_img_path = os.path.join(crops_dir, f"{source_file_prefix}_f{idx:08d}{primary_ext}")
                     hdr_out_path = None
                     if hdr_active and bool(getattr(self.cfg, "hdr_archive_crops", False)):
@@ -8453,8 +8465,8 @@ class Processor(QtCore.QObject):
             same_size = base_h == clean_h and base_w == clean_w
             if same_size:
                 clean_fit_bgr = clean_bgr
-                out = base.copy()
-                diff_ref_bgr = base_bgr
+                out = clean.copy()
+                diff_ref_bgr = clean_bgr
             else:
                 # Fast-reference mode: the yuv420/full WIC render is intentionally
                 # smaller and is used only to fit color statistics.  The final
@@ -8709,7 +8721,7 @@ class Processor(QtCore.QObject):
 
             changed, repaired_tmp = self._repair_wic_with_yuv444_color_match(ref_png, clean_png)
             if changed <= 0 or not repaired_tmp:
-                return False, "color_match_noop", 0
+                return False, "color_match_noop:changed=0", 0
             valid, invalid_why = self._validate_hdr_sdr_export_image(repaired_tmp, None)
             if not valid:
                 return False, f"color_match_invalid:{invalid_why}", 0
@@ -8802,6 +8814,11 @@ class Processor(QtCore.QObject):
                 return 0
             changed, repaired_tmp = self._repair_wic_with_yuv444_color_match(out_path, guide_png)
             if changed <= 0 or not repaired_tmp:
+                self._status(
+                    "HDR WIC yuv444 color-match noop after full render: changed=0",
+                    key="hdr_wic_yuv444_color_match",
+                    interval=5.0,
+                )
                 return 0
             valid, invalid_why = self._validate_hdr_sdr_export_image(repaired_tmp, None)
             if not valid:
@@ -10179,6 +10196,15 @@ try {{
             # Paint-like path: exact HDR crop -> WIC color-managed PNG. This is
             # deliberately not a fallback to the preview renderer; if WIC cannot
             # decode/convert the HDR still, report that as the save failure.
+            color_match_enabled_pre = self._wic_yuv444_color_match_enabled()
+            if color_match_enabled_pre:
+                self._status(
+                    "HDR WIC yuv444 color-match path active: "
+                    f"fast_ref_max_side={self._wic_yuv444_color_match_ref_max_side()} "
+                    f"out={Path(out_path).name}",
+                    key="hdr_wic_yuv444_color_match_state",
+                    interval=10.0,
+                )
             fast_ok, fast_why, fast_changed = self._try_save_wic_yuv444_color_matched_fast(
                 frame_idx, frame_pts_sec, crop_xyxy, out_path
             )
@@ -10186,7 +10212,7 @@ try {{
                 self._status(
                     f"HDR WIC yuv444 color-match fast output: {fast_changed} px",
                     key="hdr_wic_yuv444_color_match",
-                    interval=5.0,
+                    interval=0.0,
                 )
                 self._maybe_run_hdr_speckle_diagnostics(
                     ffmpeg_bin, frame_idx, frame_pts_sec, crop_xyxy, out_path
@@ -10196,7 +10222,7 @@ try {{
                 self._status(
                     f"HDR WIC yuv444 color-match fast path fell back: {fast_why}",
                     key="hdr_wic_yuv444_color_match",
-                    interval=10.0,
+                    interval=0.0,
                 )
             tmp_hdr = out_path + ".tmp_hdr.avif"
             try:
@@ -10227,7 +10253,7 @@ try {{
                         self._status(
                             f"HDR WIC yuv444 color-match output: {color_match_changed} px",
                             key="hdr_wic_yuv444_color_match",
-                            interval=5.0,
+                            interval=0.0,
                         )
                         valid, invalid_why = self._validate_hdr_sdr_export_image(out_path, None)
                         if not valid:
