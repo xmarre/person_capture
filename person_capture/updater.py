@@ -130,6 +130,54 @@ def _git_tracking_remote(repo: Path) -> Optional[str]:
         except Exception:
             return "origin/main"
 
+
+def _git_dir(repo: Path) -> Path:
+    try:
+        out = _call(["git", "rev-parse", "--git-dir"], cwd=repo).stdout.strip()
+        if out:
+            p = Path(out)
+            if not p.is_absolute():
+                p = (repo / p).resolve()
+            return p
+    except Exception:
+        pass
+    return repo / ".git"
+
+
+def _git_has_unmerged_conflicts(repo: Path) -> bool:
+    try:
+        out = _call(["git", "diff", "--name-only", "--diff-filter=U"], cwd=repo).stdout
+        return bool((out or "").strip())
+    except Exception:
+        return True
+
+
+def _git_has_tracked_local_changes(repo: Path) -> bool:
+    try:
+        out = _call(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=repo,
+        ).stdout
+        return bool((out or "").strip())
+    except Exception:
+        return True
+
+
+def _git_has_in_progress_operation(repo: Path) -> bool:
+    git_dir = _git_dir(repo)
+    markers = (
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+    )
+    try:
+        if (git_dir / "rebase-apply").exists() or (git_dir / "rebase-merge").exists():
+            return True
+        return any((git_dir / marker).exists() for marker in markers)
+    except Exception:
+        return True
+
 def _git_need_updates(repo: Path) -> Tuple[bool, str, str]:
     """
     Returns (needs_update, local_sha, remote_sha)
@@ -197,22 +245,24 @@ def git_update(repo: Path, autostash: bool = True) -> Tuple[bool, str]:
     ensure_https_remote(repo)
     try:
         prev = _call(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+        if _git_has_unmerged_conflicts(repo):
+            return False, "Update blocked: repository has unresolved merge conflicts."
+        if _git_has_in_progress_operation(repo):
+            return False, "Update blocked: git operation already in progress (merge/rebase/cherry-pick)."
+        if _git_has_tracked_local_changes(repo):
+            return False, "Update blocked: tracked local changes present. Commit/stash/reset first."
         # prepare
         _call(["git", "fetch", "--tags", "--prune"], cwd=repo)
-        # Rebase onto upstream. Do not run our own `git stash push -u` here:
-        # - `-u` includes untracked, non-ignored files and can make user output
-        #   directories appear to vanish during updates.
-        # - the old code never popped that manual stash.
-        # Git's `--autostash` is enough for tracked local edits and is restored by
-        # git itself at the end of the pull/rebase.
         upstream = _git_tracking_remote(repo) or "origin/main"
-        pull_args = ["git", "pull", "--rebase"]
-        if autostash:
-            pull_args.append("--autostash")
-        pull = _call(pull_args, cwd=repo)
-        if pull.returncode != 0 and pull.stderr:
-            # attempt a non-rebase pull
-            _call(["git", "pull", upstream.split('/')[0], upstream.split('/')[1]], cwd=repo, check=True)
+        remote_name, branch_name = upstream.split("/", 1) if "/" in upstream else ("origin", "")
+        if not branch_name:
+            return False, f"Update blocked: invalid upstream ref '{upstream}'."
+        # Safety invariant for app updates: never run rebase/autostash from GUI updater.
+        # Only allow fast-forward pulls on a clean tree.
+        pull = _call(["git", "pull", "--ff-only", remote_name, branch_name], cwd=repo)
+        if pull.returncode != 0:
+            err = (pull.stderr or pull.stdout or "").strip()
+            return False, f"git ff-only pull failed: {err}"
         # submodules (if ever added)
         try:
             _call(["git", "submodule", "update", "--init", "--recursive"], cwd=repo)
@@ -597,13 +647,14 @@ class UpdateManager(QtCore.QObject if QtCore else object):
         self._checking = False
 
     # ---- public API for GUI ----
-    def maybe_apply_pending_at_start(self) -> None:
+    def maybe_apply_pending_at_start(self) -> Tuple[bool, str]:
         ok, msg = apply_staged_update(self.repo)
         if ok and QtCore:
             try:
                 self.info.emit(f"Applied staged update: {msg}")
             except Exception:
                 pass
+        return ok, msg
 
     def check_for_updates_async(self, branch: Optional[str], force: bool = False, throttle_sec: int = CHECK_INTERVAL_SEC_DEFAULT) -> None:
         if not QtCore:
@@ -667,11 +718,20 @@ class UpdateManager(QtCore.QObject if QtCore else object):
             try:
                 if prefer_git and is_git_repo(self.repo):
                     self.progress.emit("Updating via git…")
-                    ok, msg = git_update(self.repo, autostash=True)
+                    ok, msg = git_update(self.repo, autostash=False)
                     if ok:
                         self.updated.emit(msg)
                         return
                     else:
+                        lower_msg = msg.lower()
+                        if (
+                            "update blocked:" in lower_msg
+                            or "unresolved merge conflicts" in lower_msg
+                            or "operation already in progress" in lower_msg
+                            or "tracked local changes present" in lower_msg
+                        ):
+                            self.updateFailed.emit(msg)
+                            return
                         # Fall back to zip if git failed (e.g., conflicts)
                         self.info.emit(f"git update failed, will try zip: {msg}")
                 self.progress.emit("Staging zip update…")

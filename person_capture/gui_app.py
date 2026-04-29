@@ -16239,6 +16239,7 @@ def main():
     QtCore.QCoreApplication.setOrganizationName(APP_ORG)
     QtCore.QCoreApplication.setApplicationName(APP_NAME)
     app = QtWidgets.QApplication(sys.argv)
+    startup_update_msg: Optional[str] = None
     # Apply staged updates as early as possible (no windows/dialogs shown yet)
     try:
         # Import late to avoid circulars if any
@@ -16247,11 +16248,33 @@ def main():
         except Exception:
             from updater import UpdateManager  # type: ignore
         if UpdateManager is not None:
-            UpdateManager(APP_NAME).maybe_apply_pending_at_start()
+            _updater = UpdateManager(APP_NAME)
+            ok, msg = _updater.maybe_apply_pending_at_start()
+            if ok:
+                startup_update_msg = msg
     except Exception:
         pass
     w = MainWindow()
     w.show()
+    if startup_update_msg:
+        def _notify_startup_update() -> None:
+            try:
+                QtWidgets.QMessageBox.information(
+                    w,
+                    "Update applied",
+                    "A previously staged update was applied during startup.\n\n"
+                    f"Details: {startup_update_msg}",
+                )
+            except Exception:
+                try:
+                    w.statusBar().showMessage(
+                        f"Startup update applied: {startup_update_msg}",
+                        9000,
+                    )
+                except Exception:
+                    pass
+
+        QtCore.QTimer.singleShot(0, _notify_startup_update)
     sys.exit(app.exec())
 
 
