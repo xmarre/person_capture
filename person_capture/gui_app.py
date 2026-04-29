@@ -2317,13 +2317,20 @@ class Processor(QtCore.QObject):
         face_protect = self._union_boxes_xyxy(head, face) or face
         # Hard containment is the actual detected face. The derived head/hair box
         # is a soft composition hint only. Treating the proxy head box as hard made
-        # large close-ups impossible to satisfy at 1:1, so all candidates were
-        # rejected and the fallback blindly picked the first UI ratio, usually 2:3.
+        # large close-ups impossible to satisfy at 1:1, so all candidates could be
+        # rejected even when a face-valid square crop existed. The fallback path now
+        # re-validates user ratios through the same landscape gates before using
+        # safe portrait defaults; it does not blindly consume UI ratio order.
         face_hard_protect = face
 
         profiles: list[tuple[str, Tuple[float, float, float, float], float, Tuple[float, float], Tuple[float, float]]] = []
         face_h = 0.0
         face_frame_frac = 0.0
+        small_face_frame_frac = 0.12
+        upper_small_face_profile_nudge = 0.10
+        upper_small_face_square_nudge = 0.16
+        close_small_face_penalty = 0.55
+        upper_small_face_face_loss_nudge = 0.12
         subj_h_frac = ((subj[3] - subj[1]) / bound_h) if subj is not None else 0.0
         body_period = max(0, int(getattr(cfg, "compose_body_every_n", 6)))
         body_cadence = body_period > 0 and frame_idx is not None and (int(frame_idx) % body_period == 0)
@@ -2460,10 +2467,10 @@ class Processor(QtCore.QObject):
                     ratio_prior += 0.00 if rs == "2:3" else 0.06
                     # Small/far faces need more surrounding context. This is a
                     # narrow score nudge, not a hard ratio override.
-                    if face is not None and face_frame_frac < 0.12:
-                        profile_prior -= 0.10
+                    if face is not None and face_frame_frac < small_face_frame_frac:
+                        profile_prior -= upper_small_face_profile_nudge
                         if rs == "1:1":
-                            ratio_prior += 0.16
+                            ratio_prior += upper_small_face_square_nudge
                 elif profile == "body":
                     landscape_penalty = max(0.0, min(20.0, float(getattr(cfg, "compose_landscape_face_penalty", 5.0))))
                     profile_prior = 0.78
@@ -2491,10 +2498,10 @@ class Processor(QtCore.QObject):
                 if face is not None:
                     actual_face_h_frac = face_h / crop_h
                     face_loss = abs(actual_face_h_frac - max(1e-6, target_face_h_frac))
-                    if profile == "close" and face_frame_frac < 0.12:
-                        profile_prior += 0.55
-                    if profile == "upper" and face_frame_frac < 0.12:
-                        profile_prior -= 0.12
+                    if profile == "close" and face_frame_frac < small_face_frame_frac:
+                        profile_prior += close_small_face_penalty
+                    if profile == "upper" and face_frame_frac < small_face_frame_frac:
+                        profile_prior -= upper_small_face_face_loss_nudge
                 else:
                     face_loss = 0.0
 
@@ -2533,7 +2540,7 @@ class Processor(QtCore.QObject):
             if is_landscape:
                 if subj is None:
                     continue
-                if face is not None and face_frame_frac >= 0.12:
+                if face is not None and face_frame_frac >= small_face_frame_frac:
                     continue
                 if subj_h_frac < 0.60:
                     continue
@@ -2558,7 +2565,7 @@ class Processor(QtCore.QObject):
             if (
                 fallback_aspect > 1.05
                 and subj is not None
-                and face_frame_frac < 0.12
+                and face_frame_frac < small_face_frame_frac
                 and subj_h_frac >= 0.60
             ):
                 fallback_profile = "body"
