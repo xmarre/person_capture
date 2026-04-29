@@ -371,6 +371,12 @@ class SessionConfig:
     # clean yuv444 WIC render, so positive values reduce CPU work without
     # softening the actual crop.
     hdr_wic_yuv444_color_match_ref_max_side: int = 960
+    # Full-resolution LUT/blend execution mode for the color-match remap.
+    # "auto" enables CUDA only for large images and when lowfreq is disabled.
+    hdr_wic_yuv444_color_match_gpu_mode: str = "auto"  # auto | off | on
+    # Auto mode threshold: enable CUDA LUT/blend only when pixel count is at
+    # least this value. Keep this conservative to avoid GPU launch overhead.
+    hdr_wic_yuv444_color_match_gpu_auto_min_pixels: int = 1_000_000
     # Older diagnostic cleanup that only used yuv444 as an artifact mask. It was
     # too conservative for broad shadow blobs, so keep it opt-in/fallback only.
     hdr_wic_yuv444_guide_cleanup: bool = False
@@ -5030,6 +5036,8 @@ class Processor(QtCore.QObject):
                             "hdr_wic_yuv444_color_match_chroma_strength",
                             "hdr_wic_yuv444_color_match_lowfreq",
                             "hdr_wic_yuv444_color_match_ref_max_side",
+                            "hdr_wic_yuv444_color_match_gpu_mode",
+                            "hdr_wic_yuv444_color_match_gpu_auto_min_pixels",
                             "hdr_wic_yuv444_guide_cleanup",
                             "hdr_speckle_diag",
                             "hdr_speckle_diag_dir",
@@ -8600,24 +8608,21 @@ class Processor(QtCore.QObject):
                 lut = np.interp(np.arange(256, dtype=np.float32), xp, fp)
                 return np.clip(np.rint(lut), 0, 255).astype(np.uint8)
 
-            mapped_f = clean_ycc.astype(np.float32, copy=False).copy()
-            # Match luma and chroma independently.  The previous single RGB blend
-            # forced a tradeoff: high values restored color but crushed/flattened
-            # dark detail, while lower values preserved detail but looked washed.
-            # Keep luma conservative and allow stronger chroma matching.
+            # Match luma and chroma independently. The LUT fitting remains CPU
+            # because it is cheap on the reduced reference image and avoids a new
+            # GPU quantile implementation. The full-res LUT/blend below can run
+            # on CUDA when enabled.
             channel_strengths = (
                 float(strength) * float(luma_strength),
                 float(strength) * float(chroma_strength),
                 float(strength) * float(chroma_strength),
             )
-            for c, c_strength in enumerate(channel_strengths):
+            luts: list[np.ndarray] = []
+            for c in range(3):
                 lut = _quantile_lut(clean_fit_ycc[:, :, c], base_ycc[:, :, c], fit_mask)
                 if lut is None:
                     return 0, ""
-                target = cv2.LUT(clean_ycc[:, :, c], lut).astype(np.float32, copy=False)
-                src = clean_ycc[:, :, c].astype(np.float32, copy=False)
-                mapped_f[:, :, c] = (src * (1.0 - c_strength)) + (target * c_strength)
-            mapped_ycc = np.clip(np.rint(mapped_f), 0, 255).astype(np.uint8)
+                luts.append(lut)
 
             # Add only very-low-frequency residual from the yuv420 reference.  This
             # can restore broad local grade/vibrance, but it can also copy some of
@@ -8631,6 +8636,22 @@ class Processor(QtCore.QObject):
                 lowfreq = self._float_env("PC_WIC_YUV444_COLOR_MATCH_LOWFREQ", default_lowfreq, min_value=0.0, max_value=1.0)
             except Exception:
                 lowfreq = 0.0
+
+            mapped_ycc = None
+            if self._wic_yuv444_color_match_gpu_allowed(clean_w * clean_h, lowfreq=lowfreq):
+                mapped_ycc = self._apply_yuv444_color_match_luts_torch(
+                    clean_ycc,
+                    luts,
+                    channel_strengths,
+                )
+
+            if mapped_ycc is None:
+                mapped_f = clean_ycc.astype(np.float32, copy=False).copy()
+                for c, c_strength in enumerate(channel_strengths):
+                    target = cv2.LUT(clean_ycc[:, :, c], luts[c]).astype(np.float32, copy=False)
+                    src = clean_ycc[:, :, c].astype(np.float32, copy=False)
+                    mapped_f[:, :, c] = (src * (1.0 - c_strength)) + (target * c_strength)
+                mapped_ycc = np.clip(np.rint(mapped_f), 0, 255).astype(np.uint8)
             if lowfreq > 0.0:
                 if same_size:
                     safe = fit_mask.astype(np.float32, copy=False)
@@ -8733,6 +8754,129 @@ class Processor(QtCore.QObject):
         sh -= sh % 2
         return max(2, sw), max(2, sh)
 
+    @staticmethod
+    def _normalize_wic_yuv444_color_match_gpu_mode(value: object, default: str = "auto") -> str:
+        fallback_raw = str(default if default is not None else "auto").strip().lower()
+        if fallback_raw in {"1", "true", "yes", "on", "cuda", "gpu"}:
+            fallback = "on"
+        elif fallback_raw in {"0", "false", "no", "off", "cpu"}:
+            fallback = "off"
+        elif fallback_raw == "auto":
+            fallback = "auto"
+        else:
+            fallback = "auto"
+        raw = str(value if value is not None else fallback).strip().lower()
+        if raw in {"1", "true", "yes", "on", "cuda", "gpu"}:
+            return "on"
+        if raw in {"0", "false", "no", "off", "cpu"}:
+            return "off"
+        if raw == "auto":
+            return "auto"
+        return fallback
+
+    @staticmethod
+    def _normalize_wic_yuv444_color_match_gpu_auto_min_pixels(value: object, default: int = 1_000_000) -> int:
+        try:
+            normalized = int(float(str(value).strip()))
+        except Exception:
+            normalized = int(default)
+        return max(0, min(100_000_000, normalized))
+
+    def _wic_yuv444_color_match_gpu_mode(self) -> str:
+        raw_default = getattr(self.cfg, "hdr_wic_yuv444_color_match_gpu_mode", "auto")
+        default_mode = self._normalize_wic_yuv444_color_match_gpu_mode(raw_default, default="auto")
+        raw = os.getenv("PC_WIC_YUV444_COLOR_MATCH_GPU", default_mode)
+        return self._normalize_wic_yuv444_color_match_gpu_mode(raw, default=default_mode)
+
+    def _wic_yuv444_color_match_gpu_auto_min_pixels(self) -> int:
+        raw_default = getattr(self.cfg, "hdr_wic_yuv444_color_match_gpu_auto_min_pixels", 1_000_000)
+        default_pixels = self._normalize_wic_yuv444_color_match_gpu_auto_min_pixels(raw_default, default=1_000_000)
+        raw = os.getenv("PC_WIC_YUV444_COLOR_MATCH_GPU_AUTO_MIN_PIXELS", str(default_pixels))
+        return self._normalize_wic_yuv444_color_match_gpu_auto_min_pixels(raw, default=default_pixels)
+
+    def _wic_yuv444_color_match_gpu_allowed(self, pixels: int, *, lowfreq: float) -> bool:
+        """Return true when the LUT/blend stage should use Torch CUDA.
+
+        This accelerates only the full-resolution per-pixel LUT/blend operation.
+        It does not accelerate WIC, AVIF encoding, PNG decode/encode, percentile
+        fitting, or the final OpenCV YCrCb->BGR conversion.
+        """
+        mode = self._wic_yuv444_color_match_gpu_mode()
+        if mode == "off":
+            return False
+        # Low-frequency residual currently stays on the known CPU path.
+        if lowfreq > 0.0:
+            return False
+        if mode == "auto":
+            min_pixels = self._wic_yuv444_color_match_gpu_auto_min_pixels()
+            if int(pixels) < int(min_pixels):
+                return False
+        return True
+
+    def _apply_yuv444_color_match_luts_torch(
+        self,
+        clean_ycc: np.ndarray,
+        luts: list[np.ndarray],
+        channel_strengths: tuple[float, float, float],
+    ) -> Optional[np.ndarray]:
+        """Apply 8-bit Y/Cr/Cb LUTs plus channel blend on CUDA.
+
+        Returns a uint8 YCrCb image on success, or None to use the CPU path.
+        """
+        try:
+            if clean_ycc is None or clean_ycc.ndim != 3 or clean_ycc.shape[2] < 3:
+                return None
+            if len(luts) != 3:
+                return None
+            import torch
+
+            if not torch.cuda.is_available():
+                return None
+            if clean_ycc.dtype != np.uint8:
+                clean_ycc_u8 = np.clip(np.rint(clean_ycc), 0, 255).astype(np.uint8)
+            else:
+                clean_ycc_u8 = np.ascontiguousarray(clean_ycc[:, :, :3])
+
+            device = torch.device("cuda")
+            src_u8 = torch.from_numpy(clean_ycc_u8).to(device=device, non_blocking=True)
+            src_f = src_u8.to(torch.float32)
+            out_f = torch.empty_like(src_f)
+            strengths = torch.tensor(
+                [
+                    float(channel_strengths[0]),
+                    float(channel_strengths[1]),
+                    float(channel_strengths[2]),
+                ],
+                dtype=torch.float32,
+                device=device,
+            )
+            for c in range(3):
+                lut_np = np.asarray(luts[c], dtype=np.uint8)
+                if lut_np.shape[0] != 256:
+                    return None
+                lut = torch.from_numpy(lut_np).to(device=device, non_blocking=True).to(torch.float32)
+                target = lut[src_u8[:, :, c].long()]
+                s = strengths[c]
+                out_f[:, :, c] = (src_f[:, :, c] * (1.0 - s)) + (target * s)
+
+            out_u8 = torch.clamp(torch.round(out_f), 0, 255).to(torch.uint8)
+            torch.cuda.synchronize()
+            return out_u8.cpu().numpy()
+        except Exception as exc:
+            try:
+                self._status(
+                    f"HDR WIC yuv444 color-match GPU path skipped: {type(exc).__name__}: {exc}",
+                    key="hdr_wic_yuv444_color_match_gpu",
+                    interval=10.0,
+                )
+            except Exception as status_exc:
+                self._dbg(
+                    "HDR WIC yuv444 color-match GPU skip status emit failed: "
+                    f"gpu_exc={type(exc).__name__}:{exc} "
+                    f"status_exc={type(status_exc).__name__}:{status_exc}"
+                )
+            return None
+
     def _try_save_wic_yuv444_color_matched_fast(
         self,
         frame_idx: int,
@@ -8766,6 +8910,7 @@ class Processor(QtCore.QObject):
             except OSError as exc:
                 self._dbg(f"fast yuv444 pre-clean failed for {pth}: {exc}")
         try:
+            t0 = time.perf_counter()
             ok_ref_hdr, why_ref_hdr = self._save_hdr_wic_specific_intermediate_avif(
                 frame_idx,
                 frame_pts_sec,
@@ -8777,9 +8922,11 @@ class Processor(QtCore.QObject):
             )
             if not ok_ref_hdr:
                 return False, f"ref_hdr_failed:{why_ref_hdr}", 0
+            t_ref_hdr = time.perf_counter()
             ok_ref_wic, why_ref_wic = self._save_wic_png_from_hdr_image(ref_hdr, ref_png, repair=False)
             if not ok_ref_wic:
                 return False, f"ref_wic_failed:{why_ref_wic}", 0
+            t_ref_wic = time.perf_counter()
 
             ok_clean_hdr, why_clean_hdr = self._save_hdr_wic_specific_intermediate_avif(
                 frame_idx,
@@ -8791,9 +8938,11 @@ class Processor(QtCore.QObject):
             )
             if not ok_clean_hdr:
                 return False, f"clean_hdr_failed:{why_clean_hdr}", 0
+            t_clean_hdr = time.perf_counter()
             ok_clean_wic, why_clean_wic = self._save_wic_png_from_hdr_image(clean_hdr, clean_png, repair=False)
             if not ok_clean_wic:
                 return False, f"clean_wic_failed:{why_clean_wic}", 0
+            t_clean_wic = time.perf_counter()
             block_bad, block_why = self._detect_wic_block_corruption(clean_png)
             if block_bad:
                 self._status(
@@ -8804,6 +8953,7 @@ class Processor(QtCore.QObject):
                 return False, f"clean_wic_block_corrupt:{block_why}", 0
 
             changed, repaired_tmp = self._repair_wic_with_yuv444_color_match(ref_png, clean_png)
+            t_match = time.perf_counter()
             if changed <= 0:
                 return False, "color_match_noop:changed=0", 0
             if not repaired_tmp:
@@ -8820,6 +8970,19 @@ class Processor(QtCore.QObject):
                 )
                 return False, f"color_match_block_corrupt:{block_why}", 0
             os.replace(repaired_tmp, out_path)
+            t_done = time.perf_counter()
+            self._status(
+                "HDR WIC yuv444 fast timing: "
+                f"ref_hdr={t_ref_hdr - t0:.3f}s "
+                f"ref_wic={t_ref_wic - t_ref_hdr:.3f}s "
+                f"clean_hdr={t_clean_hdr - t_ref_wic:.3f}s "
+                f"clean_wic={t_clean_wic - t_clean_hdr:.3f}s "
+                f"match={t_match - t_clean_wic:.3f}s "
+                f"replace={t_done - t_match:.3f}s "
+                f"total={t_done - t0:.3f}s",
+                key="hdr_wic_yuv444_fast_timing",
+                interval=0.0,
+            )
             return True, "", changed
         except Exception as exc:
             return False, f"exception:{type(exc).__name__}:{exc}", 0
@@ -10396,6 +10559,8 @@ try {{
                 self._status(
                     "HDR WIC yuv444 color-match path active: "
                     f"fast_ref_max_side={self._wic_yuv444_color_match_ref_max_side()} "
+                    f"gpu_mode={self._wic_yuv444_color_match_gpu_mode()} "
+                    f"gpu_auto_min_pixels={self._wic_yuv444_color_match_gpu_auto_min_pixels()} "
                     f"out={Path(out_path).name}",
                     key="hdr_wic_yuv444_color_match_state",
                     interval=10.0,
@@ -11369,6 +11534,37 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.hdr_wic_yuv444_color_match_ref_max_side_spin.valueChanged.connect(self._normalize_wic_ref_max_side_spin)
         self.hdr_wic_yuv444_color_match_ref_max_side_spin.valueChanged.connect(self._on_ui_change)
+        self.hdr_wic_yuv444_color_match_gpu_mode_combo = QtWidgets.QComboBox()
+        self.hdr_wic_yuv444_color_match_gpu_mode_combo.addItem("Auto", "auto")
+        self.hdr_wic_yuv444_color_match_gpu_mode_combo.addItem("Off (CPU only)", "off")
+        self.hdr_wic_yuv444_color_match_gpu_mode_combo.addItem("On (prefer CUDA)", "on")
+        _gpu_mode = Processor._normalize_wic_yuv444_color_match_gpu_mode(
+            getattr(self.cfg, "hdr_wic_yuv444_color_match_gpu_mode", "auto"),
+            default="auto",
+        )
+        _gpu_mode_idx = self.hdr_wic_yuv444_color_match_gpu_mode_combo.findData(_gpu_mode)
+        self.hdr_wic_yuv444_color_match_gpu_mode_combo.setCurrentIndex(_gpu_mode_idx if _gpu_mode_idx >= 0 else 0)
+        self.hdr_wic_yuv444_color_match_gpu_mode_combo.setToolTip(
+            "str: hdr_wic_yuv444_color_match_gpu_mode (PC_WIC_YUV444_COLOR_MATCH_GPU). "
+            "Controls only the full-resolution LUT/blend remap stage. WIC/AVIF decode/render stays CPU-bound."
+        )
+        self.hdr_wic_yuv444_color_match_gpu_mode_combo.currentIndexChanged.connect(self._on_ui_change)
+        self.hdr_wic_yuv444_color_match_gpu_auto_min_pixels_spin = QtWidgets.QSpinBox()
+        self.hdr_wic_yuv444_color_match_gpu_auto_min_pixels_spin.setRange(0, 100_000_000)
+        self.hdr_wic_yuv444_color_match_gpu_auto_min_pixels_spin.setSingleStep(250_000)
+        self.hdr_wic_yuv444_color_match_gpu_auto_min_pixels_spin.setToolTip(
+            "int: hdr_wic_yuv444_color_match_gpu_auto_min_pixels "
+            "(PC_WIC_YUV444_COLOR_MATCH_GPU_AUTO_MIN_PIXELS). "
+            "Auto mode uses CUDA only when crop pixels >= this threshold."
+        )
+        self.hdr_wic_yuv444_color_match_gpu_auto_min_pixels_spin.setKeyboardTracking(False)
+        self.hdr_wic_yuv444_color_match_gpu_auto_min_pixels_spin.setValue(
+            Processor._normalize_wic_yuv444_color_match_gpu_auto_min_pixels(
+                getattr(self.cfg, "hdr_wic_yuv444_color_match_gpu_auto_min_pixels", 1_000_000),
+                default=1_000_000,
+            )
+        )
+        self.hdr_wic_yuv444_color_match_gpu_auto_min_pixels_spin.valueChanged.connect(self._on_ui_change)
         self.hdr_wic_yuv444_guide_cleanup_check = QtWidgets.QCheckBox()
         self.hdr_wic_yuv444_guide_cleanup_check.setChecked(bool(getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", False)))
         self.hdr_wic_yuv444_guide_cleanup_check.setToolTip(
@@ -12021,6 +12217,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ("WIC yuv444 match chroma", self.hdr_wic_yuv444_color_match_chroma_strength_spin),
             ("WIC yuv444 match lowfreq", self.hdr_wic_yuv444_color_match_lowfreq_spin),
             ("WIC yuv444 ref max side", self.hdr_wic_yuv444_color_match_ref_max_side_spin),
+            ("WIC yuv444 GPU mode", self.hdr_wic_yuv444_color_match_gpu_mode_combo),
+            ("WIC yuv444 GPU auto min pixels", self.hdr_wic_yuv444_color_match_gpu_auto_min_pixels_spin),
             ("WIC yuv444 guide cleanup", self.hdr_wic_yuv444_guide_cleanup_check),
             ("HDR speckle diagnostics", self.hdr_speckle_diag_check),
             ("HDR speckle diag dir", self.hdr_speckle_diag_dir_widget),
@@ -13237,6 +13435,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def _normalize_wic_ref_max_side_value(value: object, default: int = 960) -> int:
         return Processor._normalize_wic_yuv444_color_match_ref_max_side(value, default=default)
 
+    @staticmethod
+    def _normalize_wic_color_match_gpu_mode_value(value: object, default: str = "auto") -> str:
+        return Processor._normalize_wic_yuv444_color_match_gpu_mode(value, default=default)
+
+    @staticmethod
+    def _normalize_wic_color_match_gpu_auto_min_pixels_value(
+        value: object,
+        default: int = 1_000_000,
+    ) -> int:
+        return Processor._normalize_wic_yuv444_color_match_gpu_auto_min_pixels(value, default=default)
+
     def _normalize_wic_ref_max_side_spin(self, *_args) -> None:
         if not hasattr(self, "hdr_wic_yuv444_color_match_ref_max_side_spin"):
             return
@@ -13400,6 +13609,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "hdr_wic_yuv444_color_match_luma_strength",
             "hdr_wic_yuv444_color_match_chroma_strength",
             "hdr_wic_yuv444_color_match_lowfreq",
+            "hdr_wic_yuv444_color_match_ref_max_side",
+            "hdr_wic_yuv444_color_match_gpu_mode",
+            "hdr_wic_yuv444_color_match_gpu_auto_min_pixels",
             "hdr_wic_yuv444_guide_cleanup",
             "hdr_speckle_diag",
             "hdr_speckle_diag_dir",
@@ -13675,6 +13887,24 @@ class MainWindow(QtWidgets.QMainWindow):
                     getattr(self.cfg, "hdr_wic_yuv444_color_match_ref_max_side", 960)
                 )
             ),
+            hdr_wic_yuv444_color_match_gpu_mode=(
+                self._normalize_wic_color_match_gpu_mode_value(
+                    self.hdr_wic_yuv444_color_match_gpu_mode_combo.currentData() or "auto"
+                )
+                if hasattr(self, "hdr_wic_yuv444_color_match_gpu_mode_combo")
+                else self._normalize_wic_color_match_gpu_mode_value(
+                    getattr(self.cfg, "hdr_wic_yuv444_color_match_gpu_mode", "auto")
+                )
+            ),
+            hdr_wic_yuv444_color_match_gpu_auto_min_pixels=(
+                self._normalize_wic_color_match_gpu_auto_min_pixels_value(
+                    self.hdr_wic_yuv444_color_match_gpu_auto_min_pixels_spin.value()
+                )
+                if hasattr(self, "hdr_wic_yuv444_color_match_gpu_auto_min_pixels_spin")
+                else self._normalize_wic_color_match_gpu_auto_min_pixels_value(
+                    getattr(self.cfg, "hdr_wic_yuv444_color_match_gpu_auto_min_pixels", 1_000_000)
+                )
+            ),
             hdr_wic_yuv444_guide_cleanup=(
                 bool(self.hdr_wic_yuv444_guide_cleanup_check.isChecked())
                 if hasattr(self, "hdr_wic_yuv444_guide_cleanup_check")
@@ -13777,6 +14007,24 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(self, "hdr_wic_yuv444_color_match_ref_max_side_spin")
             else self._normalize_wic_ref_max_side_value(
                 getattr(self.cfg, "hdr_wic_yuv444_color_match_ref_max_side", 960)
+            )
+        )
+        cfg.hdr_wic_yuv444_color_match_gpu_mode = (
+            self._normalize_wic_color_match_gpu_mode_value(
+                self.hdr_wic_yuv444_color_match_gpu_mode_combo.currentData() or "auto"
+            )
+            if hasattr(self, "hdr_wic_yuv444_color_match_gpu_mode_combo")
+            else self._normalize_wic_color_match_gpu_mode_value(
+                getattr(self.cfg, "hdr_wic_yuv444_color_match_gpu_mode", "auto")
+            )
+        )
+        cfg.hdr_wic_yuv444_color_match_gpu_auto_min_pixels = (
+            self._normalize_wic_color_match_gpu_auto_min_pixels_value(
+                self.hdr_wic_yuv444_color_match_gpu_auto_min_pixels_spin.value()
+            )
+            if hasattr(self, "hdr_wic_yuv444_color_match_gpu_auto_min_pixels_spin")
+            else self._normalize_wic_color_match_gpu_auto_min_pixels_value(
+                getattr(self.cfg, "hdr_wic_yuv444_color_match_gpu_auto_min_pixels", 1_000_000)
             )
         )
         cfg.hdr_wic_yuv444_guide_cleanup = (
@@ -13895,6 +14143,14 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         except Exception:
             self.cfg.hdr_wic_yuv444_color_match_ref_max_side = 960
+        self.cfg.hdr_wic_yuv444_color_match_gpu_mode = self._normalize_wic_color_match_gpu_mode_value(
+            getattr(cfg, "hdr_wic_yuv444_color_match_gpu_mode", "auto")
+        )
+        self.cfg.hdr_wic_yuv444_color_match_gpu_auto_min_pixels = (
+            self._normalize_wic_color_match_gpu_auto_min_pixels_value(
+                getattr(cfg, "hdr_wic_yuv444_color_match_gpu_auto_min_pixels", 1_000_000)
+            )
+        )
         self.cfg.hdr_wic_yuv444_guide_cleanup = bool(getattr(cfg, "hdr_wic_yuv444_guide_cleanup", False))
         self.cfg.hdr_avif_wic_display_compat = bool(getattr(cfg, "hdr_avif_wic_display_compat", True))
         self.cfg.compose_crop_enable = bool(getattr(cfg, "compose_crop_enable", True))
@@ -13992,6 +14248,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "hdr_wic_yuv444_color_match_ref_max_side_spin"):
             self.hdr_wic_yuv444_color_match_ref_max_side_spin.setValue(
                 self._normalize_wic_ref_max_side_value(self.cfg.hdr_wic_yuv444_color_match_ref_max_side)
+            )
+        if hasattr(self, "hdr_wic_yuv444_color_match_gpu_mode_combo"):
+            idx = self.hdr_wic_yuv444_color_match_gpu_mode_combo.findData(
+                self._normalize_wic_color_match_gpu_mode_value(self.cfg.hdr_wic_yuv444_color_match_gpu_mode)
+            )
+            self.hdr_wic_yuv444_color_match_gpu_mode_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        if hasattr(self, "hdr_wic_yuv444_color_match_gpu_auto_min_pixels_spin"):
+            self.hdr_wic_yuv444_color_match_gpu_auto_min_pixels_spin.setValue(
+                self._normalize_wic_color_match_gpu_auto_min_pixels_value(
+                    self.cfg.hdr_wic_yuv444_color_match_gpu_auto_min_pixels
+                )
             )
         if hasattr(self, "hdr_wic_yuv444_guide_cleanup_check"):
             self.hdr_wic_yuv444_guide_cleanup_check.setChecked(self.cfg.hdr_wic_yuv444_guide_cleanup)
@@ -15204,6 +15471,20 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         except Exception:
             self.cfg.hdr_wic_yuv444_color_match_ref_max_side = 960
+        self.cfg.hdr_wic_yuv444_color_match_gpu_mode = self._normalize_wic_color_match_gpu_mode_value(
+            s.value(
+                "hdr_wic_yuv444_color_match_gpu_mode",
+                getattr(self.cfg, "hdr_wic_yuv444_color_match_gpu_mode", "auto"),
+            )
+        )
+        self.cfg.hdr_wic_yuv444_color_match_gpu_auto_min_pixels = (
+            self._normalize_wic_color_match_gpu_auto_min_pixels_value(
+                s.value(
+                    "hdr_wic_yuv444_color_match_gpu_auto_min_pixels",
+                    getattr(self.cfg, "hdr_wic_yuv444_color_match_gpu_auto_min_pixels", 1_000_000),
+                )
+            )
+        )
         if hasattr(self, "hdr_wic_yuv444_color_match_luma_strength_spin"):
             self.hdr_wic_yuv444_color_match_luma_strength_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_luma_strength)
         if hasattr(self, "hdr_wic_yuv444_color_match_chroma_strength_spin"):
@@ -15213,6 +15494,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "hdr_wic_yuv444_color_match_ref_max_side_spin"):
             self.hdr_wic_yuv444_color_match_ref_max_side_spin.setValue(
                 self._normalize_wic_ref_max_side_value(self.cfg.hdr_wic_yuv444_color_match_ref_max_side)
+            )
+        if hasattr(self, "hdr_wic_yuv444_color_match_gpu_mode_combo"):
+            idx = self.hdr_wic_yuv444_color_match_gpu_mode_combo.findData(
+                self._normalize_wic_color_match_gpu_mode_value(self.cfg.hdr_wic_yuv444_color_match_gpu_mode)
+            )
+            self.hdr_wic_yuv444_color_match_gpu_mode_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        if hasattr(self, "hdr_wic_yuv444_color_match_gpu_auto_min_pixels_spin"):
+            self.hdr_wic_yuv444_color_match_gpu_auto_min_pixels_spin.setValue(
+                self._normalize_wic_color_match_gpu_auto_min_pixels_value(
+                    self.cfg.hdr_wic_yuv444_color_match_gpu_auto_min_pixels
+                )
             )
         self.cfg.hdr_wic_yuv444_guide_cleanup = bool(
             s.value(
