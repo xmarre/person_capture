@@ -7456,6 +7456,49 @@ class Processor(QtCore.QObject):
             pure_red = (r >= 240) & (b <= 16) & (g <= 16)
             pure_magenta = (r >= 220) & (b >= 220) & (g <= 32)
             saturated_chroma = ((max_ch - min_ch) >= 80) & (max_ch >= 80)
+
+            # Shadow-blob diagnostics.  These are not used for repair; they make
+            # the diagnostic output capable of distinguishing isolated saturated
+            # speckles from the broader dark-gradient luma/chroma crawl seen in
+            # WIC-rendered AVIF stills.
+            ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+            yy = ycrcb[:, :, 0].astype(np.float32, copy=False)
+            cr = ycrcb[:, :, 1].astype(np.float32, copy=False)
+            cb = ycrcb[:, :, 2].astype(np.float32, copy=False)
+            yy_med9 = cv2.medianBlur(ycrcb[:, :, 0], 9).astype(np.float32, copy=False)
+            yy_med17 = cv2.medianBlur(ycrcb[:, :, 0], 17).astype(np.float32, copy=False)
+            cr_med17 = cv2.medianBlur(ycrcb[:, :, 1], 17).astype(np.float32, copy=False)
+            cb_med17 = cv2.medianBlur(ycrcb[:, :, 2], 17).astype(np.float32, copy=False)
+            shadow = (yy <= 112.0) & (yy_med9 <= 104.0) & (max_ch <= 150)
+            luma_rough = np.abs(yy - yy_med17)
+            chroma_rough = np.maximum(np.abs(cr - cr_med17), np.abs(cb - cb_med17))
+            green_shadow = shadow & ((g - np.maximum(r, b)) >= 4)
+            blue_shadow = shadow & ((b - np.maximum(r, g)) >= 8)
+            red_shadow = shadow & ((r - np.maximum(b, g)) >= 8)
+            shadow_stats: dict = {"count": int(np.count_nonzero(shadow))}
+            if shadow_stats["count"] > 0:
+                shadow_stats.update({
+                    "y": self._array_stats(yy[shadow]),
+                    "luma_rough": self._array_stats(luma_rough[shadow]),
+                    "chroma_rough": self._array_stats(chroma_rough[shadow]),
+                    "luma_rough_gt_2": int(np.count_nonzero(luma_rough[shadow] > 2.0)),
+                    "luma_rough_gt_4": int(np.count_nonzero(luma_rough[shadow] > 4.0)),
+                    "luma_rough_gt_8": int(np.count_nonzero(luma_rough[shadow] > 8.0)),
+                    "chroma_rough_gt_4": int(np.count_nonzero(chroma_rough[shadow] > 4.0)),
+                    "chroma_rough_gt_8": int(np.count_nonzero(chroma_rough[shadow] > 8.0)),
+                    "chroma_rough_gt_16": int(np.count_nonzero(chroma_rough[shadow] > 16.0)),
+                    "green_shadow_excess_4": int(np.count_nonzero(green_shadow)),
+                    "blue_shadow_excess_8": int(np.count_nonzero(blue_shadow)),
+                    "red_shadow_excess_8": int(np.count_nonzero(red_shadow)),
+                })
+                shadow_stats["blob_score"] = int(
+                    shadow_stats["luma_rough_gt_4"]
+                    + shadow_stats["chroma_rough_gt_8"]
+                    + shadow_stats["green_shadow_excess_4"]
+                    + shadow_stats["blue_shadow_excess_8"]
+                    + shadow_stats["red_shadow_excess_8"]
+                )
+
             info.update({
                 "shape": [int(v) for v in img.shape],
                 "blue_excess_30": int(np.count_nonzero(blue_excess_30)),
@@ -7469,6 +7512,7 @@ class Processor(QtCore.QObject):
                 "pure_red": int(np.count_nonzero(pure_red)),
                 "pure_magenta": int(np.count_nonzero(pure_magenta)),
                 "saturated_chroma": int(np.count_nonzero(saturated_chroma)),
+                "shadow": shadow_stats,
             })
         except Exception as exc:
             info["error"] = f"{type(exc).__name__}:{exc}"
@@ -7601,7 +7645,18 @@ class Processor(QtCore.QObject):
             self._status(f"HDR speckle diagnostics failed: {type(exc).__name__}: {exc}", key="hdr_speckle_diag", interval=5.0)
 
     def _run_hdr_speckle_diagnostics(self, ffmpeg_bin: str, frame_idx: int, frame_pts_sec: Optional[float], crop_xyxy: tuple[int, int, int, int], saved_path: str) -> None:
-        """Export controlled sibling artifacts for one HDR crop."""
+        """Export controlled sibling artifacts for one HDR crop.
+
+        This diagnostic deliberately writes competing intermediates instead of
+        applying another cleanup pass.  Its purpose is to identify which boundary
+        first creates the visible shadow artifacts:
+
+        - source decode/crop
+        - AVIF lossless still encoding/decoding
+        - limited->full range expansion for the Windows/WIC handoff
+        - Windows WIC HDR AVIF rendering
+        - the post-WIC repair path
+        """
         x1, y1, x2, y2 = [int(v) for v in crop_xyxy]
         w = max(1, x2 - x1)
         h = max(1, y2 - y1)
@@ -7614,7 +7669,7 @@ class Processor(QtCore.QObject):
             pts_tag = "badpts"
         diag_dir = root / f"{saved.stem}_f{int(frame_idx)}_t{pts_tag}_{int(time.time())}"
         diag_dir.mkdir(parents=True, exist_ok=True)
-        self._status(f"HDR speckle diagnostics writing: {diag_dir}", key="hdr_speckle_diag", interval=0.0)
+        self._status(f"HDR root diagnostics writing: {diag_dir}", key="hdr_speckle_diag", interval=0.0)
 
         seek_sec: Optional[float] = None
         try:
@@ -7627,98 +7682,242 @@ class Processor(QtCore.QObject):
             if fps > 0 and math.isfinite(fps):
                 seek_sec = max(0.0, float(frame_idx) / fps)
         pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(seek_sec)
-        src_vf = ("setparams=color_trc=smpte2084:color_primaries=bt2020:" f"colorspace=bt2020nc:range=limited,crop={w}:{h}:{x1}:{y1},format=yuv420p10le")
+
+        src_range = self._hdr_source_range()
+        src_range_known = src_range in {"limited", "full"}
+        src_range_setparams = src_range if src_range_known else "limited"
+        crop_filter = f"crop={w}:{h}:{x1}:{y1}"
+        src_tag = (
+            "setparams=color_trc=smpte2084:color_primaries=bt2020:"
+            f"colorspace=bt2020nc:range={src_range_setparams}"
+        )
+        src_crop_vf = f"{src_tag},{crop_filter}"
+        src_raw_vf = f"{src_crop_vf},format=yuv420p10le"
+
+        def _full_range_vf(pix_fmt: str) -> str:
+            vf = src_crop_vf
+            if src_range_setparams == "limited":
+                vf = f"{vf},zscale=rangein=limited:range=full"
+            return (
+                f"{vf},format={pix_fmt},"
+                "setparams=color_trc=smpte2084:color_primaries=bt2020:"
+                "colorspace=bt2020nc:range=full"
+            )
+
+        def _limited_range_vf(pix_fmt: str) -> str:
+            return (
+                f"{src_crop_vf},format={pix_fmt},"
+                "setparams=color_trc=smpte2084:color_primaries=bt2020:"
+                "colorspace=bt2020nc:range=limited"
+            )
+
         base = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"] + pre_seek_args + ["-i", self.cfg.video, "-map", "0:v:0", "-frames:v", "1"]
 
-        source_raw = diag_dir / "01_source_crop.yuv420p10le.raw"
-        source_mkv = diag_dir / "02_source_crop_ffv1.mkv"
-        source_avif = diag_dir / "03_source_crop_libaom_lossless.avif"
-        avif_raw = diag_dir / "04_avif_decoded.yuv420p10le.raw"
-        mkv_raw = diag_dir / "05_ffv1_decoded.yuv420p10le.raw"
-        source_sdr = diag_dir / "06_source_ffmpeg_sdr.png"
-        wic_from_avif = diag_dir / "07_wic_from_libaom_avif.png"
+        def _avif_encode_cmd(vf: str, pix_fmt: str, color_range_flag: str, out_path: Path) -> list[str]:
+            cmd = base + [
+                "-vf", f"{seek_filter}{vf}",
+                "-an", "-sn", "-dn",
+                "-c:v", "libaom-av1",
+                "-still-picture", "1",
+                "-pix_fmt", pix_fmt,
+                "-g", "1",
+                "-tile-columns", "0",
+                "-tile-rows", "0",
+                "-row-mt", "1",
+                "-cpu-used", "5",
+                "-lossless", "1",
+                "-crf", "0",
+                "-b:v", "0",
+                "-aq-mode", "0",
+                "-color_range", color_range_flag,
+                "-colorspace", "bt2020nc",
+                "-color_primaries", "bt2020",
+                "-color_trc", "smpte2084",
+            ]
+            if pix_fmt == "yuv420p10le":
+                cmd += ["-chroma_sample_location", "left"]
+            cmd.append(str(out_path))
+            return cmd
+
+        def _decode_to_yuv420_cmd(in_path: Path, out_path: Path) -> list[str]:
+            return [
+                ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(in_path),
+                "-map", "0:v:0",
+                "-vf", "format=yuv420p10le",
+                "-frames:v", "1",
+                "-f", "rawvideo",
+                "-pix_fmt", "yuv420p10le",
+                str(out_path),
+            ]
+
+        def _render_wic_no_repair(name: str, in_path: Path, out_path: Path, commands: list[dict]) -> None:
+            if sys.platform == "win32" and in_path.exists():
+                ok_wic, why_wic = self._save_wic_png_from_hdr_image(str(in_path), str(out_path), repair=False)
+                commands.append({"name": name, "ok": bool(ok_wic), "why": str(why_wic), "output": str(out_path)})
+            else:
+                commands.append({"name": name, "ok": False, "why": "skipped_not_windows_or_input_missing", "output": str(out_path)})
+
+        source_raw = diag_dir / "01_source_crop_input_range.yuv420p10le.raw"
+        source_mkv = diag_dir / "02_source_crop_input_range_ffv1.mkv"
+        mkv_raw = diag_dir / "03_ffv1_decoded_input_range.yuv420p10le.raw"
+        actual_wic_avif = diag_dir / "04_actual_wic_temp_current_path.avif"
+        actual_wic_raw = diag_dir / "05_actual_wic_temp_decoded.yuv420p10le.raw"
+        actual_wic_png = diag_dir / "06_wic_from_actual_temp_no_repair.png"
+        ffmpeg_sdr = diag_dir / "07_direct_ffmpeg_sdr.png"
+        limited_avif = diag_dir / "08_limited_yuv420_wic_candidate.avif"
+        limited_raw = diag_dir / "09_limited_yuv420_decoded.yuv420p10le.raw"
+        limited_wic_png = diag_dir / "10_wic_from_limited_yuv420_no_repair.png"
+        full_avif = diag_dir / "11_fullrange_yuv420_wic_candidate.avif"
+        full_raw = diag_dir / "12_fullrange_yuv420_decoded.yuv420p10le.raw"
+        full_wic_png = diag_dir / "13_wic_from_fullrange_yuv420_no_repair.png"
+        full444_avif = diag_dir / "14_fullrange_yuv444_wic_candidate.avif"
+        full444_raw = diag_dir / "15_fullrange_yuv444_decoded_to_yuv420.yuv420p10le.raw"
+        full444_wic_png = diag_dir / "16_wic_from_fullrange_yuv444_no_repair.png"
 
         commands: list[dict] = []
-        commands.append(self._run_hdr_diag_cmd("01_source_raw", base + ["-vf", f"{seek_filter}{src_vf}", "-f", "rawvideo", "-pix_fmt", "yuv420p10le", str(source_raw)], diag_dir, timeout_sec))
-        commands.append(self._run_hdr_diag_cmd("02_source_ffv1", base + ["-vf", f"{seek_filter}{src_vf}", "-an", "-sn", "-dn", "-c:v", "ffv1", "-level", "3", "-g", "1", "-pix_fmt", "yuv420p10le", "-color_range", "1", "-colorspace", "bt2020nc", "-color_primaries", "bt2020", "-color_trc", "smpte2084", str(source_mkv)], diag_dir, timeout_sec))
-        commands.append(self._run_hdr_diag_cmd("03_source_avif_libaom_lossless", base + ["-vf", f"{seek_filter}{src_vf}", "-an", "-sn", "-dn", "-c:v", "libaom-av1", "-still-picture", "1", "-pix_fmt", "yuv420p10le", "-g", "1", "-tile-columns", "0", "-tile-rows", "0", "-row-mt", "1", "-cpu-used", "5", "-lossless", "1", "-crf", "0", "-b:v", "0", "-aq-mode", "0", "-color_range", "1", "-colorspace", "bt2020nc", "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-chroma_sample_location", "left", str(source_avif)], diag_dir, timeout_sec))
-        if source_avif.exists():
-            commands.append(self._run_hdr_diag_cmd("04_decode_avif_raw", [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source_avif), "-map", "0:v:0", "-vf", "format=yuv420p10le", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv420p10le", str(avif_raw)], diag_dir, timeout_sec))
+        commands.append(self._run_hdr_diag_cmd("01_source_raw_input_range", base + ["-vf", f"{seek_filter}{src_raw_vf}", "-f", "rawvideo", "-pix_fmt", "yuv420p10le", str(source_raw)], diag_dir, timeout_sec))
+        commands.append(self._run_hdr_diag_cmd("02_source_ffv1_input_range", base + ["-vf", f"{seek_filter}{src_raw_vf}", "-an", "-sn", "-dn", "-c:v", "ffv1", "-level", "3", "-g", "1", "-pix_fmt", "yuv420p10le", "-color_range", "2" if src_range_setparams == "full" else "1", "-colorspace", "bt2020nc", "-color_primaries", "bt2020", "-color_trc", "smpte2084", str(source_mkv)], diag_dir, timeout_sec))
         if source_mkv.exists():
-            commands.append(self._run_hdr_diag_cmd("05_decode_ffv1_raw", [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source_mkv), "-map", "0:v:0", "-vf", "format=yuv420p10le", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv420p10le", str(mkv_raw)], diag_dir, timeout_sec))
+            commands.append(self._run_hdr_diag_cmd("03_decode_ffv1_input_range", _decode_to_yuv420_cmd(source_mkv, mkv_raw), diag_dir, timeout_sec))
 
-        for i, cmd in enumerate(self._hdr_tonemap_filter_cmds(ffmpeg_bin, frame_idx, frame_pts_sec, crop_xyxy, str(source_sdr))):
-            rec = self._run_hdr_diag_cmd(f"06_source_ffmpeg_sdr_try{i + 1}", cmd, diag_dir, timeout_sec)
+        ok_actual, why_actual = self._save_hdr_wic_intermediate_avif(frame_idx, frame_pts_sec, crop_xyxy, str(actual_wic_avif))
+        commands.append({"name": "04_actual_wic_temp_current_path", "ok": bool(ok_actual), "why": str(why_actual), "output": str(actual_wic_avif), "source": "_save_hdr_wic_intermediate_avif"})
+        if actual_wic_avif.exists():
+            commands.append(self._run_hdr_diag_cmd("05_decode_actual_wic_temp", _decode_to_yuv420_cmd(actual_wic_avif, actual_wic_raw), diag_dir, timeout_sec))
+        _render_wic_no_repair("06_wic_from_actual_temp_no_repair", actual_wic_avif, actual_wic_png, commands)
+
+        for i, cmd in enumerate(self._hdr_tonemap_filter_cmds(ffmpeg_bin, frame_idx, frame_pts_sec, crop_xyxy, str(ffmpeg_sdr))):
+            rec = self._run_hdr_diag_cmd(f"07_direct_ffmpeg_sdr_try{i + 1}", cmd, diag_dir, timeout_sec)
             commands.append(rec)
-            if rec.get("ok") and source_sdr.exists() and source_sdr.stat().st_size > 0:
+            if rec.get("ok") and ffmpeg_sdr.exists() and ffmpeg_sdr.stat().st_size > 0:
                 break
 
-        if sys.platform == "win32" and source_avif.exists():
-            ok_wic, why_wic = self._save_wic_png_from_hdr_image(str(source_avif), str(wic_from_avif), repair=False)
-            commands.append({"name": "07_wic_from_libaom_avif", "ok": bool(ok_wic), "why": str(why_wic), "output": str(wic_from_avif)})
-        else:
-            commands.append({"name": "07_wic_from_libaom_avif", "ok": False, "why": "skipped_not_windows_or_avif_missing", "output": str(wic_from_avif)})
+        commands.append(self._run_hdr_diag_cmd("08_encode_limited_yuv420_candidate", _avif_encode_cmd(_limited_range_vf("yuv420p10le"), "yuv420p10le", "1", limited_avif), diag_dir, timeout_sec))
+        if limited_avif.exists():
+            commands.append(self._run_hdr_diag_cmd("09_decode_limited_yuv420_candidate", _decode_to_yuv420_cmd(limited_avif, limited_raw), diag_dir, timeout_sec))
+        _render_wic_no_repair("10_wic_from_limited_yuv420_no_repair", limited_avif, limited_wic_png, commands)
+
+        commands.append(self._run_hdr_diag_cmd("11_encode_fullrange_yuv420_candidate", _avif_encode_cmd(_full_range_vf("yuv420p10le"), "yuv420p10le", "2", full_avif), diag_dir, timeout_sec))
+        if full_avif.exists():
+            commands.append(self._run_hdr_diag_cmd("12_decode_fullrange_yuv420_candidate", _decode_to_yuv420_cmd(full_avif, full_raw), diag_dir, timeout_sec))
+        _render_wic_no_repair("13_wic_from_fullrange_yuv420_no_repair", full_avif, full_wic_png, commands)
+
+        commands.append(self._run_hdr_diag_cmd("14_encode_fullrange_yuv444_candidate", _avif_encode_cmd(_full_range_vf("yuv444p10le"), "yuv444p10le", "2", full444_avif), diag_dir, timeout_sec))
+        if full444_avif.exists():
+            commands.append(self._run_hdr_diag_cmd("15_decode_fullrange_yuv444_candidate_to_yuv420", _decode_to_yuv420_cmd(full444_avif, full444_raw), diag_dir, timeout_sec))
+        _render_wic_no_repair("16_wic_from_fullrange_yuv444_no_repair", full444_avif, full444_wic_png, commands)
 
         raw_compare = {
-            "source_vs_avif_decode": self._compare_yuv420p10le(source_raw, avif_raw, w, h),
             "source_vs_ffv1_decode": self._compare_yuv420p10le(source_raw, mkv_raw, w, h),
+            "source_vs_actual_wic_temp_decode": self._compare_yuv420p10le(source_raw, actual_wic_raw, w, h),
+            "source_vs_limited_yuv420_decode": self._compare_yuv420p10le(source_raw, limited_raw, w, h),
+            "source_vs_fullrange_yuv420_decode": self._compare_yuv420p10le(source_raw, full_raw, w, h),
+            "source_vs_fullrange_yuv444_decode_to_yuv420": self._compare_yuv420p10le(source_raw, full444_raw, w, h),
         }
         rgb_stats = {
-            "saved_primary": self._write_png_speckle_stats(saved),
-            "source_ffmpeg_sdr_png": self._write_png_speckle_stats(source_sdr),
-            "wic_from_libaom_avif_png": self._write_png_speckle_stats(wic_from_avif),
+            "saved_primary_after_repair": self._write_png_speckle_stats(saved),
+            "direct_ffmpeg_sdr_png": self._write_png_speckle_stats(ffmpeg_sdr),
+            "wic_actual_temp_no_repair_png": self._write_png_speckle_stats(actual_wic_png),
+            "wic_limited_yuv420_no_repair_png": self._write_png_speckle_stats(limited_wic_png),
+            "wic_fullrange_yuv420_no_repair_png": self._write_png_speckle_stats(full_wic_png),
+            "wic_fullrange_yuv444_no_repair_png": self._write_png_speckle_stats(full444_wic_png),
         }
         raw_stats = {
-            "source_raw": self._write_yuv420p10le_stats(source_raw, w, h),
-            "avif_decoded_raw": self._write_yuv420p10le_stats(avif_raw, w, h),
-            "ffv1_decoded_raw": self._write_yuv420p10le_stats(mkv_raw, w, h),
+            "source_raw_input_range": self._write_yuv420p10le_stats(source_raw, w, h),
+            "ffv1_decoded_input_range": self._write_yuv420p10le_stats(mkv_raw, w, h),
+            "actual_wic_temp_decoded": self._write_yuv420p10le_stats(actual_wic_raw, w, h),
+            "limited_yuv420_decoded": self._write_yuv420p10le_stats(limited_raw, w, h),
+            "fullrange_yuv420_decoded": self._write_yuv420p10le_stats(full_raw, w, h),
+            "fullrange_yuv444_decoded_to_yuv420": self._write_yuv420p10le_stats(full444_raw, w, h),
         }
+
+        def _blob_score(name: str) -> int:
+            try:
+                return int((rgb_stats.get(name, {}).get("shadow", {}) or {}).get("blob_score", 0) or 0)
+            except Exception:
+                return 0
+
+        def _speckle_score(name: str) -> int:
+            try:
+                st = rgb_stats.get(name, {}) or {}
+                return int(
+                    int(st.get("blue_excess_50", 0) or 0)
+                    + int(st.get("cyan_excess_40", 0) or 0)
+                    + int(st.get("red_excess_50", 0) or 0)
+                    + int(st.get("magenta_excess_50", 0) or 0)
+                )
+            except Exception:
+                return 0
 
         interpretation: list[str] = []
         try:
-            avif_cmp = raw_compare.get("source_vs_avif_decode", {}).get("planes", {})
-            avif_near_lossless = bool(avif_cmp) and all(int(v.get("max_abs", 999999)) <= 1 for v in avif_cmp.values())
-            if avif_near_lossless:
-                interpretation.append("AVIF decode is within 1 code value of source raw YUV; visible speckles after WIC/browser decode are not from lossy AV1 quantization.")
-            elif avif_cmp:
-                interpretation.append("AVIF decoded raw differs from source raw; inspect source_vs_avif_decode before blaming WIC/display conversion.")
-            wic_blue = int(rgb_stats.get("wic_from_libaom_avif_png", {}).get("blue_excess_50", 0) or 0)
-            ff_blue = int(rgb_stats.get("source_ffmpeg_sdr_png", {}).get("blue_excess_50", 0) or 0)
-            wic_cyan_40 = int(rgb_stats.get("wic_from_libaom_avif_png", {}).get("cyan_excess_40", 0) or 0)
-            ff_cyan_40 = int(rgb_stats.get("source_ffmpeg_sdr_png", {}).get("cyan_excess_40", 0) or 0)
-            wic_cyan_60 = int(rgb_stats.get("wic_from_libaom_avif_png", {}).get("cyan_excess_60", 0) or 0)
-            ff_cyan_60 = int(rgb_stats.get("source_ffmpeg_sdr_png", {}).get("cyan_excess_60", 0) or 0)
-            wic_blue_or_cyan = max(wic_blue, wic_cyan_40, wic_cyan_60)
-            ff_blue_or_cyan = max(ff_blue, ff_cyan_40, ff_cyan_60)
-            if wic_blue_or_cyan > 0 and ff_blue_or_cyan == 0:
-                interpretation.append("WIC-from-AVIF has blue/turquoise excess pixels while direct FFmpeg SDR does not; first visible failure is the AVIF/WIC HDR rendering-conversion boundary.")
-            elif wic_blue_or_cyan > 0 and ff_blue_or_cyan > 0:
-                interpretation.append("Both WIC-from-AVIF and direct FFmpeg SDR show blue/turquoise excess pixels; inspect source raw dark chroma stats and source frame before isolating WIC.")
-            elif wic_blue_or_cyan == 0 and ff_blue_or_cyan > 0:
-                interpretation.append("Direct FFmpeg SDR has blue/turquoise excess pixels but WIC-from-AVIF does not; first visible failure is in the FFmpeg SDR tonemap path.")
+            ff_blob = _blob_score("direct_ffmpeg_sdr_png")
+            actual_blob = _blob_score("wic_actual_temp_no_repair_png")
+            lim_blob = _blob_score("wic_limited_yuv420_no_repair_png")
+            full_blob = _blob_score("wic_fullrange_yuv420_no_repair_png")
+            full444_blob = _blob_score("wic_fullrange_yuv444_no_repair_png")
+            actual_speck = _speckle_score("wic_actual_temp_no_repair_png")
+            ff_speck = _speckle_score("direct_ffmpeg_sdr_png")
+            if actual_blob > max(ff_blob * 2, ff_blob + 1000):
+                interpretation.append("Shadow blob score is much higher after WIC rendering than after direct FFmpeg SDR render; the visible blob class is introduced or amplified at the Windows WIC HDR still-render boundary, not by the final PNG encoder.")
+            elif ff_blob > 0 and actual_blob > 0:
+                interpretation.append("Both direct FFmpeg SDR and WIC render show shadow blob score; inspect source raw dark chroma/luma stats before treating this as WIC-only.")
+            if actual_speck > 0 and ff_speck == 0:
+                interpretation.append("Saturated red/blue/cyan/magenta speckles appear in WIC output but not direct FFmpeg SDR; the speckle class is introduced at the WIC HDR still-render boundary.")
+            if lim_blob and full_blob and abs(full_blob - lim_blob) > max(1000, int(0.25 * max(lim_blob, full_blob))):
+                interpretation.append("Limited-range and full-range yuv420 WIC candidates differ materially in shadow blob score; range expansion/signaling is part of the failure boundary.")
+            if full_blob and full444_blob and abs(full444_blob - full_blob) > max(1000, int(0.25 * max(full_blob, full444_blob))):
+                interpretation.append("yuv420 and yuv444 WIC candidates differ materially in shadow blob score; Windows AVIF chroma reconstruction/path selection is part of the failure boundary.")
+            cmp_actual = raw_compare.get("source_vs_actual_wic_temp_decode", {}).get("planes", {})
+            if cmp_actual:
+                near_lossless_actual = all(int(v.get("max_abs", 999999)) <= 1 for v in cmp_actual.values())
+                if near_lossless_actual:
+                    interpretation.append("Actual WIC temp AVIF decodes within one YUV code value of source raw; lossy AV1 quantization is not the root cause.")
+                else:
+                    interpretation.append("Actual WIC temp AVIF decoded raw differs from source raw. If this is the full-range candidate, expected range expansion can explain large deltas; compare limited_yuv420 separately before blaming libaom lossless coding.")
         except Exception as exc:
             interpretation.append(f"interpretation_failed:{type(exc).__name__}:{exc}")
 
         summary = {
-            "version": 1,
-            "purpose": "HDR blue/red/magenta speckle boundary diagnostic; no repair or quality-changing filter is applied by this diagnostic.",
+            "version": 2,
+            "purpose": "HDR shadow/speckle root-boundary diagnostic. It writes comparison artifacts and stats; it does not repair or tune the saved crop.",
             "source_video": str(getattr(self.cfg, "video", "")),
             "saved_path": str(saved),
             "frame_idx": int(frame_idx),
             "frame_pts_sec": None if frame_pts_sec is None else float(frame_pts_sec),
             "seek_sec_used": seek_sec,
+            "source_range_detected": src_range or "unknown_assumed_limited",
             "crop_xyxy": [int(x1), int(y1), int(x2), int(y2)],
             "crop_size": [int(w), int(h)],
             "ffmpeg_bin": str(ffmpeg_bin),
             "commands": commands,
-            "outputs": {"saved_primary": str(saved), "source_raw": str(source_raw), "source_ffv1": str(source_mkv), "source_avif_libaom_lossless": str(source_avif), "avif_decoded_raw": str(avif_raw), "ffv1_decoded_raw": str(mkv_raw), "source_ffmpeg_sdr_png": str(source_sdr), "wic_from_libaom_avif_png": str(wic_from_avif)},
+            "outputs": {
+                "saved_primary_after_repair": str(saved),
+                "source_raw_input_range": str(source_raw),
+                "source_ffv1_input_range": str(source_mkv),
+                "ffv1_decoded_input_range": str(mkv_raw),
+                "actual_wic_temp_current_path": str(actual_wic_avif),
+                "actual_wic_temp_decoded": str(actual_wic_raw),
+                "wic_from_actual_temp_no_repair": str(actual_wic_png),
+                "direct_ffmpeg_sdr_png": str(ffmpeg_sdr),
+                "limited_yuv420_wic_candidate": str(limited_avif),
+                "limited_yuv420_decoded": str(limited_raw),
+                "wic_from_limited_yuv420_no_repair": str(limited_wic_png),
+                "fullrange_yuv420_wic_candidate": str(full_avif),
+                "fullrange_yuv420_decoded": str(full_raw),
+                "wic_from_fullrange_yuv420_no_repair": str(full_wic_png),
+                "fullrange_yuv444_wic_candidate": str(full444_avif),
+                "fullrange_yuv444_decoded_to_yuv420": str(full444_raw),
+                "wic_from_fullrange_yuv444_no_repair": str(full444_wic_png),
+            },
             "raw_stats": raw_stats,
             "raw_compare": raw_compare,
             "rgb_stats": rgb_stats,
             "interpretation": interpretation,
         }
         (diag_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
-        self._status(f"HDR speckle diagnostics done: {diag_dir}", key="hdr_speckle_diag", interval=0.0)
+        self._status(f"HDR root diagnostics done: {diag_dir}", key="hdr_speckle_diag", interval=0.0)
 
     def _stabilize_wic_dark_chroma_blotches(self, img: np.ndarray) -> tuple[bool, int]:
         """Suppress WIC-only shadow blotches without changing the HDR/WIC tone map.
