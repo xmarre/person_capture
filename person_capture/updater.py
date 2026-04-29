@@ -715,7 +715,8 @@ class UpdateManager(QtCore.QObject if QtCore else object):
                 # path 1: git
                 if is_git_checkout(self.repo):
                     if not is_git_repo(self.repo):
-                        s.setValue("update_last_check_t", _now()); s.sync()
+                        s.setValue("update_last_check_t", _now())
+                        s.sync()
                         self.info.emit("Update check skipped: git checkout detected but git executable is unavailable.")
                         return
                     need, local, remote = _git_need_updates(self.repo)
