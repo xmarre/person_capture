@@ -475,6 +475,7 @@ class SessionConfig:
     compose_crop_enable: bool = True             # compose final dataset crop from identity boxes
     compose_detect_person_for_face: bool = True  # associate global face hits with YOLO person boxes
     compose_close_face_h_frac: float = 0.34      # target face_h / crop_h for close/head crops
+    compose_portrait_close_face_h_frac: float = 0.43  # target face_h / crop_h for medium-close portrait crops
     compose_upper_face_h_frac: float = 0.22      # target face_h / crop_h for portrait/upper-body crops
     compose_body_face_h_frac: float = 0.085      # target face_h / crop_h for full-body crops
     compose_landscape_face_penalty: float = 5.0  # discourage landscape crops for prominent faces
@@ -2340,6 +2341,7 @@ class Processor(QtCore.QObject):
         def _ratio_list_for_profile(profile: str) -> list[str]:
             preferred = {
                 "close": ["1:1", "2:3", "3:4"],
+                "portrait_close": ["2:3", "3:4", "1:1"],
                 "upper": ["2:3", "3:4", "1:1"],
                 "body": ["2:3", "3:4", "1:1", "3:2"],
                 "base": ["1:1", "2:3"],
@@ -2424,6 +2426,29 @@ class Processor(QtCore.QObject):
             ) or (hx1, hy1, hx2, max(hy2, fy2 + 0.85 * face_h))
             profiles.append(("close", close_protect, close_target, (fcx, fcy + 0.70 * face_h), (fw * 2.0, face_h / close_target)))
 
+            # Medium-close portrait framing. This fills the missing range between
+            # tight square close-ups and loose upper-body crops.
+            portrait_target = max(
+                0.34,
+                min(0.48, float(cfg.compose_portrait_close_face_h_frac)),
+            )
+            portrait_protect = self._pad_box_xyxy(
+                (hx1, hy1, hx2, max(hy2, fy2 + 1.45 * face_h)),
+                pad_x=0.18 * fw,
+                pad_y_top=0.00,
+                pad_y_bottom=0.35 * face_h,
+                bounds_xyxy=bounds,
+            ) or (hx1, hy1, hx2, max(hy2, fy2 + 1.45 * face_h))
+            profiles.append(
+                (
+                    "portrait_close",
+                    portrait_protect,
+                    portrait_target,
+                    (fcx, fcy + 1.05 * face_h),
+                    (fw * 2.05, face_h / portrait_target),
+                )
+            )
+
             if subj is not None:
                 sx1, sy1, sx2, sy2 = subj
                 sw = max(1.0, sx2 - sx1)
@@ -2485,7 +2510,7 @@ class Processor(QtCore.QObject):
                 except Exception:
                     continue
                 is_landscape = aspect > 1.05
-                if profile in {"close", "upper", "base"} and is_landscape:
+                if profile in {"close", "portrait_close", "upper", "base"} and is_landscape:
                     continue
                 if profile == "body" and is_landscape:
                     # Landscape is a rare context/body sample, not a normal face
@@ -2530,6 +2555,21 @@ class Processor(QtCore.QObject):
                 if profile == "close":
                     profile_prior = 0.00
                     ratio_prior += 0.00 if rs == "1:1" else 0.08
+                elif profile == "portrait_close":
+                    # Prefer medium-close faces, but keep this from stealing very
+                    # small/far faces or extreme close-ups.
+                    if face is not None and 0.14 <= face_frame_frac <= 0.34:
+                        profile_prior = -0.16
+                    else:
+                        profile_prior = 0.20
+                    if rs == "2:3":
+                        ratio_prior -= 0.06
+                    elif rs == "3:4":
+                        ratio_prior += 0.02
+                    elif rs == "1:1":
+                        ratio_prior += 0.42
+                    else:
+                        ratio_prior += 0.22
                 elif profile == "upper":
                     profile_prior = 0.12
                     ratio_prior += 0.00 if rs == "2:3" else 0.06
@@ -2568,6 +2608,8 @@ class Processor(QtCore.QObject):
                     face_loss = abs(actual_face_h_frac - max(1e-6, target_face_h_frac))
                     if profile == "close" and face_frame_frac < small_face_frame_frac:
                         profile_prior += close_small_face_penalty
+                    if profile == "portrait_close" and face_frame_frac < 0.14:
+                        profile_prior += 0.40
                     if profile == "upper" and face_frame_frac < small_face_frame_frac:
                         profile_prior -= upper_small_face_face_loss_nudge
                 else:
@@ -2578,13 +2620,18 @@ class Processor(QtCore.QObject):
                     area_penalty += 0.35
 
                 placement_penalty = 0.0
-                if face is not None and profile in {"close", "upper"}:
+                if face is not None and profile in {"close", "portrait_close", "upper"}:
                     fcx = 0.5 * (face[0] + face[2])
                     fcy = 0.5 * (face[1] + face[3])
                     rel_x = (fcx - cx1) / crop_w
                     rel_y = (fcy - cy1) / crop_h
                     placement_penalty += 0.25 * abs(rel_x - 0.50)
-                    target_y = 0.36 if profile == "close" else 0.28
+                    if profile == "close":
+                        target_y = 0.36
+                    elif profile == "portrait_close":
+                        target_y = 0.30
+                    else:
+                        target_y = 0.28
                     placement_penalty += 0.35 * abs(rel_y - target_y)
 
                 score = containment + profile_prior + ratio_prior + 2.2 * face_loss + area_penalty + placement_penalty
@@ -5088,6 +5135,7 @@ class Processor(QtCore.QObject):
                             "compose_crop_enable",
                             "compose_detect_person_for_face",
                             "compose_close_face_h_frac",
+                            "compose_portrait_close_face_h_frac",
                             "compose_upper_face_h_frac",
                             "compose_body_face_h_frac",
                             "compose_landscape_face_penalty",
@@ -6439,9 +6487,17 @@ class Processor(QtCore.QObject):
                                             fw2 = max(1.0, float(fixed[2] - fixed[0]))
                                             fh2 = max(1.0, float(fixed[3] - fixed[1]))
                                             face_h_frac2 = hfh / fh2
-                                            target_frac = 0.34 if fix_ratio == "1:1" else 0.24
+                                            if crop_profile_for_guard == "portrait_close":
+                                                target_frac = 0.43
+                                            elif fix_ratio == "1:1":
+                                                target_frac = 0.34
+                                            else:
+                                                target_frac = 0.24
                                             score = abs(face_h_frac2 - target_frac)
-                                            score += 0.02 if fix_ratio == "2:3" else (0.04 if fix_ratio == "3:4" else 0.0)
+                                            if crop_profile_for_guard == "portrait_close":
+                                                score += -0.03 if fix_ratio == "2:3" else (0.02 if fix_ratio == "3:4" else 0.08)
+                                            else:
+                                                score += 0.02 if fix_ratio == "2:3" else (0.04 if fix_ratio == "3:4" else 0.0)
                                             score += 0.04 * ((fw2 * fh2) / max(1.0, float((repair_bx2 - repair_bx1) * (repair_by2 - repair_by1))))
                                             if best_fix is None or score < best_fix[0]:
                                                 best_fix = (score, fixed, fix_ratio)
@@ -12241,6 +12297,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.compose_close_face_h_frac_spin = _mk_fspin(0.01, 1.0, 0.01, 3, "float: compose_close_face_h_frac")
         self.compose_close_face_h_frac_spin.setValue(float(self.cfg.compose_close_face_h_frac))
         self.compose_close_face_h_frac_spin.valueChanged.connect(self._on_ui_change)
+        self.compose_portrait_close_face_h_frac_spin = _mk_fspin(0.01, 1.0, 0.01, 3, "float: compose_portrait_close_face_h_frac")
+        self.compose_portrait_close_face_h_frac_spin.setValue(float(getattr(self.cfg, "compose_portrait_close_face_h_frac", 0.43)))
+        self.compose_portrait_close_face_h_frac_spin.valueChanged.connect(self._on_ui_change)
         self.compose_upper_face_h_frac_spin = _mk_fspin(0.01, 1.0, 0.01, 3, "float: compose_upper_face_h_frac")
         self.compose_upper_face_h_frac_spin.setValue(float(self.cfg.compose_upper_face_h_frac))
         self.compose_upper_face_h_frac_spin.valueChanged.connect(self._on_ui_change)
@@ -12421,6 +12480,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("compose_crop_enable", self.compose_crop_enable_check),
             ("compose_detect_person_for_face", self.compose_detect_person_for_face_check),
             ("compose_close_face_h_frac", self.compose_close_face_h_frac_spin),
+            ("compose_portrait_close_face_h_frac", self.compose_portrait_close_face_h_frac_spin),
             ("compose_upper_face_h_frac", self.compose_upper_face_h_frac_spin),
             ("compose_body_face_h_frac", self.compose_body_face_h_frac_spin),
             ("compose_landscape_face_penalty", self.compose_landscape_face_penalty_spin),
@@ -13704,6 +13764,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "compose_crop_enable",
             "compose_detect_person_for_face",
             "compose_close_face_h_frac",
+            "compose_portrait_close_face_h_frac",
             "compose_upper_face_h_frac",
             "compose_body_face_h_frac",
             "compose_landscape_face_penalty",
@@ -13891,6 +13952,7 @@ class MainWindow(QtWidgets.QMainWindow):
             compose_crop_enable=bool(self.compose_crop_enable_check.isChecked()) if hasattr(self, "compose_crop_enable_check") else bool(getattr(self.cfg, "compose_crop_enable", True)),
             compose_detect_person_for_face=bool(self.compose_detect_person_for_face_check.isChecked()) if hasattr(self, "compose_detect_person_for_face_check") else bool(getattr(self.cfg, "compose_detect_person_for_face", True)),
             compose_close_face_h_frac=float(self.compose_close_face_h_frac_spin.value()) if hasattr(self, "compose_close_face_h_frac_spin") else float(getattr(self.cfg, "compose_close_face_h_frac", 0.34)),
+            compose_portrait_close_face_h_frac=float(self.compose_portrait_close_face_h_frac_spin.value()) if hasattr(self, "compose_portrait_close_face_h_frac_spin") else float(getattr(self.cfg, "compose_portrait_close_face_h_frac", 0.43)),
             compose_upper_face_h_frac=float(self.compose_upper_face_h_frac_spin.value()) if hasattr(self, "compose_upper_face_h_frac_spin") else float(getattr(self.cfg, "compose_upper_face_h_frac", 0.22)),
             compose_body_face_h_frac=float(self.compose_body_face_h_frac_spin.value()) if hasattr(self, "compose_body_face_h_frac_spin") else float(getattr(self.cfg, "compose_body_face_h_frac", 0.085)),
             compose_landscape_face_penalty=float(self.compose_landscape_face_penalty_spin.value()) if hasattr(self, "compose_landscape_face_penalty_spin") else float(getattr(self.cfg, "compose_landscape_face_penalty", 5.0)),
@@ -14227,6 +14289,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.compose_close_face_h_frac = float(getattr(cfg, "compose_close_face_h_frac", 0.34))
         except Exception:
             self.cfg.compose_close_face_h_frac = 0.34
+        try:
+            self.cfg.compose_portrait_close_face_h_frac = float(getattr(cfg, "compose_portrait_close_face_h_frac", 0.43))
+        except Exception:
+            self.cfg.compose_portrait_close_face_h_frac = 0.43
         try:
             self.cfg.compose_upper_face_h_frac = float(getattr(cfg, "compose_upper_face_h_frac", 0.22))
         except Exception:
@@ -14661,6 +14727,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.compose_detect_person_for_face_check.setChecked(bool(cfg.compose_detect_person_for_face))
         if hasattr(self, 'compose_close_face_h_frac_spin'):
             self.compose_close_face_h_frac_spin.setValue(float(cfg.compose_close_face_h_frac))
+        if hasattr(self, 'compose_portrait_close_face_h_frac_spin'):
+            self.compose_portrait_close_face_h_frac_spin.setValue(float(cfg.compose_portrait_close_face_h_frac))
         if hasattr(self, 'compose_upper_face_h_frac_spin'):
             self.compose_upper_face_h_frac_spin.setValue(float(cfg.compose_upper_face_h_frac))
         if hasattr(self, 'compose_body_face_h_frac_spin'):
@@ -15960,6 +16028,12 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             self.cfg.compose_close_face_h_frac = 0.34
         try:
+            self.cfg.compose_portrait_close_face_h_frac = float(
+                s.value("compose_portrait_close_face_h_frac", getattr(self.cfg, "compose_portrait_close_face_h_frac", 0.43))
+            )
+        except Exception:
+            self.cfg.compose_portrait_close_face_h_frac = 0.43
+        try:
             self.cfg.compose_upper_face_h_frac = float(
                 s.value("compose_upper_face_h_frac", getattr(self.cfg, "compose_upper_face_h_frac", 0.22))
             )
@@ -16095,6 +16169,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'compose_close_face_h_frac_spin'):
             self.compose_close_face_h_frac_spin.setValue(
                 float(s.value("compose_close_face_h_frac", self.cfg.compose_close_face_h_frac))
+            )
+        if hasattr(self, 'compose_portrait_close_face_h_frac_spin'):
+            self.compose_portrait_close_face_h_frac_spin.setValue(
+                float(s.value("compose_portrait_close_face_h_frac", self.cfg.compose_portrait_close_face_h_frac))
             )
         if hasattr(self, 'compose_upper_face_h_frac_spin'):
             self.compose_upper_face_h_frac_spin.setValue(

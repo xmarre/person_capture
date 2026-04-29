@@ -98,6 +98,7 @@
   "compose_crop_enable": true,
   "compose_detect_person_for_face": true,
   "compose_close_face_h_frac": 0.34,
+  "compose_portrait_close_face_h_frac": 0.43,
   "compose_upper_face_h_frac": 0.22,
   "compose_body_face_h_frac": 0.085,
   "compose_landscape_face_penalty": 5.0,
