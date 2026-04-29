@@ -366,6 +366,11 @@ class SessionConfig:
     hdr_wic_yuv444_color_match_luma_strength: float = 0.45
     hdr_wic_yuv444_color_match_chroma_strength: float = 0.85
     hdr_wic_yuv444_color_match_lowfreq: float = 0.0
+    # Render only a reduced yuv420/full WIC reference for the color-match
+    # statistics pass. The final output still comes from the full-resolution
+    # clean yuv444 WIC render, so positive values reduce CPU work without
+    # softening the actual crop.
+    hdr_wic_yuv444_color_match_ref_max_side: int = 960
     # Older diagnostic cleanup that only used yuv444 as an artifact mask. It was
     # too conservative for broad shadow blobs, so keep it opt-in/fallback only.
     hdr_wic_yuv444_guide_cleanup: bool = False
@@ -384,6 +389,12 @@ class SessionConfig:
     lock_after_hits: int = 1
     lock_face_thresh: float = 0.28
     lock_reid_thresh: float = 0.30
+    # After a face match, probe only a padded ROI around the last matched face
+    # before falling back to the expensive whole-frame/person scan. This reduces
+    # false intermittent "No match" churn on stable shots and cuts detector work.
+    lock_face_roi_enable: bool = True
+    lock_face_roi_pad: float = 1.25
+    lock_face_roi_max_misses: int = 8
     score_margin: float = 0.03
     iou_gate: float = 0.05
     # --- HDR tonemap tuning ---
@@ -3564,6 +3575,8 @@ class Processor(QtCore.QObject):
         # Target lock state for faceless fallback
         self._lock_active: bool = False
         self._lock_last_bbox: Optional[Tuple[int, int, int, int]] = None  # x,y,w,h in frame coords
+        self._lock_last_face_box: Optional[Tuple[int, int, int, int]] = None  # x1,y1,x2,y2 in frame coords
+        self._lock_face_track_misses: int = 0
         self._lock_last_seen_idx: int = -10**9
         self._locked_reid_feat: Optional[np.ndarray] = None
         self._prev_gray: Optional[np.ndarray] = None
@@ -3600,11 +3613,40 @@ class Processor(QtCore.QObject):
         self._lock_last_bbox = (x, y, w, h)
         self._lock_last_seen_idx = int(frame_idx)
 
+    def _set_lock_face_box(self, face_box_xyxy: Optional[Tuple[int, int, int, int]]) -> None:
+        if face_box_xyxy is None:
+            return
+        try:
+            x1, y1, x2, y2 = [int(round(v)) for v in face_box_xyxy]
+        except Exception:
+            return
+        if x2 <= x1 or y2 <= y1:
+            return
+        self._lock_last_face_box = (x1, y1, x2, y2)
+        self._lock_face_track_misses = 0
+
     def _clear_lock(self):
         self._lock_active = False
         self._lock_last_bbox = None
+        self._lock_last_face_box = None
+        self._lock_face_track_misses = 0
         self._lock_last_seen_idx = -10**9
         self._locked_reid_feat = None
+
+    @staticmethod
+    def _expand_xyxy(
+        box_xyxy: Tuple[float, float, float, float],
+        pad_x: float,
+        pad_y: float,
+        frame_w: int,
+        frame_h: int,
+    ) -> Tuple[int, int, int, int]:
+        x1, y1, x2, y2 = [float(v) for v in box_xyxy]
+        ix1 = max(0, min(frame_w - 1, int(math.floor(x1 - pad_x))))
+        iy1 = max(0, min(frame_h - 1, int(math.floor(y1 - pad_y))))
+        ix2 = max(ix1 + 1, min(frame_w, int(math.ceil(x2 + pad_x))))
+        iy2 = max(iy1 + 1, min(frame_h, int(math.ceil(y2 + pad_y))))
+        return ix1, iy1, ix2, iy2
 
     def _iou_xywh(self, a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
         ax, ay, aw, ah = a
@@ -4918,6 +4960,7 @@ class Processor(QtCore.QObject):
                             "hdr_wic_yuv444_color_match_luma_strength",
                             "hdr_wic_yuv444_color_match_chroma_strength",
                             "hdr_wic_yuv444_color_match_lowfreq",
+                            "hdr_wic_yuv444_color_match_ref_max_side",
                             "hdr_wic_yuv444_guide_cleanup",
                             "hdr_speckle_diag",
                             "hdr_speckle_diag_dir",
@@ -5179,6 +5222,231 @@ class Processor(QtCore.QObject):
                     except (TypeError, ValueError):
                         fullframe_imgsz = None
 
+                quality_min = float(cfg.face_quality_min)
+                use_quality_vis = bool(cfg.face_visible_uses_quality)
+
+                lock_face_short_ok = (
+                    ref_face_feat is not None
+                    and face is not None
+                    and bool(getattr(cfg, "lock_face_roi_enable", True))
+                    and self._lock_last_face_box is not None
+                    and self._seek_cooldown_frames <= 0
+                )
+                if lock_face_short_ok:
+                    try:
+                        lock_roi_pad = max(0.0, float(getattr(cfg, "lock_face_roi_pad", 1.25)))
+                    except Exception:
+                        lock_roi_pad = 1.25
+                    try:
+                        lock_roi_max_misses = max(0, int(getattr(cfg, "lock_face_roi_max_misses", 8)))
+                    except Exception:
+                        lock_roi_max_misses = 8
+                    roi_faces = []
+                    ran_lock_roi = False
+                    try:
+                        lx1g, ly1g, lx2g, ly2g = self._lock_last_face_box
+                        lx1 = float(lx1g - off_x)
+                        ly1 = float(ly1g - off_y)
+                        lx2 = float(lx2g - off_x)
+                        ly2 = float(ly2g - off_y)
+                        if lx2 > 0.0 and ly2 > 0.0 and lx1 < float(W2) and ly1 < float(H2):
+                            fw = max(1.0, lx2 - lx1)
+                            fh = max(1.0, ly2 - ly1)
+                            rx1, ry1, rx2, ry2 = self._expand_xyxy(
+                                (lx1, ly1, lx2, ly2),
+                                max(16.0, fw * lock_roi_pad),
+                                max(16.0, fh * lock_roi_pad),
+                                W2,
+                                H2,
+                            )
+                            if rx2 > rx1 + 8 and ry2 > ry1 + 8:
+                                ran_lock_roi = True
+                                roi = frame_for_det[ry1:ry2, rx1:rx2]
+                                if roi.size > 0:
+                                    try:
+                                        roi_faces = face.extract(roi, imgsz=fullframe_imgsz)
+                                    except Exception:
+                                        roi_faces = []
+                            else:
+                                rx1 = ry1 = rx2 = ry2 = 0
+                        else:
+                            rx1 = ry1 = rx2 = ry2 = 0
+                    except Exception:
+                        rx1 = ry1 = rx2 = ry2 = 0
+                        roi_faces = []
+                        ran_lock_roi = False
+
+                    if roi_faces:
+                        tmp_faces_detected = len(roi_faces)
+                        tmp_faces_passing_quality = sum(
+                            1 for gf in roi_faces if float(gf.get("quality", 0.0)) >= quality_min
+                        )
+                        tmp_dists_all = []
+                        tmp_dists_quality = []
+                        faces_with_feat = [gf for gf in roi_faces if gf.get("feat") is not None]
+                        if ref_face_feat is not None and faces_with_feat:
+                            cand = faces_with_feat
+                            if use_quality_vis:
+                                cand = [
+                                    gf for gf in cand if float(gf.get("quality", 0.0)) >= quality_min
+                                ]
+                            gbest = min(
+                                cand or faces_with_feat,
+                                key=lambda f: self._fd_min(f["feat"], ref_face_feat),
+                            )
+                        else:
+                            gbest = FaceEmbedder.best_face(roi_faces)
+                        for gf in roi_faces:
+                            bbox = gf.get("bbox")
+                            if bbox is None or len(bbox) != 4:
+                                continue
+                            fx1, fy1, fx2, fy2 = [int(round(v)) for v in bbox]
+                            fx1 += rx1; fx2 += rx1; fy1 += ry1; fy2 += ry1
+                            fx1 = max(0, min(W2 - 1, fx1))
+                            fy1 = max(0, min(H2 - 1, fy1))
+                            fx2 = max(fx1 + 1, min(W2, int(round(fx2))))
+                            fy2 = max(fy1 + 1, min(H2, int(round(fy2))))
+                            q = float(gf.get("quality", 0.0))
+                            feat_vec = gf.get("feat")
+                            fd_val = None
+                            if feat_vec is not None and ref_face_feat is not None:
+                                fd_val = self._fd_min(feat_vec, ref_face_feat)
+                                tmp_dists_all.append(fd_val)
+                                if (not use_quality_vis) or q >= quality_min:
+                                    tmp_dists_quality.append(fd_val)
+                            face_debug_boxes.append(
+                                (
+                                    max(0, min(W - 1, fx1 + off_x)),
+                                    max(0, min(H - 1, fy1 + off_y)),
+                                    max(0, min(W - 1, fx2 + off_x)),
+                                    max(0, min(H - 1, fy2 + off_y)),
+                                    q,
+                                    fd_val,
+                                )
+                            )
+
+                        if (
+                            gbest
+                            and gbest.get("feat") is not None
+                            and gbest.get("bbox") is not None
+                            and len(gbest.get("bbox")) == 4
+                        ):
+                            gbbox = gbest.get("bbox")
+                            fx1, fy1, fx2, fy2 = [float(v) for v in gbbox]
+                            fx1 += float(rx1); fx2 += float(rx1); fy1 += float(ry1); fy2 += float(ry1)
+                            fx1 = max(0.0, min(float(W2), fx1))
+                            fy1 = max(0.0, min(float(H2), fy1))
+                            fx2 = max(fx1 + 1.0, min(float(W2), fx2))
+                            fy2 = max(fy1 + 1.0, min(float(H2), fy2))
+                            face_box_abs = (fx1, fy1, fx2, fy2)
+                            acx = (fx1 + fx2) / 2.0
+                            acy = (fy1 + fy2) / 2.0
+                            fd_val = self._fd_min(gbest["feat"], ref_face_feat)
+                            if fd_val <= float(cfg.face_thresh):
+                                subject_box_abs = None
+                                assoc_persons = []
+                                if bool(getattr(cfg, "compose_detect_person_for_face", True)):
+                                    try:
+                                        body_period = max(1, int(getattr(cfg, "compose_person_detect_cadence", getattr(cfg, "compose_body_every_n", 6)) or 1))
+                                    except Exception:
+                                        body_period = 6
+                                    face_h_frac = (fy2 - fy1) / max(1.0, float(H2))
+                                    need_person_assoc = (face_h_frac < 0.11) or (body_period > 0 and int(idx) % body_period == 0)
+                                    if need_person_assoc:
+                                        try:
+                                            assoc_persons = det.detect(frame_for_det, conf=float(cfg.min_det_conf))
+                                            subject_box_abs = self._find_person_box_for_face(face_box_abs, assoc_persons, W2, H2)
+                                        except Exception:
+                                            assoc_persons = []
+                                            subject_box_abs = None
+                                compose_seed_box = subject_box_abs or face_box_abs
+                                (ex1, ey1, ex2, ey2), chosen_ratio, chosen_tloss = self._choose_best_ratio(
+                                    compose_seed_box, ratios, W2, H2, anchor=(acx, acy), face_box=face_box_abs
+                                )
+                                ex1, ey1, ex2, ey2 = self._enforce_scale_and_margins(
+                                    (ex1, ey1, ex2, ey2),
+                                    chosen_ratio,
+                                    W2,
+                                    H2,
+                                    face_box=face_box_abs,
+                                    anchor=(acx, acy),
+                                )
+                                ox1, oy1, ox2, oy2 = ex1 + off_x, ey1 + off_y, ex2 + off_x, ey2 + off_y
+                                ox1 = max(0, min(W - 1, int(round(ox1))))
+                                oy1 = max(0, min(H - 1, int(round(oy1))))
+                                ox2 = max(ox1 + 1, min(W, int(round(ox2))))
+                                oy2 = max(oy1 + 1, min(H, int(round(oy2))))
+                                if ox2 > ox1 + 1 and oy2 > oy1 + 1:
+                                    crop_img = frame[oy1:oy2, ox1:ox2]
+                                    sharp = self._calc_sharpness(crop_img)
+                                    carea = max(1.0, float((ex2 - ex1) * (ey2 - ey1)))
+                                    farea = max(1.0, (fx2 - fx1) * (fy2 - fy1))
+                                    face_frac = float(farea) / carea
+                                    fx1i = max(0, min(W - 1, int(round(fx1 + off_x))))
+                                    fy1i = max(0, min(H - 1, int(round(fy1 + off_y))))
+                                    fx2i = max(fx1i + 1, min(W, int(round(fx2 + off_x))))
+                                    fy2i = max(fy1i + 1, min(H, int(round(fy2 + off_y))))
+                                    face_box_global = (fx1i, fy1i, fx2i, fy2i)
+                                    subject_box_global = None
+                                    if subject_box_abs is not None:
+                                        sx1, sy1, sx2, sy2 = subject_box_abs
+                                        sgx1 = max(0, min(W - 1, int(round(sx1 + off_x))))
+                                        sgy1 = max(0, min(H - 1, int(round(sy1 + off_y))))
+                                        sgx2 = max(sgx1 + 1, min(W, int(round(sx2 + off_x))))
+                                        sgy2 = max(sgy1 + 1, min(H, int(round(sy2 + off_y))))
+                                        subject_box_global = (sgx1, sgy1, sgx2, sgy2)
+                                    head_box_global = None
+                                    head_box_roi = self._face_head_proxy_box(face_box_abs, W2, H2)
+                                    if head_box_roi is not None:
+                                        hx1, hy1, hx2, hy2 = head_box_roi
+                                        head_box_global = (
+                                            max(0, min(W, hx1 + off_x)),
+                                            max(0, min(H, hy1 + off_y)),
+                                            max(0, min(W, hx2 + off_x)),
+                                            max(0, min(H, hy2 + off_y)),
+                                        )
+                                    short_circuit_candidate = dict(
+                                        score=fd_val,
+                                        fd=fd_val,
+                                        rd=None,
+                                        sharp=sharp,
+                                        box=(ox1, oy1, ox2, oy2),
+                                        area=(ox2 - ox1) * (oy2 - oy1),
+                                        show_box=subject_box_global or (ox1, oy1, ox2, oy2),
+                                        subject_box=subject_box_global,
+                                        face_box=face_box_global,
+                                        head_box=head_box_global,
+                                        face_feat=gbest["feat"],
+                                        reid_feat=None,
+                                        ratio=chosen_ratio,
+                                        face_frac=face_frac,
+                                        tloss=float(chosen_tloss),
+                                        reasons=["face_lock_roi"],
+                                        face_quality=float(gbest.get("quality", 0.0)),
+                                        accept_pre=True,
+                                    )
+                                    candidates = [short_circuit_candidate]
+                                    diag_persons = len(assoc_persons)
+                                    reid_feats = []
+                                    faces_local = {}
+                                    faces_detected = tmp_faces_detected
+                                    faces_passing_quality = tmp_faces_passing_quality
+                                    face_dists_all = tmp_dists_all
+                                    face_dists_quality = tmp_dists_quality
+                                    any_face_detected = tmp_faces_detected > 0
+                                    any_face_visible = (
+                                        tmp_faces_passing_quality > 0 if use_quality_vis else any_face_detected
+                                    )
+                                    any_face_match = True
+                                    min_fd_all = min(tmp_dists_all) if tmp_dists_all else None
+                                    best_face_dist = min(tmp_dists_quality) if tmp_dists_quality else None
+                                    self._lock_face_track_misses = 0
+                    if ran_lock_roi and short_circuit_candidate is None:
+                        self._lock_face_track_misses += 1
+                        if self._lock_face_track_misses > lock_roi_max_misses:
+                            self._lock_last_face_box = None
+                            self._lock_face_track_misses = 0
+
                 face_short_ok = (
                     ref_face_feat is not None
                     and face is not None
@@ -5187,7 +5455,7 @@ class Processor(QtCore.QObject):
                 )
                 # Run full-frame face detect at a coarse cadence only.
                 gfaces = []
-                if face_short_ok:
+                if face_short_ok and short_circuit_candidate is None:
                     try:
                         ff_cad = int(getattr(cfg, "face_fullframe_cadence", 12))
                     except Exception:
@@ -6428,6 +6696,9 @@ class Processor(QtCore.QObject):
                     person_box = c.get("show_box") or (cx1, cy1, cx2, cy2)
                     px1, py1, px2, py2 = [int(round(v)) for v in person_box]
                     self._set_lock((px1, py1, px2 - px1, py2 - py1), idx)
+                    face_box = c.get("face_box")
+                    if face_box is not None and len(face_box) == 4:
+                        self._set_lock_face_box(tuple(face_box))
                     if locked_reid is not None:
                         self._locked_reid_feat = locked_reid
                     elif c.get("reid_feat") is not None:
@@ -6767,6 +7038,9 @@ class Processor(QtCore.QObject):
                         if show_box is not None and len(show_box) == 4:
                             px1, py1, px2, py2 = [int(round(v)) for v in show_box]
                             self._set_lock((px1, py1, px2 - px1, py2 - py1), current_idx)
+                        face_box_sel = chosen.get("face_box")
+                        if face_box_sel is not None and len(face_box_sel) == 4:
+                            self._set_lock_face_box(tuple(face_box_sel))
                         if chosen.get("reid_feat") is not None:
                             try:
                                 self._locked_reid_feat = np.asarray(chosen["reid_feat"], dtype=np.float32)
@@ -8281,6 +8555,122 @@ class Processor(QtCore.QObject):
                 pass
             return 0, ""
 
+    def _wic_yuv444_color_match_ref_max_side(self) -> int:
+        try:
+            default_ref = int(getattr(self.cfg, "hdr_wic_yuv444_color_match_ref_max_side", 960) or 0)
+        except Exception:
+            default_ref = 960
+        raw = os.getenv("PC_WIC_YUV444_COLOR_MATCH_REF_MAX_SIDE", str(default_ref))
+        try:
+            value = int(float(str(raw).strip()))
+        except Exception:
+            value = default_ref
+        if value <= 0:
+            return 0
+        return max(128, min(4096, value))
+
+    @staticmethod
+    def _scaled_even_dims_for_max_side(w: int, h: int, max_side: int) -> tuple[int, int]:
+        w = max(2, int(w))
+        h = max(2, int(h))
+        max_side = int(max_side)
+        if max_side <= 0 or max(w, h) <= max_side:
+            sw, sh = w, h
+        elif w >= h:
+            sw = max_side
+            sh = max(2, int(round(h * (float(max_side) / float(w)))))
+        else:
+            sh = max_side
+            sw = max(2, int(round(w * (float(max_side) / float(h)))))
+        sw -= sw % 2
+        sh -= sh % 2
+        return max(2, sw), max(2, sh)
+
+    def _try_save_wic_yuv444_color_matched_fast(
+        self,
+        frame_idx: int,
+        frame_pts_sec: Optional[float],
+        crop_xyxy: tuple[int, int, int, int],
+        out_path: str,
+    ) -> tuple[bool, str, int]:
+        """Fast WIC color-match path using a reduced yuv420 reference."""
+        if not self._wic_yuv444_color_match_enabled():
+            return False, "disabled", 0
+        ref_max_side = self._wic_yuv444_color_match_ref_max_side()
+        if ref_max_side <= 0:
+            return False, "fast_reference_disabled", 0
+        x1, y1, x2, y2 = crop_xyxy
+        w = max(2, int(x2 - x1))
+        h = max(2, int(y2 - y1))
+        ref_w, ref_h = self._scaled_even_dims_for_max_side(w, h, ref_max_side)
+        if ref_w == w and ref_h == h:
+            return False, "fast_reference_not_smaller", 0
+
+        base = out_path + ".tmp_yuv444_fast"
+        ref_hdr = base + f".ref_{ref_w}x{ref_h}.avif"
+        ref_png = base + f".ref_{ref_w}x{ref_h}.png"
+        clean_hdr = base + ".clean_yuv444.avif"
+        clean_png = base + ".clean_yuv444.png"
+        repaired_tmp = ""
+        try:
+            for pth in (ref_hdr, ref_png, clean_hdr, clean_png):
+                if os.path.exists(pth):
+                    os.remove(pth)
+        except Exception:
+            pass
+        try:
+            ok_ref_hdr, why_ref_hdr = self._save_hdr_wic_specific_intermediate_avif(
+                frame_idx,
+                frame_pts_sec,
+                crop_xyxy,
+                ref_hdr,
+                pix_fmt="yuv420p10le",
+                avif_range="full",
+                scale_to=(ref_w, ref_h),
+            )
+            if not ok_ref_hdr:
+                return False, f"ref_hdr_failed:{why_ref_hdr}", 0
+            ok_ref_wic, why_ref_wic = self._save_wic_png_from_hdr_image(ref_hdr, ref_png, repair=False)
+            if not ok_ref_wic:
+                return False, f"ref_wic_failed:{why_ref_wic}", 0
+
+            ok_clean_hdr, why_clean_hdr = self._save_hdr_wic_specific_intermediate_avif(
+                frame_idx,
+                frame_pts_sec,
+                crop_xyxy,
+                clean_hdr,
+                pix_fmt="yuv444p10le",
+                avif_range="limited",
+            )
+            if not ok_clean_hdr:
+                return False, f"clean_hdr_failed:{why_clean_hdr}", 0
+            ok_clean_wic, why_clean_wic = self._save_wic_png_from_hdr_image(clean_hdr, clean_png, repair=False)
+            if not ok_clean_wic:
+                return False, f"clean_wic_failed:{why_clean_wic}", 0
+
+            changed, repaired_tmp = self._repair_wic_with_yuv444_color_match(ref_png, clean_png)
+            if changed <= 0 or not repaired_tmp:
+                return False, "color_match_noop", 0
+            valid, invalid_why = self._validate_hdr_sdr_export_image(repaired_tmp, None)
+            if not valid:
+                return False, f"color_match_invalid:{invalid_why}", 0
+            try:
+                if os.path.exists(out_path):
+                    os.remove(out_path)
+            except Exception:
+                pass
+            os.replace(repaired_tmp, out_path)
+            return True, "", changed
+        except Exception as exc:
+            return False, f"exception:{type(exc).__name__}:{exc}", 0
+        finally:
+            for pth in (ref_hdr, ref_png, clean_hdr, clean_png, repaired_tmp):
+                try:
+                    if pth and os.path.exists(pth):
+                        os.remove(pth)
+                except Exception:
+                    pass
+
     def _wic_yuv444_color_match_enabled(self) -> bool:
         if self._truthy_env("PC_DISABLE_WIC_YUV444_COLOR_MATCH"):
             return False
@@ -9137,6 +9527,7 @@ class Processor(QtCore.QObject):
         *,
         pix_fmt: str,
         avif_range: str,
+        scale_to: Optional[tuple[int, int]] = None,
     ) -> tuple[bool, str]:
         """Write a specific WIC diagnostic/guide HDR AVIF without env overrides."""
         pix_fmt = str(pix_fmt or "yuv420p10le").strip().lower()
@@ -9153,6 +9544,7 @@ class Processor(QtCore.QObject):
             quiet=True,
             avif_pix_fmt=pix_fmt,
             avif_range=avif_range,
+            scale_to=scale_to,
         )
 
     def _save_wic_display_avif_from_hdr_crop(
@@ -9733,6 +10125,25 @@ try {{
             # Paint-like path: exact HDR crop -> WIC color-managed PNG. This is
             # deliberately not a fallback to the preview renderer; if WIC cannot
             # decode/convert the HDR still, report that as the save failure.
+            fast_ok, fast_why, fast_changed = self._try_save_wic_yuv444_color_matched_fast(
+                frame_idx, frame_pts_sec, crop_xyxy, out_path
+            )
+            if fast_ok:
+                self._status(
+                    f"HDR WIC yuv444 color-match fast output: {fast_changed} px",
+                    key="hdr_wic_yuv444_color_match",
+                    interval=5.0,
+                )
+                self._maybe_run_hdr_speckle_diagnostics(
+                    ffmpeg_bin, frame_idx, frame_pts_sec, crop_xyxy, out_path
+                )
+                return True, ""
+            if fast_why not in {"disabled", "fast_reference_disabled", "fast_reference_not_smaller"}:
+                self._status(
+                    f"HDR WIC yuv444 color-match fast path fell back: {fast_why}",
+                    key="hdr_wic_yuv444_color_match",
+                    interval=10.0,
+                )
             tmp_hdr = out_path + ".tmp_hdr.avif"
             try:
                 if os.path.exists(tmp_hdr):
@@ -9868,6 +10279,7 @@ try {{
         quiet: bool = False,
         avif_pix_fmt: str = "yuv420p10le",
         avif_range: str = "full",
+        scale_to: Optional[tuple[int, int]] = None,
     ) -> tuple[bool, str]:
         """Use ffmpeg directly to export an HDR crop from the original source."""
 
@@ -9898,6 +10310,16 @@ try {{
             "setparams=color_trc=smpte2084:color_primaries=bt2020:"
             f"colorspace=bt2020nc:range={src_range_setparams},crop={w}:{h}:{int(x1)}:{int(y1)}"
         )
+        if scale_to is not None:
+            try:
+                sw = max(2, int(scale_to[0]))
+                sh = max(2, int(scale_to[1]))
+                sw -= sw % 2
+                sh -= sh % 2
+                if sw > 1 and sh > 1 and (sw != w or sh != h):
+                    vf = f"{vf},scale={sw}:{sh}:flags=lanczos"
+            except Exception:
+                pass
         # Keep FFV1 tagging conservative when source range is unknown.
         ffv1_color_range = "2" if src_range == "full" else "1"
         seek_sec: Optional[float] = None
@@ -10655,6 +11077,20 @@ class MainWindow(QtWidgets.QMainWindow):
             float(getattr(self.cfg, "hdr_wic_yuv444_color_match_lowfreq", 0.0))
         )
         self.hdr_wic_yuv444_color_match_lowfreq_spin.valueChanged.connect(self._on_ui_change)
+        self.hdr_wic_yuv444_color_match_ref_max_side_spin = QtWidgets.QSpinBox()
+        self.hdr_wic_yuv444_color_match_ref_max_side_spin.setRange(0, 4096)
+        self.hdr_wic_yuv444_color_match_ref_max_side_spin.setSingleStep(64)
+        self.hdr_wic_yuv444_color_match_ref_max_side_spin.setSpecialValueText("Full reference")
+        self.hdr_wic_yuv444_color_match_ref_max_side_spin.setToolTip(
+            "int: hdr_wic_yuv444_color_match_ref_max_side (PC_WIC_YUV444_COLOR_MATCH_REF_MAX_SIDE). "
+            "0 keeps the old full-resolution yuv420/full WIC reference. Positive values render only a smaller "
+            "reference for the color statistics pass while the final yuv444 output stays full resolution."
+        )
+        self.hdr_wic_yuv444_color_match_ref_max_side_spin.setKeyboardTracking(False)
+        self.hdr_wic_yuv444_color_match_ref_max_side_spin.setValue(
+            int(getattr(self.cfg, "hdr_wic_yuv444_color_match_ref_max_side", 960) or 0)
+        )
+        self.hdr_wic_yuv444_color_match_ref_max_side_spin.valueChanged.connect(self._on_ui_change)
         self.hdr_wic_yuv444_guide_cleanup_check = QtWidgets.QCheckBox()
         self.hdr_wic_yuv444_guide_cleanup_check.setChecked(bool(getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", False)))
         self.hdr_wic_yuv444_guide_cleanup_check.setToolTip(
@@ -11306,6 +11742,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("WIC yuv444 match luma", self.hdr_wic_yuv444_color_match_luma_strength_spin),
             ("WIC yuv444 match chroma", self.hdr_wic_yuv444_color_match_chroma_strength_spin),
             ("WIC yuv444 match lowfreq", self.hdr_wic_yuv444_color_match_lowfreq_spin),
+            ("WIC yuv444 ref max side", self.hdr_wic_yuv444_color_match_ref_max_side_spin),
             ("WIC yuv444 guide cleanup", self.hdr_wic_yuv444_guide_cleanup_check),
             ("HDR speckle diagnostics", self.hdr_speckle_diag_check),
             ("HDR speckle diag dir", self.hdr_speckle_diag_dir_widget),
@@ -12796,6 +13233,9 @@ class MainWindow(QtWidgets.QMainWindow):
             lock_after_hits=int(self.lock_after_spin.value()),
             lock_face_thresh=float(self.lock_face_spin.value()),
             lock_reid_thresh=float(self.lock_reid_spin.value()),
+            lock_face_roi_enable=bool(getattr(self.cfg, "lock_face_roi_enable", True)),
+            lock_face_roi_pad=float(getattr(self.cfg, "lock_face_roi_pad", 1.25)),
+            lock_face_roi_max_misses=int(getattr(self.cfg, "lock_face_roi_max_misses", 8)),
             score_margin=float(self.margin_spin.value()),
             iou_gate=float(self.iou_gate_spin.value()),
             use_arcface=bool(self.use_arc_check.isChecked()),
@@ -12927,6 +13367,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 if hasattr(self, "hdr_wic_yuv444_color_match_lowfreq_spin")
                 else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_lowfreq", 0.0))
             ),
+            hdr_wic_yuv444_color_match_ref_max_side=(
+                int(self.hdr_wic_yuv444_color_match_ref_max_side_spin.value())
+                if hasattr(self, "hdr_wic_yuv444_color_match_ref_max_side_spin")
+                else int(getattr(self.cfg, "hdr_wic_yuv444_color_match_ref_max_side", 960) or 0)
+            ),
             hdr_wic_yuv444_guide_cleanup=(
                 bool(self.hdr_wic_yuv444_guide_cleanup_check.isChecked())
                 if hasattr(self, "hdr_wic_yuv444_guide_cleanup_check")
@@ -13022,6 +13467,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(self, "hdr_wic_yuv444_color_match_lowfreq_spin")
             else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_lowfreq", 0.0))
         )
+        cfg.hdr_wic_yuv444_color_match_ref_max_side = (
+            int(self.hdr_wic_yuv444_color_match_ref_max_side_spin.value())
+            if hasattr(self, "hdr_wic_yuv444_color_match_ref_max_side_spin")
+            else int(getattr(self.cfg, "hdr_wic_yuv444_color_match_ref_max_side", 960) or 0)
+        )
         cfg.hdr_wic_yuv444_guide_cleanup = (
             bool(self.hdr_wic_yuv444_guide_cleanup_check.isChecked())
             if hasattr(self, "hdr_wic_yuv444_guide_cleanup_check")
@@ -13050,6 +13500,15 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             self.cfg.seek_preview_peek_every = 16
         self.cfg.overlay_scores = bool(getattr(cfg, "overlay_scores", False))
+        self.cfg.lock_face_roi_enable = bool(getattr(cfg, "lock_face_roi_enable", True))
+        try:
+            self.cfg.lock_face_roi_pad = float(getattr(cfg, "lock_face_roi_pad", 1.25))
+        except Exception:
+            self.cfg.lock_face_roi_pad = 1.25
+        try:
+            self.cfg.lock_face_roi_max_misses = max(0, int(getattr(cfg, "lock_face_roi_max_misses", 8)))
+        except Exception:
+            self.cfg.lock_face_roi_max_misses = 8
         try:
             self.cfg.preview_every = int(getattr(cfg, "preview_every", 3))
         except Exception:
@@ -13123,6 +13582,12 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         except Exception:
             self.cfg.hdr_wic_yuv444_color_match_lowfreq = 0.0
+        try:
+            self.cfg.hdr_wic_yuv444_color_match_ref_max_side = max(
+                0, int(getattr(cfg, "hdr_wic_yuv444_color_match_ref_max_side", 960) or 0)
+            )
+        except Exception:
+            self.cfg.hdr_wic_yuv444_color_match_ref_max_side = 960
         self.cfg.hdr_wic_yuv444_guide_cleanup = bool(getattr(cfg, "hdr_wic_yuv444_guide_cleanup", False))
         self.cfg.hdr_avif_wic_display_compat = bool(getattr(cfg, "hdr_avif_wic_display_compat", True))
         self.cfg.compose_crop_enable = bool(getattr(cfg, "compose_crop_enable", True))
@@ -13217,6 +13682,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.hdr_wic_yuv444_color_match_chroma_strength_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_chroma_strength)
         if hasattr(self, "hdr_wic_yuv444_color_match_lowfreq_spin"):
             self.hdr_wic_yuv444_color_match_lowfreq_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_lowfreq)
+        if hasattr(self, "hdr_wic_yuv444_color_match_ref_max_side_spin"):
+            self.hdr_wic_yuv444_color_match_ref_max_side_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_ref_max_side)
         if hasattr(self, "hdr_wic_yuv444_guide_cleanup_check"):
             self.hdr_wic_yuv444_guide_cleanup_check.setChecked(self.cfg.hdr_wic_yuv444_guide_cleanup)
         self.cfg.hdr_speckle_diag = bool(getattr(cfg, "hdr_speckle_diag", False))
@@ -14419,12 +14886,27 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         except Exception:
             self.cfg.hdr_wic_yuv444_color_match_lowfreq = 0.0
+        try:
+            self.cfg.hdr_wic_yuv444_color_match_ref_max_side = max(
+                0,
+                int(
+                    s.value(
+                        "hdr_wic_yuv444_color_match_ref_max_side",
+                        getattr(self.cfg, "hdr_wic_yuv444_color_match_ref_max_side", 960),
+                    )
+                    or 0
+                ),
+            )
+        except Exception:
+            self.cfg.hdr_wic_yuv444_color_match_ref_max_side = 960
         if hasattr(self, "hdr_wic_yuv444_color_match_luma_strength_spin"):
             self.hdr_wic_yuv444_color_match_luma_strength_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_luma_strength)
         if hasattr(self, "hdr_wic_yuv444_color_match_chroma_strength_spin"):
             self.hdr_wic_yuv444_color_match_chroma_strength_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_chroma_strength)
         if hasattr(self, "hdr_wic_yuv444_color_match_lowfreq_spin"):
             self.hdr_wic_yuv444_color_match_lowfreq_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_lowfreq)
+        if hasattr(self, "hdr_wic_yuv444_color_match_ref_max_side_spin"):
+            self.hdr_wic_yuv444_color_match_ref_max_side_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_ref_max_side)
         self.cfg.hdr_wic_yuv444_guide_cleanup = bool(
             s.value(
                 "hdr_wic_yuv444_guide_cleanup",
@@ -14656,6 +15138,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lock_after_spin.setValue(int(s.value("lock_after_hits", 1)))
         self.lock_face_spin.setValue(float(s.value("lock_face_thresh", 0.28)))
         self.lock_reid_spin.setValue(float(s.value("lock_reid_thresh", 0.30)))
+        self.cfg.lock_face_roi_enable = bool(
+            s.value("lock_face_roi_enable", getattr(self.cfg, "lock_face_roi_enable", True), type=bool)
+        )
+        try:
+            self.cfg.lock_face_roi_pad = float(
+                s.value("lock_face_roi_pad", getattr(self.cfg, "lock_face_roi_pad", 1.25))
+            )
+        except Exception:
+            self.cfg.lock_face_roi_pad = 1.25
+        try:
+            self.cfg.lock_face_roi_max_misses = max(
+                0,
+                int(s.value("lock_face_roi_max_misses", getattr(self.cfg, "lock_face_roi_max_misses", 8))),
+            )
+        except Exception:
+            self.cfg.lock_face_roi_max_misses = 8
         self.margin_spin.setValue(float(s.value("score_margin", 0.03)))
         self.iou_gate_spin.setValue(float(s.value("iou_gate", 0.05)))
         self.use_arc_check.setChecked(s.value("use_arcface", True, type=bool))
