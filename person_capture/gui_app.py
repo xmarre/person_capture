@@ -8202,7 +8202,7 @@ class Processor(QtCore.QObject):
             matched_bgr = cv2.cvtColor(mapped_ycc, cv2.COLOR_YCrCb2BGR)
             if strength < 1.0:
                 out_bgr = np.clip(
-                    np.rint((base_bgr.astype(np.float32) * (1.0 - strength)) + (matched_bgr.astype(np.float32) * strength)),
+                    np.rint((clean_bgr.astype(np.float32) * (1.0 - strength)) + (matched_bgr.astype(np.float32) * strength)),
                     0,
                     255,
                 ).astype(np.uint8)
@@ -8251,6 +8251,18 @@ class Processor(QtCore.QObject):
         if self._truthy_env("PC_DISABLE_WIC_YUV444_COLOR_MATCH"):
             return 0
         if not bool(getattr(self.cfg, "hdr_wic_yuv444_color_match", True)):
+            return 0
+        try:
+            default_strength = float(getattr(self.cfg, "hdr_wic_yuv444_color_match_strength", 1.0))
+        except Exception:
+            default_strength = 1.0
+        strength = self._float_env(
+            "PC_WIC_YUV444_COLOR_MATCH_STRENGTH",
+            default_strength,
+            min_value=0.0,
+            max_value=1.0,
+        )
+        if strength <= 0.0:
             return 0
         guide_base = out_path + ".tmp_yuv444_match"
         guide_hdr = guide_base + ".avif"
