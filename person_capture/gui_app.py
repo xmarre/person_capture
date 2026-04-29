@@ -358,7 +358,14 @@ class SessionConfig:
     # yuv420 display pixels as final shadow texture while preserving its color
     # response.
     hdr_wic_yuv444_color_match: bool = True
+    # Overall blend for the yuv444 color-match renderer.  Keep this separate
+    # from the per-channel strengths below: luma is what crushed/darkened shadow
+    # detail at high values, while chroma can usually be matched harder to regain
+    # the WIC/Paint-like colorfulness.
     hdr_wic_yuv444_color_match_strength: float = 1.0
+    hdr_wic_yuv444_color_match_luma_strength: float = 0.45
+    hdr_wic_yuv444_color_match_chroma_strength: float = 0.85
+    hdr_wic_yuv444_color_match_lowfreq: float = 0.0
     # Older diagnostic cleanup that only used yuv444 as an artifact mask. It was
     # too conservative for broad shadow blobs, so keep it opt-in/fallback only.
     hdr_wic_yuv444_guide_cleanup: bool = False
@@ -4908,6 +4915,9 @@ class Processor(QtCore.QObject):
                             "hdr_wic_experimental_primary",
                             "hdr_wic_yuv444_color_match",
                             "hdr_wic_yuv444_color_match_strength",
+                            "hdr_wic_yuv444_color_match_luma_strength",
+                            "hdr_wic_yuv444_color_match_chroma_strength",
+                            "hdr_wic_yuv444_color_match_lowfreq",
                             "hdr_wic_yuv444_guide_cleanup",
                             "hdr_speckle_diag",
                             "hdr_speckle_diag_dir",
@@ -8114,6 +8124,26 @@ class Processor(QtCore.QObject):
         except Exception:
             default_strength = 1.0
         strength = self._float_env("PC_WIC_YUV444_COLOR_MATCH_STRENGTH", default_strength, min_value=0.0, max_value=1.0)
+        try:
+            default_luma_strength = float(getattr(self.cfg, "hdr_wic_yuv444_color_match_luma_strength", 0.45))
+        except Exception:
+            default_luma_strength = 0.45
+        try:
+            default_chroma_strength = float(getattr(self.cfg, "hdr_wic_yuv444_color_match_chroma_strength", 0.85))
+        except Exception:
+            default_chroma_strength = 0.85
+        luma_strength = self._float_env(
+            "PC_WIC_YUV444_COLOR_MATCH_LUMA_STRENGTH",
+            default_luma_strength,
+            min_value=0.0,
+            max_value=1.0,
+        )
+        chroma_strength = self._float_env(
+            "PC_WIC_YUV444_COLOR_MATCH_CHROMA_STRENGTH",
+            default_chroma_strength,
+            min_value=0.0,
+            max_value=1.0,
+        )
         if strength <= 0.0:
             return 0, ""
         try:
@@ -8171,20 +8201,37 @@ class Processor(QtCore.QObject):
                 lut = np.interp(np.arange(256, dtype=np.float32), xp, fp)
                 return np.clip(np.rint(lut), 0, 255).astype(np.uint8)
 
-            mapped_ycc = clean_ycc.copy()
-            for c in range(3):
+            mapped_f = clean_ycc.astype(np.float32, copy=False).copy()
+            # Match luma and chroma independently.  The previous single RGB blend
+            # forced a tradeoff: high values restored color but crushed/flattened
+            # dark detail, while lower values preserved detail but looked washed.
+            # Keep luma conservative and allow stronger chroma matching.
+            channel_strengths = (
+                float(strength) * float(luma_strength),
+                float(strength) * float(chroma_strength),
+                float(strength) * float(chroma_strength),
+            )
+            for c, c_strength in enumerate(channel_strengths):
                 lut = _quantile_lut(clean_ycc[:, :, c], base_ycc[:, :, c], fit_mask)
                 if lut is None:
                     return 0, ""
-                mapped_ycc[:, :, c] = cv2.LUT(clean_ycc[:, :, c], lut)
+                target = cv2.LUT(clean_ycc[:, :, c], lut).astype(np.float32, copy=False)
+                src = clean_ycc[:, :, c].astype(np.float32, copy=False)
+                mapped_f[:, :, c] = (src * (1.0 - c_strength)) + (target * c_strength)
+            mapped_ycc = np.clip(np.rint(mapped_f), 0, 255).astype(np.uint8)
 
             # Add only very-low-frequency residual from the yuv420 reference.  This
-            # improves local color-grade matching without copying the high-frequency
-            # WIC yuv420 shadow crawl/salt defects back into the output.
+            # can restore broad local grade/vibrance, but it can also copy some of
+            # the shadow blotch structure back into the image.  Keep it disabled by
+            # default and expose it as a separate GUI/runtime knob.
             try:
-                lowfreq = self._float_env("PC_WIC_YUV444_COLOR_MATCH_LOWFREQ", 0.22, min_value=0.0, max_value=1.0)
+                default_lowfreq = float(getattr(self.cfg, "hdr_wic_yuv444_color_match_lowfreq", 0.0))
             except Exception:
-                lowfreq = 0.22
+                default_lowfreq = 0.0
+            try:
+                lowfreq = self._float_env("PC_WIC_YUV444_COLOR_MATCH_LOWFREQ", default_lowfreq, min_value=0.0, max_value=1.0)
+            except Exception:
+                lowfreq = 0.0
             if lowfreq > 0.0:
                 safe = fit_mask.astype(np.float32, copy=False)
                 # Strong blur: intentional.  Smaller kernels reintroduce the blocky
@@ -8193,21 +8240,15 @@ class Processor(QtCore.QObject):
                 denom = np.maximum(denom, 1.0e-4)
                 mapped_f = mapped_ycc.astype(np.float32, copy=False)
                 base_f = base_ycc.astype(np.float32, copy=False)
-                for c in range(3):
+                # Apply the low-frequency residual to chroma only.  Luma residual is
+                # what made strong color-match settings crush/flatten dark detail.
+                for c in (1, 2):
                     residual = (base_f[:, :, c] - mapped_f[:, :, c]) * safe
                     residual_lp = cv2.GaussianBlur(residual, (0, 0), 48.0) / denom
                     mapped_f[:, :, c] = np.clip(mapped_f[:, :, c] + residual_lp * float(lowfreq), 0.0, 255.0)
                 mapped_ycc = np.clip(np.rint(mapped_f), 0, 255).astype(np.uint8)
 
-            matched_bgr = cv2.cvtColor(mapped_ycc, cv2.COLOR_YCrCb2BGR)
-            if strength < 1.0:
-                out_bgr = np.clip(
-                    np.rint((clean_bgr.astype(np.float32) * (1.0 - strength)) + (matched_bgr.astype(np.float32) * strength)),
-                    0,
-                    255,
-                ).astype(np.uint8)
-            else:
-                out_bgr = matched_bgr
+            out_bgr = cv2.cvtColor(mapped_ycc, cv2.COLOR_YCrCb2BGR)
 
             out = base.copy()
             out[:, :, :3] = out_bgr
@@ -8239,6 +8280,23 @@ class Processor(QtCore.QObject):
             except Exception:
                 pass
             return 0, ""
+
+    def _wic_yuv444_color_match_enabled(self) -> bool:
+        if self._truthy_env("PC_DISABLE_WIC_YUV444_COLOR_MATCH"):
+            return False
+        if not bool(getattr(self.cfg, "hdr_wic_yuv444_color_match", True)):
+            return False
+        try:
+            default_strength = float(getattr(self.cfg, "hdr_wic_yuv444_color_match_strength", 1.0))
+        except Exception:
+            default_strength = 1.0
+        strength = self._float_env(
+            "PC_WIC_YUV444_COLOR_MATCH_STRENGTH",
+            default_strength,
+            min_value=0.0,
+            max_value=1.0,
+        )
+        return strength > 0.0
 
     def _maybe_apply_wic_yuv444_color_match(
         self,
@@ -9690,7 +9748,12 @@ try {{
             if not ok_hdr:
                 return False, f"windows_wic_hdr_source_failed:{why_hdr}"
             try:
-                ok_wic, why_wic = self._save_wic_png_from_hdr_image(tmp_hdr, out_path)
+                color_match_enabled = self._wic_yuv444_color_match_enabled()
+                ok_wic, why_wic = self._save_wic_png_from_hdr_image(
+                    tmp_hdr,
+                    out_path,
+                    repair=not color_match_enabled,
+                )
                 if ok_wic:
                     color_match_changed = self._maybe_apply_wic_yuv444_color_match(
                         frame_idx, frame_pts_sec, crop_xyxy, out_path
@@ -9704,6 +9767,17 @@ try {{
                         valid, invalid_why = self._validate_hdr_sdr_export_image(out_path, None)
                         if not valid:
                             return False, f"windows_wic_invalid_post_yuv444_color_match:{invalid_why}"
+                    elif color_match_enabled and bool(getattr(self.cfg, "hdr_wic_speckle_cleanup", True)):
+                        fallback_changed = self._repair_wic_saturated_rgb_speckles(out_path)
+                        if fallback_changed > 0:
+                            self._status(
+                                f"HDR WIC saturated speckle cleanup after color-match fallback: {fallback_changed} px",
+                                key="hdr_wic_speckle_cleanup",
+                                interval=5.0,
+                            )
+                            valid, invalid_why = self._validate_hdr_sdr_export_image(out_path, None)
+                            if not valid:
+                                return False, f"windows_wic_invalid_post_speckle_fallback:{invalid_why}"
                     elif bool(getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", False)):
                         guide_changed = self._maybe_apply_wic_yuv444_guided_cleanup(
                             frame_idx, frame_pts_sec, crop_xyxy, out_path
@@ -10476,6 +10550,14 @@ class MainWindow(QtWidgets.QMainWindow):
             "Allow inaccurate full-res scale fallback if HDR tone-map filters fail. Off preserves fidelity by failing instead of saving washed-out crops."
         )
         self.hdr_sdr_bad_fallback_check.stateChanged.connect(self._on_ui_change)
+        self.hdr_wic_speckle_cleanup_check = QtWidgets.QCheckBox()
+        self.hdr_wic_speckle_cleanup_check.setChecked(bool(getattr(self.cfg, "hdr_wic_speckle_cleanup", True)))
+        self.hdr_wic_speckle_cleanup_check.setToolTip(
+            "bool: hdr_wic_speckle_cleanup. Repairs saturated red/blue/magenta WIC salt pixels when "
+            "the yuv444 color-match path is disabled or fails. Disable to save time when yuv444 color match is working."
+        )
+        self.hdr_wic_speckle_cleanup_check.stateChanged.connect(self._on_ui_change)
+
         self.wic_shadow_deblob_strength_spin = _mk_fspin(
             0.0,
             2.0,
@@ -10537,6 +10619,42 @@ class MainWindow(QtWidgets.QMainWindow):
             float(getattr(self.cfg, "hdr_wic_yuv444_color_match_strength", 1.0))
         )
         self.hdr_wic_yuv444_color_match_strength_spin.valueChanged.connect(self._on_ui_change)
+        self.hdr_wic_yuv444_color_match_luma_strength_spin = _mk_fspin(
+            0.0,
+            1.0,
+            0.05,
+            2,
+            "float: hdr_wic_yuv444_color_match_luma_strength (PC_WIC_YUV444_COLOR_MATCH_LUMA_STRENGTH). "
+            "Lower values preserve dark detail/brightness; higher values match the yuv420 WIC luma more strongly."
+        )
+        self.hdr_wic_yuv444_color_match_luma_strength_spin.setValue(
+            float(getattr(self.cfg, "hdr_wic_yuv444_color_match_luma_strength", 0.45))
+        )
+        self.hdr_wic_yuv444_color_match_luma_strength_spin.valueChanged.connect(self._on_ui_change)
+        self.hdr_wic_yuv444_color_match_chroma_strength_spin = _mk_fspin(
+            0.0,
+            1.0,
+            0.05,
+            2,
+            "float: hdr_wic_yuv444_color_match_chroma_strength (PC_WIC_YUV444_COLOR_MATCH_CHROMA_STRENGTH). "
+            "Higher values restore more of the accepted WIC/Paint colorfulness without forcing luma darker."
+        )
+        self.hdr_wic_yuv444_color_match_chroma_strength_spin.setValue(
+            float(getattr(self.cfg, "hdr_wic_yuv444_color_match_chroma_strength", 0.85))
+        )
+        self.hdr_wic_yuv444_color_match_chroma_strength_spin.valueChanged.connect(self._on_ui_change)
+        self.hdr_wic_yuv444_color_match_lowfreq_spin = _mk_fspin(
+            0.0,
+            1.0,
+            0.05,
+            2,
+            "float: hdr_wic_yuv444_color_match_lowfreq (PC_WIC_YUV444_COLOR_MATCH_LOWFREQ). "
+            "Optional broad chroma residual from the yuv420 WIC reference. 0 is fastest/safest."
+        )
+        self.hdr_wic_yuv444_color_match_lowfreq_spin.setValue(
+            float(getattr(self.cfg, "hdr_wic_yuv444_color_match_lowfreq", 0.0))
+        )
+        self.hdr_wic_yuv444_color_match_lowfreq_spin.valueChanged.connect(self._on_ui_change)
         self.hdr_wic_yuv444_guide_cleanup_check = QtWidgets.QCheckBox()
         self.hdr_wic_yuv444_guide_cleanup_check.setChecked(bool(getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", False)))
         self.hdr_wic_yuv444_guide_cleanup_check.setToolTip(
@@ -11178,12 +11296,16 @@ class MainWindow(QtWidgets.QMainWindow):
             ("HDR contrast recovery", self.hdr_sdr_contrast_spin),
             ("HDR peak detect", self.hdr_sdr_peak_check),
             ("Allow inaccurate HDR fallback", self.hdr_sdr_bad_fallback_check),
+            ("WIC saturated speckle cleanup", self.hdr_wic_speckle_cleanup_check),
             ("WIC shadow deblob strength", self.wic_shadow_deblob_strength_spin),
             ("WIC intermediate AVIF pixfmt", self.hdr_wic_avif_pixfmt_combo),
             ("WIC intermediate AVIF range", self.hdr_wic_avif_range_combo),
             ("WIC experimental primary override", self.hdr_wic_experimental_primary_check),
             ("WIC yuv444 color match", self.hdr_wic_yuv444_color_match_check),
-            ("WIC yuv444 color match strength", self.hdr_wic_yuv444_color_match_strength_spin),
+            ("WIC yuv444 match overall", self.hdr_wic_yuv444_color_match_strength_spin),
+            ("WIC yuv444 match luma", self.hdr_wic_yuv444_color_match_luma_strength_spin),
+            ("WIC yuv444 match chroma", self.hdr_wic_yuv444_color_match_chroma_strength_spin),
+            ("WIC yuv444 match lowfreq", self.hdr_wic_yuv444_color_match_lowfreq_spin),
             ("WIC yuv444 guide cleanup", self.hdr_wic_yuv444_guide_cleanup_check),
             ("HDR speckle diagnostics", self.hdr_speckle_diag_check),
             ("HDR speckle diag dir", self.hdr_speckle_diag_dir_widget),
@@ -12539,6 +12661,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "hdr_wic_experimental_primary",
             "hdr_wic_yuv444_color_match",
             "hdr_wic_yuv444_color_match_strength",
+            "hdr_wic_yuv444_color_match_luma_strength",
+            "hdr_wic_yuv444_color_match_chroma_strength",
+            "hdr_wic_yuv444_color_match_lowfreq",
             "hdr_wic_yuv444_guide_cleanup",
             "hdr_speckle_diag",
             "hdr_speckle_diag_dir",
@@ -12752,7 +12877,11 @@ class MainWindow(QtWidgets.QMainWindow):
             compose_landscape_face_penalty=float(self.compose_landscape_face_penalty_spin.value()) if hasattr(self, "compose_landscape_face_penalty_spin") else float(getattr(self.cfg, "compose_landscape_face_penalty", 5.0)),
             compose_body_every_n=int(self.compose_body_every_n_spin.value()) if hasattr(self, "compose_body_every_n_spin") else int(getattr(self.cfg, "compose_body_every_n", 6)),
             compose_person_detect_cadence=int(self.compose_person_detect_cadence_spin.value()) if hasattr(self, "compose_person_detect_cadence_spin") else int(getattr(self.cfg, "compose_person_detect_cadence", 6)),
-            hdr_wic_speckle_cleanup=bool(getattr(self.cfg, "hdr_wic_speckle_cleanup", True)),
+            hdr_wic_speckle_cleanup=(
+                bool(self.hdr_wic_speckle_cleanup_check.isChecked())
+                if hasattr(self, "hdr_wic_speckle_cleanup_check")
+                else bool(getattr(self.cfg, "hdr_wic_speckle_cleanup", True))
+            ),
             wic_shadow_deblob_strength=(
                 float(self.wic_shadow_deblob_strength_spin.value())
                 if hasattr(self, "wic_shadow_deblob_strength_spin")
@@ -12782,6 +12911,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 float(self.hdr_wic_yuv444_color_match_strength_spin.value())
                 if hasattr(self, "hdr_wic_yuv444_color_match_strength_spin")
                 else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_strength", 1.0))
+            ),
+            hdr_wic_yuv444_color_match_luma_strength=(
+                float(self.hdr_wic_yuv444_color_match_luma_strength_spin.value())
+                if hasattr(self, "hdr_wic_yuv444_color_match_luma_strength_spin")
+                else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_luma_strength", 0.45))
+            ),
+            hdr_wic_yuv444_color_match_chroma_strength=(
+                float(self.hdr_wic_yuv444_color_match_chroma_strength_spin.value())
+                if hasattr(self, "hdr_wic_yuv444_color_match_chroma_strength_spin")
+                else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_chroma_strength", 0.85))
+            ),
+            hdr_wic_yuv444_color_match_lowfreq=(
+                float(self.hdr_wic_yuv444_color_match_lowfreq_spin.value())
+                if hasattr(self, "hdr_wic_yuv444_color_match_lowfreq_spin")
+                else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_lowfreq", 0.0))
             ),
             hdr_wic_yuv444_guide_cleanup=(
                 bool(self.hdr_wic_yuv444_guide_cleanup_check.isChecked())
@@ -12863,6 +13007,21 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(self, "hdr_wic_yuv444_color_match_strength_spin")
             else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_strength", 1.0))
         )
+        cfg.hdr_wic_yuv444_color_match_luma_strength = (
+            float(self.hdr_wic_yuv444_color_match_luma_strength_spin.value())
+            if hasattr(self, "hdr_wic_yuv444_color_match_luma_strength_spin")
+            else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_luma_strength", 0.45))
+        )
+        cfg.hdr_wic_yuv444_color_match_chroma_strength = (
+            float(self.hdr_wic_yuv444_color_match_chroma_strength_spin.value())
+            if hasattr(self, "hdr_wic_yuv444_color_match_chroma_strength_spin")
+            else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_chroma_strength", 0.85))
+        )
+        cfg.hdr_wic_yuv444_color_match_lowfreq = (
+            float(self.hdr_wic_yuv444_color_match_lowfreq_spin.value())
+            if hasattr(self, "hdr_wic_yuv444_color_match_lowfreq_spin")
+            else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_lowfreq", 0.0))
+        )
         cfg.hdr_wic_yuv444_guide_cleanup = (
             bool(self.hdr_wic_yuv444_guide_cleanup_check.isChecked())
             if hasattr(self, "hdr_wic_yuv444_guide_cleanup_check")
@@ -12921,6 +13080,8 @@ class MainWindow(QtWidgets.QMainWindow):
             hdr_sdr_conversion = "ffmpeg"
         self.cfg.hdr_sdr_conversion = hdr_sdr_conversion
         self.cfg.hdr_wic_speckle_cleanup = bool(getattr(cfg, "hdr_wic_speckle_cleanup", True))
+        if hasattr(self, "hdr_wic_speckle_cleanup_check"):
+            self.hdr_wic_speckle_cleanup_check.setChecked(self.cfg.hdr_wic_speckle_cleanup)
         try:
             self.cfg.wic_shadow_deblob_strength = min(
                 2.0,
@@ -12944,6 +13105,24 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         except Exception:
             self.cfg.hdr_wic_yuv444_color_match_strength = 1.0
+        try:
+            self.cfg.hdr_wic_yuv444_color_match_luma_strength = min(
+                1.0, max(0.0, float(getattr(cfg, "hdr_wic_yuv444_color_match_luma_strength", 0.45)))
+            )
+        except Exception:
+            self.cfg.hdr_wic_yuv444_color_match_luma_strength = 0.45
+        try:
+            self.cfg.hdr_wic_yuv444_color_match_chroma_strength = min(
+                1.0, max(0.0, float(getattr(cfg, "hdr_wic_yuv444_color_match_chroma_strength", 0.85)))
+            )
+        except Exception:
+            self.cfg.hdr_wic_yuv444_color_match_chroma_strength = 0.85
+        try:
+            self.cfg.hdr_wic_yuv444_color_match_lowfreq = min(
+                1.0, max(0.0, float(getattr(cfg, "hdr_wic_yuv444_color_match_lowfreq", 0.0)))
+            )
+        except Exception:
+            self.cfg.hdr_wic_yuv444_color_match_lowfreq = 0.0
         self.cfg.hdr_wic_yuv444_guide_cleanup = bool(getattr(cfg, "hdr_wic_yuv444_guide_cleanup", False))
         self.cfg.hdr_avif_wic_display_compat = bool(getattr(cfg, "hdr_avif_wic_display_compat", True))
         self.cfg.compose_crop_enable = bool(getattr(cfg, "compose_crop_enable", True))
@@ -13032,6 +13211,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.hdr_wic_yuv444_color_match_check.setChecked(self.cfg.hdr_wic_yuv444_color_match)
         if hasattr(self, "hdr_wic_yuv444_color_match_strength_spin"):
             self.hdr_wic_yuv444_color_match_strength_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_strength)
+        if hasattr(self, "hdr_wic_yuv444_color_match_luma_strength_spin"):
+            self.hdr_wic_yuv444_color_match_luma_strength_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_luma_strength)
+        if hasattr(self, "hdr_wic_yuv444_color_match_chroma_strength_spin"):
+            self.hdr_wic_yuv444_color_match_chroma_strength_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_chroma_strength)
+        if hasattr(self, "hdr_wic_yuv444_color_match_lowfreq_spin"):
+            self.hdr_wic_yuv444_color_match_lowfreq_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_lowfreq)
         if hasattr(self, "hdr_wic_yuv444_guide_cleanup_check"):
             self.hdr_wic_yuv444_guide_cleanup_check.setChecked(self.cfg.hdr_wic_yuv444_guide_cleanup)
         self.cfg.hdr_speckle_diag = bool(getattr(cfg, "hdr_speckle_diag", False))
@@ -14189,6 +14374,57 @@ class MainWindow(QtWidgets.QMainWindow):
             self.hdr_wic_yuv444_color_match_check.setChecked(self.cfg.hdr_wic_yuv444_color_match)
         if hasattr(self, "hdr_wic_yuv444_color_match_strength_spin"):
             self.hdr_wic_yuv444_color_match_strength_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_strength)
+        try:
+            self.cfg.hdr_wic_yuv444_color_match_luma_strength = min(
+                1.0,
+                max(
+                    0.0,
+                    float(
+                        s.value(
+                            "hdr_wic_yuv444_color_match_luma_strength",
+                            getattr(self.cfg, "hdr_wic_yuv444_color_match_luma_strength", 0.45),
+                        )
+                    ),
+                ),
+            )
+        except Exception:
+            self.cfg.hdr_wic_yuv444_color_match_luma_strength = 0.45
+        try:
+            self.cfg.hdr_wic_yuv444_color_match_chroma_strength = min(
+                1.0,
+                max(
+                    0.0,
+                    float(
+                        s.value(
+                            "hdr_wic_yuv444_color_match_chroma_strength",
+                            getattr(self.cfg, "hdr_wic_yuv444_color_match_chroma_strength", 0.85),
+                        )
+                    ),
+                ),
+            )
+        except Exception:
+            self.cfg.hdr_wic_yuv444_color_match_chroma_strength = 0.85
+        try:
+            self.cfg.hdr_wic_yuv444_color_match_lowfreq = min(
+                1.0,
+                max(
+                    0.0,
+                    float(
+                        s.value(
+                            "hdr_wic_yuv444_color_match_lowfreq",
+                            getattr(self.cfg, "hdr_wic_yuv444_color_match_lowfreq", 0.0),
+                        )
+                    ),
+                ),
+            )
+        except Exception:
+            self.cfg.hdr_wic_yuv444_color_match_lowfreq = 0.0
+        if hasattr(self, "hdr_wic_yuv444_color_match_luma_strength_spin"):
+            self.hdr_wic_yuv444_color_match_luma_strength_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_luma_strength)
+        if hasattr(self, "hdr_wic_yuv444_color_match_chroma_strength_spin"):
+            self.hdr_wic_yuv444_color_match_chroma_strength_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_chroma_strength)
+        if hasattr(self, "hdr_wic_yuv444_color_match_lowfreq_spin"):
+            self.hdr_wic_yuv444_color_match_lowfreq_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_lowfreq)
         self.cfg.hdr_wic_yuv444_guide_cleanup = bool(
             s.value(
                 "hdr_wic_yuv444_guide_cleanup",
@@ -14234,6 +14470,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 type=bool,
             )
         )
+        if hasattr(self, "hdr_wic_speckle_cleanup_check"):
+            self.hdr_wic_speckle_cleanup_check.setChecked(self.cfg.hdr_wic_speckle_cleanup)
         self.cfg.hdr_avif_wic_display_compat = bool(
             s.value(
                 "hdr_avif_wic_display_compat",
