@@ -8756,12 +8756,23 @@ class Processor(QtCore.QObject):
 
     @staticmethod
     def _normalize_wic_yuv444_color_match_gpu_mode(value: object, default: str = "auto") -> str:
-        raw = str(value if value is not None else default).strip().lower()
+        fallback_raw = str(default if default is not None else "auto").strip().lower()
+        if fallback_raw in {"1", "true", "yes", "on", "cuda", "gpu"}:
+            fallback = "on"
+        elif fallback_raw in {"0", "false", "no", "off", "cpu"}:
+            fallback = "off"
+        elif fallback_raw == "auto":
+            fallback = "auto"
+        else:
+            fallback = "auto"
+        raw = str(value if value is not None else fallback).strip().lower()
         if raw in {"1", "true", "yes", "on", "cuda", "gpu"}:
             return "on"
         if raw in {"0", "false", "no", "off", "cpu"}:
             return "off"
-        return "auto"
+        if raw == "auto":
+            return "auto"
+        return fallback
 
     @staticmethod
     def _normalize_wic_yuv444_color_match_gpu_auto_min_pixels(value: object, default: int = 1_000_000) -> int:
@@ -8858,8 +8869,12 @@ class Processor(QtCore.QObject):
                     key="hdr_wic_yuv444_color_match_gpu",
                     interval=10.0,
                 )
-            except Exception:
-                pass
+            except Exception as status_exc:
+                self._dbg(
+                    "HDR WIC yuv444 color-match GPU skip status emit failed: "
+                    f"gpu_exc={type(exc).__name__}:{exc} "
+                    f"status_exc={type(status_exc).__name__}:{status_exc}"
+                )
             return None
 
     def _try_save_wic_yuv444_color_matched_fast(
@@ -14131,14 +14146,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cfg.hdr_wic_yuv444_color_match_gpu_mode = self._normalize_wic_color_match_gpu_mode_value(
             getattr(cfg, "hdr_wic_yuv444_color_match_gpu_mode", "auto")
         )
-        try:
-            self.cfg.hdr_wic_yuv444_color_match_gpu_auto_min_pixels = (
-                self._normalize_wic_color_match_gpu_auto_min_pixels_value(
-                    getattr(cfg, "hdr_wic_yuv444_color_match_gpu_auto_min_pixels", 1_000_000)
-                )
+        self.cfg.hdr_wic_yuv444_color_match_gpu_auto_min_pixels = (
+            self._normalize_wic_color_match_gpu_auto_min_pixels_value(
+                getattr(cfg, "hdr_wic_yuv444_color_match_gpu_auto_min_pixels", 1_000_000)
             )
-        except Exception:
-            self.cfg.hdr_wic_yuv444_color_match_gpu_auto_min_pixels = 1_000_000
+        )
         self.cfg.hdr_wic_yuv444_guide_cleanup = bool(getattr(cfg, "hdr_wic_yuv444_guide_cleanup", False))
         self.cfg.hdr_avif_wic_display_compat = bool(getattr(cfg, "hdr_avif_wic_display_compat", True))
         self.cfg.compose_crop_enable = bool(getattr(cfg, "compose_crop_enable", True))
@@ -15465,17 +15477,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 getattr(self.cfg, "hdr_wic_yuv444_color_match_gpu_mode", "auto"),
             )
         )
-        try:
-            self.cfg.hdr_wic_yuv444_color_match_gpu_auto_min_pixels = (
-                self._normalize_wic_color_match_gpu_auto_min_pixels_value(
-                    s.value(
-                        "hdr_wic_yuv444_color_match_gpu_auto_min_pixels",
-                        getattr(self.cfg, "hdr_wic_yuv444_color_match_gpu_auto_min_pixels", 1_000_000),
-                    )
+        self.cfg.hdr_wic_yuv444_color_match_gpu_auto_min_pixels = (
+            self._normalize_wic_color_match_gpu_auto_min_pixels_value(
+                s.value(
+                    "hdr_wic_yuv444_color_match_gpu_auto_min_pixels",
+                    getattr(self.cfg, "hdr_wic_yuv444_color_match_gpu_auto_min_pixels", 1_000_000),
                 )
             )
-        except Exception:
-            self.cfg.hdr_wic_yuv444_color_match_gpu_auto_min_pixels = 1_000_000
+        )
         if hasattr(self, "hdr_wic_yuv444_color_match_luma_strength_spin"):
             self.hdr_wic_yuv444_color_match_luma_strength_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_luma_strength)
         if hasattr(self, "hdr_wic_yuv444_color_match_chroma_strength_spin"):
