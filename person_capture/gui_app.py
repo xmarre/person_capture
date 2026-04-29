@@ -2545,6 +2545,7 @@ class Processor(QtCore.QObject):
                 if subj_h_frac < 0.60:
                     continue
                 fallback_profile = "body"
+                fallback_protect = subj or base or face_hard_protect or (bx1, by1, bx2, by2)
             fallback_ratio = rs
             break
         if fallback_ratio is None:
@@ -2569,6 +2570,7 @@ class Processor(QtCore.QObject):
                 and subj_h_frac >= 0.60
             ):
                 fallback_profile = "body"
+                fallback_protect = subj or base or face_hard_protect or (bx1, by1, bx2, by2)
         crop = self._ratio_crop_containing_box(fallback_protect, fallback_ratio, bounds)
         return crop, fallback_ratio, fallback_profile
 
