@@ -9,8 +9,7 @@ Two things are central to the current project:
 - **Target-person dataset capture:** face-driven ArcFace identity matching, pre-scan span pruning, crop composition, optional lock-face ROI tracking, and optional curation.
 - **HDR still export:** full-resolution HDR source-frame crop export to SDR PNG/JPG, with a Windows WIC conversion path, yuv444 color-match repair for WIC dark-region artifacts, and optional legacy speckle cleanup for false saturated salt pixels.
 
-The current high-precision preset is face-driven: ArcFace is enabled, ReID is disabled, and SCRFD is the default face detector. This keeps identity decisions anchored to face embeddings instead of body-feature drift.
-
+The recommended high-precision identity setup uses SCRFD for face detection and ArcFace for matching against the reference bank. ReID is disabled in the current preset.
 ---
 
 ## Current pipeline
@@ -38,7 +37,7 @@ The current high-precision preset is face-driven: ArcFace is enabled, ReID is di
 
 5. **Export**
    - Writes primary crops under the selected output directory.
-   - For HDR footage, can export full-resolution SDR PNG/JPG crops through the HDR still path instead of relying on the low-resolution preview path.
+   - For HDR footage, accepted crop coordinates are exported from the original source frame through the HDR still backend as full-resolution SDR PNG/JPG crops.
    - Optional annotations, debug dumps, HDR source archives, and curated subsets are controlled independently.
 
 ---
