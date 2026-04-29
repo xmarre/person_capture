@@ -2340,6 +2340,7 @@ class Processor(QtCore.QObject):
         def _ratio_list_for_profile(profile: str) -> list[str]:
             preferred = {
                 "close": ["1:1", "2:3", "3:4"],
+                "portrait_close": ["2:3", "3:4", "1:1"],
                 "upper": ["2:3", "3:4", "1:1"],
                 "body": ["2:3", "3:4", "1:1", "3:2"],
                 "base": ["1:1", "2:3"],
@@ -2424,6 +2425,29 @@ class Processor(QtCore.QObject):
             ) or (hx1, hy1, hx2, max(hy2, fy2 + 0.85 * face_h))
             profiles.append(("close", close_protect, close_target, (fcx, fcy + 0.70 * face_h), (fw * 2.0, face_h / close_target)))
 
+            # Medium-close portrait framing. This fills the missing range between
+            # tight square close-ups and loose upper-body crops.
+            portrait_target = max(
+                0.34,
+                min(0.48, float(getattr(cfg, "compose_portrait_close_face_h_frac", 0.43))),
+            )
+            portrait_protect = self._pad_box_xyxy(
+                (hx1, hy1, hx2, max(hy2, fy2 + 1.45 * face_h)),
+                pad_x=0.18 * fw,
+                pad_y_top=0.00,
+                pad_y_bottom=0.35 * face_h,
+                bounds_xyxy=bounds,
+            ) or (hx1, hy1, hx2, max(hy2, fy2 + 1.45 * face_h))
+            profiles.append(
+                (
+                    "portrait_close",
+                    portrait_protect,
+                    portrait_target,
+                    (fcx, fcy + 1.05 * face_h),
+                    (fw * 2.05, face_h / portrait_target),
+                )
+            )
+
             if subj is not None:
                 sx1, sy1, sx2, sy2 = subj
                 sw = max(1.0, sx2 - sx1)
@@ -2485,7 +2509,7 @@ class Processor(QtCore.QObject):
                 except Exception:
                     continue
                 is_landscape = aspect > 1.05
-                if profile in {"close", "upper", "base"} and is_landscape:
+                if profile in {"close", "portrait_close", "upper", "base"} and is_landscape:
                     continue
                 if profile == "body" and is_landscape:
                     # Landscape is a rare context/body sample, not a normal face
@@ -2530,6 +2554,21 @@ class Processor(QtCore.QObject):
                 if profile == "close":
                     profile_prior = 0.00
                     ratio_prior += 0.00 if rs == "1:1" else 0.08
+                elif profile == "portrait_close":
+                    # Prefer medium-close faces, but keep this from stealing very
+                    # small/far faces or extreme close-ups.
+                    if face is not None and 0.14 <= face_frame_frac <= 0.34:
+                        profile_prior = -0.16
+                    else:
+                        profile_prior = 0.20
+                    if rs == "2:3":
+                        ratio_prior -= 0.06
+                    elif rs == "3:4":
+                        ratio_prior += 0.02
+                    elif rs == "1:1":
+                        ratio_prior += 0.42
+                    else:
+                        ratio_prior += 0.22
                 elif profile == "upper":
                     profile_prior = 0.12
                     ratio_prior += 0.00 if rs == "2:3" else 0.06
@@ -2568,6 +2607,8 @@ class Processor(QtCore.QObject):
                     face_loss = abs(actual_face_h_frac - max(1e-6, target_face_h_frac))
                     if profile == "close" and face_frame_frac < small_face_frame_frac:
                         profile_prior += close_small_face_penalty
+                    if profile == "portrait_close" and face_frame_frac < 0.14:
+                        profile_prior += 0.40
                     if profile == "upper" and face_frame_frac < small_face_frame_frac:
                         profile_prior -= upper_small_face_face_loss_nudge
                 else:
@@ -2578,13 +2619,18 @@ class Processor(QtCore.QObject):
                     area_penalty += 0.35
 
                 placement_penalty = 0.0
-                if face is not None and profile in {"close", "upper"}:
+                if face is not None and profile in {"close", "portrait_close", "upper"}:
                     fcx = 0.5 * (face[0] + face[2])
                     fcy = 0.5 * (face[1] + face[3])
                     rel_x = (fcx - cx1) / crop_w
                     rel_y = (fcy - cy1) / crop_h
                     placement_penalty += 0.25 * abs(rel_x - 0.50)
-                    target_y = 0.36 if profile == "close" else 0.28
+                    if profile == "close":
+                        target_y = 0.36
+                    elif profile == "portrait_close":
+                        target_y = 0.30
+                    else:
+                        target_y = 0.28
                     placement_penalty += 0.35 * abs(rel_y - target_y)
 
                 score = containment + profile_prior + ratio_prior + 2.2 * face_loss + area_penalty + placement_penalty
@@ -6439,9 +6485,17 @@ class Processor(QtCore.QObject):
                                             fw2 = max(1.0, float(fixed[2] - fixed[0]))
                                             fh2 = max(1.0, float(fixed[3] - fixed[1]))
                                             face_h_frac2 = hfh / fh2
-                                            target_frac = 0.34 if fix_ratio == "1:1" else 0.24
+                                            if fix_ratio == "1:1":
+                                                target_frac = 0.34
+                                            elif crop_profile_for_guard == "portrait_close":
+                                                target_frac = 0.43
+                                            else:
+                                                target_frac = 0.24
                                             score = abs(face_h_frac2 - target_frac)
-                                            score += 0.02 if fix_ratio == "2:3" else (0.04 if fix_ratio == "3:4" else 0.0)
+                                            if crop_profile_for_guard == "portrait_close":
+                                                score += -0.03 if fix_ratio == "2:3" else (0.02 if fix_ratio == "3:4" else 0.08)
+                                            else:
+                                                score += 0.02 if fix_ratio == "2:3" else (0.04 if fix_ratio == "3:4" else 0.0)
                                             score += 0.04 * ((fw2 * fh2) / max(1.0, float((repair_bx2 - repair_bx1) * (repair_by2 - repair_by1))))
                                             if best_fix is None or score < best_fix[0]:
                                                 best_fix = (score, fixed, fix_ratio)
