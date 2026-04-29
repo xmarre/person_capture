@@ -2316,6 +2316,15 @@ class Processor(QtCore.QObject):
         subj_h_frac = ((subj[3] - subj[1]) / bound_h) if subj is not None else 0.0
         body_period = max(0, int(getattr(cfg, "compose_body_every_n", 6)))
         body_cadence = body_period > 0 and frame_idx is not None and (int(frame_idx) % body_period == 0)
+        # Coarse composition class from actual face size in the debarred content
+        # window. The previous scorer let the close profile pick portrait crops
+        # and let small/far faces fall back to square crops because profile/ratio
+        # priors were mostly static. Keep ratio selection tied to shot scale:
+        #   - prominent/full-face shots prefer square close-ups,
+        #   - smaller/farther shots prefer portrait/context crops,
+        # while still allowing the containment checks below to override when needed.
+        close_face_frame_frac = 0.16
+        far_face_frame_frac = 0.11
 
         if face is not None:
             fx1, fy1, fx2, fy2 = face
@@ -2442,10 +2451,39 @@ class Processor(QtCore.QObject):
                 ratio_prior = 0.0
                 if profile == "close":
                     profile_prior = 0.00
-                    ratio_prior += 0.00 if rs == "1:1" else 0.08
+                    if face is not None and face_frame_frac >= close_face_frame_frac:
+                        # True close-ups should not be reframed as upper-body
+                        # portraits just because the 2:3 crop has a slightly
+                        # lower face-height loss.
+                        profile_prior -= 0.18
+                        if rs == "1:1":
+                            ratio_prior -= 0.08
+                        elif rs == "2:3":
+                            ratio_prior += 0.20
+                        else:
+                            ratio_prior += 0.26
+                    elif face is not None and face_frame_frac < far_face_frame_frac:
+                        # Small/far faces need context. A square close crop is
+                        # the wrong profile and was the source of repeated 1:1
+                        # farther-away samples.
+                        profile_prior += 0.95
+                        ratio_prior += 0.32 if rs == "1:1" else 0.12
+                    else:
+                        ratio_prior += 0.00 if rs == "1:1" else 0.08
                 elif profile == "upper":
                     profile_prior = 0.12
-                    ratio_prior += 0.00 if rs == "2:3" else 0.06
+                    if face is not None and face_frame_frac >= close_face_frame_frac:
+                        profile_prior += 0.34
+                    elif face is not None and face_frame_frac < far_face_frame_frac:
+                        profile_prior -= 0.18
+                    if rs == "2:3":
+                        ratio_prior += 0.00
+                    elif rs == "3:4":
+                        ratio_prior += 0.05
+                    elif rs == "1:1":
+                        ratio_prior += 0.28 if (face is not None and face_frame_frac < far_face_frame_frac) else 0.12
+                    else:
+                        ratio_prior += 0.16
                 elif profile == "body":
                     landscape_penalty = max(0.0, min(20.0, float(getattr(cfg, "compose_landscape_face_penalty", 5.0))))
                     profile_prior = 0.78
@@ -2477,6 +2515,13 @@ class Processor(QtCore.QObject):
                         profile_prior += 0.65
                     if profile == "upper" and face_frame_frac < 0.085:
                         profile_prior -= 0.12
+                    if profile == "close" and face_frame_frac >= close_face_frame_frac and rs != "1:1":
+                        # Avoid portrait-only full-face closeups.
+                        face_loss *= 1.18
+                    if profile == "upper" and face_frame_frac < far_face_frame_frac and rs == "1:1":
+                        # Far shots should not collapse to square just because it
+                        # is geometrically compact.
+                        face_loss *= 1.25
                 else:
                     face_loss = 0.0
 
@@ -2523,7 +2568,14 @@ class Processor(QtCore.QObject):
             fallback_ratio = rs
             break
         if fallback_ratio is None:
-            fallback_ratio = "1:1" if face_protect is not None else "2:3"
+            if face_protect is not None and face_frame_frac < far_face_frame_frac:
+                preferred_fallbacks = ("2:3", "3:4", "1:1")
+            elif face_protect is not None:
+                preferred_fallbacks = ("1:1", "2:3", "3:4")
+            else:
+                preferred_fallbacks = ("2:3", "3:4", "1:1")
+            available = validated_user_ratios or list(preferred_fallbacks)
+            fallback_ratio = next((rs for rs in preferred_fallbacks if rs in available), available[0] if available else "2:3")
             fallback_profile = "fallback"
         crop = self._ratio_crop_containing_box(fallback_protect, fallback_ratio, bounds)
         return crop, fallback_ratio, fallback_profile
@@ -6145,9 +6197,13 @@ class Processor(QtCore.QObject):
                         # face plus the active associated person box. show_box is
                         # a fallback only when subject_box is missing, because
                         # show_box can be stale composed geometry.
-                        subject_or_show = c.get("subject_box") or c.get("show_box")
+                        # show_box is only an annotation/display fallback. In
+                        # face-only candidates it is often the stale pre-final
+                        # composed crop, not a detected person. Feeding it back
+                        # into final composition pins the new crop to old geometry
+                        # and causes the repeated portrait/square bias.
                         protect_box = self._union_boxes_xyxy(
-                            subject_or_show,
+                            c.get("subject_box"),
                             c.get("head_box"),
                             c.get("face_box"),
                         )
@@ -6277,10 +6333,13 @@ class Processor(QtCore.QObject):
                                             (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                         )
                                     else:
-                                        subject_or_show = c.get("subject_box") or c.get("show_box")
+                                        # Same invariant as protect_box above: do not
+                                        # guard final face repairs with show_box unless
+                                        # there is a real subject_box. show_box may be
+                                        # the stale candidate crop itself.
                                         identity_guard = self._coerce_box_xyxy(
                                             self._union_boxes_xyxy(
-                                                subject_or_show,
+                                                c.get("subject_box"),
                                                 c.get("head_box"),
                                                 c.get("face_box"),
                                             ),
@@ -6292,10 +6351,10 @@ class Processor(QtCore.QObject):
                                         else None
                                     )
                                     # Do not add any extra show_box-only guard here.
-                                    # identity_guard already carries subject_or_show in the
-                                    # non-body / forced-portrait branch; adding another
-                                    # standalone show_box guard can resurrect stale wide
-                                    # preview geometry.
+                                    # identity_guard already carries the real identity
+                                    # geometry for the non-body / forced-portrait branch;
+                                    # adding a standalone show_box guard can resurrect
+                                    # stale wide preview geometry.
                                     full_guard_box = self._union_boxes_xyxy(
                                         hard_face_padded,
                                         identity_guard,
@@ -6657,7 +6716,8 @@ class Processor(QtCore.QObject):
                         (
                             f"CAPTURE idx={idx} t={idx/float(fps):.2f} "
                             f"fd={c.get('fd')} rd={c.get('rd')} score={c.get('score')} "
-                            f"area={area} ratio={ratio_str} face_frac={c.get('face_frac'):.3f} tloss={c.get('tloss', 0.0):.4f} reasons={reasons}"
+                            f"area={area} ratio={ratio_str} profile={c.get('crop_profile', 'n/a')} "
+                            f"face_frac={c.get('face_frac'):.3f} tloss={c.get('tloss', 0.0):.4f} reasons={reasons}"
                         ),
                         key="cap",
                     )
@@ -10021,7 +10081,7 @@ try {{
                 f"components={rect_count} area={rect_area}"
             )
         except Exception as exc:
-            return False, f"block_guard_failed:{type(exc).__name__}:{exc}"
+            return True, f"block_guard_failed:{type(exc).__name__}:{exc}"
 
     def _hdr_tonemap_filter_cmds(
         self,
