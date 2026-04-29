@@ -475,6 +475,7 @@ class SessionConfig:
     compose_crop_enable: bool = True             # compose final dataset crop from identity boxes
     compose_detect_person_for_face: bool = True  # associate global face hits with YOLO person boxes
     compose_close_face_h_frac: float = 0.34      # target face_h / crop_h for close/head crops
+    compose_portrait_close_face_h_frac: float = 0.43  # target face_h / crop_h for medium-close portrait crops
     compose_upper_face_h_frac: float = 0.22      # target face_h / crop_h for portrait/upper-body crops
     compose_body_face_h_frac: float = 0.085      # target face_h / crop_h for full-body crops
     compose_landscape_face_penalty: float = 5.0  # discourage landscape crops for prominent faces
@@ -2429,7 +2430,7 @@ class Processor(QtCore.QObject):
             # tight square close-ups and loose upper-body crops.
             portrait_target = max(
                 0.34,
-                min(0.48, float(getattr(cfg, "compose_portrait_close_face_h_frac", 0.43))),
+                min(0.48, float(cfg.compose_portrait_close_face_h_frac)),
             )
             portrait_protect = self._pad_box_xyxy(
                 (hx1, hy1, hx2, max(hy2, fy2 + 1.45 * face_h)),
@@ -5134,6 +5135,7 @@ class Processor(QtCore.QObject):
                             "compose_crop_enable",
                             "compose_detect_person_for_face",
                             "compose_close_face_h_frac",
+                            "compose_portrait_close_face_h_frac",
                             "compose_upper_face_h_frac",
                             "compose_body_face_h_frac",
                             "compose_landscape_face_penalty",
@@ -12295,6 +12297,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.compose_close_face_h_frac_spin = _mk_fspin(0.01, 1.0, 0.01, 3, "float: compose_close_face_h_frac")
         self.compose_close_face_h_frac_spin.setValue(float(self.cfg.compose_close_face_h_frac))
         self.compose_close_face_h_frac_spin.valueChanged.connect(self._on_ui_change)
+        self.compose_portrait_close_face_h_frac_spin = _mk_fspin(0.01, 1.0, 0.01, 3, "float: compose_portrait_close_face_h_frac")
+        self.compose_portrait_close_face_h_frac_spin.setValue(float(getattr(self.cfg, "compose_portrait_close_face_h_frac", 0.43)))
+        self.compose_portrait_close_face_h_frac_spin.valueChanged.connect(self._on_ui_change)
         self.compose_upper_face_h_frac_spin = _mk_fspin(0.01, 1.0, 0.01, 3, "float: compose_upper_face_h_frac")
         self.compose_upper_face_h_frac_spin.setValue(float(self.cfg.compose_upper_face_h_frac))
         self.compose_upper_face_h_frac_spin.valueChanged.connect(self._on_ui_change)
@@ -12475,6 +12480,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("compose_crop_enable", self.compose_crop_enable_check),
             ("compose_detect_person_for_face", self.compose_detect_person_for_face_check),
             ("compose_close_face_h_frac", self.compose_close_face_h_frac_spin),
+            ("compose_portrait_close_face_h_frac", self.compose_portrait_close_face_h_frac_spin),
             ("compose_upper_face_h_frac", self.compose_upper_face_h_frac_spin),
             ("compose_body_face_h_frac", self.compose_body_face_h_frac_spin),
             ("compose_landscape_face_penalty", self.compose_landscape_face_penalty_spin),
@@ -13758,6 +13764,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "compose_crop_enable",
             "compose_detect_person_for_face",
             "compose_close_face_h_frac",
+            "compose_portrait_close_face_h_frac",
             "compose_upper_face_h_frac",
             "compose_body_face_h_frac",
             "compose_landscape_face_penalty",
@@ -13945,6 +13952,7 @@ class MainWindow(QtWidgets.QMainWindow):
             compose_crop_enable=bool(self.compose_crop_enable_check.isChecked()) if hasattr(self, "compose_crop_enable_check") else bool(getattr(self.cfg, "compose_crop_enable", True)),
             compose_detect_person_for_face=bool(self.compose_detect_person_for_face_check.isChecked()) if hasattr(self, "compose_detect_person_for_face_check") else bool(getattr(self.cfg, "compose_detect_person_for_face", True)),
             compose_close_face_h_frac=float(self.compose_close_face_h_frac_spin.value()) if hasattr(self, "compose_close_face_h_frac_spin") else float(getattr(self.cfg, "compose_close_face_h_frac", 0.34)),
+            compose_portrait_close_face_h_frac=float(self.compose_portrait_close_face_h_frac_spin.value()) if hasattr(self, "compose_portrait_close_face_h_frac_spin") else float(getattr(self.cfg, "compose_portrait_close_face_h_frac", 0.43)),
             compose_upper_face_h_frac=float(self.compose_upper_face_h_frac_spin.value()) if hasattr(self, "compose_upper_face_h_frac_spin") else float(getattr(self.cfg, "compose_upper_face_h_frac", 0.22)),
             compose_body_face_h_frac=float(self.compose_body_face_h_frac_spin.value()) if hasattr(self, "compose_body_face_h_frac_spin") else float(getattr(self.cfg, "compose_body_face_h_frac", 0.085)),
             compose_landscape_face_penalty=float(self.compose_landscape_face_penalty_spin.value()) if hasattr(self, "compose_landscape_face_penalty_spin") else float(getattr(self.cfg, "compose_landscape_face_penalty", 5.0)),
@@ -14281,6 +14289,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.compose_close_face_h_frac = float(getattr(cfg, "compose_close_face_h_frac", 0.34))
         except Exception:
             self.cfg.compose_close_face_h_frac = 0.34
+        try:
+            self.cfg.compose_portrait_close_face_h_frac = float(getattr(cfg, "compose_portrait_close_face_h_frac", 0.43))
+        except Exception:
+            self.cfg.compose_portrait_close_face_h_frac = 0.43
         try:
             self.cfg.compose_upper_face_h_frac = float(getattr(cfg, "compose_upper_face_h_frac", 0.22))
         except Exception:
@@ -14715,6 +14727,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.compose_detect_person_for_face_check.setChecked(bool(cfg.compose_detect_person_for_face))
         if hasattr(self, 'compose_close_face_h_frac_spin'):
             self.compose_close_face_h_frac_spin.setValue(float(cfg.compose_close_face_h_frac))
+        if hasattr(self, 'compose_portrait_close_face_h_frac_spin'):
+            self.compose_portrait_close_face_h_frac_spin.setValue(float(cfg.compose_portrait_close_face_h_frac))
         if hasattr(self, 'compose_upper_face_h_frac_spin'):
             self.compose_upper_face_h_frac_spin.setValue(float(cfg.compose_upper_face_h_frac))
         if hasattr(self, 'compose_body_face_h_frac_spin'):
@@ -16014,6 +16028,12 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             self.cfg.compose_close_face_h_frac = 0.34
         try:
+            self.cfg.compose_portrait_close_face_h_frac = float(
+                s.value("compose_portrait_close_face_h_frac", getattr(self.cfg, "compose_portrait_close_face_h_frac", 0.43))
+            )
+        except Exception:
+            self.cfg.compose_portrait_close_face_h_frac = 0.43
+        try:
             self.cfg.compose_upper_face_h_frac = float(
                 s.value("compose_upper_face_h_frac", getattr(self.cfg, "compose_upper_face_h_frac", 0.22))
             )
@@ -16149,6 +16169,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'compose_close_face_h_frac_spin'):
             self.compose_close_face_h_frac_spin.setValue(
                 float(s.value("compose_close_face_h_frac", self.cfg.compose_close_face_h_frac))
+            )
+        if hasattr(self, 'compose_portrait_close_face_h_frac_spin'):
+            self.compose_portrait_close_face_h_frac_spin.setValue(
+                float(s.value("compose_portrait_close_face_h_frac", self.cfg.compose_portrait_close_face_h_frac))
             )
         if hasattr(self, 'compose_upper_face_h_frac_spin'):
             self.compose_upper_face_h_frac_spin.setValue(
