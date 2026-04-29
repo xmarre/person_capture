@@ -2316,6 +2316,15 @@ class Processor(QtCore.QObject):
         subj_h_frac = ((subj[3] - subj[1]) / bound_h) if subj is not None else 0.0
         body_period = max(0, int(getattr(cfg, "compose_body_every_n", 6)))
         body_cadence = body_period > 0 and frame_idx is not None and (int(frame_idx) % body_period == 0)
+        # Coarse composition class from actual face size in the debarred content
+        # window. The previous scorer let the close profile pick portrait crops
+        # and let small/far faces fall back to square crops because profile/ratio
+        # priors were mostly static. Keep ratio selection tied to shot scale:
+        #   - prominent/full-face shots prefer square close-ups,
+        #   - smaller/farther shots prefer portrait/context crops,
+        # while still allowing the containment checks below to override when needed.
+        close_face_frame_frac = 0.16
+        far_face_frame_frac = 0.11
 
         if face is not None:
             fx1, fy1, fx2, fy2 = face
@@ -2442,10 +2451,39 @@ class Processor(QtCore.QObject):
                 ratio_prior = 0.0
                 if profile == "close":
                     profile_prior = 0.00
-                    ratio_prior += 0.00 if rs == "1:1" else 0.08
+                    if face is not None and face_frame_frac >= close_face_frame_frac:
+                        # True close-ups should not be reframed as upper-body
+                        # portraits just because the 2:3 crop has a slightly
+                        # lower face-height loss.
+                        profile_prior -= 0.18
+                        if rs == "1:1":
+                            ratio_prior -= 0.08
+                        elif rs == "2:3":
+                            ratio_prior += 0.20
+                        else:
+                            ratio_prior += 0.26
+                    elif face is not None and face_frame_frac < far_face_frame_frac:
+                        # Small/far faces need context. A square close crop is
+                        # the wrong profile and was the source of repeated 1:1
+                        # farther-away samples.
+                        profile_prior += 0.95
+                        ratio_prior += 0.32 if rs == "1:1" else 0.12
+                    else:
+                        ratio_prior += 0.00 if rs == "1:1" else 0.08
                 elif profile == "upper":
                     profile_prior = 0.12
-                    ratio_prior += 0.00 if rs == "2:3" else 0.06
+                    if face is not None and face_frame_frac >= close_face_frame_frac:
+                        profile_prior += 0.34
+                    elif face is not None and face_frame_frac < far_face_frame_frac:
+                        profile_prior -= 0.18
+                    if rs == "2:3":
+                        ratio_prior += 0.00
+                    elif rs == "3:4":
+                        ratio_prior += 0.05
+                    elif rs == "1:1":
+                        ratio_prior += 0.28 if (face is not None and face_frame_frac < far_face_frame_frac) else 0.12
+                    else:
+                        ratio_prior += 0.16
                 elif profile == "body":
                     landscape_penalty = max(0.0, min(20.0, float(getattr(cfg, "compose_landscape_face_penalty", 5.0))))
                     profile_prior = 0.78
@@ -2477,6 +2515,13 @@ class Processor(QtCore.QObject):
                         profile_prior += 0.65
                     if profile == "upper" and face_frame_frac < 0.085:
                         profile_prior -= 0.12
+                    if profile == "close" and face_frame_frac >= close_face_frame_frac and rs != "1:1":
+                        # Avoid portrait-only full-face closeups.
+                        face_loss *= 1.18
+                    if profile == "upper" and face_frame_frac < far_face_frame_frac and rs == "1:1":
+                        # Far shots should not collapse to square just because it
+                        # is geometrically compact.
+                        face_loss *= 1.25
                 else:
                     face_loss = 0.0
 
@@ -2523,8 +2568,27 @@ class Processor(QtCore.QObject):
             fallback_ratio = rs
             break
         if fallback_ratio is None:
-            fallback_ratio = "1:1" if face_protect is not None else "2:3"
+            if face_protect is not None and face_frame_frac < far_face_frame_frac:
+                preferred_fallbacks = ("2:3", "3:4", "1:1")
+            elif face_protect is not None:
+                preferred_fallbacks = ("1:1", "2:3", "3:4")
+            else:
+                preferred_fallbacks = ("2:3", "3:4", "1:1")
+            available = validated_user_ratios or list(preferred_fallbacks)
+            fallback_ratio = next((rs for rs in preferred_fallbacks if rs in available), available[0] if available else "2:3")
             fallback_profile = "fallback"
+            try:
+                rw, rh = parse_ratio(fallback_ratio)
+                fallback_aspect = float(rw) / max(1e-6, float(rh))
+            except Exception:
+                fallback_aspect = 1.0
+            if (
+                fallback_aspect > 1.05
+                and subj is not None
+                and face_frame_frac < 0.12
+                and subj_h_frac >= 0.60
+            ):
+                fallback_profile = "body"
         crop = self._ratio_crop_containing_box(fallback_protect, fallback_ratio, bounds)
         return crop, fallback_ratio, fallback_profile
 
@@ -6145,9 +6209,13 @@ class Processor(QtCore.QObject):
                         # face plus the active associated person box. show_box is
                         # a fallback only when subject_box is missing, because
                         # show_box can be stale composed geometry.
-                        subject_or_show = c.get("subject_box") or c.get("show_box")
+                        # show_box is only an annotation/display fallback. In
+                        # face-only candidates it is often the stale pre-final
+                        # composed crop, not a detected person. Feeding it back
+                        # into final composition pins the new crop to old geometry
+                        # and causes the repeated portrait/square bias.
                         protect_box = self._union_boxes_xyxy(
-                            subject_or_show,
+                            c.get("subject_box"),
                             c.get("head_box"),
                             c.get("face_box"),
                         )
@@ -6277,10 +6345,13 @@ class Processor(QtCore.QObject):
                                             (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                         )
                                     else:
-                                        subject_or_show = c.get("subject_box") or c.get("show_box")
+                                        # Same invariant as protect_box above: do not
+                                        # guard final face repairs with show_box unless
+                                        # there is a real subject_box. show_box may be
+                                        # the stale candidate crop itself.
                                         identity_guard = self._coerce_box_xyxy(
                                             self._union_boxes_xyxy(
-                                                subject_or_show,
+                                                c.get("subject_box"),
                                                 c.get("head_box"),
                                                 c.get("face_box"),
                                             ),
@@ -6292,10 +6363,10 @@ class Processor(QtCore.QObject):
                                         else None
                                     )
                                     # Do not add any extra show_box-only guard here.
-                                    # identity_guard already carries subject_or_show in the
-                                    # non-body / forced-portrait branch; adding another
-                                    # standalone show_box guard can resurrect stale wide
-                                    # preview geometry.
+                                    # identity_guard already carries the real identity
+                                    # geometry for the non-body / forced-portrait branch;
+                                    # adding a standalone show_box guard can resurrect
+                                    # stale wide preview geometry.
                                     full_guard_box = self._union_boxes_xyxy(
                                         hard_face_padded,
                                         identity_guard,
@@ -6653,11 +6724,16 @@ class Processor(QtCore.QObject):
                     reasons = "|".join(reasons_list)
                     bx1, by1, bx2, by2 = c["box"]
                     area = (bx2 - bx1) * (by2 - by1)
+                    try:
+                        face_frac_dbg = float(c.get("face_frac"))
+                    except Exception:
+                        face_frac_dbg = 0.0
                     self._status(
                         (
                             f"CAPTURE idx={idx} t={idx/float(fps):.2f} "
                             f"fd={c.get('fd')} rd={c.get('rd')} score={c.get('score')} "
-                            f"area={area} ratio={ratio_str} face_frac={c.get('face_frac'):.3f} tloss={c.get('tloss', 0.0):.4f} reasons={reasons}"
+                            f"area={area} ratio={ratio_str} profile={c.get('crop_profile', 'n/a')} "
+                            f"face_frac={face_frac_dbg:.3f} tloss={c.get('tloss', 0.0):.4f} reasons={reasons}"
                         ),
                         key="cap",
                     )
@@ -8718,6 +8794,14 @@ class Processor(QtCore.QObject):
             ok_clean_wic, why_clean_wic = self._save_wic_png_from_hdr_image(clean_hdr, clean_png, repair=False)
             if not ok_clean_wic:
                 return False, f"clean_wic_failed:{why_clean_wic}", 0
+            block_bad, block_why = self._detect_wic_block_corruption(clean_png)
+            if block_bad:
+                self._status(
+                    f"HDR WIC yuv444 clean render rejected: {block_why}",
+                    key="hdr_wic_yuv444_color_match",
+                    interval=0.0,
+                )
+                return False, f"clean_wic_block_corrupt:{block_why}", 0
 
             changed, repaired_tmp = self._repair_wic_with_yuv444_color_match(ref_png, clean_png)
             if changed <= 0:
@@ -8727,6 +8811,14 @@ class Processor(QtCore.QObject):
             valid, invalid_why = self._validate_hdr_sdr_export_image(repaired_tmp, None)
             if not valid:
                 return False, f"color_match_invalid:{invalid_why}", 0
+            block_bad, block_why = self._detect_wic_block_corruption(repaired_tmp)
+            if block_bad:
+                self._status(
+                    f"HDR WIC yuv444 color-match output rejected: {block_why}",
+                    key="hdr_wic_yuv444_color_match",
+                    interval=0.0,
+                )
+                return False, f"color_match_block_corrupt:{block_why}", 0
             os.replace(repaired_tmp, out_path)
             return True, "", changed
         except Exception as exc:
@@ -8814,6 +8906,14 @@ class Processor(QtCore.QObject):
                     interval=10.0,
                 )
                 return 0
+            block_bad, block_why = self._detect_wic_block_corruption(guide_png)
+            if block_bad:
+                self._status(
+                    f"HDR WIC yuv444 color-match render rejected: {block_why}",
+                    key="hdr_wic_yuv444_color_match",
+                    interval=0.0,
+                )
+                return 0
             changed, repaired_tmp = self._repair_wic_with_yuv444_color_match(out_path, guide_png)
             if changed <= 0:
                 self._status(
@@ -8835,6 +8935,14 @@ class Processor(QtCore.QObject):
                     f"HDR WIC yuv444 color-match output invalid: {invalid_why}",
                     key="hdr_wic_yuv444_color_match",
                     interval=5.0,
+                )
+                return 0
+            block_bad, block_why = self._detect_wic_block_corruption(repaired_tmp)
+            if block_bad:
+                self._status(
+                    f"HDR WIC yuv444 color-match output rejected: {block_why}",
+                    key="hdr_wic_yuv444_color_match",
+                    interval=0.0,
                 )
                 return 0
             os.replace(repaired_tmp, out_path)
@@ -9912,6 +10020,84 @@ try {{
             return True, ""
         except Exception as exc:
             return False, f"validate_failed:{exc}"
+
+    @staticmethod
+    def _detect_wic_block_corruption(path: str) -> tuple[bool, str]:
+        """Detect valid PNGs that contain WIC/AVIF block-dropout corruption.
+
+        This is intentionally not a general denoiser or visual-quality metric.
+        It catches the catastrophic one-frame failure mode where the yuv444 WIC
+        render is a syntactically valid PNG but contains many hard-edged black
+        rectangular dropouts in dark regions. Those pixels must not be used as
+        the final yuv444 texture for color matching.
+        """
+        if str(os.getenv("PC_DISABLE_WIC_BLOCK_CORRUPTION_GUARD", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return False, ""
+        try:
+            if not path or not os.path.exists(path):
+                return False, ""
+            data = np.fromfile(path, dtype=np.uint8)
+            if data.size <= 16:
+                return False, ""
+            img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+            if img is None or img.ndim != 3 or img.shape[2] < 3:
+                return False, ""
+            bgr = img[:, :, :3]
+            h, w = bgr.shape[:2]
+            if h < 64 or w < 64:
+                return False, ""
+
+            ycc = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+            y = ycc[:, :, 0].astype(np.int16, copy=False)
+            y_med = cv2.medianBlur(ycc[:, :, 0], 17).astype(np.int16, copy=False)
+
+            # Valid dark scenes can be globally near-black. The bad case is
+            # different: many small hard-edged pixels/blocks are much darker than
+            # their local dark neighborhood.
+            drop = (y <= 52) & (y_med >= 12) & ((y_med - y) >= 12)
+            drop_count = int(np.count_nonzero(drop))
+            if drop_count < 2500:
+                return False, ""
+
+            n, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+                drop.astype(np.uint8),
+                8,
+            )
+            rect_count = 0
+            rect_area = 0
+            for i in range(1, n):
+                x = int(stats[i, cv2.CC_STAT_LEFT])
+                y0 = int(stats[i, cv2.CC_STAT_TOP])
+                cw = int(stats[i, cv2.CC_STAT_WIDTH])
+                ch = int(stats[i, cv2.CC_STAT_HEIGHT])
+                area = int(stats[i, cv2.CC_STAT_AREA])
+                if area < 12:
+                    continue
+                if cw < 3 or ch < 3 or cw > 80 or ch > 80:
+                    continue
+                fill = float(area) / float(max(1, cw * ch))
+                if fill < 0.15:
+                    continue
+                rect_count += 1
+                rect_area += area
+
+            bad = (
+                (rect_count >= 80 and rect_area >= 5000)
+                or (rect_count >= 50 and drop_count >= 12000)
+            )
+            if not bad:
+                return False, ""
+            return True, (
+                f"dark_block_dropouts pixels={drop_count} "
+                f"components={rect_count} area={rect_area}"
+            )
+        except Exception as exc:
+            return True, f"block_guard_failed:{type(exc).__name__}:{exc}"
 
     def _hdr_tonemap_filter_cmds(
         self,
