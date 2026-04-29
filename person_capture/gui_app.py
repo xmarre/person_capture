@@ -8720,8 +8720,10 @@ class Processor(QtCore.QObject):
                 return False, f"clean_wic_failed:{why_clean_wic}", 0
 
             changed, repaired_tmp = self._repair_wic_with_yuv444_color_match(ref_png, clean_png)
-            if changed <= 0 or not repaired_tmp:
+            if changed <= 0:
                 return False, "color_match_noop:changed=0", 0
+            if not repaired_tmp:
+                return False, "color_match_failed:missing_output", 0
             valid, invalid_why = self._validate_hdr_sdr_export_image(repaired_tmp, None)
             if not valid:
                 return False, f"color_match_invalid:{invalid_why}", 0
@@ -8813,9 +8815,16 @@ class Processor(QtCore.QObject):
                 )
                 return 0
             changed, repaired_tmp = self._repair_wic_with_yuv444_color_match(out_path, guide_png)
-            if changed <= 0 or not repaired_tmp:
+            if changed <= 0:
                 self._status(
                     "HDR WIC yuv444 color-match noop after full render: changed=0",
+                    key="hdr_wic_yuv444_color_match",
+                    interval=5.0,
+                )
+                return 0
+            if not repaired_tmp:
+                self._status(
+                    "HDR WIC yuv444 color-match failed after full render: missing temp output",
                     key="hdr_wic_yuv444_color_match",
                     interval=5.0,
                 )
