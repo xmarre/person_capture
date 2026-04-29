@@ -8615,12 +8615,12 @@ class Processor(QtCore.QObject):
         clean_hdr = base + ".clean_yuv444.avif"
         clean_png = base + ".clean_yuv444.png"
         repaired_tmp = ""
-        try:
-            for pth in (ref_hdr, ref_png, clean_hdr, clean_png):
+        for pth in (ref_hdr, ref_png, clean_hdr, clean_png):
+            try:
                 if os.path.exists(pth):
                     os.remove(pth)
-        except Exception:
-            pass
+            except OSError as exc:
+                self._dbg(f"fast yuv444 pre-clean failed for {pth}: {exc}")
         try:
             ok_ref_hdr, why_ref_hdr = self._save_hdr_wic_specific_intermediate_avif(
                 frame_idx,
@@ -8666,8 +8666,8 @@ class Processor(QtCore.QObject):
                 try:
                     if pth and os.path.exists(pth):
                         os.remove(pth)
-                except Exception:
-                    pass
+                except OSError as exc:
+                    self._dbg(f"fast yuv444 temp cleanup failed for {pth}: {exc}")
 
     def _wic_yuv444_color_match_enabled(self) -> bool:
         if self._truthy_env("PC_DISABLE_WIC_YUV444_COLOR_MATCH"):
