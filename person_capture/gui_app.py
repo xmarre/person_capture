@@ -7364,10 +7364,14 @@ class Processor(QtCore.QObject):
 
     @staticmethod
     def _float_env(name: str, default: float, *, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
+        default_value = float(default)
+        raw = str(os.getenv(name, "") or "").strip()
         try:
-            value = float(str(os.getenv(name, "")).strip() or float(default))
-        except Exception:
-            value = float(default)
+            value = float(raw) if raw else default_value
+        except (TypeError, ValueError):
+            value = default_value
+        if not math.isfinite(value):
+            value = default_value
         if min_value is not None:
             value = max(float(min_value), value)
         if max_value is not None:
