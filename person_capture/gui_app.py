@@ -7701,6 +7701,82 @@ class Processor(QtCore.QObject):
         (diag_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
         self._status(f"HDR speckle diagnostics done: {diag_dir}", key="hdr_speckle_diag", interval=0.0)
 
+    def _stabilize_wic_dark_chroma_blotches(self, img: np.ndarray) -> tuple[bool, int]:
+        """Suppress WIC-only dark chroma blotches without changing luma.
+
+        The saturated speckle repair handles impossible RGB salt pixels.  The
+        remaining defect is a lower-amplitude dark chroma crawl/blotch pattern:
+        black cloth and hair pick up green/cyan/magenta patches after the WIC
+        HDR AVIF render, while the accepted WIC/Paint tone response is otherwise
+        correct.  Do this after WIC, in display-referred YCrCb, and preserve the
+        rendered luma channel exactly so this cannot become another tone-map or
+        washed-color path.
+        """
+        if self._truthy_env("PC_DISABLE_WIC_DARK_CHROMA_CLEANUP"):
+            return False, 0
+        if img is None or img.ndim != 3 or img.shape[2] < 3:
+            return False, 0
+        bgr = img[:, :, :3]
+        try:
+            ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+        except Exception:
+            return False, 0
+
+        y = ycrcb[:, :, 0].astype(np.float32, copy=False)
+        cr = ycrcb[:, :, 1].astype(np.float32, copy=False)
+        cb = ycrcb[:, :, 2].astype(np.float32, copy=False)
+
+        # Use small odd kernels.  The target is block/chroma crawl in dark
+        # regions, not photographic denoising.  Luma remains untouched.
+        y_med = cv2.medianBlur(ycrcb[:, :, 0], 5).astype(np.float32, copy=False)
+        cr_med = cv2.medianBlur(ycrcb[:, :, 1], 9).astype(np.float32, copy=False)
+        cb_med = cv2.medianBlur(ycrcb[:, :, 2], 9).astype(np.float32, copy=False)
+
+        bgr16 = bgr.astype(np.int16, copy=False)
+        max_ch = bgr16.max(axis=2).astype(np.float32, copy=False)
+        cr_delta = np.abs(cr - cr_med)
+        cb_delta = np.abs(cb - cb_med)
+        chroma_delta = np.maximum(cr_delta, cb_delta)
+
+        # Constrain this to shadows/black textures.  This protects candle/fire,
+        # visible skin, and normal colored detail while still covering the coat
+        # and hair regions where WIC creates the green dark-gradient blobs.
+        dark_gate = (y_med <= 96.0) & (y <= 112.0) & (max_ch <= 154.0)
+        if int(np.count_nonzero(dark_gate)) <= 0:
+            return False, 0
+
+        # Blend dark chroma toward its local median to remove crawl.  Add a
+        # stronger term only for local chroma outliers.  For near-black pixels,
+        # add a small neutral pull because broad low-frequency chroma blotches
+        # can have no sharp local outlier center.
+        base_alpha = np.clip((96.0 - y_med) / 80.0, 0.0, 1.0) * 0.20
+        outlier_alpha = np.clip((chroma_delta - 3.0) / 20.0, 0.0, 1.0) * 0.55
+        alpha = np.maximum(base_alpha, outlier_alpha)
+        alpha = np.where(dark_gate, alpha, 0.0).astype(np.float32, copy=False)
+        if float(np.max(alpha)) <= 0.0:
+            return False, 0
+
+        neutral_alpha = np.clip((60.0 - y_med) / 52.0, 0.0, 1.0) * 0.28
+        neutral_alpha = np.where(dark_gate, neutral_alpha, 0.0).astype(np.float32, copy=False)
+
+        target_cr = cr_med * (1.0 - neutral_alpha) + 128.0 * neutral_alpha
+        target_cb = cb_med * (1.0 - neutral_alpha) + 128.0 * neutral_alpha
+        cr_new = cr * (1.0 - alpha) + target_cr * alpha
+        cb_new = cb * (1.0 - alpha) + target_cb * alpha
+
+        fixed_ycrcb = ycrcb.copy()
+        fixed_ycrcb[:, :, 1] = np.clip(np.rint(cr_new), 0, 255).astype(np.uint8)
+        fixed_ycrcb[:, :, 2] = np.clip(np.rint(cb_new), 0, 255).astype(np.uint8)
+        fixed_bgr = cv2.cvtColor(fixed_ycrcb, cv2.COLOR_YCrCb2BGR)
+
+        diff = np.max(np.abs(fixed_bgr.astype(np.int16, copy=False) - bgr.astype(np.int16, copy=False)), axis=2)
+        if int(np.count_nonzero(diff)) <= 0:
+            return False, 0
+        bgr[:, :, :] = fixed_bgr
+
+        # Report significant chroma fixes, not every one-code rounding change.
+        return True, int(np.count_nonzero(diff > 2))
+
     def _repair_wic_saturated_rgb_speckles(self, path: str) -> int:
         """Remove WIC/Windows HDR-AVIF salt pixels from an already-rendered SDR image.
 
@@ -7883,7 +7959,14 @@ class Processor(QtCore.QObject):
                 | ((red_halo | magenta_halo) & strict_near_seed)
             ).astype(np.uint8)
             if int(mask.sum()) <= 0:
-                return 0
+                out = img.copy()
+                dark_changed, dark_report = self._stabilize_wic_dark_chroma_blotches(out)
+                if not dark_changed:
+                    return 0
+                ok = cv2.imwrite(str(path), out)
+                if not ok:
+                    return 0
+                return max(1, int(dark_report))
 
             # Reject broad regions. Blue/cyan WIC faults can be short streaks, so
             # preserve the PR #328 48x48/420px allowance. Strict red/magenta
@@ -7974,7 +8057,14 @@ class Processor(QtCore.QObject):
                     repair_rois.append((comp_x, comp_y, bbox_w, bbox_h))
             changed = int(np.count_nonzero(keep))
             if changed <= 0:
-                return 0
+                out = img.copy()
+                dark_changed, dark_report = self._stabilize_wic_dark_chroma_blotches(out)
+                if not dark_changed:
+                    return 0
+                ok = cv2.imwrite(str(path), out)
+                if not ok:
+                    return 0
+                return max(1, int(dark_report))
             # Inpaint only the kept local defect regions from surrounding
             # good WIC-rendered pixels.  The old code inpainted the complete
             # multi-megapixel crop for a few hundred/thousand bad pixels.
@@ -7994,6 +8084,9 @@ class Processor(QtCore.QObject):
                 roi_src = repaired_bgr[y1:y2, x1:x2]
                 roi_fixed = cv2.inpaint(roi_src, roi_mask, 2.0, cv2.INPAINT_TELEA)
                 roi_src[roi_mask > 0] = roi_fixed[roi_mask > 0]
+            dark_changed, dark_report = self._stabilize_wic_dark_chroma_blotches(out)
+            if dark_changed:
+                changed += max(1, int(dark_report))
             ok = cv2.imwrite(str(path), out)
             if not ok:
                 return 0
