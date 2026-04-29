@@ -8093,6 +8093,9 @@ class Processor(QtCore.QObject):
         """Write the temporary HDR AVIF used only as WIC/Paint input."""
         failures: list[str] = []
         for pix_fmt in self._hdr_wic_intermediate_pixfmts():
+            # This helper only selects the temporary AVIF chroma sampling path.
+            # The older AVIF chroma prefilter toggle is not part of this call
+            # boundary on current master.
             ok, why = self._save_hdr_crop_p010(
                 frame_idx,
                 frame_pts_sec,
