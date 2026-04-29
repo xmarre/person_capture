@@ -2577,6 +2577,18 @@ class Processor(QtCore.QObject):
             available = validated_user_ratios or list(preferred_fallbacks)
             fallback_ratio = next((rs for rs in preferred_fallbacks if rs in available), available[0] if available else "2:3")
             fallback_profile = "fallback"
+            try:
+                rw, rh = parse_ratio(fallback_ratio)
+                fallback_aspect = float(rw) / max(1e-6, float(rh))
+            except Exception:
+                fallback_aspect = 1.0
+            if (
+                fallback_aspect > 1.05
+                and subj is not None
+                and face_frame_frac < 0.12
+                and subj_h_frac >= 0.60
+            ):
+                fallback_profile = "body"
         crop = self._ratio_crop_containing_box(fallback_protect, fallback_ratio, bounds)
         return crop, fallback_ratio, fallback_profile
 
