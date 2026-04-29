@@ -6485,10 +6485,10 @@ class Processor(QtCore.QObject):
                                             fw2 = max(1.0, float(fixed[2] - fixed[0]))
                                             fh2 = max(1.0, float(fixed[3] - fixed[1]))
                                             face_h_frac2 = hfh / fh2
-                                            if fix_ratio == "1:1":
-                                                target_frac = 0.34
-                                            elif crop_profile_for_guard == "portrait_close":
+                                            if crop_profile_for_guard == "portrait_close":
                                                 target_frac = 0.43
+                                            elif fix_ratio == "1:1":
+                                                target_frac = 0.34
                                             else:
                                                 target_frac = 0.24
                                             score = abs(face_h_frac2 - target_frac)
