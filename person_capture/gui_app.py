@@ -2190,6 +2190,74 @@ class Processor(QtCore.QObject):
         )
         return ibx1 + lx1, iby1 + ly1, ibx1 + lx2, iby1 + ly2
 
+    def _prefer_lower_face_crop_y(
+        self,
+        crop_xyxy: Tuple[float, float, float, float],
+        face_xyxy: Optional[Tuple[float, float, float, float]],
+        head_xyxy: Optional[Tuple[float, float, float, float]],
+        bounds_xyxy: Tuple[int, int, int, int],
+        profile: str,
+    ) -> Tuple[int, int, int, int]:
+        """Shift a finished face crop downward when that only removes headroom.
+
+        Ratio/size are preserved. This is a final placement pass, not a new
+        composition candidate: when there is a choice between empty space above
+        the head and more body/shoulders below, keep the face contained and move
+        the crop down.
+        """
+        if face_xyxy is None or str(profile or "").lower() == "body":
+            return tuple(int(round(v)) for v in crop_xyxy)  # type: ignore[return-value]
+        face = self._coerce_box_xyxy(face_xyxy, bounds_xyxy)
+        if face is None:
+            return tuple(int(round(v)) for v in crop_xyxy)  # type: ignore[return-value]
+
+        bx1, by1, bx2, by2 = [float(v) for v in bounds_xyxy]
+        cx1, cy1, cx2, cy2 = [float(v) for v in crop_xyxy]
+        crop_w = max(1.0, cx2 - cx1)
+        crop_h = max(1.0, cy2 - cy1)
+        max_y1 = by2 - crop_h
+        if max_y1 <= by1 + 1.0:
+            return tuple(int(round(v)) for v in crop_xyxy)  # type: ignore[return-value]
+
+        fx1, fy1, fx2, fy2 = face
+        fh = max(1.0, fy2 - fy1)
+        head = self._coerce_box_xyxy(head_xyxy, bounds_xyxy) if head_xyxy is not None else None
+
+        # Use the head/hair proxy as a top hint, but cap extreme proxy expansion.
+        # Over-expanded head boxes must not reserve huge empty space above.
+        top_guard = fy1
+        if head is not None:
+            proxy_top = min(float(head[1]), fy1)
+            proxy_floor = fy1 - 0.45 * fh
+            top_guard = max(proxy_floor, proxy_top)
+        top_guard = max(by1, min(by2, top_guard))
+
+        top_margin = max(4.0, min(0.055 * fh, 0.030 * crop_h))
+        bottom_margin = max(4.0, min(0.10 * fh, 0.075 * crop_h))
+
+        # Legal interval that keeps the detected face inside the fixed-size crop.
+        hard_low = max(by1, fy2 + 1.0 - crop_h)
+        hard_high = min(max_y1, fy1 - 1.0)
+        if hard_high < hard_low:
+            return tuple(int(round(v)) for v in crop_xyxy)  # type: ignore[return-value]
+
+        # Preferred interval keeps small top/bottom margins around the face/head.
+        # Pick the lowest legal crop in that interval.
+        pref_low = max(hard_low, fy2 + bottom_margin - crop_h)
+        pref_high = min(hard_high, top_guard - top_margin)
+        target_y1 = pref_high if pref_high >= pref_low else hard_high
+
+        # Only fix excessive top headroom. Do not move an already-low crop up.
+        if target_y1 <= cy1 + 1.0:
+            return tuple(int(round(v)) for v in crop_xyxy)  # type: ignore[return-value]
+        y1 = max(by1, min(max_y1, target_y1))
+        return (
+            int(round(cx1)),
+            int(round(y1)),
+            int(round(cx1 + crop_w)),
+            int(round(y1 + crop_h)),
+        )
+
     @staticmethod
     def _find_person_box_for_face(
         face_xyxy: Tuple[float, float, float, float],
@@ -6473,6 +6541,31 @@ class Processor(QtCore.QObject):
                                 (repair_bx1, repair_by1, repair_bx2, repair_by2),
                                 (cx1, cy1, cx2, cy2),
                             )
+
+                    # Final vertical placement pass. After face/side guards are
+                    # satisfied, remove avoidable headroom by sliding down while
+                    # preserving ratio/size and hard face containment.
+                    try:
+                        before_y1 = float(cy1)
+                        cx1, cy1, cx2, cy2 = self._prefer_lower_face_crop_y(
+                            (cx1, cy1, cx2, cy2),
+                            c.get("face_box"),
+                            c.get("head_box"),
+                            (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                            str(c.get("crop_profile", "")),
+                        )
+                        if float(cy1) > before_y1 + 1.0:
+                            self._status(
+                                f"vertical crop settle dy={float(cy1) - before_y1:.1f} profile={c.get('crop_profile', 'n/a')} ratio={ratio_str}",
+                                key="crop_vertical_settle",
+                            )
+                    except Exception:
+                        logger.exception(
+                            "Vertical crop settle failed idx=%s crop=%s face=%s",
+                            idx,
+                            (cx1, cy1, cx2, cy2),
+                            c.get("face_box"),
+                        )
 
                     # Final clamp inside de-barred content window (prevents 1px bar re-entry)
                     cx1 = max(repair_bx1, min(repair_bx2 - 1, cx1))
