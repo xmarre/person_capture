@@ -8061,6 +8061,62 @@ class Processor(QtCore.QObject):
                 pass
             return False, f"sdr_avif_encode_failed:{type(exc).__name__}:{exc}"
 
+    def _hdr_wic_intermediate_pixfmts(self) -> list[str]:
+        """Return AVIF pixel formats to try for the temporary WIC HDR still.
+
+        The WIC/Paint-style primary PNG path is intentionally routed through
+        Windows' HDR still renderer, but feeding that renderer a 4:2:0 HDR AVIF
+        leaves Windows responsible for dark-region chroma reconstruction.  That
+        is the failure boundary that shows up as green blotches and sporadic
+        blue/cyan/magenta salt pixels.  Prefer a lossless 4:4:4 AVIF intermediate
+        so FFmpeg performs the chroma reconstruction once, deterministically,
+        before WIC tone maps the still.  Keep 4:2:0 as a compatibility fallback
+        for Windows installs whose AVIF WIC codec rejects 4:4:4 AVIF.
+        """
+        raw = os.getenv("PC_HDR_WIC_AVIF_PIXFMT", "yuv444p10le,yuv420p10le")
+        out: list[str] = []
+        for part in str(raw or "").replace(";", ",").split(","):
+            pix = part.strip().lower()
+            if pix in {"yuv444p10le", "yuv420p10le"} and pix not in out:
+                out.append(pix)
+        if not out:
+            out = ["yuv444p10le", "yuv420p10le"]
+        return out
+
+    def _save_hdr_wic_intermediate_avif(
+        self,
+        frame_idx: int,
+        frame_pts_sec: Optional[float],
+        crop_xyxy: tuple[int, int, int, int],
+        out_path: str,
+    ) -> tuple[bool, str]:
+        """Write the temporary HDR AVIF used only as WIC/Paint input."""
+        failures: list[str] = []
+        for pix_fmt in self._hdr_wic_intermediate_pixfmts():
+            ok, why = self._save_hdr_crop_p010(
+                frame_idx,
+                frame_pts_sec,
+                crop_xyxy,
+                out_path,
+                quiet=True,
+                avif_pix_fmt=pix_fmt,
+            )
+            if ok:
+                if pix_fmt != "yuv444p10le":
+                    self._status(
+                        f"HDR WIC intermediate used fallback {pix_fmt}",
+                        key="hdr_wic_intermediate",
+                        interval=10.0,
+                    )
+                return True, ""
+            failures.append(f"{pix_fmt}:{why}")
+            try:
+                if os.path.exists(out_path):
+                    os.remove(out_path)
+            except Exception:
+                pass
+        return False, "hdr_wic_intermediate_failed:" + " || ".join(failures)
+
     def _save_wic_display_avif_from_hdr_crop(
         self,
         frame_idx: int,
@@ -8086,7 +8142,12 @@ class Processor(QtCore.QObject):
         except Exception:
             pass
         try:
-            ok_hdr, why_hdr = self._save_hdr_crop_p010(frame_idx, frame_pts_sec, crop_xyxy, tmp_hdr, quiet=True)
+            ok_hdr, why_hdr = self._save_hdr_wic_intermediate_avif(
+                frame_idx,
+                frame_pts_sec,
+                crop_xyxy,
+                tmp_hdr,
+            )
             if not ok_hdr:
                 return False, f"wic_display_hdr_source_failed:{why_hdr}"
             ok_wic, why_wic = self._save_wic_png_from_hdr_image(tmp_hdr, tmp_png, repair=True)
@@ -8640,7 +8701,12 @@ try {{
                     os.remove(tmp_hdr)
             except Exception:
                 pass
-            ok_hdr, why_hdr = self._save_hdr_crop_p010(frame_idx, frame_pts_sec, crop_xyxy, tmp_hdr, quiet=True)
+            ok_hdr, why_hdr = self._save_hdr_wic_intermediate_avif(
+                frame_idx,
+                frame_pts_sec,
+                crop_xyxy,
+                tmp_hdr,
+            )
             if not ok_hdr:
                 return False, f"windows_wic_hdr_source_failed:{why_hdr}"
             try:
@@ -8721,6 +8787,7 @@ try {{
         out_path: str,
         *,
         quiet: bool = False,
+        avif_pix_fmt: str = "yuv420p10le",
     ) -> tuple[bool, str]:
         """Use ffmpeg directly to export an HDR crop from the original source."""
 
@@ -8766,6 +8833,9 @@ try {{
 
         is_avif = out_path.lower().endswith(".avif")
         avif_color_range = "2"
+        avif_pix_fmt = str(avif_pix_fmt or "yuv420p10le").strip().lower()
+        if avif_pix_fmt not in {"yuv420p10le", "yuv444p10le"}:
+            avif_pix_fmt = "yuv420p10le"
         if is_avif:
             # Keep AVIF on the same full-range signaling used by the historical
             # HDR path. WIC's problematic path is limited-range HDR AVIF; expand
@@ -8774,7 +8844,7 @@ try {{
                 vf = f"{vf},zscale=rangein=limited:range=full"
             vf = (
                 f"{vf},"
-                "format=yuv420p10le,"
+                f"format={avif_pix_fmt},"
                 "setparams=color_trc=smpte2084:color_primaries=bt2020:"
                 "colorspace=bt2020nc:range=full"
             )
@@ -8801,7 +8871,7 @@ try {{
                 "-still-picture",
                 "1",
                 "-pix_fmt",
-                "yuv420p10le",
+                avif_pix_fmt,
                 "-g",
                 "1",
                 "-tile-columns",
@@ -8813,10 +8883,12 @@ try {{
                 "-cpu-used",
                 "5",
                 # CRF 0 by itself is not a strict no-artifact guarantee for AV1.
-                # Keep the compatible 4:2:0 pixel format but force libaom's true
-                # lossless path so dark HDR chroma is not quantized into red/blue
-                # speckles.  AQ stays disabled because it can redistribute error
-                # into flat/dark regions.
+                # Force libaom's true lossless path so the HDR still used for
+                # WIC display rendering is not quantized in dark regions.  The
+                # caller may request 4:4:4 for WIC intermediates to avoid Windows
+                # doing its own unstable 4:2:0 dark-chroma reconstruction.
+                # AQ stays disabled because it can redistribute error into flat
+                # and dark regions.
                 "-lossless",
                 "1",
                 "-crf",
@@ -8835,9 +8907,9 @@ try {{
                 "bt2020",
                 "-color_trc",
                 "smpte2084",
-                "-chroma_sample_location",
-                "left",
             ]
+            if avif_pix_fmt == "yuv420p10le":
+                cmd += ["-chroma_sample_location", "left"]
         else:
             # Lossless 10-bit HDR in Matroska via FFV1.
             # Decoded pixels in the crop match the original decode bit-for-bit.
