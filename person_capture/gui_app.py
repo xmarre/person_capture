@@ -2396,6 +2396,7 @@ class Processor(QtCore.QObject):
         profiles: list[tuple[str, Tuple[float, float, float, float], float, Tuple[float, float], Tuple[float, float]]] = []
         face_h = 0.0
         face_frame_frac = 0.0
+        portrait_close_eligible = False
         small_face_frame_frac = 0.12
         upper_small_face_profile_nudge = 0.10
         upper_small_face_square_nudge = 0.16
@@ -2411,6 +2412,18 @@ class Processor(QtCore.QObject):
             fcx = 0.5 * (fx1 + fx2)
             fcy = 0.5 * (fy1 + fy2)
             face_frame_frac = face_h / bound_h
+            # Medium-close portrait eligibility is based on vertical face scale
+            # and recoverable lower context. The logged capture face_frac is an
+            # area fraction; this scorer uses face_h / content_h. The old upper
+            # gate of 0.34 incorrectly excluded shots like the 4955x sequence,
+            # where the face is large but a 2:3 portrait still preserves useful
+            # shoulders/body below.
+            room_below_face = max(0.0, float(by2) - float(fy2))
+            portrait_close_eligible = (
+                face_frame_frac >= 0.14
+                and face_frame_frac <= 0.56
+                and room_below_face >= 0.35 * face_h
+            )
             hx1, hy1, hx2, hy2 = face_protect or face
 
             close_target = max(0.20, min(0.46, float(getattr(cfg, "compose_close_face_h_frac", 0.34))))
@@ -2555,21 +2568,26 @@ class Processor(QtCore.QObject):
                 if profile == "close":
                     profile_prior = 0.00
                     ratio_prior += 0.00 if rs == "1:1" else 0.08
+                    if portrait_close_eligible:
+                        # Medium-close with usable lower context is not a square
+                        # close-up. Demote close/1:1 so portrait_close/2:3 can win.
+                        profile_prior += 0.26
+                        if rs == "1:1":
+                            ratio_prior += 0.10
                 elif profile == "portrait_close":
-                    # Prefer medium-close faces, but keep this from stealing very
-                    # small/far faces or extreme close-ups.
-                    if face is not None and 0.14 <= face_frame_frac <= 0.34:
-                        profile_prior = -0.16
+                    # Prefer medium-close faces with usable lower context.
+                    if portrait_close_eligible:
+                        profile_prior = -0.38
                     else:
-                        profile_prior = 0.20
+                        profile_prior = 0.30
                     if rs == "2:3":
-                        ratio_prior -= 0.06
+                        ratio_prior -= 0.12 if portrait_close_eligible else -0.02
                     elif rs == "3:4":
-                        ratio_prior += 0.02
+                        ratio_prior += 0.00 if portrait_close_eligible else 0.04
                     elif rs == "1:1":
-                        ratio_prior += 0.42
+                        ratio_prior += 0.72
                     else:
-                        ratio_prior += 0.22
+                        ratio_prior += 0.24
                 elif profile == "upper":
                     profile_prior = 0.12
                     ratio_prior += 0.00 if rs == "2:3" else 0.06
@@ -2608,7 +2626,7 @@ class Processor(QtCore.QObject):
                     face_loss = abs(actual_face_h_frac - max(1e-6, target_face_h_frac))
                     if profile == "close" and face_frame_frac < small_face_frame_frac:
                         profile_prior += close_small_face_penalty
-                    if profile == "portrait_close" and face_frame_frac < 0.14:
+                    if profile == "portrait_close" and not portrait_close_eligible:
                         profile_prior += 0.40
                     if profile == "upper" and face_frame_frac < small_face_frame_frac:
                         profile_prior -= upper_small_face_face_loss_nudge
@@ -2629,7 +2647,7 @@ class Processor(QtCore.QObject):
                     if profile == "close":
                         target_y = 0.36
                     elif profile == "portrait_close":
-                        target_y = 0.30
+                        target_y = 0.33
                     else:
                         target_y = 0.28
                     placement_penalty += 0.35 * abs(rel_y - target_y)
