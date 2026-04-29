@@ -6724,12 +6724,16 @@ class Processor(QtCore.QObject):
                     reasons = "|".join(reasons_list)
                     bx1, by1, bx2, by2 = c["box"]
                     area = (bx2 - bx1) * (by2 - by1)
+                    try:
+                        face_frac_dbg = float(c.get("face_frac"))
+                    except Exception:
+                        face_frac_dbg = 0.0
                     self._status(
                         (
                             f"CAPTURE idx={idx} t={idx/float(fps):.2f} "
                             f"fd={c.get('fd')} rd={c.get('rd')} score={c.get('score')} "
                             f"area={area} ratio={ratio_str} profile={c.get('crop_profile', 'n/a')} "
-                            f"face_frac={c.get('face_frac'):.3f} tloss={c.get('tloss', 0.0):.4f} reasons={reasons}"
+                            f"face_frac={face_frac_dbg:.3f} tloss={c.get('tloss', 0.0):.4f} reasons={reasons}"
                         ),
                         key="cap",
                     )
