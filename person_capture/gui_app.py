@@ -340,8 +340,15 @@ class SessionConfig:
     # that Windows renders incorrectly. Set PC_HDR_AVIF_SOURCE_ARCHIVE=1 to
     # force raw source-HDR AVIF archives for debugging/comparison.
     hdr_wic_speckle_cleanup: bool = True
-    # WIC-only dark shadow deblob strength (0 disables, 1 default, 2 max).
-    wic_shadow_deblob_strength: float = 1.0
+    # WIC-only dark shadow deblob strength. Disabled by default because root
+    # diagnostics showed the broad shadow artifacts originate at the Windows WIC
+    # HDR AVIF render boundary; strong post-filtering damages legitimate color.
+    # Keep this as an opt-in emergency cleanup only.
+    wic_shadow_deblob_strength: float = 0.0
+    # Temporary WIC HDR AVIF handoff controls for the primary PNG path.
+    # Defaults keep the historical full-range yuv420 behavior.
+    hdr_wic_avif_pixfmt: str = "yuv420p10le"  # yuv420p10le | yuv444p10le
+    hdr_wic_avif_range: str = "full"          # full | limited
     hdr_avif_wic_display_compat: bool = True
     # Full-resolution HDR->SDR still-render quality controls. These affect only
     # primary crops/f*.png/f*.jpg source export, not pre-scan/detection preview.
@@ -7768,6 +7775,9 @@ class Processor(QtCore.QObject):
         limited_avif = diag_dir / "08_limited_yuv420_wic_candidate.avif"
         limited_raw = diag_dir / "09_limited_yuv420_decoded.yuv420p10le.raw"
         limited_wic_png = diag_dir / "10_wic_from_limited_yuv420_no_repair.png"
+        limited444_avif = diag_dir / "17_limited_yuv444_wic_candidate.avif"
+        limited444_raw = diag_dir / "18_limited_yuv444_decoded_to_yuv420.yuv420p10le.raw"
+        limited444_wic_png = diag_dir / "19_wic_from_limited_yuv444_no_repair.png"
         full_avif = diag_dir / "11_fullrange_yuv420_wic_candidate.avif"
         full_raw = diag_dir / "12_fullrange_yuv420_decoded.yuv420p10le.raw"
         full_wic_png = diag_dir / "13_wic_from_fullrange_yuv420_no_repair.png"
@@ -7798,6 +7808,11 @@ class Processor(QtCore.QObject):
             commands.append(self._run_hdr_diag_cmd("09_decode_limited_yuv420_candidate", _decode_to_yuv420_cmd(limited_avif, limited_raw), diag_dir, timeout_sec))
         _render_wic_no_repair("10_wic_from_limited_yuv420_no_repair", limited_avif, limited_wic_png, commands)
 
+        commands.append(self._run_hdr_diag_cmd("17_encode_limited_yuv444_candidate", _avif_encode_cmd(_limited_range_vf("yuv444p10le"), "yuv444p10le", "1", limited444_avif), diag_dir, timeout_sec))
+        if limited444_avif.exists():
+            commands.append(self._run_hdr_diag_cmd("18_decode_limited_yuv444_candidate_to_yuv420", _decode_to_yuv420_cmd(limited444_avif, limited444_raw), diag_dir, timeout_sec))
+        _render_wic_no_repair("19_wic_from_limited_yuv444_no_repair", limited444_avif, limited444_wic_png, commands)
+
         commands.append(self._run_hdr_diag_cmd("11_encode_fullrange_yuv420_candidate", _avif_encode_cmd(_full_range_vf("yuv420p10le"), "yuv420p10le", "2", full_avif), diag_dir, timeout_sec))
         if full_avif.exists():
             commands.append(self._run_hdr_diag_cmd("12_decode_fullrange_yuv420_candidate", _decode_to_yuv420_cmd(full_avif, full_raw), diag_dir, timeout_sec))
@@ -7812,6 +7827,7 @@ class Processor(QtCore.QObject):
             "source_vs_ffv1_decode": self._compare_yuv420p10le(source_raw, mkv_raw, w, h),
             "source_vs_actual_wic_temp_decode": self._compare_yuv420p10le(source_raw, actual_wic_raw, w, h),
             "source_vs_limited_yuv420_decode": self._compare_yuv420p10le(source_raw, limited_raw, w, h),
+            "source_vs_limited_yuv444_decode_to_yuv420": self._compare_yuv420p10le(source_raw, limited444_raw, w, h),
             "source_vs_fullrange_yuv420_decode": self._compare_yuv420p10le(source_raw, full_raw, w, h),
             "source_vs_fullrange_yuv444_decode_to_yuv420": self._compare_yuv420p10le(source_raw, full444_raw, w, h),
         }
@@ -7820,6 +7836,7 @@ class Processor(QtCore.QObject):
             "direct_ffmpeg_sdr_png": self._write_png_speckle_stats(ffmpeg_sdr),
             "wic_actual_temp_no_repair_png": self._write_png_speckle_stats(actual_wic_png),
             "wic_limited_yuv420_no_repair_png": self._write_png_speckle_stats(limited_wic_png),
+            "wic_limited_yuv444_no_repair_png": self._write_png_speckle_stats(limited444_wic_png),
             "wic_fullrange_yuv420_no_repair_png": self._write_png_speckle_stats(full_wic_png),
             "wic_fullrange_yuv444_no_repair_png": self._write_png_speckle_stats(full444_wic_png),
         }
@@ -7828,6 +7845,7 @@ class Processor(QtCore.QObject):
             "ffv1_decoded_input_range": self._write_yuv420p10le_stats(mkv_raw, w, h),
             "actual_wic_temp_decoded": self._write_yuv420p10le_stats(actual_wic_raw, w, h),
             "limited_yuv420_decoded": self._write_yuv420p10le_stats(limited_raw, w, h),
+            "limited_yuv444_decoded_to_yuv420": self._write_yuv420p10le_stats(limited444_raw, w, h),
             "fullrange_yuv420_decoded": self._write_yuv420p10le_stats(full_raw, w, h),
             "fullrange_yuv444_decoded_to_yuv420": self._write_yuv420p10le_stats(full444_raw, w, h),
         }
@@ -7855,10 +7873,14 @@ class Processor(QtCore.QObject):
             ff_blob = _blob_score("direct_ffmpeg_sdr_png")
             actual_blob = _blob_score("wic_actual_temp_no_repair_png")
             lim_blob = _blob_score("wic_limited_yuv420_no_repair_png")
+            lim444_blob = _blob_score("wic_limited_yuv444_no_repair_png")
             full_blob = _blob_score("wic_fullrange_yuv420_no_repair_png")
             full444_blob = _blob_score("wic_fullrange_yuv444_no_repair_png")
             actual_speck = _speckle_score("wic_actual_temp_no_repair_png")
             ff_speck = _speckle_score("direct_ffmpeg_sdr_png")
+            lim_speck = _speckle_score("wic_limited_yuv420_no_repair_png")
+            lim444_speck = _speckle_score("wic_limited_yuv444_no_repair_png")
+            full444_speck = _speckle_score("wic_fullrange_yuv444_no_repair_png")
             if actual_blob > max(ff_blob * 2, ff_blob + 1000):
                 interpretation.append("Shadow blob score is much higher after WIC rendering than after direct FFmpeg SDR render; the visible blob class is introduced or amplified at the Windows WIC HDR still-render boundary, not by the final PNG encoder.")
             elif ff_blob > 0 and actual_blob > 0:
@@ -7869,6 +7891,14 @@ class Processor(QtCore.QObject):
                 interpretation.append("Limited-range and full-range yuv420 WIC candidates differ materially in shadow blob score; range expansion/signaling is part of the failure boundary.")
             if full_blob and full444_blob and abs(full444_blob - full_blob) > max(1000, int(0.25 * max(full_blob, full444_blob))):
                 interpretation.append("yuv420 and yuv444 WIC candidates differ materially in shadow blob score; Windows AVIF chroma reconstruction/path selection is part of the failure boundary.")
+            if lim_speck > 0 and lim444_speck == 0:
+                interpretation.append("Limited-range yuv444 removes saturated WIC speckles that are present in limited-range yuv420; visually inspect 19_wic_from_limited_yuv444_no_repair.png against 10_wic_from_limited_yuv420_no_repair.png for color preservation.")
+            elif lim_speck > 0 and lim444_speck > 0:
+                interpretation.append("Limited-range yuv444 still has saturated WIC speckles; the yuv444 chroma path alone is not sufficient in limited-range mode on this system.")
+            if full444_speck == 0 and lim444_speck == 0:
+                interpretation.append("Both yuv444 WIC candidates remove the saturated-speckle class; the remaining decision is visual color/range correctness, not speckle suppression.")
+            if lim444_blob and lim_blob and abs(lim444_blob - lim_blob) > max(1000, int(0.25 * max(lim_blob, lim444_blob))):
+                interpretation.append("Limited-range yuv444 and limited-range yuv420 differ materially in shadow blob score; this directly tests whether WIC's yuv420 chroma reconstruction is the broad-shadow artifact source.")
             cmp_actual = raw_compare.get("source_vs_actual_wic_temp_decode", {}).get("planes", {})
             if cmp_actual:
                 near_lossless_actual = all(int(v.get("max_abs", 999999)) <= 1 for v in cmp_actual.values())
@@ -7880,8 +7910,8 @@ class Processor(QtCore.QObject):
             interpretation.append(f"interpretation_failed:{type(exc).__name__}:{exc}")
 
         summary = {
-            "version": 2,
-            "purpose": "HDR shadow/speckle root-boundary diagnostic. It writes comparison artifacts and stats; it does not repair or tune the saved crop.",
+            "version": 3,
+            "purpose": "HDR shadow/speckle root-boundary diagnostic. It writes comparison artifacts and stats; it does not repair or tune the saved crop. Version 3 adds the decisive limited-range yuv444 WIC candidate.",
             "source_video": str(getattr(self.cfg, "video", "")),
             "saved_path": str(saved),
             "frame_idx": int(frame_idx),
@@ -7904,6 +7934,9 @@ class Processor(QtCore.QObject):
                 "limited_yuv420_wic_candidate": str(limited_avif),
                 "limited_yuv420_decoded": str(limited_raw),
                 "wic_from_limited_yuv420_no_repair": str(limited_wic_png),
+                "limited_yuv444_wic_candidate": str(limited444_avif),
+                "limited_yuv444_decoded_to_yuv420": str(limited444_raw),
+                "wic_from_limited_yuv444_no_repair": str(limited444_wic_png),
                 "fullrange_yuv420_wic_candidate": str(full_avif),
                 "fullrange_yuv420_decoded": str(full_raw),
                 "wic_from_fullrange_yuv420_no_repair": str(full_wic_png),
@@ -7937,9 +7970,9 @@ class Processor(QtCore.QObject):
         if img is None or img.ndim != 3 or img.shape[2] < 3:
             return False, 0
         try:
-            default_strength = float(getattr(self.cfg, "wic_shadow_deblob_strength", 1.0))
+            default_strength = float(getattr(self.cfg, "wic_shadow_deblob_strength", 0.0))
         except Exception:
-            default_strength = 1.0
+            default_strength = 0.0
         strength = self._float_env("PC_WIC_SHADOW_DEBLOB_STRENGTH", default_strength, min_value=0.0, max_value=2.0)
         if strength <= 0.0:
             return False, 0
@@ -8509,7 +8542,8 @@ class Processor(QtCore.QObject):
         PC_HDR_WIC_AVIF_PIXFMT remains available for local diagnostics or codec
         experiments, for example "yuv444p10le,yuv420p10le".
         """
-        raw = os.getenv("PC_HDR_WIC_AVIF_PIXFMT", "yuv420p10le")
+        default_pixfmt = str(getattr(self.cfg, "hdr_wic_avif_pixfmt", "yuv420p10le") or "yuv420p10le")
+        raw = os.getenv("PC_HDR_WIC_AVIF_PIXFMT", default_pixfmt)
         out: list[str] = []
         for part in str(raw or "").replace(";", ",").split(","):
             pix = part.strip().lower()
@@ -8518,6 +8552,21 @@ class Processor(QtCore.QObject):
         if not out:
             out = ["yuv420p10le"]
         return out
+
+    def _hdr_wic_intermediate_range(self) -> str:
+        """Return range signaling/conversion for the temporary WIC HDR still.
+
+        The current production WIC/Paint path keeps the historical full-range
+        handoff by default because that restored the accepted colors after the
+        yuv444 regression.  For root-cause testing, PC_HDR_WIC_AVIF_RANGE=limited
+        can be combined with PC_HDR_WIC_AVIF_PIXFMT=yuv444p10le to test the
+        missing limited-yuv444 case without changing code again.
+        """
+        default_range = str(getattr(self.cfg, "hdr_wic_avif_range", "full") or "full").strip().lower()
+        raw = str(os.getenv("PC_HDR_WIC_AVIF_RANGE", default_range) or default_range).strip().lower()
+        if raw in {"limited", "tv", "mpeg"}:
+            return "limited"
+        return "full"
 
     def _save_hdr_wic_intermediate_avif(
         self,
@@ -8528,10 +8577,11 @@ class Processor(QtCore.QObject):
     ) -> tuple[bool, str]:
         """Write the temporary HDR AVIF used only as WIC/Paint input."""
         failures: list[str] = []
+        avif_range = self._hdr_wic_intermediate_range()
         for pix_fmt in self._hdr_wic_intermediate_pixfmts():
-            # This helper only selects the temporary AVIF chroma sampling path.
-            # The older AVIF chroma prefilter toggle is not part of this call
-            # boundary on current master.
+            # This helper selects only the temporary WIC AVIF handoff shape.
+            # The default stays historical full-range yuv420; limited/yuv444 is
+            # deliberately opt-in until diagnostics prove it preserves color.
             ok, why = self._save_hdr_crop_p010(
                 frame_idx,
                 frame_pts_sec,
@@ -8539,11 +8589,12 @@ class Processor(QtCore.QObject):
                 out_path,
                 quiet=True,
                 avif_pix_fmt=pix_fmt,
+                avif_range=avif_range,
             )
             if ok:
-                if pix_fmt != "yuv420p10le":
+                if pix_fmt != "yuv420p10le" or avif_range != "full":
                     self._status(
-                        f"HDR WIC intermediate used requested {pix_fmt}",
+                        f"HDR WIC intermediate used requested {pix_fmt}/{avif_range}",
                         key="hdr_wic_intermediate",
                         interval=10.0,
                     )
@@ -9227,6 +9278,7 @@ try {{
         *,
         quiet: bool = False,
         avif_pix_fmt: str = "yuv420p10le",
+        avif_range: str = "full",
     ) -> tuple[bool, str]:
         """Use ffmpeg directly to export an HDR crop from the original source."""
 
@@ -9271,21 +9323,27 @@ try {{
                 seek_sec = max(0.0, float(frame_idx) / fps)
 
         is_avif = out_path.lower().endswith(".avif")
-        avif_color_range = "2"
         avif_pix_fmt = str(avif_pix_fmt or "yuv420p10le").strip().lower()
         if avif_pix_fmt not in {"yuv420p10le", "yuv444p10le"}:
             avif_pix_fmt = "yuv420p10le"
+        avif_range = str(avif_range or "full").strip().lower()
+        if avif_range not in {"full", "limited"}:
+            avif_range = "full"
+        avif_color_range = "2" if avif_range == "full" else "1"
         if is_avif:
-            # Keep AVIF on the same full-range signaling used by the historical
-            # HDR path. WIC's problematic path is limited-range HDR AVIF; expand
-            # only when source was explicitly limited.
-            if src_range == "limited":
+            # Production AVIF exports keep the historical full-range handoff by
+            # default.  The WIC diagnostic path can also request a limited-range
+            # AVIF to test whether Windows' limited-yuv444 render path keeps the
+            # good color response while avoiding yuv420 dark-chroma artifacts.
+            if avif_range == "full" and src_range == "limited":
                 vf = f"{vf},zscale=rangein=limited:range=full"
+            elif avif_range == "limited" and src_range == "full":
+                vf = f"{vf},zscale=rangein=full:range=limited"
             vf = (
                 f"{vf},"
                 f"format={avif_pix_fmt},"
                 "setparams=color_trc=smpte2084:color_primaries=bt2020:"
-                "colorspace=bt2020nc:range=full"
+                f"colorspace=bt2020nc:range={avif_range}"
             )
 
         pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(seek_sec)
@@ -9910,8 +9968,34 @@ class MainWindow(QtWidgets.QMainWindow):
             2,
             "float: wic_shadow_deblob_strength (PC_WIC_SHADOW_DEBLOB_STRENGTH)",
         )
-        self.wic_shadow_deblob_strength_spin.setValue(float(getattr(self.cfg, "wic_shadow_deblob_strength", 1.0)))
+        self.wic_shadow_deblob_strength_spin.setValue(float(getattr(self.cfg, "wic_shadow_deblob_strength", 0.0)))
         self.wic_shadow_deblob_strength_spin.valueChanged.connect(self._on_ui_change)
+        self.hdr_wic_avif_pixfmt_combo = QtWidgets.QComboBox()
+        self.hdr_wic_avif_pixfmt_combo.addItem("4:2:0 (yuv420p10le)", "yuv420p10le")
+        self.hdr_wic_avif_pixfmt_combo.addItem("4:4:4 (yuv444p10le)", "yuv444p10le")
+        _wic_pixfmt = str(getattr(self.cfg, "hdr_wic_avif_pixfmt", "yuv420p10le") or "yuv420p10le").strip().lower()
+        _wic_pixfmt_idx = self.hdr_wic_avif_pixfmt_combo.findData(_wic_pixfmt)
+        self.hdr_wic_avif_pixfmt_combo.setCurrentIndex(_wic_pixfmt_idx if _wic_pixfmt_idx >= 0 else 0)
+        self.hdr_wic_avif_pixfmt_combo.setToolTip(
+            "Temporary WIC HDR AVIF pixfmt for primary PNG export. "
+            "Key: hdr_wic_avif_pixfmt. Env override: PC_HDR_WIC_AVIF_PIXFMT."
+        )
+        self.hdr_wic_avif_pixfmt_combo.currentIndexChanged.connect(self._on_ui_change)
+        self.hdr_wic_avif_range_combo = QtWidgets.QComboBox()
+        self.hdr_wic_avif_range_combo.addItem("Full range", "full")
+        self.hdr_wic_avif_range_combo.addItem("Limited range", "limited")
+        _wic_range = str(getattr(self.cfg, "hdr_wic_avif_range", "full") or "full").strip().lower()
+        if _wic_range in {"tv", "mpeg"}:
+            _wic_range = "limited"
+        if _wic_range not in {"full", "limited"}:
+            _wic_range = "full"
+        _wic_range_idx = self.hdr_wic_avif_range_combo.findData(_wic_range)
+        self.hdr_wic_avif_range_combo.setCurrentIndex(_wic_range_idx if _wic_range_idx >= 0 else 0)
+        self.hdr_wic_avif_range_combo.setToolTip(
+            "Temporary WIC HDR AVIF range for primary PNG export. "
+            "Key: hdr_wic_avif_range. Env override: PC_HDR_WIC_AVIF_RANGE."
+        )
+        self.hdr_wic_avif_range_combo.currentIndexChanged.connect(self._on_ui_change)
 
         self.hdr_speckle_diag_check = QtWidgets.QCheckBox()
         self.hdr_speckle_diag_check.setChecked(bool(getattr(self.cfg, "hdr_speckle_diag", False)))
@@ -10547,6 +10631,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ("HDR peak detect", self.hdr_sdr_peak_check),
             ("Allow inaccurate HDR fallback", self.hdr_sdr_bad_fallback_check),
             ("WIC shadow deblob strength", self.wic_shadow_deblob_strength_spin),
+            ("WIC intermediate AVIF pixfmt", self.hdr_wic_avif_pixfmt_combo),
+            ("WIC intermediate AVIF range", self.hdr_wic_avif_range_combo),
             ("HDR speckle diagnostics", self.hdr_speckle_diag_check),
             ("HDR speckle diag dir", self.hdr_speckle_diag_dir_widget),
             ("FFmpeg hardware decode", self.hwaccel_combo),
@@ -11896,6 +11982,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "hdr_sdr_peak_detect",
             "hdr_sdr_allow_inaccurate_fallback",
             "wic_shadow_deblob_strength",
+            "hdr_wic_avif_pixfmt",
+            "hdr_wic_avif_range",
             "hdr_speckle_diag",
             "hdr_speckle_diag_dir",
         }
@@ -12112,7 +12200,17 @@ class MainWindow(QtWidgets.QMainWindow):
             wic_shadow_deblob_strength=(
                 float(self.wic_shadow_deblob_strength_spin.value())
                 if hasattr(self, "wic_shadow_deblob_strength_spin")
-                else float(getattr(self.cfg, "wic_shadow_deblob_strength", 1.0))
+                else float(getattr(self.cfg, "wic_shadow_deblob_strength", 0.0))
+            ),
+            hdr_wic_avif_pixfmt=(
+                (self.hdr_wic_avif_pixfmt_combo.currentData() or "yuv420p10le")
+                if hasattr(self, "hdr_wic_avif_pixfmt_combo")
+                else str(getattr(self.cfg, "hdr_wic_avif_pixfmt", "yuv420p10le") or "yuv420p10le")
+            ),
+            hdr_wic_avif_range=(
+                (self.hdr_wic_avif_range_combo.currentData() or "full")
+                if hasattr(self, "hdr_wic_avif_range_combo")
+                else str(getattr(self.cfg, "hdr_wic_avif_range", "full") or "full")
             ),
             hdr_avif_wic_display_compat=(
                 bool(self.hdr_avif_display_compat_check.isChecked())
@@ -12162,7 +12260,17 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg.wic_shadow_deblob_strength = (
             float(self.wic_shadow_deblob_strength_spin.value())
             if hasattr(self, "wic_shadow_deblob_strength_spin")
-            else float(getattr(self.cfg, "wic_shadow_deblob_strength", 1.0))
+            else float(getattr(self.cfg, "wic_shadow_deblob_strength", 0.0))
+        )
+        cfg.hdr_wic_avif_pixfmt = (
+            (self.hdr_wic_avif_pixfmt_combo.currentData() or "yuv420p10le")
+            if hasattr(self, "hdr_wic_avif_pixfmt_combo")
+            else str(getattr(self.cfg, "hdr_wic_avif_pixfmt", "yuv420p10le") or "yuv420p10le")
+        )
+        cfg.hdr_wic_avif_range = (
+            (self.hdr_wic_avif_range_combo.currentData() or "full")
+            if hasattr(self, "hdr_wic_avif_range_combo")
+            else str(getattr(self.cfg, "hdr_wic_avif_range", "full") or "full")
         )
         cfg.hdr_speckle_diag = bool(self.hdr_speckle_diag_check.isChecked()) if hasattr(self, "hdr_speckle_diag_check") else bool(getattr(self.cfg, "hdr_speckle_diag", False))
         cfg.hdr_speckle_diag_dir = self.hdr_speckle_diag_dir_edit.text().strip() if hasattr(self, "hdr_speckle_diag_dir_edit") else str(getattr(self.cfg, "hdr_speckle_diag_dir", "") or "")
@@ -12220,10 +12328,18 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self.cfg.wic_shadow_deblob_strength = min(
                 2.0,
-                max(0.0, float(getattr(cfg, "wic_shadow_deblob_strength", 1.0))),
+                max(0.0, float(getattr(cfg, "wic_shadow_deblob_strength", 0.0))),
             )
         except Exception:
-            self.cfg.wic_shadow_deblob_strength = 1.0
+            self.cfg.wic_shadow_deblob_strength = 0.0
+        self.cfg.hdr_wic_avif_pixfmt = str(getattr(cfg, "hdr_wic_avif_pixfmt", "yuv420p10le") or "yuv420p10le").strip().lower()
+        if self.cfg.hdr_wic_avif_pixfmt not in {"yuv420p10le", "yuv444p10le"}:
+            self.cfg.hdr_wic_avif_pixfmt = "yuv420p10le"
+        self.cfg.hdr_wic_avif_range = str(getattr(cfg, "hdr_wic_avif_range", "full") or "full").strip().lower()
+        if self.cfg.hdr_wic_avif_range in {"tv", "mpeg"}:
+            self.cfg.hdr_wic_avif_range = "limited"
+        if self.cfg.hdr_wic_avif_range not in {"full", "limited"}:
+            self.cfg.hdr_wic_avif_range = "full"
         self.cfg.hdr_avif_wic_display_compat = bool(getattr(cfg, "hdr_avif_wic_display_compat", True))
         self.cfg.compose_crop_enable = bool(getattr(cfg, "compose_crop_enable", True))
         self.cfg.compose_detect_person_for_face = bool(getattr(cfg, "compose_detect_person_for_face", True))
@@ -12292,6 +12408,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.hdr_sdr_bad_fallback_check.setChecked(bool(getattr(cfg, "hdr_sdr_allow_inaccurate_fallback", False)))
         if hasattr(self, "wic_shadow_deblob_strength_spin"):
             self.wic_shadow_deblob_strength_spin.setValue(self.cfg.wic_shadow_deblob_strength)
+        if hasattr(self, "hdr_wic_avif_pixfmt_combo"):
+            idx = self.hdr_wic_avif_pixfmt_combo.findData(self.cfg.hdr_wic_avif_pixfmt)
+            self.hdr_wic_avif_pixfmt_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        if hasattr(self, "hdr_wic_avif_range_combo"):
+            idx = self.hdr_wic_avif_range_combo.findData(self.cfg.hdr_wic_avif_range)
+            self.hdr_wic_avif_range_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.cfg.hdr_speckle_diag = bool(getattr(cfg, "hdr_speckle_diag", False))
         self.cfg.hdr_speckle_diag_dir = str(getattr(cfg, "hdr_speckle_diag_dir", "") or "")
         if hasattr(self, "hdr_speckle_diag_check"):
@@ -13385,15 +13507,33 @@ class MainWindow(QtWidgets.QMainWindow):
                     float(
                         s.value(
                             "wic_shadow_deblob_strength",
-                            getattr(self.cfg, "wic_shadow_deblob_strength", 1.0),
+                            getattr(self.cfg, "wic_shadow_deblob_strength", 0.0),
                         )
                     ),
                 ),
             )
         except Exception:
-            self.cfg.wic_shadow_deblob_strength = 1.0
+            self.cfg.wic_shadow_deblob_strength = 0.0
         if hasattr(self, "wic_shadow_deblob_strength_spin"):
             self.wic_shadow_deblob_strength_spin.setValue(self.cfg.wic_shadow_deblob_strength)
+        self.cfg.hdr_wic_avif_pixfmt = str(
+            s.value("hdr_wic_avif_pixfmt", getattr(self.cfg, "hdr_wic_avif_pixfmt", "yuv420p10le")) or "yuv420p10le"
+        ).strip().lower()
+        if self.cfg.hdr_wic_avif_pixfmt not in {"yuv420p10le", "yuv444p10le"}:
+            self.cfg.hdr_wic_avif_pixfmt = "yuv420p10le"
+        if hasattr(self, "hdr_wic_avif_pixfmt_combo"):
+            idx = self.hdr_wic_avif_pixfmt_combo.findData(self.cfg.hdr_wic_avif_pixfmt)
+            self.hdr_wic_avif_pixfmt_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.cfg.hdr_wic_avif_range = str(
+            s.value("hdr_wic_avif_range", getattr(self.cfg, "hdr_wic_avif_range", "full")) or "full"
+        ).strip().lower()
+        if self.cfg.hdr_wic_avif_range in {"tv", "mpeg"}:
+            self.cfg.hdr_wic_avif_range = "limited"
+        if self.cfg.hdr_wic_avif_range not in {"full", "limited"}:
+            self.cfg.hdr_wic_avif_range = "full"
+        if hasattr(self, "hdr_wic_avif_range_combo"):
+            idx = self.hdr_wic_avif_range_combo.findData(self.cfg.hdr_wic_avif_range)
+            self.hdr_wic_avif_range_combo.setCurrentIndex(idx if idx >= 0 else 0)
         if hasattr(self, "hdr_speckle_diag_check"):
             self.hdr_speckle_diag_check.setChecked(
                 s.value("hdr_speckle_diag", getattr(self.cfg, "hdr_speckle_diag", False), type=bool)
