@@ -398,10 +398,13 @@ def _discard_pending_zip_update(repo: Path, flag: Optional[Path] = None, staged:
             staged = repo / "update_staged"
         # Only delete the updater-owned staging directory under the install root.
         repo_resolved = repo.resolve()
+        expected_raw = repo_resolved / "update_staged"
+        if expected_raw.is_symlink() or staged.is_symlink():
+            return
         staged_resolved = staged.resolve(strict=False)
-        expected = (repo_resolved / "update_staged").resolve(strict=False)
-        if staged_resolved == expected and not staged_resolved.is_symlink():
-            shutil.rmtree(staged_resolved, ignore_errors=True)
+        expected_resolved = expected_raw.resolve(strict=False)
+        if staged_resolved == expected_resolved:
+            shutil.rmtree(expected_raw, ignore_errors=True)
     except Exception:
         pass
 
