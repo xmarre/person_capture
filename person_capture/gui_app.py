@@ -340,6 +340,8 @@ class SessionConfig:
     # that Windows renders incorrectly. Set PC_HDR_AVIF_SOURCE_ARCHIVE=1 to
     # force raw source-HDR AVIF archives for debugging/comparison.
     hdr_wic_speckle_cleanup: bool = True
+    # WIC-only dark shadow deblob strength (0 disables, 1 default, 2 max).
+    wic_shadow_deblob_strength: float = 1.0
     hdr_avif_wic_display_compat: bool = True
     # Full-resolution HDR->SDR still-render quality controls. These affect only
     # primary crops/f*.png/f*.jpg source export, not pre-scan/detection preview.
@@ -4882,6 +4884,7 @@ class Processor(QtCore.QObject):
                             "hdr_sdr_contrast_recovery",
                             "hdr_sdr_peak_detect",
                             "hdr_sdr_allow_inaccurate_fallback",
+                            "wic_shadow_deblob_strength",
                             "hdr_speckle_diag",
                             "hdr_speckle_diag_dir",
                             "compose_crop_enable",
@@ -7720,21 +7723,25 @@ class Processor(QtCore.QObject):
     def _stabilize_wic_dark_chroma_blotches(self, img: np.ndarray) -> tuple[bool, int]:
         """Suppress WIC-only shadow blotches without changing the HDR/WIC tone map.
 
-        PR #339 only stabilized display chroma and preserved WIC luma exactly.
-        The remaining visible defect is not just chroma salt: in very dark cloth,
-        hair, and background gradients WIC expands the HDR AVIF handoff into a
-        coupled low-end luma/chroma crawl.  Chroma-only cleanup leaves the visible
-        blocky/pixel-gradient pattern intact.  This pass is still WIC-only and
-        display-referred, but it now applies a bounded shadow deblob to both Y and
-        Cr/Cb inside near-black, non-skin regions.  The accepted WIC/Paint color
-        rendering is preserved by keeping the mask narrow, edge-protected, and by
-        clamping per-pixel changes to a few display code values.
+        The first deblob pass only applied a very small luma correction and fully
+        excluded warm face/candle shadows.  That reduced the coat/background
+        crawl, but it left the visible low-end blotch pattern in skin-shadow and
+        other dark gradients because the defect is a coupled Y + Cr/Cb instability,
+        not only saturated chroma salt.  Keep this pass display-referred and
+        WIC-only, but allow a reduced-strength cleanup inside warm shadows and use
+        a larger local shadow target so the blocky dark-gradient pixels are
+        actually moved.  The accepted WIC/Paint look is protected by edge gating,
+        dark gating, and bounded per-pixel deltas.
         """
         if self._truthy_env("PC_DISABLE_WIC_DARK_CHROMA_CLEANUP"):
             return False, 0
         if img is None or img.ndim != 3 or img.shape[2] < 3:
             return False, 0
-        strength = self._float_env("PC_WIC_SHADOW_DEBLOB_STRENGTH", 1.0, min_value=0.0, max_value=2.0)
+        try:
+            default_strength = float(getattr(self.cfg, "wic_shadow_deblob_strength", 1.0))
+        except Exception:
+            default_strength = 1.0
+        strength = self._float_env("PC_WIC_SHADOW_DEBLOB_STRENGTH", default_strength, min_value=0.0, max_value=2.0)
         if strength <= 0.0:
             return False, 0
 
@@ -7755,61 +7762,74 @@ class Processor(QtCore.QObject):
 
         y_med5 = cv2.medianBlur(ycrcb[:, :, 0], 5).astype(np.float32, copy=False)
         y_med9 = cv2.medianBlur(ycrcb[:, :, 0], 9).astype(np.float32, copy=False)
-        cr_med = cv2.medianBlur(ycrcb[:, :, 1], 11).astype(np.float32, copy=False)
-        cb_med = cv2.medianBlur(ycrcb[:, :, 2], 11).astype(np.float32, copy=False)
+        y_med15 = cv2.medianBlur(ycrcb[:, :, 0], 15).astype(np.float32, copy=False)
+        cr_med = cv2.medianBlur(ycrcb[:, :, 1], 17).astype(np.float32, copy=False)
+        cb_med = cv2.medianBlur(ycrcb[:, :, 2], 17).astype(np.float32, copy=False)
+        chroma_delta = np.maximum(np.abs(cr - cr_med), np.abs(cb - cb_med))
+        luma_roughness = np.abs(y - y_med5)
 
-        # Protect the part of the WIC/Paint look that the previous fix restored:
-        # warm face/candle shadows and visible midtones must not be neutralized.
-        warm_protect = (r >= (g + 6.0)) & (r >= (b + 12.0)) & (max_ch >= 34.0) & (y_med5 >= 24.0)
-
-        # The visible defect lives in near-black materials/gradients.  A separate
-        # greenish branch catches dark green/teal blotches that are not saturated
-        # enough to be accepted by the existing speckle component filter.
-        black_shadow = (y_med9 <= 72.0) & (y <= 104.0) & (max_ch <= 118.0)
-        near_black = (y_med9 <= 44.0) & (y <= 80.0) & (max_ch <= 142.0)
-        greenish_shadow = ((g - np.maximum(r, b)) >= 2.0) & (y_med9 <= 92.0) & (y <= 124.0) & (max_ch <= 136.0)
-        shadow_gate = (black_shadow | near_black | greenish_shadow) & ~warm_protect
+        # The visible defect lives in near-black materials/gradients.  The first
+        # version excluded warm pixels entirely, which protected the look but also
+        # left face-shadow crawl untouched.  Use warm pixels as an alpha scale
+        # instead of a hard rejection, and still fully accept cool/green outliers.
+        black_shadow = (y_med9 <= 76.0) & (y <= 112.0) & (max_ch <= 128.0)
+        near_black = (y_med9 <= 54.0) & (y <= 88.0) & (max_ch <= 150.0)
+        crawl_shadow = (y_med9 <= 100.0) & (y <= 136.0) & (max_ch <= 154.0) & ((luma_roughness >= 1.5) | (chroma_delta >= 2.0))
+        greenish_shadow = ((g - np.maximum(r, b)) >= 1.5) & (y_med9 <= 104.0) & (y <= 138.0) & (max_ch <= 154.0)
+        cool_shadow = ((b - r) >= 2.0) & (y_med9 <= 104.0) & (y <= 138.0) & (max_ch <= 154.0) & (chroma_delta >= 1.5)
+        shadow_gate = black_shadow | near_black | crawl_shadow | greenish_shadow | cool_shadow
         if int(np.count_nonzero(shadow_gate)) <= 0:
             return False, 0
 
+        warm_shadow = (r >= (g + 5.0)) & (r >= (b + 10.0)) & (max_ch >= 34.0) & (y_med5 >= 24.0)
+        # Warm shadows are real scene color, not a hard no-op.  Give them a
+        # reduced cleanup amount unless they are also clear green/cool/chroma
+        # outliers.  This is the part that fixes the remaining skin-shadow blobs
+        # without flattening the candle-lit WIC/Paint grade.
+        warm_scale = np.where(warm_shadow & ~(greenish_shadow | cool_shadow | (chroma_delta >= 5.0)), 0.46, 1.0).astype(np.float32, copy=False)
+
         # Do not smear real edges such as face contours, hair outlines, hands, or
-        # candle geometry.  Sobel is evaluated on rendered WIC luma so this also
-        # protects the accepted crop composition and visible detail.
+        # candle geometry.  Use a softer cutoff than the previous pass because the
+        # artifact itself creates small Sobel gradients in dark gradients.
         grad_x = cv2.Sobel(ycrcb[:, :, 0], cv2.CV_32F, 1, 0, ksize=3)
         grad_y = cv2.Sobel(ycrcb[:, :, 0], cv2.CV_32F, 0, 1, ksize=3)
         grad = np.sqrt((grad_x * grad_x) + (grad_y * grad_y))
-        edge_alpha = np.clip((30.0 - grad) / 30.0, 0.0, 1.0)
-        dark_alpha = np.clip((86.0 - y_med9) / 74.0, 0.0, 1.0)
+        edge_alpha = np.clip((46.0 - grad) / 46.0, 0.0, 1.0)
+        edge_alpha = (edge_alpha * edge_alpha).astype(np.float32, copy=False)
+        dark_alpha = np.clip((106.0 - y_med9) / 94.0, 0.0, 1.0).astype(np.float32, copy=False)
 
-        # Luma is now stabilized too.  This is the missing part: preserving luma
-        # exactly leaves the dark pixel-gradient blobs visible even if chroma is
-        # cleaned.  Clamp the applied luma delta so this cannot become a blur or
-        # a new tone mapper.
-        y_target = cv2.bilateralFilter(ycrcb[:, :, 0], 7, 7, 5).astype(np.float32, copy=False)
-        luma_roughness = np.abs(y - y_med5)
-        y_alpha = np.maximum(
-            dark_alpha * 0.22,
-            np.clip((luma_roughness - 1.0) / 8.0, 0.0, 1.0) * 0.35,
-        ) * edge_alpha * float(strength)
-        y_alpha = np.where(shadow_gate, np.clip(y_alpha, 0.0, 0.55), 0.0).astype(np.float32, copy=False)
-        y_delta = np.clip((y_target - y) * y_alpha, -3.0 * strength, 3.0 * strength)
+        # The previous target was a small bilateral filter, which tends to keep
+        # the low-end blobs as if they were image detail.  Blend toward a larger
+        # local median only in very dark, flat-ish regions, while retaining a
+        # smaller bilateral target around real low-light edges/detail.
+        y_bilateral = cv2.bilateralFilter(ycrcb[:, :, 0], 9, 9, 7).astype(np.float32, copy=False)
+        flat_alpha = np.clip((62.0 - y_med9) / 46.0, 0.0, 1.0).astype(np.float32, copy=False)
+        y_target = (y_bilateral * (1.0 - flat_alpha)) + (y_med15 * flat_alpha)
+        y_alpha = (
+            (dark_alpha * 0.34)
+            + (np.clip((luma_roughness - 0.5) / 7.0, 0.0, 1.0) * 0.36)
+        ) * edge_alpha * warm_scale * float(strength)
+        y_alpha = np.where(shadow_gate, np.clip(y_alpha, 0.0, 0.72), 0.0).astype(np.float32, copy=False)
+        y_limit = 5.0 * float(strength)
+        y_delta = np.clip((y_target - y) * y_alpha, -y_limit, y_limit)
 
-        chroma_delta = np.maximum(np.abs(cr - cr_med), np.abs(cb - cb_med))
         chroma_alpha = (
-            dark_alpha * 0.62
-            + np.clip((chroma_delta - 1.0) / 14.0, 0.0, 1.0) * 0.35
-        ) * edge_alpha * float(strength)
-        chroma_alpha = np.where(shadow_gate, np.clip(chroma_alpha, 0.0, 0.88), 0.0).astype(np.float32, copy=False)
+            (dark_alpha * 0.78)
+            + (np.clip((chroma_delta - 0.5) / 12.0, 0.0, 1.0) * 0.42)
+        ) * edge_alpha * warm_scale * float(strength)
+        chroma_alpha = np.where(shadow_gate, np.clip(chroma_alpha, 0.0, 0.96), 0.0).astype(np.float32, copy=False)
 
         # Near black, real cloth/hair/background chroma should be close to local
-        # chroma or neutral.  Pull only through the shadow mask and clamp the
-        # final chroma movement so saturated/intentional scene color survives.
-        neutral_alpha = np.clip((64.0 - y_med9) / 56.0, 0.0, 1.0) * 0.48 * float(strength)
-        neutral_alpha = np.where(shadow_gate, np.clip(neutral_alpha, 0.0, 0.58), 0.0).astype(np.float32, copy=False)
+        # chroma or neutral.  The neutral pull is stronger than the previous pass
+        # only at the low end; mid-dark warm scene color is still mostly local
+        # median-preserved through warm_scale and the dark gate.
+        neutral_alpha = np.clip((72.0 - y_med9) / 62.0, 0.0, 1.0) * 0.62 * float(strength)
+        neutral_alpha = np.where(shadow_gate, np.clip(neutral_alpha, 0.0, 0.72), 0.0).astype(np.float32, copy=False)
         target_cr = (cr_med * (1.0 - neutral_alpha)) + (128.0 * neutral_alpha)
         target_cb = (cb_med * (1.0 - neutral_alpha)) + (128.0 * neutral_alpha)
-        cr_delta = np.clip((target_cr - cr) * chroma_alpha, -10.0 * strength, 10.0 * strength)
-        cb_delta = np.clip((target_cb - cb) * chroma_alpha, -10.0 * strength, 10.0 * strength)
+        chroma_limit = 16.0 * float(strength)
+        cr_delta = np.clip((target_cr - cr) * chroma_alpha, -chroma_limit, chroma_limit)
+        cb_delta = np.clip((target_cb - cb) * chroma_alpha, -chroma_limit, chroma_limit)
 
         fixed_ycrcb = ycrcb.copy()
         fixed_ycrcb[:, :, 0] = np.clip(np.rint(y + y_delta), 0, 255).astype(np.uint8)
@@ -7866,8 +7886,8 @@ class Processor(QtCore.QObject):
             STRICT_HUE_SEED_DILATE = 5
             STRICT_HUE_MAX_AREA = 160
             STRICT_HUE_MAX_BBOX = 24
-            RESIDUAL_HUE_MAX_AREA = 12
-            RESIDUAL_HUE_MAX_BBOX = 6
+            RESIDUAL_HUE_MAX_AREA = 32
+            RESIDUAL_HUE_MAX_BBOX = 10
 
             # Use a local luma gate so real bright colored content such as
             # candles/fire is never treated as a defect. The observed WIC bug is
@@ -7979,7 +7999,39 @@ class Processor(QtCore.QObject):
             residual_green = dark_blue & (g >= 38) & ((g - np.maximum(r, b)) >= 12) & (r <= 128) & (b <= 128) & (g_jump >= 12)
             residual_red = dark_strict & (r >= 112) & ((r - max_bg) >= 42) & (b <= 128) & (g <= 128) & (r_jump >= 24)
             residual_magenta = dark_strict & (r >= 112) & (b >= 112) & ((min_rb - g) >= 34) & (g <= 128) & (r_jump >= 18) & (b_jump >= 18)
-            residual_hue_seed = (residual_blue | residual_cyan | residual_green | residual_red | residual_magenta) & ~strict_seed & ~(blue_seed | cyan_seed | green_seed)
+
+            # Some remaining WIC defects are rare one- to few-pixel red/blue
+            # chroma impulses that do not always have enough absolute intensity
+            # to trip the primary hue branches above.  Add a tiny-component-only
+            # high-saturation/local-outlier seed.  It is accepted only by the
+            # residual component bounds below, so it cannot become a broad
+            # dark-region desaturation pass or eat real candle/fire detail.
+            hsv_tiny_seed = np.zeros_like(residual_blue, dtype=bool)
+            try:
+                hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+                sat = hsv[:, :, 1].astype(np.int16, copy=False)
+                val = hsv[:, :, 2].astype(np.int16, copy=False)
+                local_sat = cv2.medianBlur(hsv[:, :, 1], 5).astype(np.int16, copy=False)
+                channel_jump = np.maximum(np.maximum(np.abs(b_jump), np.abs(g_jump)), np.abs(r_jump))
+                min_ch = np.minimum(np.minimum(r, g), b)
+                hsv_tiny_seed = (
+                    (local_luma <= 136)
+                    & (sat >= 72)
+                    & (val >= 42)
+                    & ((max_ch - min_ch) >= 34)
+                    & (((sat - local_sat) >= 24) | (channel_jump >= 20))
+                )
+            except Exception:
+                hsv_tiny_seed = np.zeros_like(residual_blue, dtype=bool)
+
+            residual_hue_seed = (
+                residual_blue
+                | residual_cyan
+                | residual_green
+                | residual_red
+                | residual_magenta
+                | hsv_tiny_seed
+            ) & ~strict_seed & ~(blue_seed | cyan_seed | green_seed)
 
             blue_or_cyan_seed = blue_seed | cyan_seed
             blue_near_seed = cv2.dilate(
@@ -9650,6 +9702,15 @@ class MainWindow(QtWidgets.QMainWindow):
             "Allow inaccurate full-res scale fallback if HDR tone-map filters fail. Off preserves fidelity by failing instead of saving washed-out crops."
         )
         self.hdr_sdr_bad_fallback_check.stateChanged.connect(self._on_ui_change)
+        self.wic_shadow_deblob_strength_spin = _mk_fspin(
+            0.0,
+            2.0,
+            0.05,
+            2,
+            "float: wic_shadow_deblob_strength (PC_WIC_SHADOW_DEBLOB_STRENGTH)",
+        )
+        self.wic_shadow_deblob_strength_spin.setValue(float(getattr(self.cfg, "wic_shadow_deblob_strength", 1.0)))
+        self.wic_shadow_deblob_strength_spin.valueChanged.connect(self._on_ui_change)
 
         self.hdr_speckle_diag_check = QtWidgets.QCheckBox()
         self.hdr_speckle_diag_check.setChecked(bool(getattr(self.cfg, "hdr_speckle_diag", False)))
@@ -10284,6 +10345,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("HDR contrast recovery", self.hdr_sdr_contrast_spin),
             ("HDR peak detect", self.hdr_sdr_peak_check),
             ("Allow inaccurate HDR fallback", self.hdr_sdr_bad_fallback_check),
+            ("WIC shadow deblob strength", self.wic_shadow_deblob_strength_spin),
             ("HDR speckle diagnostics", self.hdr_speckle_diag_check),
             ("HDR speckle diag dir", self.hdr_speckle_diag_dir_widget),
             ("FFmpeg hardware decode", self.hwaccel_combo),
@@ -11632,6 +11694,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "hdr_sdr_contrast_recovery",
             "hdr_sdr_peak_detect",
             "hdr_sdr_allow_inaccurate_fallback",
+            "wic_shadow_deblob_strength",
             "hdr_speckle_diag",
             "hdr_speckle_diag_dir",
         }
@@ -11845,6 +11908,11 @@ class MainWindow(QtWidgets.QMainWindow):
             compose_body_every_n=int(self.compose_body_every_n_spin.value()) if hasattr(self, "compose_body_every_n_spin") else int(getattr(self.cfg, "compose_body_every_n", 6)),
             compose_person_detect_cadence=int(self.compose_person_detect_cadence_spin.value()) if hasattr(self, "compose_person_detect_cadence_spin") else int(getattr(self.cfg, "compose_person_detect_cadence", 6)),
             hdr_wic_speckle_cleanup=bool(getattr(self.cfg, "hdr_wic_speckle_cleanup", True)),
+            wic_shadow_deblob_strength=(
+                float(self.wic_shadow_deblob_strength_spin.value())
+                if hasattr(self, "wic_shadow_deblob_strength_spin")
+                else float(getattr(self.cfg, "wic_shadow_deblob_strength", 1.0))
+            ),
             hdr_avif_wic_display_compat=(
                 bool(self.hdr_avif_display_compat_check.isChecked())
                 if hasattr(self, "hdr_avif_display_compat_check")
@@ -11890,6 +11958,11 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg.hdr_sdr_contrast_recovery = float(self.hdr_sdr_contrast_spin.value()) if hasattr(self, "hdr_sdr_contrast_spin") else 0.30
         cfg.hdr_sdr_peak_detect = bool(self.hdr_sdr_peak_check.isChecked()) if hasattr(self, "hdr_sdr_peak_check") else True
         cfg.hdr_sdr_allow_inaccurate_fallback = bool(self.hdr_sdr_bad_fallback_check.isChecked()) if hasattr(self, "hdr_sdr_bad_fallback_check") else False
+        cfg.wic_shadow_deblob_strength = (
+            float(self.wic_shadow_deblob_strength_spin.value())
+            if hasattr(self, "wic_shadow_deblob_strength_spin")
+            else float(getattr(self.cfg, "wic_shadow_deblob_strength", 1.0))
+        )
         cfg.hdr_speckle_diag = bool(self.hdr_speckle_diag_check.isChecked()) if hasattr(self, "hdr_speckle_diag_check") else bool(getattr(self.cfg, "hdr_speckle_diag", False))
         cfg.hdr_speckle_diag_dir = self.hdr_speckle_diag_dir_edit.text().strip() if hasattr(self, "hdr_speckle_diag_dir_edit") else str(getattr(self.cfg, "hdr_speckle_diag_dir", "") or "")
         return cfg
@@ -11943,6 +12016,13 @@ class MainWindow(QtWidgets.QMainWindow):
             hdr_sdr_conversion = "ffmpeg"
         self.cfg.hdr_sdr_conversion = hdr_sdr_conversion
         self.cfg.hdr_wic_speckle_cleanup = bool(getattr(cfg, "hdr_wic_speckle_cleanup", True))
+        try:
+            self.cfg.wic_shadow_deblob_strength = min(
+                2.0,
+                max(0.0, float(getattr(cfg, "wic_shadow_deblob_strength", 1.0))),
+            )
+        except Exception:
+            self.cfg.wic_shadow_deblob_strength = 1.0
         self.cfg.hdr_avif_wic_display_compat = bool(getattr(cfg, "hdr_avif_wic_display_compat", True))
         self.cfg.compose_crop_enable = bool(getattr(cfg, "compose_crop_enable", True))
         self.cfg.compose_detect_person_for_face = bool(getattr(cfg, "compose_detect_person_for_face", True))
@@ -12009,6 +12089,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.hdr_sdr_peak_check.setChecked(bool(getattr(cfg, "hdr_sdr_peak_detect", True)))
         if hasattr(self, "hdr_sdr_bad_fallback_check"):
             self.hdr_sdr_bad_fallback_check.setChecked(bool(getattr(cfg, "hdr_sdr_allow_inaccurate_fallback", False)))
+        if hasattr(self, "wic_shadow_deblob_strength_spin"):
+            self.wic_shadow_deblob_strength_spin.setValue(self.cfg.wic_shadow_deblob_strength)
         self.cfg.hdr_speckle_diag = bool(getattr(cfg, "hdr_speckle_diag", False))
         self.cfg.hdr_speckle_diag_dir = str(getattr(cfg, "hdr_speckle_diag_dir", "") or "")
         if hasattr(self, "hdr_speckle_diag_check"):
@@ -13094,6 +13176,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 s.value("hdr_sdr_allow_inaccurate_fallback", getattr(self.cfg, "hdr_sdr_allow_inaccurate_fallback", False), type=bool)
             )
             self.cfg.hdr_sdr_allow_inaccurate_fallback = bool(self.hdr_sdr_bad_fallback_check.isChecked())
+        try:
+            self.cfg.wic_shadow_deblob_strength = min(
+                2.0,
+                max(
+                    0.0,
+                    float(
+                        s.value(
+                            "wic_shadow_deblob_strength",
+                            getattr(self.cfg, "wic_shadow_deblob_strength", 1.0),
+                        )
+                    ),
+                ),
+            )
+        except Exception:
+            self.cfg.wic_shadow_deblob_strength = 1.0
+        if hasattr(self, "wic_shadow_deblob_strength_spin"):
+            self.wic_shadow_deblob_strength_spin.setValue(self.cfg.wic_shadow_deblob_strength)
         if hasattr(self, "hdr_speckle_diag_check"):
             self.hdr_speckle_diag_check.setChecked(
                 s.value("hdr_speckle_diag", getattr(self.cfg, "hdr_speckle_diag", False), type=bool)
