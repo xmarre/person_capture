@@ -8085,7 +8085,7 @@ class Processor(QtCore.QObject):
         bgr[:, :, :] = fixed_bgr
         return True, changed
 
-    def _repair_wic_with_yuv444_guide(self, base_path: str, guide_path: str) -> int:
+    def _repair_wic_with_yuv444_guide(self, base_path: str, guide_path: str) -> tuple[int, str]:
         """Use a clean WIC yuv444 render as an artifact mask, not as color source.
 
         Diagnostics showed the WIC yuv420 HDR-AVIF path preserves the desired
@@ -8097,18 +8097,18 @@ class Processor(QtCore.QObject):
         pulls in the yuv420 output; no pixel color is copied from the washed guide.
         """
         if self._truthy_env("PC_DISABLE_WIC_YUV444_GUIDE_CLEANUP"):
-            return 0
+            return 0, ""
         if not bool(getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", True)):
-            return 0
+            return 0, ""
         if not bool(getattr(self.cfg, "hdr_wic_speckle_cleanup", True)):
-            return 0
+            return 0, ""
         try:
             base = cv2.imread(str(base_path), cv2.IMREAD_UNCHANGED)
             guide = cv2.imread(str(guide_path), cv2.IMREAD_UNCHANGED)
             if base is None or guide is None:
-                return 0
+                return 0, ""
             if base.ndim != 3 or guide.ndim != 3 or base.shape[:2] != guide.shape[:2]:
-                return 0
+                return 0, ""
             bgr = base[:, :, :3]
             guide_bgr = guide[:, :, :3]
             ycc = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
@@ -8150,7 +8150,7 @@ class Processor(QtCore.QObject):
             cool_bad = ((b - r) >= 4.0) & (base_chroma_rough >= 2.0)
             artifact = dark & (chroma_bad | (luma_bad & (base_chroma_rough >= 2.0)) | green_bad | cool_bad)
             if int(np.count_nonzero(artifact)) <= 0:
-                return 0
+                return 0, ""
 
             artifact_u8 = (artifact.astype(np.uint8) * 255)
             artifact_u8 = cv2.morphologyEx(
@@ -8162,7 +8162,7 @@ class Processor(QtCore.QObject):
             artifact_u8 = cv2.dilate(artifact_u8, np.ones((3, 3), np.uint8), iterations=1)
             artifact = artifact_u8 > 0
             if int(np.count_nonzero(artifact)) <= 0:
-                return 0
+                return 0, ""
 
             grad_x = cv2.Sobel(ycc[:, :, 0], cv2.CV_32F, 1, 0, ksize=3)
             grad_y = cv2.Sobel(ycc[:, :, 0], cv2.CV_32F, 0, 1, ksize=3)
@@ -8200,10 +8200,23 @@ class Processor(QtCore.QObject):
             diff = np.max(np.abs(fixed_bgr.astype(np.int16, copy=False) - bgr.astype(np.int16, copy=False)), axis=2)
             changed = int(np.count_nonzero(diff > 0))
             if changed <= 0:
-                return 0
+                return 0, ""
             bgr[:, :, :] = fixed_bgr
-            ok = cv2.imwrite(str(base_path), base)
-            return changed if ok else 0
+            tmp_out = base_path + ".tmp_yuv444_guide_cleanup.png"
+            try:
+                if os.path.exists(tmp_out):
+                    os.remove(tmp_out)
+            except Exception:
+                pass
+            ok = cv2.imwrite(str(tmp_out), base)
+            if not ok:
+                try:
+                    if os.path.exists(tmp_out):
+                        os.remove(tmp_out)
+                except Exception:
+                    pass
+                return 0, ""
+            return changed, tmp_out
         except Exception as exc:
             try:
                 self._status(
@@ -8213,7 +8226,7 @@ class Processor(QtCore.QObject):
                 )
             except Exception:
                 pass
-            return 0
+            return 0, ""
 
     def _maybe_apply_wic_yuv444_guided_cleanup(
         self,
@@ -8227,9 +8240,12 @@ class Processor(QtCore.QObject):
             return 0
         if not bool(getattr(self.cfg, "hdr_wic_yuv444_guide_cleanup", True)):
             return 0
+        if not bool(getattr(self.cfg, "hdr_wic_speckle_cleanup", True)):
+            return 0
         guide_base = out_path + ".tmp_yuv444_guide"
         guide_hdr = guide_base + ".avif"
         guide_png = guide_base + ".png"
+        repaired_tmp = ""
         try:
             for pth in (guide_hdr, guide_png):
                 if os.path.exists(pth):
@@ -8260,11 +8276,24 @@ class Processor(QtCore.QObject):
                     interval=10.0,
                 )
                 return 0
-            return self._repair_wic_with_yuv444_guide(out_path, guide_png)
+            changed, repaired_tmp = self._repair_wic_with_yuv444_guide(out_path, guide_png)
+            if changed <= 0 or not repaired_tmp:
+                return 0
+            valid, invalid_why = self._validate_hdr_sdr_export_image(repaired_tmp, None)
+            if not valid:
+                self._status(
+                    f"HDR WIC yuv444-guide output invalid: {invalid_why}",
+                    key="hdr_wic_guide_cleanup",
+                    interval=5.0,
+                )
+                return 0
+            os.replace(repaired_tmp, out_path)
+            repaired_tmp = ""
+            return changed
         finally:
-            for pth in (guide_hdr, guide_png):
+            for pth in (guide_hdr, guide_png, repaired_tmp):
                 try:
-                    if os.path.exists(pth):
+                    if pth and os.path.exists(pth):
                         os.remove(pth)
                 except Exception:
                     pass
