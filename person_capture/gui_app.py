@@ -2753,9 +2753,9 @@ class Processor(QtCore.QObject):
                     portrait_side_margin,
                     portrait_bottom_margin,
                 )
-                square_is_true_tight_close = square_face_h_frac >= 0.54
+                square_is_legitimate = _square_rescue_allowed()
                 portrait_is_competitive = portrait_score <= best_score + 0.85
-                if portrait_is_useful and portrait_is_competitive and not square_is_true_tight_close:
+                if portrait_is_useful and portrait_is_competitive and not square_is_legitimate:
                     self._status(
                         f"portrait crop override {profile}/1:1 -> {portrait_profile}/{portrait_rs} "
                         f"sq_fh={square_face_h_frac:.3f} p_fh={portrait_face_h_frac:.3f}",
