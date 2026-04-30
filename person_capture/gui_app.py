@@ -2087,6 +2087,21 @@ class Processor(QtCore.QObject):
         dy = max(0.0, (cy1 + m) - py1) + max(0.0, py2 - (cy2 - m))
         return (dx / pw) + (dy / ph)
 
+    @staticmethod
+    def _wide_context_cadence_active(cfg, frame_idx: Optional[int]) -> bool:
+        wide_period = max(0, int(getattr(cfg, "compose_wide_context_every_n", 5)))
+        return wide_period > 0 and frame_idx is not None and (int(frame_idx) % wide_period == 0)
+
+    @staticmethod
+    def _effective_wide_context_max_frame_frac(cfg, wide_cadence: bool) -> float:
+        wide_frame_max = max(
+            0.08,
+            min(0.32, float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18))),
+        )
+        if wide_cadence:
+            wide_frame_max = max(wide_frame_max + 0.12, 0.32)
+        return max(0.08, min(0.34, wide_frame_max))
+
     def _ratio_crop_containing_box(
         self,
         protect_xyxy: Tuple[float, float, float, float],
@@ -2447,7 +2462,7 @@ class Processor(QtCore.QObject):
         body_period = max(0, int(getattr(cfg, "compose_body_every_n", 6)))
         body_cadence = body_period > 0 and frame_idx is not None and (int(frame_idx) % body_period == 0)
         wide_period = max(0, int(getattr(cfg, "compose_wide_context_every_n", 5)))
-        wide_cadence = wide_period > 0 and frame_idx is not None and (int(frame_idx) % wide_period == 0)
+        wide_cadence = self._wide_context_cadence_active(cfg, frame_idx)
         # Reuse the same deterministic variety oscillator for square too, but on
         # an interleaved phase instead of the exact same frame. That keeps the
         # existing widescreen cadence intact while occasionally tipping a nearby
@@ -2483,17 +2498,12 @@ class Processor(QtCore.QObject):
             body_target = max(0.035, min(0.16, float(getattr(cfg, "compose_body_face_h_frac", 0.085))))
             wide_context_enabled = bool(getattr(cfg, "compose_wide_context_enable", True))
             wide_context_target = max(0.08, min(0.26, float(getattr(cfg, "compose_wide_context_face_h_frac", 0.16))))
-            wide_context_max_frame_frac = max(0.08, min(0.32, float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18))))
             wide_context_min_side_face_heights = max(0.0, min(4.0, float(getattr(cfg, "compose_wide_context_min_side_face_heights", 1.20))))
             # Cadence is a real variety oscillator, not just a score nudge.
             # Regular wide/context remains conservative; the cadence frame may
             # consider medium upper-body shots, then hard containment/repair below
             # still rejects anything that would cut the detected face or subject.
-            if wide_cadence:
-                effective_wide_context_max_frame_frac = max(wide_context_max_frame_frac + 0.12, 0.32)
-            else:
-                effective_wide_context_max_frame_frac = wide_context_max_frame_frac
-            effective_wide_context_max_frame_frac = max(0.08, min(0.34, effective_wide_context_max_frame_frac))
+            effective_wide_context_max_frame_frac = self._effective_wide_context_max_frame_frac(cfg, wide_cadence)
             effective_wide_context_min_side_face_heights = wide_context_min_side_face_heights * (0.70 if wide_cadence else 1.0)
 
             close_protect = self._pad_box_xyxy(
@@ -2975,8 +2985,6 @@ class Processor(QtCore.QObject):
         fallback_ratio = None
         fallback_profile = "fallback"
         fallback_ratios = list(validated_user_ratios)
-        if square_cadence and "1:1" in fallback_ratios:
-            fallback_ratios = ["1:1"] + [rs for rs in fallback_ratios if rs != "1:1"]
         for rs in fallback_ratios:
             try:
                 rw, rh = parse_ratio(rs)
@@ -2989,7 +2997,7 @@ class Processor(QtCore.QObject):
                 if (
                     face is not None
                     and bool(getattr(cfg, "compose_wide_context_enable", True))
-                    and face_frame_frac <= max(0.08, min(0.34, (max(float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18)) + 0.12, 0.32) if wide_cadence else float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18)))))
+                    and face_frame_frac <= effective_wide_context_max_frame_frac
                 ):
                     fx1_f, fy1_f, fx2_f, fy2_f = [float(v) for v in face]
                     side_room_face_heights = min(
@@ -3035,7 +3043,7 @@ class Processor(QtCore.QObject):
                 if (
                     face is not None
                     and bool(getattr(cfg, "compose_wide_context_enable", True))
-                    and face_frame_frac <= max(0.08, min(0.34, (max(float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18)) + 0.12, 0.32) if wide_cadence else float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18)))))
+                    and face_frame_frac <= effective_wide_context_max_frame_frac
                 ):
                     fx1_f, fy1_f, fx2_f, fy2_f = [float(v) for v in face]
                     side_room_face_heights = min(
@@ -6821,17 +6829,8 @@ class Processor(QtCore.QObject):
                                         or frame_face_h_frac >= 0.12
                                     )
                                 elif crop_profile_for_guard == "wide_context":
-                                    wide_frame_max_base = max(
-                                        0.08,
-                                        min(0.32, float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18))),
-                                    )
-                                    wide_period_guard = max(0, int(getattr(cfg, "compose_wide_context_every_n", 5)))
-                                    wide_cadence_guard = wide_period_guard > 0 and (int(idx) % wide_period_guard == 0)
-                                    if wide_cadence_guard:
-                                        wide_frame_max = max(wide_frame_max_base + 0.12, 0.32)
-                                    else:
-                                        wide_frame_max = wide_frame_max_base
-                                    wide_frame_max = max(0.08, min(0.34, wide_frame_max))
+                                    wide_cadence_guard = self._wide_context_cadence_active(cfg, idx)
+                                    wide_frame_max = self._effective_wide_context_max_frame_frac(cfg, wide_cadence_guard)
                                     # Wide/context may contain a visible face, but it is
                                     # still not a close-up. Only force portrait when the
                                     # selected landscape crop has drifted into close/upper
