@@ -9604,6 +9604,58 @@ class Processor(QtCore.QObject):
                 lut = np.interp(np.arange(256, dtype=np.float32), xp, fp)
                 return np.clip(np.rint(lut), 0, 255).astype(np.uint8)
 
+            def _neutral_chroma_gain_lut(src_ch: np.ndarray, dst_ch: np.ndarray, mask: np.ndarray) -> Optional[np.ndarray]:
+                """Return a chroma LUT that changes saturation without adding a tint.
+
+                The previous per-channel quantile match was allowed to translate
+                Cr/Cb away from the neutral axis. In very dark candle/night
+                scenes the fit is dominated by near-neutral shadow pixels, so a
+                small percentile wobble can become a visible frame-to-frame
+                green/magenta cast. Chroma remap must preserve 128 -> 128 and
+                only scale positive/negative chroma excursions around neutral.
+                """
+                src_vals = src_ch[mask].astype(np.float32, copy=False) - 128.0
+                dst_vals = dst_ch[mask].astype(np.float32, copy=False) - 128.0
+                if src_vals.size < 1024 or dst_vals.size < 1024:
+                    return None
+
+                def _side_gain(src_dev: np.ndarray, dst_dev: np.ndarray, side: int) -> Optional[float]:
+                    if side > 0:
+                        sel = (src_dev > 1.0) | (dst_dev > 1.0)
+                        src_abs = src_dev[sel]
+                        dst_abs = dst_dev[sel]
+                    else:
+                        sel = (src_dev < -1.0) | (dst_dev < -1.0)
+                        src_abs = -src_dev[sel]
+                        dst_abs = -dst_dev[sel]
+                    if src_abs.size < 256 or dst_abs.size < 256:
+                        return None
+                    src_p = float(np.percentile(src_abs, 75.0))
+                    dst_p = float(np.percentile(dst_abs, 75.0))
+                    if not math.isfinite(src_p) or not math.isfinite(dst_p) or src_p < 1.0:
+                        return None
+                    return max(0.25, min(3.0, dst_p / src_p))
+
+                src_abs_all = np.abs(src_vals)
+                dst_abs_all = np.abs(dst_vals)
+                src_p_all = float(np.percentile(src_abs_all, 75.0)) if src_abs_all.size else 0.0
+                dst_p_all = float(np.percentile(dst_abs_all, 75.0)) if dst_abs_all.size else 0.0
+                fallback_gain = 1.0
+                if math.isfinite(src_p_all) and math.isfinite(dst_p_all) and src_p_all >= 1.0:
+                    fallback_gain = max(0.25, min(3.0, dst_p_all / src_p_all))
+
+                pos_gain = _side_gain(src_vals, dst_vals, 1)
+                neg_gain = _side_gain(src_vals, dst_vals, -1)
+                if pos_gain is None:
+                    pos_gain = fallback_gain
+                if neg_gain is None:
+                    neg_gain = fallback_gain
+
+                axis = np.arange(256, dtype=np.float32) - 128.0
+                gain = np.where(axis >= 0.0, float(pos_gain), float(neg_gain))
+                lut = 128.0 + (axis * gain)
+                return np.clip(np.rint(lut), 0, 255).astype(np.uint8)
+
             # Match luma and chroma independently. The LUT fitting remains CPU
             # because it is cheap on the reduced reference image and avoids a new
             # GPU quantile implementation. The full-res LUT/blend below can run
@@ -9615,7 +9667,23 @@ class Processor(QtCore.QObject):
             )
             luts: list[np.ndarray] = []
             for c in range(3):
-                lut = _quantile_lut(clean_fit_ycc[:, :, c], base_ycc[:, :, c], fit_mask)
+                if c == 0:
+                    lut = _quantile_lut(clean_fit_ycc[:, :, c], base_ycc[:, :, c], fit_mask)
+                else:
+                    src_dev = np.abs(clean_fit_ycc[:, :, c].astype(np.int16, copy=False) - 128)
+                    dst_dev = np.abs(base_ycc[:, :, c].astype(np.int16, copy=False) - 128)
+                    chroma_mask = fit_mask & ((src_dev >= 2) | (dst_dev >= 2))
+                    if int(np.count_nonzero(chroma_mask)) < 1024:
+                        chroma_mask = fit_mask
+                    lut = _neutral_chroma_gain_lut(clean_fit_ycc[:, :, c], base_ycc[:, :, c], chroma_mask)
+                    if lut is None:
+                        # Last-resort compatibility path. Keep the neutral axis
+                        # pinned so the fallback cannot introduce a global cast.
+                        lut = _quantile_lut(clean_fit_ycc[:, :, c], base_ycc[:, :, c], fit_mask)
+                        if lut is not None:
+                            lut_i = lut.astype(np.int16, copy=False)
+                            delta_128 = int(lut_i[128]) - 128
+                            lut = np.clip(lut_i - delta_128, 0, 255).astype(np.uint8)
                 if lut is None:
                     return 0, ""
                 luts.append(lut)
