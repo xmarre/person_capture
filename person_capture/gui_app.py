@@ -3876,6 +3876,9 @@ class Processor(QtCore.QObject):
         self._hdr_preview_latest: Optional[
             tuple[int, int, np.ndarray, np.ndarray, int, int]
         ] = None
+        self._wic_raw_pair_worker: Optional[subprocess.Popen] = None
+        self._wic_raw_pair_worker_lock = threading.Lock()
+        self._last_wic_raw_pair_worker_used = False
 
     def _emit_hit(self, path: str) -> None:
         emit = getattr(self.hit, "emit", None)
@@ -7708,6 +7711,7 @@ class Processor(QtCore.QObject):
                 except Exception:
                     pass
             self._hdr_preview_close()
+            self._close_wic_raw_pair_worker()
             if csv_f is not None:
                 try:
                     csv_f.close()
@@ -9587,6 +9591,7 @@ class Processor(QtCore.QObject):
 
             t_wic_start = time.perf_counter()
             if use_raw_wic:
+                self._last_wic_raw_pair_worker_used = False
                 ok_pair_wic, why_pair_wic, ref_pair_meta, clean_pair_meta = self._save_wic_bgra_raw_pair_from_hdr_images(
                     ref_hdr,
                     ref_raw,
@@ -9598,7 +9603,7 @@ class Processor(QtCore.QObject):
                     ref_raw_meta = ref_pair_meta
                     clean_raw_meta = clean_pair_meta
                     raw_mode = True
-                    wic_mode = "raw_pair"
+                    wic_mode = "raw_pair_worker" if bool(getattr(self, "_last_wic_raw_pair_worker_used", False)) else "raw_pair"
                     t_clean_wic = t_pair_wic
                     d_clean_wic = t_pair_wic - t_wic_start
                 else:
@@ -10722,6 +10727,338 @@ class Processor(QtCore.QObject):
             return self._save_hdr_crop_p010(frame_idx, frame_pts_sec, crop_xyxy, out_path)
         return self._save_hdr_crop_p010(frame_idx, frame_pts_sec, crop_xyxy, out_path)
 
+
+    def _close_wic_raw_pair_worker_unlocked(self) -> None:
+        proc = getattr(self, "_wic_raw_pair_worker", None)
+        self._wic_raw_pair_worker = None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None and proc.stdin is not None:
+                try:
+                    proc.stdin.write("__EXIT__\n")
+                    proc.stdin.flush()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=0.5)
+                except Exception:
+                    proc.kill()
+        except Exception:
+            pass
+
+    def _close_wic_raw_pair_worker(self) -> None:
+        lock = getattr(self, "_wic_raw_pair_worker_lock", None)
+        if lock is None:
+            self._close_wic_raw_pair_worker_unlocked()
+            return
+        try:
+            with lock:
+                self._close_wic_raw_pair_worker_unlocked()
+        except Exception:
+            pass
+
+    def _ensure_wic_raw_pair_worker_unlocked(self) -> tuple[Optional[subprocess.Popen], str]:
+        if sys.platform != "win32":
+            return None, "worker_unavailable:not_windows"
+        ps = self._resolve_powershell_bin()
+        if not ps:
+            return None, "worker_unavailable:powershell_not_found"
+        proc = getattr(self, "_wic_raw_pair_worker", None)
+        if proc is not None and proc.poll() is None and proc.stdin is not None and proc.stdout is not None:
+            return proc, ""
+        if proc is not None:
+            self._close_wic_raw_pair_worker_unlocked()
+
+        script = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::InputEncoding = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName PresentationCore,WindowsBase
+
+function Convert-WicBgr32Raw([string]$src, [string]$dst, [string]$label) {
+    $stream = [System.IO.File]::Open($src, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    try {
+        $decoder = [System.Windows.Media.Imaging.BitmapDecoder]::Create($stream, [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat, [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
+    } finally {
+        $stream.Close()
+    }
+    if ($decoder.Frames.Count -lt 1) { throw ($label + ': WIC decoder returned no frames') }
+    $frame = $decoder.Frames[0]
+    $converted = New-Object System.Windows.Media.Imaging.FormatConvertedBitmap
+    $converted.BeginInit()
+    $converted.Source = $frame
+    $converted.DestinationFormat = [System.Windows.Media.PixelFormats]::Bgr32
+    $converted.EndInit()
+    $width = [int]$converted.PixelWidth
+    $height = [int]$converted.PixelHeight
+    $stride = [int]([Math]::Ceiling(($width * $converted.Format.BitsPerPixel) / 8.0))
+    if ($width -le 0 -or $height -le 0 -or $stride -lt ($width * 4)) {
+        throw ("{0}: invalid dimensions {1}x{2} stride={3}" -f $label, $width, $height, $stride)
+    }
+    $pixels = [System.Byte[]]::new($stride * $height)
+    $converted.CopyPixels($pixels, $stride, 0)
+    [System.IO.File]::WriteAllBytes($dst, $pixels)
+    return [pscustomobject]@{ Width = $width; Height = $height; Stride = $stride }
+}
+
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+    if ($line -eq '__EXIT__') { break }
+    try {
+        $req = $line | ConvertFrom-Json
+        $ref = Convert-WicBgr32Raw ([string]$req.refSrc) ([string]$req.refDst) 'REF'
+        $clean = Convert-WicBgr32Raw ([string]$req.cleanSrc) ([string]$req.cleanDst) 'CLEAN'
+        $resp = @{
+            ok = $true
+            ref = @([int]$ref.Width, [int]$ref.Height, [int]$ref.Stride)
+            clean = @([int]$clean.Width, [int]$clean.Height, [int]$clean.Stride)
+        } | ConvertTo-Json -Compress
+        [Console]::Out.WriteLine($resp)
+        [Console]::Out.Flush()
+    } catch {
+        $msg = $_.Exception.Message
+        if (-not $msg) { $msg = [string]$_ }
+        $resp = @{ ok = $false; why = $msg } | ConvertTo-Json -Compress
+        [Console]::Out.WriteLine($resp)
+        [Console]::Out.Flush()
+    }
+}
+"""
+        try:
+            proc = subprocess.Popen(
+                [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+        except Exception as exc:
+            return None, f"worker_start_failed:{type(exc).__name__}:{exc}"
+        self._wic_raw_pair_worker = proc
+        return proc, ""
+
+    @staticmethod
+    def _parse_wic_raw_worker_meta(value: object) -> Optional[tuple[int, int, int]]:
+        try:
+            if not isinstance(value, (list, tuple)) or len(value) != 3:
+                return None
+            width, height, stride = (int(value[0]), int(value[1]), int(value[2]))
+            if width <= 0 or height <= 0 or stride < width * 4:
+                return None
+            return width, height, stride
+        except Exception:
+            return None
+
+    def _try_save_wic_bgra_raw_pair_with_worker(
+        self,
+        ref_hdr_path: str,
+        ref_out_path: str,
+        clean_hdr_path: str,
+        clean_out_path: str,
+    ) -> tuple[bool, str, tuple[int, int, int] | None, tuple[int, int, int] | None]:
+        """Convert two HDR stills through a persistent PowerShell/WIC worker.
+
+        This preserves the same WPF/WIC FormatConvertedBitmap path as the
+        single-shot PowerShell helper but avoids paying PowerShell/.NET startup
+        cost for every captured crop.  Failures are contained: the caller falls
+        back to the existing single-shot path.
+        """
+        lock = getattr(self, "_wic_raw_pair_worker_lock", None)
+        if lock is None:
+            return False, "worker_unavailable:no_lock", None, None
+
+        ref_tmp = ref_out_path + ".tmp.raw"
+        clean_tmp = clean_out_path + ".tmp.raw"
+        ref_backup = ref_out_path + ".bak.rawpair"
+        clean_backup = clean_out_path + ".bak.rawpair"
+
+        path_roles = (
+            ("ref_out", ref_out_path),
+            ("clean_out", clean_out_path),
+            ("ref_tmp", ref_tmp),
+            ("clean_tmp", clean_tmp),
+            ("ref_backup", ref_backup),
+            ("clean_backup", clean_backup),
+        )
+        seen_paths: dict[str, str] = {}
+        for role, path in path_roles:
+            norm_path = os.path.normcase(os.path.abspath(path))
+            prev_role = seen_paths.get(norm_path)
+            if prev_role is not None:
+                return False, f"worker_path_collision:{prev_role}:{role}:{norm_path}", None, None
+            seen_paths[norm_path] = role
+
+        for out_path in (ref_out_path, clean_out_path):
+            out_dir = os.path.dirname(out_path)
+            if not out_dir:
+                continue
+            try:
+                ensure_dir(out_dir)
+            except Exception as exc:
+                return False, f"worker_out_dir_unwritable:{out_dir}:{type(exc).__name__}:{exc}", None, None
+
+        for tmp in (ref_tmp, clean_tmp):
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+        timeout_sec = max(5, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
+        try:
+            with lock:
+                proc, why = self._ensure_wic_raw_pair_worker_unlocked()
+                if proc is None or proc.stdin is None or proc.stdout is None:
+                    return False, why or "worker_unavailable", None, None
+                request = {
+                    "refSrc": ref_hdr_path,
+                    "refDst": ref_tmp,
+                    "cleanSrc": clean_hdr_path,
+                    "cleanDst": clean_tmp,
+                }
+                try:
+                    proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+                    proc.stdin.flush()
+                except Exception as exc:
+                    self._close_wic_raw_pair_worker_unlocked()
+                    return False, f"worker_write_failed:{type(exc).__name__}:{exc}", None, None
+
+                line_q: queue.Queue = queue.Queue(maxsize=1)
+
+                def _read_worker_line() -> None:
+                    try:
+                        line_q.put(proc.stdout.readline())
+                    except Exception:
+                        try:
+                            line_q.put("")
+                        except Exception:
+                            pass
+
+                reader = threading.Thread(target=_read_worker_line, daemon=True)
+                reader.start()
+                try:
+                    line = line_q.get(timeout=timeout_sec)
+                except queue.Empty:
+                    self._close_wic_raw_pair_worker_unlocked()
+                    return False, f"worker_timeout_{timeout_sec}s", None, None
+                if not line:
+                    rc = proc.poll()
+                    self._close_wic_raw_pair_worker_unlocked()
+                    return False, f"worker_eof rc={rc}", None, None
+                try:
+                    resp = json.loads(line)
+                except Exception as exc:
+                    self._close_wic_raw_pair_worker_unlocked()
+                    return False, f"worker_bad_json:{type(exc).__name__}:{line[:200]!r}", None, None
+                if not isinstance(resp, dict) or not bool(resp.get("ok")):
+                    why = str(resp.get("why", "worker_failed")) if isinstance(resp, dict) else "worker_bad_response"
+                    return False, why, None, None
+                ref_meta = self._parse_wic_raw_worker_meta(resp.get("ref"))
+                clean_meta = self._parse_wic_raw_worker_meta(resp.get("clean"))
+                if ref_meta is None or clean_meta is None:
+                    return False, f"worker_bad_dims:{resp!r}", None, None
+
+            for label, tmp, meta in (("ref", ref_tmp, ref_meta), ("clean", clean_tmp, clean_meta)):
+                width, height, stride = meta
+                expected = int(height) * int(stride)
+                if not os.path.exists(tmp) or os.path.getsize(tmp) != expected:
+                    got = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+                    return False, f"worker_size_mismatch:{label}:got={got}:expected={expected}", None, None
+
+            backed_up_ref = False
+            backed_up_clean = False
+            published_ref = False
+            published_clean = False
+            restored_ref = False
+            restored_clean = False
+            publish_succeeded = False
+            try:
+                stale_backups: list[str] = []
+                if os.path.exists(ref_backup):
+                    stale_backups.append("ref")
+                if os.path.exists(clean_backup):
+                    stale_backups.append("clean")
+                if stale_backups:
+                    return False, (
+                        "worker_recovery_required:"
+                        + ",".join(stale_backups)
+                        + "_backup_present"
+                    ), None, None
+                if os.path.exists(ref_out_path):
+                    os.replace(ref_out_path, ref_backup)
+                    backed_up_ref = True
+                if os.path.exists(clean_out_path):
+                    os.replace(clean_out_path, clean_backup)
+                    backed_up_clean = True
+
+                os.replace(ref_tmp, ref_out_path)
+                published_ref = True
+                os.replace(clean_tmp, clean_out_path)
+                published_clean = True
+                publish_succeeded = True
+            except Exception as exc:
+                restore_notes: list[str] = []
+                if published_ref:
+                    try:
+                        if os.path.exists(ref_out_path):
+                            os.remove(ref_out_path)
+                    except Exception:
+                        pass
+                if published_clean:
+                    try:
+                        if os.path.exists(clean_out_path):
+                            os.remove(clean_out_path)
+                    except Exception:
+                        pass
+                if backed_up_ref and os.path.exists(ref_backup):
+                    try:
+                        os.replace(ref_backup, ref_out_path)
+                        restored_ref = True
+                    except Exception as restore_exc:
+                        restore_notes.append(f"ref_restore_failed:{type(restore_exc).__name__}:{restore_exc}")
+                if backed_up_clean and os.path.exists(clean_backup):
+                    try:
+                        os.replace(clean_backup, clean_out_path)
+                        restored_clean = True
+                    except Exception as restore_exc:
+                        restore_notes.append(f"clean_restore_failed:{type(restore_exc).__name__}:{restore_exc}")
+                reason = f"worker_publish_failed:{type(exc).__name__}:{exc}"
+                if restore_notes:
+                    reason += "|" + "|".join(restore_notes)
+                return False, reason, None, None
+            finally:
+                for bak, should_remove in (
+                    (ref_backup, publish_succeeded or restored_ref),
+                    (clean_backup, publish_succeeded or restored_clean),
+                ):
+                    if not should_remove:
+                        continue
+                    try:
+                        if os.path.exists(bak):
+                            os.remove(bak)
+                    except Exception:
+                        pass
+            return True, "", ref_meta, clean_meta
+        except Exception as exc:
+            self._close_wic_raw_pair_worker()
+            return False, f"worker_failed:{type(exc).__name__}:{exc}", None, None
+        finally:
+            for tmp in (ref_tmp, clean_tmp):
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+
+
     def _save_wic_bgra_raw_pair_from_hdr_images(
         self,
         ref_hdr_path: str,
@@ -10744,6 +11081,24 @@ class Processor(QtCore.QObject):
         if not clean_hdr_path or not os.path.exists(clean_hdr_path):
             return False, "windows_wic_unavailable:clean_hdr_source_missing", None, None
 
+        if not self._truthy_env("PC_DISABLE_WIC_YUV444_RAW_PAIR_WORKER"):
+            ok_worker, why_worker, ref_worker_meta, clean_worker_meta = self._try_save_wic_bgra_raw_pair_with_worker(
+                ref_hdr_path,
+                ref_out_path,
+                clean_hdr_path,
+                clean_out_path,
+            )
+            if ok_worker and ref_worker_meta is not None and clean_worker_meta is not None:
+                self._last_wic_raw_pair_worker_used = True
+                return True, "", ref_worker_meta, clean_worker_meta
+            if why_worker and not why_worker.startswith("worker_unavailable:"):
+                self._status(
+                    f"HDR WIC yuv444 persistent raw worker fell back to one-shot PowerShell: {why_worker}",
+                    key="hdr_wic_raw_pair_worker_fallback",
+                    interval=10.0,
+                )
+
+        self._last_wic_raw_pair_worker_used = False
         if not ref_out_path or not clean_out_path:
             return False, "windows_wic_raw_pair_out_path_missing", None, None
         ref_tmp = ref_out_path + ".tmp.raw"
