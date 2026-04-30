@@ -10837,6 +10837,9 @@ Write-WicBgr32Raw $cleanSrc $cleanDst 'CLEAN'
             clean_backup = clean_out_path + ".bak.rawpair"
             backed_up_ref = False
             backed_up_clean = False
+            restored_ref = False
+            restored_clean = False
+            publish_succeeded = False
             try:
                 for bak in (ref_backup, clean_backup):
                     try:
@@ -10853,6 +10856,7 @@ Write-WicBgr32Raw $cleanSrc $cleanDst 'CLEAN'
 
                 os.replace(ref_tmp, ref_out_path)
                 os.replace(clean_tmp, clean_out_path)
+                publish_succeeded = True
             except Exception as exc:
                 try:
                     if os.path.exists(ref_out_path):
@@ -10867,16 +10871,23 @@ Write-WicBgr32Raw $cleanSrc $cleanDst 'CLEAN'
                 if backed_up_ref and os.path.exists(ref_backup):
                     try:
                         os.replace(ref_backup, ref_out_path)
+                        restored_ref = True
                     except Exception:
                         pass
                 if backed_up_clean and os.path.exists(clean_backup):
                     try:
                         os.replace(clean_backup, clean_out_path)
+                        restored_clean = True
                     except Exception:
                         pass
                 return False, f"windows_wic_raw_pair_publish_failed:{type(exc).__name__}:{exc}", None, None
             finally:
-                for bak in (ref_backup, clean_backup):
+                for bak, should_remove in (
+                    (ref_backup, publish_succeeded or restored_ref),
+                    (clean_backup, publish_succeeded or restored_clean),
+                ):
+                    if not should_remove:
+                        continue
                     try:
                         if os.path.exists(bak):
                             os.remove(bak)
