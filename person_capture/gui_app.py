@@ -8163,6 +8163,24 @@ class Processor(QtCore.QObject):
             offsets = [(float(dx), float(dy)) for dx in dx_vals for dy in dy_vals]
 
         candidate_set = {seed_crop, anchor_crop}
+        if face is not None and prof in {"close", "portrait_close", "upper", "base"}:
+            # Add a deterministic downward-settled candidate. The saliency grid
+            # below may legitimately move left/right, but portrait placement must
+            # not waste vertical pixels above the detected head when the same
+            # fixed-size crop can include more body/shoulder context below.
+            for base_cand in (seed_crop, anchor_crop):
+                try:
+                    candidate_set.add(
+                        self._prefer_lower_face_crop_y(
+                            base_cand,
+                            face,
+                            protect,
+                            bounds,
+                            prof,
+                        )
+                    )
+                except Exception:
+                    pass
         ax1, ay1, ax2, ay2 = anchor_crop
         acx = 0.5 * (ax1 + ax2)
         acy = 0.5 * (ay1 + ay2)
@@ -8222,6 +8240,42 @@ class Processor(QtCore.QObject):
                 right = max(0.0, x2 - fx2)
                 if desired_side > 0:
                     score += 0.40 * max(0.0, desired_side - min(left, right)) / desired_side
+
+                if prof in {"close", "portrait_close", "upper", "base"}:
+                    # Vertical composition invariant for face crops: excess
+                    # headroom is worse than using the same fixed-ratio crop to
+                    # keep more body/shoulders below the face. Use the generated
+                    # head proxy as a top hint, but cap over-expanded proxies so
+                    # close-ups are not forced to reserve unrealistic hair space.
+                    top_guard = fy1
+                    if protect is not None:
+                        try:
+                            _, py1, _, _ = [float(v) for v in protect]
+                            proxy_top = min(py1, fy1)
+                            proxy_floor = fy1 - 0.45 * fh
+                            top_guard = max(proxy_floor, proxy_top)
+                        except Exception:
+                            top_guard = fy1
+                    top_margin_frac = max(0.0, top_guard - y1) / ch
+                    headroom_cap = max(0.02, min(0.30, float(getattr(cfg, "crop_top_headroom_max_frac", 0.15))))
+                    if prof == "upper":
+                        headroom_cap = min(headroom_cap, 0.09)
+                    elif prof == "portrait_close":
+                        headroom_cap = min(headroom_cap, 0.10)
+                    elif prof == "close":
+                        headroom_cap = min(headroom_cap, 0.12)
+                    score += 1.35 * max(0.0, top_margin_frac - headroom_cap) / max(0.04, headroom_cap)
+
+                    bottom_face_heights = max(0.0, y2 - fy2) / fh
+                    want_bottom = max(0.0, float(getattr(cfg, "crop_bottom_min_face_heights", 1.5)))
+                    if prof == "upper":
+                        want_bottom = max(want_bottom, 2.25)
+                    elif prof == "portrait_close":
+                        want_bottom = max(want_bottom, 1.75)
+                    elif prof == "close":
+                        want_bottom = max(want_bottom, 1.20)
+                    score += 0.18 * max(0.0, want_bottom - bottom_face_heights)
+
                 if prof == "wide_context":
                     # Wide/context should actually use horizontal context.
                     side_face_heights = min(left, right) / max(1.0, fh)
