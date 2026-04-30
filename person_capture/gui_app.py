@@ -8799,16 +8799,40 @@ class Processor(QtCore.QObject):
         return True, changed
 
     def _repair_wic_with_yuv444_color_match(self, base_path: str, clean_path: str) -> tuple[int, str]:
+        """Path-based wrapper for the yuv444 color-match repair."""
+        try:
+            base = cv2.imread(str(base_path), cv2.IMREAD_UNCHANGED)
+            clean = cv2.imread(str(clean_path), cv2.IMREAD_UNCHANGED)
+            if base is None or clean is None:
+                return 0, ""
+            return self._repair_wic_yuv444_color_match_arrays(base, clean, str(base_path))
+        except Exception as exc:
+            try:
+                self._status(
+                    f"HDR WIC yuv444 color-match failed: {type(exc).__name__}: {exc}",
+                    key="hdr_wic_yuv444_color_match",
+                    interval=10.0,
+                )
+            except Exception:
+                pass
+            return 0, ""
+
+    def _repair_wic_yuv444_color_match_arrays(
+        self,
+        base: np.ndarray,
+        clean: np.ndarray,
+        output_base_path: str,
+    ) -> tuple[int, str]:
         """Use artifact-free WIC yuv444 pixels, remapped to the yuv420 WIC look.
 
         The guide-mask cleanup was intentionally conservative and therefore did
-        not move broad shadow blobs.  Diagnostics showed a stricter invariant:
+        not move broad shadow blobs. Diagnostics showed a stricter invariant:
         WIC yuv420/full has the accepted color response but can create bad final
         display pixels; WIC yuv444/limited has clean final pixels but a washed
-        global response.  This pass therefore does not try to detect individual
-        blobs.  It uses the yuv444 WIC render as the final texture source and
+        global response. This pass therefore does not try to detect individual
+        blobs. It uses the yuv444 WIC render as the final texture source and
         maps its display-referred Y/Cr/Cb distributions back to the already
-        accepted yuv420 WIC PNG.  The yuv420 image is only the color reference.
+        accepted yuv420 WIC image. The yuv420 image is only the color reference.
         """
         if self._truthy_env("PC_DISABLE_WIC_YUV444_COLOR_MATCH"):
             return 0, ""
@@ -8842,14 +8866,12 @@ class Processor(QtCore.QObject):
         if strength <= 0.0:
             return 0, ""
         try:
-            base = cv2.imread(str(base_path), cv2.IMREAD_UNCHANGED)
-            clean = cv2.imread(str(clean_path), cv2.IMREAD_UNCHANGED)
             if base is None or clean is None:
                 return 0, ""
             if base.ndim != 3 or clean.ndim != 3 or base.shape[2] < 3 or clean.shape[2] < 3:
                 return 0, ""
-            base_bgr = base[:, :, :3]
-            clean_bgr = clean[:, :, :3]
+            base_bgr = np.ascontiguousarray(base[:, :, :3], dtype=np.uint8)
+            clean_bgr = np.ascontiguousarray(clean[:, :, :3], dtype=np.uint8)
             base_h, base_w = base_bgr.shape[:2]
             clean_h, clean_w = clean_bgr.shape[:2]
             if base_h < 2 or base_w < 2 or clean_h < 2 or clean_w < 2:
@@ -8862,7 +8884,7 @@ class Processor(QtCore.QObject):
                 diff_ref_bgr = clean_bgr
             else:
                 # Fast-reference mode: the yuv420/full WIC render is intentionally
-                # smaller and is used only to fit color statistics.  The final
+                # smaller and is used only to fit color statistics. The final
                 # output must stay full-resolution from the yuv444/limited clean
                 # render, otherwise the fast path either no-ops or softens crops.
                 interp = cv2.INTER_AREA if (clean_h >= base_h or clean_w >= base_w) else cv2.INTER_LANCZOS4
@@ -8872,7 +8894,7 @@ class Processor(QtCore.QObject):
 
             base_ycc = cv2.cvtColor(base_bgr, cv2.COLOR_BGR2YCrCb)
             # Keep the full-resolution clean conversion out of the CPU path when
-            # CUDA is going to do the remap.  The reduced/reference-size fit image
+            # CUDA is going to do the remap. The reduced/reference-size fit image
             # is still converted on CPU because percentile fitting is CPU-side and
             # normally runs on the small fast-reference image.
             clean_ycc: Optional[np.ndarray] = None
@@ -8888,7 +8910,7 @@ class Processor(QtCore.QObject):
             bmax = np.max(bp, axis=2)
             bmin = np.min(bp, axis=2)
             # Exclude invalid/clipped pixels and the exact false-color salt class
-            # from the reference statistics.  Keep dark pixels; the whole point is
+            # from the reference statistics. Keep dark pixels; the whole point is
             # to recover the accepted WIC shadow response.
             spike = ((bmax - bmin) >= 90) & (by <= 132)
             fit_mask = (by >= 2) & (by <= 252) & (cy >= 2) & (cy <= 252) & (~spike)
@@ -8941,9 +8963,9 @@ class Processor(QtCore.QObject):
                     return 0, ""
                 luts.append(lut)
 
-            # Add only very-low-frequency residual from the yuv420 reference.  This
+            # Add only very-low-frequency residual from the yuv420 reference. This
             # can restore broad local grade/vibrance, but it can also copy some of
-            # the shadow blotch structure back into the image.  Keep it disabled by
+            # the shadow blotch structure back into the image. Keep it disabled by
             # default and expose it as a separate GUI/runtime knob.
             try:
                 default_lowfreq = float(getattr(self.cfg, "hdr_wic_yuv444_color_match_lowfreq", 0.0))
@@ -8992,12 +9014,12 @@ class Processor(QtCore.QObject):
                             (clean_w, clean_h),
                             interpolation=cv2.INTER_CUBIC,
                         ).astype(np.float32, copy=False)
-                    # Strong blur: intentional.  Smaller kernels reintroduce the blocky
+                    # Strong blur: intentional. Smaller kernels reintroduce the blocky
                     # shadow texture this path is meant to avoid.
                     denom = cv2.GaussianBlur(safe, (0, 0), 48.0)
                     denom = np.maximum(denom, 1.0e-4)
                     mapped_f = mapped_ycc.astype(np.float32, copy=False)
-                    # Apply the low-frequency residual to chroma only.  Luma residual is
+                    # Apply the low-frequency residual to chroma only. Luma residual is
                     # what made strong color-match settings crush/flatten dark detail.
                     for c in (1, 2):
                         residual = (base_f[:, :, c] - mapped_f[:, :, c]) * safe
@@ -9018,7 +9040,7 @@ class Processor(QtCore.QObject):
             out[:, :, :3] = out_bgr
             if changed <= 0:
                 return 0, ""
-            tmp_out = base_path + ".tmp_yuv444_color_match.png"
+            tmp_out = str(output_base_path) + ".tmp_yuv444_color_match.png"
             try:
                 if os.path.exists(tmp_out):
                     os.remove(tmp_out)
@@ -9258,10 +9280,12 @@ class Processor(QtCore.QObject):
         base = out_path + ".tmp_yuv444_fast"
         ref_hdr = base + f".ref_{ref_w}x{ref_h}.avif"
         ref_png = base + f".ref_{ref_w}x{ref_h}.png"
+        ref_raw = base + f".ref_{ref_w}x{ref_h}.bgra"
         clean_hdr = base + ".clean_yuv444.avif"
         clean_png = base + ".clean_yuv444.png"
+        clean_raw = base + ".clean_yuv444.bgra"
         repaired_tmp = ""
-        for pth in (ref_hdr, ref_png, clean_hdr, clean_png):
+        for pth in (ref_hdr, ref_png, ref_raw, clean_hdr, clean_png, clean_raw):
             try:
                 if os.path.exists(pth):
                     os.remove(pth)
@@ -9281,11 +9305,27 @@ class Processor(QtCore.QObject):
             if not ok_ref_hdr:
                 return False, f"ref_hdr_failed:{why_ref_hdr}", 0
             t_ref_hdr = time.perf_counter()
-            ok_ref_wic, why_ref_wic = self._save_wic_png_from_hdr_image(ref_hdr, ref_png, repair=False)
-            if not ok_ref_wic:
-                return False, f"ref_wic_failed:{why_ref_wic}", 0
-            t_ref_wic = time.perf_counter()
+            d_ref_hdr = t_ref_hdr - t0
 
+            use_raw_wic = not self._truthy_env("PC_DISABLE_WIC_YUV444_COLOR_MATCH_RAW")
+            raw_mode = False
+            ref_raw_meta: tuple[int, int, int] | None = None
+            clean_raw_meta: tuple[int, int, int] | None = None
+            raw_failures: list[str] = []
+
+            if use_raw_wic:
+                ok_ref_wic, why_ref_wic, rrw, rrh, rstride = self._save_wic_bgra_raw_from_hdr_image(ref_hdr, ref_raw)
+                if ok_ref_wic:
+                    ref_raw_meta = (rrw, rrh, rstride)
+                else:
+                    raw_failures.append(f"ref_raw:{why_ref_wic}")
+            else:
+                ok_ref_wic = False
+                why_ref_wic = "raw_disabled"
+            t_ref_wic = time.perf_counter()
+            d_ref_wic = t_ref_wic - t_ref_hdr
+
+            t_clean_hdr_start = time.perf_counter()
             ok_clean_hdr, why_clean_hdr = self._save_hdr_wic_specific_intermediate_avif(
                 frame_idx,
                 frame_pts_sec,
@@ -9297,21 +9337,73 @@ class Processor(QtCore.QObject):
             if not ok_clean_hdr:
                 return False, f"clean_hdr_failed:{why_clean_hdr}", 0
             t_clean_hdr = time.perf_counter()
-            ok_clean_wic, why_clean_wic = self._save_wic_png_from_hdr_image(clean_hdr, clean_png, repair=False)
-            if not ok_clean_wic:
-                return False, f"clean_wic_failed:{why_clean_wic}", 0
-            t_clean_wic = time.perf_counter()
-            block_bad, block_why = self._detect_wic_block_corruption(clean_png)
-            if block_bad:
-                self._status(
-                    f"HDR WIC yuv444 clean render rejected: {block_why}",
-                    key="hdr_wic_yuv444_color_match",
-                    interval=0.0,
-                )
-                return False, f"clean_wic_block_corrupt:{block_why}", 0
+            d_clean_hdr = t_clean_hdr - t_clean_hdr_start
 
-            changed, repaired_tmp = self._repair_wic_with_yuv444_color_match(ref_png, clean_png)
+            if use_raw_wic and ok_ref_wic:
+                ok_clean_wic, why_clean_wic, crw, crh, cstride = self._save_wic_bgra_raw_from_hdr_image(clean_hdr, clean_raw)
+                if ok_clean_wic:
+                    clean_raw_meta = (crw, crh, cstride)
+                    raw_mode = True
+                else:
+                    raw_failures.append(f"clean_raw:{why_clean_wic}")
+            else:
+                ok_clean_wic = False
+                why_clean_wic = "raw_ref_failed"
+            t_clean_wic = time.perf_counter()
+            d_clean_wic = t_clean_wic - t_clean_hdr
+
+            if raw_mode and ref_raw_meta is not None and clean_raw_meta is not None:
+                ref_bgr = self._read_wic_bgra_raw_image(ref_raw, *ref_raw_meta)
+                clean_bgr = self._read_wic_bgra_raw_image(clean_raw, *clean_raw_meta)
+                if ref_bgr is None or clean_bgr is None:
+                    raw_mode = False
+                    raw_failures.append("raw_read_failed")
+                else:
+                    block_bad, block_why = self._detect_wic_block_corruption_bgr(clean_bgr)
+                    if block_bad:
+                        self._status(
+                            f"HDR WIC yuv444 clean raw render rejected: {block_why}",
+                            key="hdr_wic_yuv444_color_match",
+                            interval=0.0,
+                        )
+                        return False, f"clean_wic_block_corrupt:{block_why}", 0
+                    changed, repaired_tmp = self._repair_wic_yuv444_color_match_arrays(ref_bgr, clean_bgr, ref_raw)
+            else:
+                changed = 0
+
+            if not raw_mode:
+                if raw_failures:
+                    self._status(
+                        "HDR WIC yuv444 raw intermediate path fell back to PNG: " + " | ".join(raw_failures[-2:]),
+                        key="hdr_wic_yuv444_raw_fallback",
+                        interval=10.0,
+                    )
+                # Fallback preserves the known-good path if raw CopyPixels is not
+                # available on a specific Windows/WIC installation.
+                t_ref_wic_start = time.perf_counter()
+                ok_ref_wic, why_ref_wic = self._save_wic_png_from_hdr_image(ref_hdr, ref_png, repair=False)
+                if not ok_ref_wic:
+                    return False, f"ref_wic_failed:{why_ref_wic}", 0
+                t_ref_wic = time.perf_counter()
+                d_ref_wic = t_ref_wic - t_ref_wic_start
+                t_clean_wic_start = time.perf_counter()
+                ok_clean_wic, why_clean_wic = self._save_wic_png_from_hdr_image(clean_hdr, clean_png, repair=False)
+                if not ok_clean_wic:
+                    return False, f"clean_wic_failed:{why_clean_wic}", 0
+                t_clean_wic = time.perf_counter()
+                d_clean_wic = t_clean_wic - t_clean_wic_start
+                block_bad, block_why = self._detect_wic_block_corruption(clean_png)
+                if block_bad:
+                    self._status(
+                        f"HDR WIC yuv444 clean render rejected: {block_why}",
+                        key="hdr_wic_yuv444_color_match",
+                        interval=0.0,
+                    )
+                    return False, f"clean_wic_block_corrupt:{block_why}", 0
+                changed, repaired_tmp = self._repair_wic_with_yuv444_color_match(ref_png, clean_png)
             t_match = time.perf_counter()
+            d_match = t_match - t_clean_wic
+
             if changed <= 0:
                 return False, "color_match_noop:changed=0", 0
             if not repaired_tmp:
@@ -9331,11 +9423,12 @@ class Processor(QtCore.QObject):
             t_done = time.perf_counter()
             self._status(
                 "HDR WIC yuv444 fast timing: "
-                f"ref_hdr={t_ref_hdr - t0:.3f}s "
-                f"ref_wic={t_ref_wic - t_ref_hdr:.3f}s "
-                f"clean_hdr={t_clean_hdr - t_ref_wic:.3f}s "
-                f"clean_wic={t_clean_wic - t_clean_hdr:.3f}s "
-                f"match={t_match - t_clean_wic:.3f}s "
+                f"intermediate={'raw' if raw_mode else 'png'} "
+                f"ref_hdr={d_ref_hdr:.3f}s "
+                f"ref_wic={d_ref_wic:.3f}s "
+                f"clean_hdr={d_clean_hdr:.3f}s "
+                f"clean_wic={d_clean_wic:.3f}s "
+                f"match={d_match:.3f}s "
                 f"replace={t_done - t_match:.3f}s "
                 f"total={t_done - t0:.3f}s",
                 key="hdr_wic_yuv444_fast_timing",
@@ -9345,7 +9438,7 @@ class Processor(QtCore.QObject):
         except Exception as exc:
             return False, f"exception:{type(exc).__name__}:{exc}", 0
         finally:
-            for pth in (ref_hdr, ref_png, clean_hdr, clean_png, repaired_tmp):
+            for pth in (ref_hdr, ref_png, ref_raw, clean_hdr, clean_png, clean_raw, repaired_tmp):
                 try:
                     if pth and os.path.exists(pth):
                         os.remove(pth)
@@ -10352,6 +10445,140 @@ class Processor(QtCore.QObject):
             return self._save_hdr_crop_p010(frame_idx, frame_pts_sec, crop_xyxy, out_path)
         return self._save_hdr_crop_p010(frame_idx, frame_pts_sec, crop_xyxy, out_path)
 
+    def _save_wic_bgra_raw_from_hdr_image(self, hdr_path: str, out_path: str) -> tuple[bool, str, int, int, int]:
+        """Convert an HDR still through WIC and write raw Bgr32 pixels.
+
+        This is for internal yuv444 color-match intermediates only. It keeps the
+        same WIC decode/color-conversion boundary as the PNG path, but avoids
+        CPU PNG encoding in PowerShell and CPU PNG decoding in Python.
+        """
+        ps = self._resolve_powershell_bin()
+        if not ps:
+            return False, "windows_wic_unavailable:powershell_not_found", 0, 0, 0
+        if not hdr_path or not os.path.exists(hdr_path):
+            return False, "windows_wic_unavailable:hdr_source_missing", 0, 0, 0
+        tmp = out_path + ".tmp.raw"
+        try:
+            ensure_dir(os.path.dirname(out_path))
+        except Exception:
+            pass
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        script = f"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName PresentationCore,WindowsBase
+$src = {self._quote_ps_single(hdr_path)}
+$dst = {self._quote_ps_single(tmp)}
+$stream = [System.IO.File]::Open($src, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+try {{
+    $decoder = [System.Windows.Media.Imaging.BitmapDecoder]::Create($stream, [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat, [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
+}} finally {{
+    $stream.Close()
+}}
+if ($decoder.Frames.Count -lt 1) {{ throw 'WIC decoder returned no frames' }}
+$frame = $decoder.Frames[0]
+$converted = New-Object System.Windows.Media.Imaging.FormatConvertedBitmap
+$converted.BeginInit()
+$converted.Source = $frame
+$converted.DestinationFormat = [System.Windows.Media.PixelFormats]::Bgr32
+$converted.EndInit()
+$width = [int]$converted.PixelWidth
+$height = [int]$converted.PixelHeight
+$stride = [int]([Math]::Ceiling(($width * $converted.Format.BitsPerPixel) / 8.0))
+$pixels = [System.Byte[]]::new($stride * $height)
+$converted.CopyPixels($pixels, $stride, 0)
+[System.IO.File]::WriteAllBytes($dst, $pixels)
+Write-Output ("{{0}} {{1}} {{2}}" -f $width, $height, $stride)
+"""
+        timeout_sec = max(5, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
+        try:
+            cp = subprocess.run(
+                [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=timeout_sec,
+            )
+            if cp.returncode != 0:
+                tail = (cp.stderr or cp.stdout or "").splitlines()[-4:]
+                why = " | ".join(tail) if tail else f"powershell_rc={cp.returncode}"
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+                return False, f"windows_wic_raw_failed:{why}", 0, 0, 0
+            dims_line = ""
+            for line in (cp.stdout or "").splitlines():
+                line = line.strip()
+                if line:
+                    dims_line = line
+            parts = dims_line.split()
+            if len(parts) != 3:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+                return False, f"windows_wic_raw_bad_dims:{dims_line!r}", 0, 0, 0
+            width, height, stride = [int(v) for v in parts]
+            if width <= 0 or height <= 0 or stride < width * 4:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+                return False, f"windows_wic_raw_invalid_dims:{width}x{height}:stride={stride}", 0, 0, 0
+            expected = int(height) * int(stride)
+            if not os.path.exists(tmp) or os.path.getsize(tmp) != expected:
+                got = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+                return False, f"windows_wic_raw_size_mismatch:got={got}:expected={expected}", 0, 0, 0
+            os.replace(tmp, out_path)
+            return True, "", width, height, stride
+        except subprocess.TimeoutExpired as exc:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            return False, f"windows_wic_raw_timeout_{timeout_sec}s:{exc}", 0, 0, 0
+        except Exception as exc:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            return False, f"windows_wic_raw_failed:{type(exc).__name__}:{exc}", 0, 0, 0
+
+    @staticmethod
+    def _read_wic_bgra_raw_image(path: str, width: int, height: int, stride: int) -> Optional[np.ndarray]:
+        """Read raw Bgr32 pixels written by _save_wic_bgra_raw_from_hdr_image."""
+        try:
+            width = int(width)
+            height = int(height)
+            stride = int(stride)
+            if width <= 0 or height <= 0 or stride < width * 4:
+                return None
+            if not path or not os.path.exists(path):
+                return None
+            data = np.fromfile(path, dtype=np.uint8)
+            expected = height * stride
+            if int(data.size) != int(expected):
+                return None
+            rows = data.reshape((height, stride))[:, : width * 4]
+            bgra = rows.reshape((height, width, 4))
+            return np.ascontiguousarray(bgra[:, :, :3], dtype=np.uint8)
+        except Exception:
+            return None
+
     def _save_wic_png_from_hdr_image(self, hdr_path: str, out_path: str, *, repair: bool = True) -> tuple[bool, str]:
         """Convert an HDR still to SDR PNG using Windows Imaging Component.
 
@@ -10543,15 +10770,8 @@ try {{
             return False, f"validate_failed:{exc}"
 
     @staticmethod
-    def _detect_wic_block_corruption(path: str) -> tuple[bool, str]:
-        """Detect valid PNGs that contain WIC/AVIF block-dropout corruption.
-
-        This is intentionally not a general denoiser or visual-quality metric.
-        It catches the catastrophic one-frame failure mode where the yuv444 WIC
-        render is a syntactically valid PNG but contains many hard-edged black
-        rectangular dropouts in dark regions. Those pixels must not be used as
-        the final yuv444 texture for color matching.
-        """
+    def _detect_wic_block_corruption_bgr(bgr: np.ndarray) -> tuple[bool, str]:
+        """Detect WIC/AVIF block-dropout corruption from decoded BGR pixels."""
         if str(os.getenv("PC_DISABLE_WIC_BLOCK_CORRUPTION_GUARD", "")).strip().lower() in {
             "1",
             "true",
@@ -10560,15 +10780,9 @@ try {{
         }:
             return False, ""
         try:
-            if not path or not os.path.exists(path):
+            if bgr is None or bgr.ndim != 3 or bgr.shape[2] < 3:
                 return False, ""
-            data = np.fromfile(path, dtype=np.uint8)
-            if data.size <= 16:
-                return False, ""
-            img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
-            if img is None or img.ndim != 3 or img.shape[2] < 3:
-                return False, ""
-            bgr = img[:, :, :3]
+            bgr = bgr[:, :, :3]
             h, w = bgr.shape[:2]
             if h < 64 or w < 64:
                 return False, ""
@@ -10617,6 +10831,22 @@ try {{
                 f"dark_block_dropouts pixels={drop_count} "
                 f"components={rect_count} area={rect_area}"
             )
+        except Exception as exc:
+            return True, f"block_guard_failed:{type(exc).__name__}:{exc}"
+
+    @staticmethod
+    def _detect_wic_block_corruption(path: str) -> tuple[bool, str]:
+        """Detect valid PNGs that contain WIC/AVIF block-dropout corruption."""
+        try:
+            if not path or not os.path.exists(path):
+                return False, ""
+            data = np.fromfile(path, dtype=np.uint8)
+            if data.size <= 16:
+                return False, ""
+            img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+            if img is None or img.ndim != 3 or img.shape[2] < 3:
+                return False, ""
+            return MainWindow._detect_wic_block_corruption_bgr(img[:, :, :3])
         except Exception as exc:
             return True, f"block_guard_failed:{type(exc).__name__}:{exc}"
 
