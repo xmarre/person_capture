@@ -10846,7 +10846,7 @@ try {{
             img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
             if img is None or img.ndim != 3 or img.shape[2] < 3:
                 return False, ""
-            return MainWindow._detect_wic_block_corruption_bgr(img[:, :, :3])
+            return Processor._detect_wic_block_corruption_bgr(img[:, :, :3])
         except Exception as exc:
             return True, f"block_guard_failed:{type(exc).__name__}:{exc}"
 
