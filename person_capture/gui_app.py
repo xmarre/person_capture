@@ -10722,6 +10722,227 @@ class Processor(QtCore.QObject):
             return self._save_hdr_crop_p010(frame_idx, frame_pts_sec, crop_xyxy, out_path)
         return self._save_hdr_crop_p010(frame_idx, frame_pts_sec, crop_xyxy, out_path)
 
+    def _save_wic_bgra_raw_pair_from_hdr_images(
+        self,
+        ref_hdr_path: str,
+        ref_out_path: str,
+        clean_hdr_path: str,
+        clean_out_path: str,
+    ) -> tuple[bool, str, tuple[int, int, int] | None, tuple[int, int, int] | None]:
+        """Convert two HDR stills through WIC to raw Bgr32 in one PowerShell process.
+
+        The fast yuv444 color-match path needs a small reference render and a
+        full-size clean render. Running WIC in one process removes one
+        PowerShell/.NET startup cost while preserving the exact WIC conversion
+        boundary used by the single-image raw helper.
+        """
+        ps = self._resolve_powershell_bin()
+        if not ps:
+            return False, "windows_wic_unavailable:powershell_not_found", None, None
+        if not ref_hdr_path or not os.path.exists(ref_hdr_path):
+            return False, "windows_wic_unavailable:ref_hdr_source_missing", None, None
+        if not clean_hdr_path or not os.path.exists(clean_hdr_path):
+            return False, "windows_wic_unavailable:clean_hdr_source_missing", None, None
+
+        if not ref_out_path or not clean_out_path:
+            return False, "windows_wic_raw_pair_out_path_missing", None, None
+        ref_tmp = ref_out_path + ".tmp.raw"
+        clean_tmp = clean_out_path + ".tmp.raw"
+        ref_backup = ref_out_path + ".bak.rawpair"
+        clean_backup = clean_out_path + ".bak.rawpair"
+
+        path_roles = (
+            ("ref_out", ref_out_path),
+            ("clean_out", clean_out_path),
+            ("ref_tmp", ref_tmp),
+            ("clean_tmp", clean_tmp),
+            ("ref_backup", ref_backup),
+            ("clean_backup", clean_backup),
+        )
+        seen_paths: dict[str, str] = {}
+        for role, path in path_roles:
+            norm_path = os.path.normcase(os.path.abspath(path))
+            prev_role = seen_paths.get(norm_path)
+            if prev_role is not None:
+                return False, f"windows_wic_raw_pair_path_collision:{prev_role}:{role}:{norm_path}", None, None
+            seen_paths[norm_path] = role
+
+        for out_path in (ref_out_path, clean_out_path):
+            out_dir = os.path.dirname(out_path)
+            if not out_dir:
+                continue
+            try:
+                ensure_dir(out_dir)
+            except Exception as exc:
+                return False, f"windows_wic_raw_pair_out_dir_unwritable:{out_dir}:{type(exc).__name__}:{exc}", None, None
+        for tmp in (ref_tmp, clean_tmp):
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+        script = f"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName PresentationCore,WindowsBase
+
+function Write-WicBgr32Raw([string]$src, [string]$dst, [string]$label) {{
+    $stream = [System.IO.File]::Open($src, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    try {{
+        $decoder = [System.Windows.Media.Imaging.BitmapDecoder]::Create($stream, [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat, [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
+    }} finally {{
+        $stream.Close()
+    }}
+    if ($decoder.Frames.Count -lt 1) {{ throw ($label + ': WIC decoder returned no frames') }}
+    $frame = $decoder.Frames[0]
+    $converted = New-Object System.Windows.Media.Imaging.FormatConvertedBitmap
+    $converted.BeginInit()
+    $converted.Source = $frame
+    $converted.DestinationFormat = [System.Windows.Media.PixelFormats]::Bgr32
+    $converted.EndInit()
+    $width = [int]$converted.PixelWidth
+    $height = [int]$converted.PixelHeight
+    $stride = [int]([Math]::Ceiling(($width * $converted.Format.BitsPerPixel) / 8.0))
+    if ($width -le 0 -or $height -le 0 -or $stride -lt ($width * 4)) {{
+        throw ("{{0}}: invalid dimensions {{1}}x{{2}} stride={{3}}" -f $label, $width, $height, $stride)
+    }}
+    $pixels = [System.Byte[]]::new($stride * $height)
+    $converted.CopyPixels($pixels, $stride, 0)
+    [System.IO.File]::WriteAllBytes($dst, $pixels)
+    Write-Output ("{{0}} {{1}} {{2}} {{3}}" -f $label, $width, $height, $stride)
+}}
+
+$refSrc = {self._quote_ps_single(ref_hdr_path)}
+$refDst = {self._quote_ps_single(ref_tmp)}
+$cleanSrc = {self._quote_ps_single(clean_hdr_path)}
+$cleanDst = {self._quote_ps_single(clean_tmp)}
+Write-WicBgr32Raw $refSrc $refDst 'REF'
+Write-WicBgr32Raw $cleanSrc $cleanDst 'CLEAN'
+"""
+        timeout_sec = max(5, int(getattr(self.cfg, "hdr_export_timeout_sec", 300) or 300))
+        try:
+            cp = subprocess.run(
+                [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=timeout_sec,
+            )
+            if cp.returncode != 0:
+                tail = (cp.stderr or cp.stdout or "").splitlines()[-4:]
+                why = " | ".join(tail) if tail else f"powershell_rc={cp.returncode}"
+                return False, f"windows_wic_raw_pair_failed:{why}", None, None
+
+            parsed: dict[str, tuple[int, int, int]] = {}
+            for line in (cp.stdout or "").splitlines():
+                parts = line.strip().split()
+                if len(parts) == 4 and parts[0] in {"REF", "CLEAN"}:
+                    try:
+                        width, height, stride = (int(parts[1]), int(parts[2]), int(parts[3]))
+                    except Exception:
+                        continue
+                    parsed[parts[0]] = (width, height, stride)
+            ref_meta = parsed.get("REF")
+            clean_meta = parsed.get("CLEAN")
+            if ref_meta is None or clean_meta is None:
+                return False, f"windows_wic_raw_pair_bad_dims:{(cp.stdout or '').strip()!r}", None, None
+
+            for label, tmp, meta in (("ref", ref_tmp, ref_meta), ("clean", clean_tmp, clean_meta)):
+                width, height, stride = meta
+                if width <= 0 or height <= 0 or stride < width * 4:
+                    return False, f"windows_wic_raw_pair_invalid_dims:{label}:{width}x{height}:stride={stride}", None, None
+                expected = int(height) * int(stride)
+                if not os.path.exists(tmp) or os.path.getsize(tmp) != expected:
+                    got = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+                    return False, f"windows_wic_raw_pair_size_mismatch:{label}:got={got}:expected={expected}", None, None
+
+            # Publish both outputs with rollback so we never leave a mixed pair.
+            backed_up_ref = False
+            backed_up_clean = False
+            published_ref = False
+            published_clean = False
+            restored_ref = False
+            restored_clean = False
+            publish_succeeded = False
+            try:
+                stale_backups: list[str] = []
+                if os.path.exists(ref_backup):
+                    stale_backups.append("ref")
+                if os.path.exists(clean_backup):
+                    stale_backups.append("clean")
+                if stale_backups:
+                    return False, (
+                        "windows_wic_raw_pair_recovery_required:"
+                        + ",".join(stale_backups)
+                        + "_backup_present"
+                    ), None, None
+                if os.path.exists(ref_out_path):
+                    os.replace(ref_out_path, ref_backup)
+                    backed_up_ref = True
+                if os.path.exists(clean_out_path):
+                    os.replace(clean_out_path, clean_backup)
+                    backed_up_clean = True
+
+                os.replace(ref_tmp, ref_out_path)
+                published_ref = True
+                os.replace(clean_tmp, clean_out_path)
+                published_clean = True
+                publish_succeeded = True
+            except Exception as exc:
+                restore_notes: list[str] = []
+                if published_ref:
+                    try:
+                        if os.path.exists(ref_out_path):
+                            os.remove(ref_out_path)
+                    except Exception:
+                        pass
+                if published_clean:
+                    try:
+                        if os.path.exists(clean_out_path):
+                            os.remove(clean_out_path)
+                    except Exception:
+                        pass
+                if backed_up_ref and os.path.exists(ref_backup):
+                    try:
+                        os.replace(ref_backup, ref_out_path)
+                        restored_ref = True
+                    except Exception as restore_exc:
+                        restore_notes.append(f"ref_restore_failed:{type(restore_exc).__name__}:{restore_exc}")
+                if backed_up_clean and os.path.exists(clean_backup):
+                    try:
+                        os.replace(clean_backup, clean_out_path)
+                        restored_clean = True
+                    except Exception as restore_exc:
+                        restore_notes.append(f"clean_restore_failed:{type(restore_exc).__name__}:{restore_exc}")
+                reason = f"windows_wic_raw_pair_publish_failed:{type(exc).__name__}:{exc}"
+                if restore_notes:
+                    reason += "|" + "|".join(restore_notes)
+                return False, reason, None, None
+            finally:
+                for bak, should_remove in (
+                    (ref_backup, publish_succeeded or restored_ref),
+                    (clean_backup, publish_succeeded or restored_clean),
+                ):
+                    if not should_remove:
+                        continue
+                    try:
+                        if os.path.exists(bak):
+                            os.remove(bak)
+                    except Exception:
+                        pass
+            return True, "", ref_meta, clean_meta
+        except subprocess.TimeoutExpired as exc:
+            return False, f"windows_wic_raw_pair_timeout_{timeout_sec}s:{exc}", None, None
+        except Exception as exc:
+            return False, f"windows_wic_raw_pair_failed:{type(exc).__name__}:{exc}", None, None
+        finally:
+            for tmp in (ref_tmp, clean_tmp):
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+
     def _save_wic_bgra_raw_from_hdr_image(self, hdr_path: str, out_path: str) -> tuple[bool, str, int, int, int]:
         """Convert an HDR still through WIC and write raw Bgr32 pixels.
 
