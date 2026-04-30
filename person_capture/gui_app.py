@@ -380,6 +380,10 @@ class SessionConfig:
     # Auto mode threshold: enable CUDA LUT/blend only when pixel count is at
     # least this value. Keep this conservative to avoid GPU launch overhead.
     hdr_wic_yuv444_color_match_gpu_auto_min_pixels: int = 1_000_000
+    # Fast-path FFmpeg pre-roll used only for internal WIC color-match HDR
+    # intermediates. Lower values reduce per-crop decode work before AVIF encode;
+    # the global HDR export pre-roll remains unchanged.
+    hdr_wic_yuv444_color_match_preroll_sec: float = 0.50
     # Older diagnostic cleanup that only used yuv444 as an artifact mask. It was
     # too conservative for broad shadow blobs, so keep it opt-in/fallback only.
     hdr_wic_yuv444_guide_cleanup: bool = False
@@ -5261,6 +5265,7 @@ class Processor(QtCore.QObject):
                             "hdr_wic_yuv444_color_match_ref_max_side",
                             "hdr_wic_yuv444_color_match_gpu_mode",
                             "hdr_wic_yuv444_color_match_gpu_auto_min_pixels",
+                            "hdr_wic_yuv444_color_match_preroll_sec",
                             "hdr_wic_yuv444_guide_cleanup",
                             "hdr_speckle_diag",
                             "hdr_speckle_diag_dir",
@@ -9156,6 +9161,22 @@ class Processor(QtCore.QObject):
             normalized = int(default)
         return max(0, min(100_000_000, normalized))
 
+    @staticmethod
+    def _normalize_wic_yuv444_color_match_preroll_sec(value: object, default: float = 0.50) -> float:
+        try:
+            normalized = float(str(value).strip())
+        except Exception:
+            normalized = float(default)
+        if not math.isfinite(normalized):
+            normalized = float(default)
+        return max(0.0, min(2.0, normalized))
+
+    def _wic_yuv444_color_match_preroll_sec(self) -> float:
+        raw_default = getattr(self.cfg, "hdr_wic_yuv444_color_match_preroll_sec", 0.50)
+        default_preroll = self._normalize_wic_yuv444_color_match_preroll_sec(raw_default, default=0.50)
+        raw = os.getenv("PC_WIC_YUV444_COLOR_MATCH_PREROLL_SEC", str(default_preroll))
+        return self._normalize_wic_yuv444_color_match_preroll_sec(raw, default=default_preroll)
+
     def _wic_yuv444_color_match_gpu_mode(self) -> str:
         raw_default = getattr(self.cfg, "hdr_wic_yuv444_color_match_gpu_mode", "auto")
         default_mode = self._normalize_wic_yuv444_color_match_gpu_mode(raw_default, default="auto")
@@ -9356,7 +9377,11 @@ class Processor(QtCore.QObject):
             if fps > 0 and math.isfinite(fps):
                 seek_sec = max(0.0, float(frame_idx) / fps)
 
-        pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(seek_sec)
+        fast_preroll_sec = self._wic_yuv444_color_match_preroll_sec()
+        pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(
+            seek_sec,
+            preroll_sec=fast_preroll_sec,
+        )
         common = (
             f"{seek_filter}"
             "setparams=color_trc=smpte2084:color_primaries=bt2020:"
@@ -9708,6 +9733,7 @@ class Processor(QtCore.QObject):
                 f"ref_wic={d_ref_wic:.3f}s "
                 f"clean_hdr={d_clean_hdr:.3f}s "
                 f"clean_wic={d_clean_wic:.3f}s "
+                f"preroll={self._wic_yuv444_color_match_preroll_sec():.3f}s "
                 f"match={d_match:.3f}s "
                 f"replace={t_done - t_match:.3f}s "
                 f"total={t_done - t0:.3f}s",
@@ -11548,7 +11574,12 @@ try {{
                 pass
             return False, f"windows_wic_failed:{type(exc).__name__}:{exc}"
 
-    def _ffmpeg_still_seek_args_and_filter(self, seek_sec: Optional[float]) -> tuple[list[str], str]:
+    def _ffmpeg_still_seek_args_and_filter(
+        self,
+        seek_sec: Optional[float],
+        *,
+        preroll_sec: Optional[float] = None,
+    ) -> tuple[list[str], str]:
         """Return FFmpeg input seek args and a filter-prefix for exact still export.
 
         Do not use a second output-side ``-ss`` for HDR still exports. With some
@@ -11557,6 +11588,10 @@ try {{
         survives the output seek at the requested timestamp. Decode from a short
         pre-roll and perform the exact selection inside the filter graph instead,
         before tone mapping/cropping.
+
+        ``preroll_sec`` is intentionally opt-in so production exports keep the
+        conservative global pre-roll, while the internal WIC color-match path can
+        use a shorter exact-seek window to avoid decoding unnecessary frames.
         """
         if seek_sec is None:
             return [], ""
@@ -11564,10 +11599,16 @@ try {{
             seek_f = max(0.0, float(seek_sec))
         except Exception:
             return [], ""
-        try:
-            preroll_sec = max(0.0, float(os.getenv("PC_HDR_EXPORT_PREROLL_SEC", "2.0")))
-        except Exception:
-            preroll_sec = 2.0
+        if preroll_sec is None:
+            try:
+                preroll_sec = max(0.0, float(os.getenv("PC_HDR_EXPORT_PREROLL_SEC", "2.0")))
+            except Exception:
+                preroll_sec = 2.0
+        else:
+            try:
+                preroll_sec = max(0.0, float(preroll_sec))
+            except Exception:
+                preroll_sec = 2.0
         preroll_sec = min(seek_f, preroll_sec)
         if preroll_sec > 1e-6:
             start_offset = max(0.0, seek_f - preroll_sec)
@@ -12999,6 +13040,22 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.hdr_wic_yuv444_color_match_ref_max_side_spin.valueChanged.connect(self._normalize_wic_ref_max_side_spin)
         self.hdr_wic_yuv444_color_match_ref_max_side_spin.valueChanged.connect(self._on_ui_change)
+        self.hdr_wic_yuv444_color_match_preroll_sec_spin = _mk_fspin(
+            0.0,
+            2.0,
+            0.05,
+            2,
+            "float: hdr_wic_yuv444_color_match_preroll_sec "
+            "(PC_WIC_YUV444_COLOR_MATCH_PREROLL_SEC). Internal FFmpeg pre-roll for WIC color-match AVIFs only. "
+            "Lower is faster; raise toward 2.0 if exact HDR stills fail on a source."
+        )
+        self.hdr_wic_yuv444_color_match_preroll_sec_spin.setValue(
+            Processor._normalize_wic_yuv444_color_match_preroll_sec(
+                getattr(self.cfg, "hdr_wic_yuv444_color_match_preroll_sec", 0.50),
+                default=0.50,
+            )
+        )
+        self.hdr_wic_yuv444_color_match_preroll_sec_spin.valueChanged.connect(self._on_ui_change)
         self.hdr_wic_yuv444_color_match_gpu_mode_combo = QtWidgets.QComboBox()
         self.hdr_wic_yuv444_color_match_gpu_mode_combo.addItem("Auto", "auto")
         self.hdr_wic_yuv444_color_match_gpu_mode_combo.addItem("Off (CPU only)", "off")
@@ -13687,6 +13744,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("WIC yuv444 match chroma", self.hdr_wic_yuv444_color_match_chroma_strength_spin),
             ("WIC yuv444 match lowfreq", self.hdr_wic_yuv444_color_match_lowfreq_spin),
             ("WIC yuv444 ref max side", self.hdr_wic_yuv444_color_match_ref_max_side_spin),
+            ("WIC yuv444 preroll sec", self.hdr_wic_yuv444_color_match_preroll_sec_spin),
             ("WIC yuv444 GPU mode", self.hdr_wic_yuv444_color_match_gpu_mode_combo),
             ("WIC yuv444 GPU auto min pixels", self.hdr_wic_yuv444_color_match_gpu_auto_min_pixels_spin),
             ("WIC yuv444 guide cleanup", self.hdr_wic_yuv444_guide_cleanup_check),
@@ -14921,6 +14979,10 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> int:
         return Processor._normalize_wic_yuv444_color_match_gpu_auto_min_pixels(value, default=default)
 
+    @staticmethod
+    def _normalize_wic_color_match_preroll_sec_value(value: object, default: float = 0.50) -> float:
+        return Processor._normalize_wic_yuv444_color_match_preroll_sec(value, default=default)
+
     def _normalize_wic_ref_max_side_spin(self, *_args) -> None:
         if not hasattr(self, "hdr_wic_yuv444_color_match_ref_max_side_spin"):
             return
@@ -15087,6 +15149,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "hdr_wic_yuv444_color_match_ref_max_side",
             "hdr_wic_yuv444_color_match_gpu_mode",
             "hdr_wic_yuv444_color_match_gpu_auto_min_pixels",
+            "hdr_wic_yuv444_color_match_preroll_sec",
             "hdr_wic_yuv444_guide_cleanup",
             "hdr_speckle_diag",
             "hdr_speckle_diag_dir",
@@ -15522,6 +15585,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 getattr(self.cfg, "hdr_wic_yuv444_color_match_gpu_auto_min_pixels", 1_000_000)
             )
         )
+        cfg.hdr_wic_yuv444_color_match_preroll_sec = (
+            self._normalize_wic_color_match_preroll_sec_value(
+                self.hdr_wic_yuv444_color_match_preroll_sec_spin.value()
+            )
+            if hasattr(self, "hdr_wic_yuv444_color_match_preroll_sec_spin")
+            else self._normalize_wic_color_match_preroll_sec_value(
+                getattr(self.cfg, "hdr_wic_yuv444_color_match_preroll_sec", 0.50)
+            )
+        )
         cfg.hdr_wic_yuv444_guide_cleanup = (
             bool(self.hdr_wic_yuv444_guide_cleanup_check.isChecked())
             if hasattr(self, "hdr_wic_yuv444_guide_cleanup_check")
@@ -15649,6 +15721,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 getattr(cfg, "hdr_wic_yuv444_color_match_gpu_auto_min_pixels", 1_000_000)
             )
         )
+        self.cfg.hdr_wic_yuv444_color_match_preroll_sec = self._normalize_wic_color_match_preroll_sec_value(
+            getattr(cfg, "hdr_wic_yuv444_color_match_preroll_sec", 0.50)
+        )
         self.cfg.hdr_wic_yuv444_guide_cleanup = bool(getattr(cfg, "hdr_wic_yuv444_guide_cleanup", False))
         self.cfg.hdr_avif_wic_display_compat = bool(getattr(cfg, "hdr_avif_wic_display_compat", True))
         self.cfg.compose_crop_enable = bool(getattr(cfg, "compose_crop_enable", True))
@@ -15767,6 +15842,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.hdr_wic_yuv444_color_match_gpu_auto_min_pixels_spin.setValue(
                 self._normalize_wic_color_match_gpu_auto_min_pixels_value(
                     self.cfg.hdr_wic_yuv444_color_match_gpu_auto_min_pixels
+                )
+            )
+        if hasattr(self, "hdr_wic_yuv444_color_match_preroll_sec_spin"):
+            self.hdr_wic_yuv444_color_match_preroll_sec_spin.setValue(
+                self._normalize_wic_color_match_preroll_sec_value(
+                    self.cfg.hdr_wic_yuv444_color_match_preroll_sec
                 )
             )
         if hasattr(self, "hdr_wic_yuv444_guide_cleanup_check"):
