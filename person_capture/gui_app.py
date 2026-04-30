@@ -2476,11 +2476,14 @@ class Processor(QtCore.QObject):
             wide_context_target = max(0.08, min(0.26, float(getattr(cfg, "compose_wide_context_face_h_frac", 0.16))))
             wide_context_max_frame_frac = max(0.08, min(0.32, float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18))))
             wide_context_min_side_face_heights = max(0.0, min(4.0, float(getattr(cfg, "compose_wide_context_min_side_face_heights", 1.20))))
-            # Cadence is a soft variety bias, not a hard ratio override. It only
-            # relaxes the context gate on frames that are already plausible
-            # landscape candidates, and the scorer can still reject the crop if
-            # it would cut identity/body evidence or over-enlarge the face.
-            effective_wide_context_max_frame_frac = wide_context_max_frame_frac + (0.035 if wide_cadence else 0.0)
+            # Cadence is a real variety oscillator, not just a score nudge.
+            # Regular wide/context remains conservative; the cadence frame may
+            # consider medium upper-body shots, then hard containment/repair below
+            # still rejects anything that would cut the detected face or subject.
+            if wide_cadence:
+                effective_wide_context_max_frame_frac = max(wide_context_max_frame_frac + 0.12, 0.32)
+            else:
+                effective_wide_context_max_frame_frac = wide_context_max_frame_frac
             effective_wide_context_max_frame_frac = max(0.08, min(0.34, effective_wide_context_max_frame_frac))
             effective_wide_context_min_side_face_heights = wide_context_min_side_face_heights * (0.70 if wide_cadence else 1.0)
 
@@ -2592,6 +2595,10 @@ class Processor(QtCore.QObject):
                         min(float(bx2), max(hx2, float(wide_anchor[0]) + wide_half_w)),
                         wide_bottom,
                     )
+                    if subj is not None:
+                        # Wide/context must not become a landscape crop that only
+                        # contains the face/torso while clipping the detected person.
+                        wide_protect = self._union_boxes_xyxy(wide_protect, subj) or wide_protect
                     profiles.append(
                         (
                             "wide_context",
@@ -2733,7 +2740,7 @@ class Processor(QtCore.QObject):
 
                 face_deficit = self._containment_deficit_xyxy(crop, face_hard_protect, margin_px=1.0) if face_hard_protect is not None else 0.0
                 head_deficit = self._containment_deficit_xyxy(crop, face_protect, margin_px=1.0) if face_protect is not None else 0.0
-                body_deficit = self._containment_deficit_xyxy(crop, subj, margin_px=1.0) if (profile == "body" and subj is not None) else 0.0
+                body_deficit = self._containment_deficit_xyxy(crop, subj, margin_px=1.0) if (profile in {"body", "wide_context"} and subj is not None) else 0.0
                 protect_deficit = self._containment_deficit_xyxy(crop, protect, margin_px=1.0)
                 # A crop candidate that cuts the detected face is invalid. The
                 # derived head/hair proxy is allowed to be clipped when the face is
@@ -2799,12 +2806,12 @@ class Processor(QtCore.QObject):
                     over = max(0.0, face_frame_frac - effective_wide_context_max_frame_frac)
                     ratio_prior += landscape_penalty * 4.0 * over
                     if wide_cadence:
-                        # Deterministic oscillator: every Nth viable frame gets a
-                        # small landscape/context bias. This is deliberately softer
-                        # than containment/face-size penalties so it cannot force a
-                        # bad widescreen crop.
-                        profile_prior -= 0.32
-                        ratio_prior -= 0.10
+                        # Deterministic oscillator: every Nth viable frame gets
+                        # enough landscape/context bias to tip one acceptable crop
+                        # in a repeated sequence. Hard face/person containment and
+                        # the final guard still veto invalid widescreen crops.
+                        profile_prior -= 0.72
+                        ratio_prior -= 0.20
                     actual_probe_face_frac = face_h / max(1.0, crop_h)
                     if actual_probe_face_frac > 0.30:
                         ratio_prior += landscape_penalty * (actual_probe_face_frac - 0.30)
@@ -2958,7 +2965,7 @@ class Processor(QtCore.QObject):
                 if (
                     face is not None
                     and bool(getattr(cfg, "compose_wide_context_enable", True))
-                    and face_frame_frac <= max(0.08, min(0.34, float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18)) + (0.035 if wide_cadence else 0.0)))
+                    and face_frame_frac <= max(0.08, min(0.34, (max(float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18)) + 0.12, 0.32) if wide_cadence else float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18)))))
                 ):
                     fx1_f, fy1_f, fx2_f, fy2_f = [float(v) for v in face]
                     side_room_face_heights = min(
@@ -3002,7 +3009,7 @@ class Processor(QtCore.QObject):
                 if (
                     face is not None
                     and bool(getattr(cfg, "compose_wide_context_enable", True))
-                    and face_frame_frac <= max(0.08, min(0.34, float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18)) + (0.035 if wide_cadence else 0.0)))
+                    and face_frame_frac <= max(0.08, min(0.34, (max(float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18)) + 0.12, 0.32) if wide_cadence else float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18)))))
                 ):
                     fx1_f, fy1_f, fx2_f, fy2_f = [float(v) for v in face]
                     side_room_face_heights = min(
@@ -6788,10 +6795,17 @@ class Processor(QtCore.QObject):
                                         or frame_face_h_frac >= 0.12
                                     )
                                 elif crop_profile_for_guard == "wide_context":
-                                    wide_frame_max = max(
+                                    wide_frame_max_base = max(
                                         0.08,
                                         min(0.32, float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18))),
                                     )
+                                    wide_period_guard = max(0, int(getattr(cfg, "compose_wide_context_every_n", 5)))
+                                    wide_cadence_guard = wide_period_guard > 0 and (int(idx) % wide_period_guard == 0)
+                                    if wide_cadence_guard:
+                                        wide_frame_max = max(wide_frame_max_base + 0.12, 0.32)
+                                    else:
+                                        wide_frame_max = wide_frame_max_base
+                                    wide_frame_max = max(0.08, min(0.34, wide_frame_max))
                                     # Wide/context may contain a visible face, but it is
                                     # still not a close-up. Only force portrait when the
                                     # selected landscape crop has drifted into close/upper
