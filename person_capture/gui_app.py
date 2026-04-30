@@ -488,6 +488,11 @@ class SessionConfig:
     compose_portrait_close_face_h_frac: float = 0.43  # target face_h / crop_h for medium-close portrait crops
     compose_upper_face_h_frac: float = 0.22      # target face_h / crop_h for portrait/upper-body crops
     compose_body_face_h_frac: float = 0.085      # target face_h / crop_h for full-body crops
+    compose_wide_context_enable: bool = True     # allow a real landscape/context crop profile
+    compose_wide_context_face_h_frac: float = 0.16  # target face_h / crop_h for landscape/context crops
+    compose_wide_context_max_frame_face_frac: float = 0.18  # max face_h / content_h for landscape/context
+    compose_wide_context_min_side_face_heights: float = 1.20  # require horizontal room around face for context
+    compose_wide_context_prior: float = 0.18     # base score prior for landscape/context crops
     compose_landscape_face_penalty: float = 5.0  # discourage landscape crops for prominent faces
     compose_body_every_n: int = 6                # deterministic body-shot bias cadence when viable
     compose_person_detect_cadence: int = 6        # only run YOLO person association for face hits on body-suited cadence
@@ -2358,15 +2363,16 @@ class Processor(QtCore.QObject):
                 "portrait_close": ["2:3", "3:4"],
                 "upper": ["2:3", "3:4", "1:1"],
                 "body": ["2:3", "3:4", "1:1", "3:2"],
+                "wide_context": ["3:2", "4:3", "16:9"],
                 "base": ["1:1", "2:3"],
             }.get(profile, ["1:1", "2:3"])
 
             # User ratios are an availability list, not a command to use the same
             # geometry for every crop profile. Close/upper portraits must never
             # become landscape crops merely because 3:2 exists in the UI list.
-            # Keep 3:2 available only for body/context profiles after the scorer
-            # confirms the current frame is actually suited to it.
-            allow_landscape = profile == "body"
+            # Keep landscape available only for explicit body/context profiles
+            # after the scorer confirms the current frame is actually suited to it.
+            allow_landscape = profile in {"body", "wide_context"}
             available = validated_user_ratios if validated_user_ratios else preferred
             out: list[str] = []
 
@@ -2389,6 +2395,24 @@ class Processor(QtCore.QObject):
             if out:
                 return out
             return [] if validated_user_ratios else ["1:1", "2:3"]
+
+        def _ratio_aspect_or_none(rs: str) -> Optional[float]:
+            try:
+                rw, rh = parse_ratio(rs)
+                return float(rw) / max(1e-6, float(rh))
+            except Exception:
+                return None
+
+        def _is_landscape_ratio(rs: str) -> bool:
+            aspect = _ratio_aspect_or_none(rs)
+            return bool(aspect is not None and aspect > 1.05)
+
+        def _landscape_ratio_available() -> bool:
+            # With an explicit user ratio list, do not synthesize landscape ratios.
+            # Without one, the profile defaults may still provide a context ratio.
+            if validated_user_ratios:
+                return any(_is_landscape_ratio(rs) for rs in validated_user_ratios)
+            return True
 
         base = self._coerce_box_xyxy(base_crop_xyxy, bounds)
         subj = self._coerce_box_xyxy(subject_box, bounds)
@@ -2444,6 +2468,10 @@ class Processor(QtCore.QObject):
             close_target = max(0.20, min(0.46, float(getattr(cfg, "compose_close_face_h_frac", 0.34))))
             upper_target = max(0.12, min(0.34, float(getattr(cfg, "compose_upper_face_h_frac", 0.22))))
             body_target = max(0.035, min(0.16, float(getattr(cfg, "compose_body_face_h_frac", 0.085))))
+            wide_context_enabled = bool(getattr(cfg, "compose_wide_context_enable", True))
+            wide_context_target = max(0.08, min(0.26, float(getattr(cfg, "compose_wide_context_face_h_frac", 0.16))))
+            wide_context_max_frame_frac = max(0.08, min(0.32, float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18))))
+            wide_context_min_side_face_heights = max(0.0, min(4.0, float(getattr(cfg, "compose_wide_context_min_side_face_heights", 1.20))))
 
             close_protect = self._pad_box_xyxy(
                 (hx1, hy1, hx2, max(hy2, fy2 + 0.85 * face_h)),
@@ -2498,6 +2526,47 @@ class Processor(QtCore.QObject):
                     bounds_xyxy=bounds,
                 ) or (hx1, hy1, hx2, max(hy2, fy2 + 2.6 * face_h))
             profiles.append(("upper", upper_protect, upper_target, (fcx, fcy + 1.45 * face_h), (fw * 2.8, face_h / upper_target)))
+
+            if (
+                wide_context_enabled
+                and _landscape_ratio_available()
+                and face_frame_frac <= wide_context_max_frame_frac
+            ):
+                # Dedicated landscape/context framing. This is intentionally
+                # separate from the body profile: a strong widescreen still does
+                # not require a tall associated YOLO person box. It only needs
+                # a non-close-up face plus enough horizontal room to show context.
+                side_room_face_heights = min(
+                    max(0.0, float(fx1) - float(bx1)),
+                    max(0.0, float(bx2) - float(fx2)),
+                ) / max(1.0, face_h)
+                if side_room_face_heights >= wide_context_min_side_face_heights:
+                    if subj is not None:
+                        sx1, sy1, sx2, sy2 = subj
+                        sw = max(1.0, sx2 - sx1)
+                        sh = max(1.0, sy2 - sy1)
+                        wide_bottom = min(float(by2), max(fy2 + 2.4 * face_h, sy1 + 0.70 * sh))
+                        wide_half_w = max(2.2 * fw, 0.62 * sw)
+                        wide_top = min(hy1, max(float(by1), sy1 - 0.05 * sh))
+                    else:
+                        wide_bottom = min(float(by2), max(hy2, fy2 + 2.8 * face_h))
+                        wide_half_w = max(2.4 * fw, 0.45 * float(bx2 - bx1))
+                        wide_top = hy1
+                    wide_protect = (
+                        max(float(bx1), min(hx1, fcx - wide_half_w)),
+                        max(float(by1), wide_top),
+                        min(float(bx2), max(hx2, fcx + wide_half_w)),
+                        wide_bottom,
+                    )
+                    profiles.append(
+                        (
+                            "wide_context",
+                            wide_protect,
+                            wide_context_target,
+                            (fcx, fcy + 1.20 * face_h),
+                            (max(fw * 4.0, wide_half_w * 2.0), face_h / wide_context_target),
+                        )
+                    )
 
             if subj is not None:
                 sx1, sy1, sx2, sy2 = subj
@@ -2600,15 +2669,20 @@ class Processor(QtCore.QObject):
                     # profile=portrait_close ratio=1:1.
                     continue
                 if profile == "body" and is_landscape:
-                    # Landscape is a rare context/body sample, not a normal face
-                    # framing choice. Eligibility requires an associated subject
-                    # plus small-face/tall-subject gates; body_cadence influences
-                    # scoring later and is not an eligibility gate.
+                    # Landscape remains a stricter full-body sample. Wide/context
+                    # has its own profile and does not borrow this tall-subject gate.
                     if subj is None:
                         continue
                     if face is not None and face_frame_frac >= 0.12:
                         continue
                     if subj_h_frac < 0.60:
+                        continue
+                if profile == "wide_context":
+                    if not is_landscape:
+                        continue
+                    if face is None:
+                        continue
+                    if face_frame_frac > wide_context_max_frame_frac:
                         continue
 
                 crop = self._ratio_crop_containing_box(
@@ -2678,6 +2752,25 @@ class Processor(QtCore.QObject):
                         profile_prior -= upper_small_face_profile_nudge
                         if rs == "1:1":
                             ratio_prior += upper_small_face_square_nudge
+                elif profile == "wide_context":
+                    landscape_penalty = max(0.0, min(20.0, float(getattr(cfg, "compose_landscape_face_penalty", 5.0))))
+                    profile_prior = max(-0.25, min(1.50, float(getattr(cfg, "compose_wide_context_prior", 0.18))))
+                    if is_landscape:
+                        ratio_prior -= 0.26
+                    else:
+                        ratio_prior += 2.0
+                    # The profile should win only for real context shots. Once
+                    # the face becomes close/upper scale, portrait profiles should
+                    # dominate even if a landscape ratio is allowed.
+                    over = max(0.0, face_frame_frac - wide_context_max_frame_frac)
+                    ratio_prior += landscape_penalty * 4.0 * over
+                    actual_probe_face_frac = face_h / max(1.0, crop_h)
+                    if actual_probe_face_frac > 0.30:
+                        ratio_prior += landscape_penalty * (actual_probe_face_frac - 0.30)
+                    if subj is None:
+                        # Missing YOLO association should not ban widescreen, but a
+                        # verified subject box is still a small confidence signal.
+                        profile_prior += 0.08
                 elif profile == "body":
                     landscape_penalty = max(0.0, min(20.0, float(getattr(cfg, "compose_landscape_face_penalty", 5.0))))
                     profile_prior = 0.78
@@ -2716,11 +2809,11 @@ class Processor(QtCore.QObject):
                     face_loss = 0.0
 
                 area_penalty = 0.08 * (crop_area / bound_area)
-                if profile != "body" and crop_area / bound_area > 0.72:
+                if profile not in {"body", "wide_context"} and crop_area / bound_area > 0.72:
                     area_penalty += 0.35
 
                 placement_penalty = 0.0
-                if face is not None and profile in {"close", "portrait_close", "upper"}:
+                if face is not None and profile in {"close", "portrait_close", "upper", "wide_context"}:
                     fcx = 0.5 * (face[0] + face[2])
                     fcy = 0.5 * (face[1] + face[3])
                     rel_x = (fcx - cx1) / crop_w
@@ -2730,8 +2823,10 @@ class Processor(QtCore.QObject):
                         target_y = 0.36
                     elif profile == "portrait_close":
                         target_y = 0.33
-                    else:
+                    elif profile == "upper":
                         target_y = 0.28
+                    else:
+                        target_y = 0.38
                     placement_penalty += 0.35 * abs(rel_y - target_y)
 
                 score = containment + profile_prior + ratio_prior + 2.2 * face_loss + area_penalty + placement_penalty
@@ -2786,14 +2881,30 @@ class Processor(QtCore.QObject):
                 continue
             is_landscape = aspect > 1.05
             if is_landscape:
-                if subj is None:
-                    continue
-                if face is not None and face_frame_frac >= small_face_frame_frac:
-                    continue
-                if subj_h_frac < 0.60:
-                    continue
-                fallback_profile = "body"
-                fallback_protect = subj or base or face_hard_protect or (bx1, by1, bx2, by2)
+                wide_context_ok = False
+                if (
+                    face is not None
+                    and bool(getattr(cfg, "compose_wide_context_enable", True))
+                    and face_frame_frac <= max(0.08, min(0.32, float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18))))
+                ):
+                    fx1_f, fy1_f, fx2_f, fy2_f = [float(v) for v in face]
+                    side_room_face_heights = min(
+                        max(0.0, fx1_f - float(bx1)),
+                        max(0.0, float(bx2) - fx2_f),
+                    ) / max(1.0, fy2_f - fy1_f)
+                    wide_context_ok = side_room_face_heights >= max(0.0, min(4.0, float(getattr(cfg, "compose_wide_context_min_side_face_heights", 1.20))))
+                    if wide_context_ok:
+                        fallback_profile = "wide_context"
+                        fallback_protect = face_protect or face or base or (bx1, by1, bx2, by2)
+                if not wide_context_ok:
+                    if subj is None:
+                        continue
+                    if face is not None and face_frame_frac >= small_face_frame_frac:
+                        continue
+                    if subj_h_frac < 0.60:
+                        continue
+                    fallback_profile = "body"
+                    fallback_protect = subj or base or face_hard_protect or (bx1, by1, bx2, by2)
             fallback_ratio = rs
             break
         if fallback_ratio is None:
@@ -2813,14 +2924,30 @@ class Processor(QtCore.QObject):
                 fallback_aspect = float(rw) / max(1e-6, float(rh))
             except Exception:
                 fallback_aspect = 1.0
-            if (
-                fallback_aspect > 1.05
-                and subj is not None
-                and face_frame_frac < small_face_frame_frac
-                and subj_h_frac >= 0.60
-            ):
-                fallback_profile = "body"
-                fallback_protect = subj or base or face_hard_protect or (bx1, by1, bx2, by2)
+            if fallback_aspect > 1.05:
+                wide_context_ok = False
+                if (
+                    face is not None
+                    and bool(getattr(cfg, "compose_wide_context_enable", True))
+                    and face_frame_frac <= max(0.08, min(0.32, float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18))))
+                ):
+                    fx1_f, fy1_f, fx2_f, fy2_f = [float(v) for v in face]
+                    side_room_face_heights = min(
+                        max(0.0, fx1_f - float(bx1)),
+                        max(0.0, float(bx2) - fx2_f),
+                    ) / max(1.0, fy2_f - fy1_f)
+                    wide_context_ok = side_room_face_heights >= max(0.0, min(4.0, float(getattr(cfg, "compose_wide_context_min_side_face_heights", 1.20))))
+                    if wide_context_ok:
+                        fallback_profile = "wide_context"
+                        fallback_protect = face_protect or face or base or (bx1, by1, bx2, by2)
+                if (
+                    not wide_context_ok
+                    and subj is not None
+                    and face_frame_frac < small_face_frame_frac
+                    and subj_h_frac >= 0.60
+                ):
+                    fallback_profile = "body"
+                    fallback_protect = subj or base or face_hard_protect or (bx1, by1, bx2, by2)
         crop = self._ratio_crop_containing_box(fallback_protect, fallback_ratio, bounds)
         return crop, fallback_ratio, fallback_profile
 
@@ -5279,6 +5406,11 @@ class Processor(QtCore.QObject):
                             "compose_portrait_close_face_h_frac",
                             "compose_upper_face_h_frac",
                             "compose_body_face_h_frac",
+                            "compose_wide_context_enable",
+                            "compose_wide_context_face_h_frac",
+                            "compose_wide_context_max_frame_face_frac",
+                            "compose_wide_context_min_side_face_heights",
+                            "compose_wide_context_prior",
                             "compose_landscape_face_penalty",
                             "compose_body_every_n",
                             "compose_person_detect_cadence",
@@ -6439,7 +6571,7 @@ class Processor(QtCore.QObject):
                         pass
 
                     crop_profile_for_guard = str(c.get("crop_profile") or "").lower()
-                    if crop_profile_for_guard == "body":
+                    if crop_profile_for_guard in {"body", "wide_context"}:
                         protect_box = self._union_boxes_xyxy(
                             c.get("subject_box"),
                             c.get("head_box"),
@@ -6508,7 +6640,7 @@ class Processor(QtCore.QObject):
                             # Do not preserve a stale landscape crop size for non-body
                             # profiles. Side repair must keep the face/head visible,
                             # not lock in a bad earlier composition.
-                            min_size_for_side = (cur_w, cur_h) if crop_profile_for_guard == "body" else None
+                            min_size_for_side = (cur_w, cur_h) if crop_profile_for_guard in {"body", "wide_context"} else None
                             cx1, cy1, cx2, cy2 = self._ratio_crop_containing_box(
                                 side_guard_box,
                                 ratio_str,
@@ -6568,13 +6700,28 @@ class Processor(QtCore.QObject):
                                         cur_face_h_frac >= 0.12
                                         or frame_face_h_frac >= 0.12
                                     )
+                                elif crop_profile_for_guard == "wide_context":
+                                    wide_frame_max = max(
+                                        0.08,
+                                        min(0.32, float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18))),
+                                    )
+                                    # Wide/context may contain a visible face, but it is
+                                    # still not a close-up. Only force portrait when the
+                                    # selected landscape crop has drifted into close/upper
+                                    # territory.
+                                    prominent_face = (
+                                        cur_face_h_frac >= 0.30
+                                        or frame_face_h_frac > wide_frame_max
+                                        or float(c.get("face_frac") or 0.0) >= 0.070
+                                    )
                                 else:
                                     prominent_face = (
                                         cur_face_h_frac >= 0.10
                                         or frame_face_h_frac >= 0.075
                                         or float(c.get("face_frac") or 0.0) >= 0.035
                                     )
-                                force_portrait = was_landscape and (crop_profile_for_guard != "body" or prominent_face)
+                                landscape_context_profile = crop_profile_for_guard in {"body", "wide_context"}
+                                force_portrait = was_landscape and ((not landscape_context_profile) or prominent_face)
                                 room_below_hard_face = max(0.0, float(repair_by2) - float(hfy2))
                                 side_room_hard_face = min(float(hfx1 - repair_bx1), float(repair_bx2 - hfx2))
                                 portrait_ratios_available = True
@@ -6617,7 +6764,7 @@ class Processor(QtCore.QObject):
                                     )
                                 )
                                 if hard_def > 0.01 or force_portrait:
-                                    if crop_profile_for_guard == "body" and not force_portrait:
+                                    if crop_profile_for_guard in {"body", "wide_context"} and not force_portrait:
                                         identity_guard = self._coerce_box_xyxy(
                                             self._union_boxes_xyxy(
                                                 c.get("subject_box"),
@@ -6640,7 +6787,7 @@ class Processor(QtCore.QObject):
                                         )
                                     protect_box_clamped = (
                                         self._coerce_box_xyxy(protect_box, (repair_bx1, repair_by1, repair_bx2, repair_by2))
-                                        if (protect_box is not None and crop_profile_for_guard == "body" and not force_portrait)
+                                        if (protect_box is not None and crop_profile_for_guard in {"body", "wide_context"} and not force_portrait)
                                         else None
                                     )
                                     # Do not add any extra show_box-only guard here.
@@ -6659,7 +6806,31 @@ class Processor(QtCore.QObject):
                                     # that have enough lower/side context to make portrait
                                     # framing viable. Square remains available as a rescue
                                     # fallback when portrait ratios cannot satisfy guards.
-                                    fix_ratios = ("2:3", "3:4", "1:1") if portrait_square_repair else ("1:1", "2:3", "3:4")
+                                    if landscape_context_profile and was_landscape and not force_portrait:
+                                        repair_ratio_order = (ratio_str, "3:2", "16:9", "4:3", "2:3", "3:4", "1:1")
+                                    elif portrait_square_repair:
+                                        repair_ratio_order = ("2:3", "3:4", "1:1")
+                                    else:
+                                        repair_ratio_order = ("1:1", "2:3", "3:4")
+                                    fix_ratios_list: list[str] = []
+                                    for _fix_ratio in repair_ratio_order:
+                                        _fix_ratio = str(_fix_ratio or "").strip()
+                                        if not _fix_ratio or _fix_ratio in fix_ratios_list:
+                                            continue
+                                        try:
+                                            _rw, _rh = parse_ratio(_fix_ratio)
+                                            _fix_is_landscape = (float(_rw) / max(1e-6, float(_rh))) > 1.05
+                                        except Exception:
+                                            continue
+                                        if (
+                                            explicit_ratio_list
+                                            and _fix_is_landscape
+                                            and _fix_ratio not in explicit_ratio_list
+                                            and _fix_ratio != ratio_str
+                                        ):
+                                            continue
+                                        fix_ratios_list.append(_fix_ratio)
+                                    fix_ratios = tuple(fix_ratios_list)
                                     for fix_ratio in fix_ratios:
                                         try:
                                             fixed = self._ratio_crop_containing_box(
@@ -6675,14 +6846,32 @@ class Processor(QtCore.QObject):
                                             fw2 = max(1.0, float(fixed[2] - fixed[0]))
                                             fh2 = max(1.0, float(fixed[3] - fixed[1]))
                                             face_h_frac2 = hfh / fh2
-                                            if portrait_square_repair:
+                                            try:
+                                                frw, frh = parse_ratio(fix_ratio)
+                                                fix_is_landscape = (float(frw) / max(1e-6, float(frh))) > 1.05
+                                            except Exception:
+                                                fix_is_landscape = False
+                                            if landscape_context_profile and was_landscape and not force_portrait and fix_is_landscape:
+                                                if crop_profile_for_guard == "wide_context":
+                                                    target_frac = max(
+                                                        0.08,
+                                                        min(0.26, float(getattr(cfg, "compose_wide_context_face_h_frac", 0.16))),
+                                                    )
+                                                else:
+                                                    target_frac = 0.12
+                                            elif portrait_square_repair:
                                                 target_frac = 0.43
                                             elif fix_ratio == "1:1":
                                                 target_frac = 0.34
                                             else:
                                                 target_frac = 0.24
                                             score = abs(face_h_frac2 - target_frac)
-                                            if portrait_square_repair:
+                                            if landscape_context_profile and was_landscape and not force_portrait:
+                                                if fix_is_landscape:
+                                                    score -= 0.18
+                                                else:
+                                                    score += 0.55
+                                            elif portrait_square_repair:
                                                 if fix_ratio == "2:3":
                                                     score -= 0.12
                                                 elif fix_ratio == "3:4":
@@ -6709,7 +6898,7 @@ class Processor(QtCore.QObject):
                                                 key="crop_portrait_square_repair",
                                                 interval=5.0,
                                             )
-                                        if crop_profile_for_guard == "body" and was_landscape and fixed_ratio in {"1:1", "2:3", "3:4"}:
+                                        if crop_profile_for_guard in {"body", "wide_context"} and was_landscape and fixed_ratio in {"1:1", "2:3", "3:4"}:
                                             c["crop_profile"] = "upper"
                                             crop_profile_for_guard = "upper"
                                     elif hard_def > 0.01 or force_portrait:
@@ -6787,7 +6976,7 @@ class Processor(QtCore.QObject):
                                                         )
                                                     except Exception:
                                                         pass
-                                        if crop_profile_for_guard == "body" and was_landscape and c.get("ratio") in {"1:1", "2:3", "3:4"}:
+                                        if crop_profile_for_guard in {"body", "wide_context"} and was_landscape and c.get("ratio") in {"1:1", "2:3", "3:4"}:
                                             c["crop_profile"] = "upper"
                                             crop_profile_for_guard = "upper"
                         except Exception:
@@ -6799,26 +6988,70 @@ class Processor(QtCore.QObject):
                                 (cx1, cy1, cx2, cy2),
                             )
 
-                    # Final vertical placement pass. After face/side guards are
-                    # satisfied, remove avoidable headroom by sliding down while
-                    # preserving ratio/size and hard face containment.
-                    try:
-                        before_y1 = float(cy1)
-                        cx1, cy1, cx2, cy2 = self._prefer_lower_face_crop_y(
-                            (cx1, cy1, cx2, cy2),
-                            c.get("face_box"),
-                            c.get("head_box"),
-                            (repair_bx1, repair_by1, repair_bx2, repair_by2),
-                            str(c.get("crop_profile", "")),
-                        )
-                        if float(cy1) > before_y1 + 1.0:
-                            self._status(
-                                f"vertical crop settle dy={float(cy1) - before_y1:.1f} profile={c.get('crop_profile', 'n/a')} ratio={ratio_str}",
-                                key="crop_vertical_settle",
+                    # Legacy vertical settle is kept only when smart crop is disabled.
+                    # With smart crop enabled, the single smart placement pass below owns
+                    # both horizontal and vertical ratio-preserving placement.
+                    if not bool(getattr(cfg, "smart_crop_enable", True)):
+                        try:
+                            before_y1 = float(cy1)
+                            cx1, cy1, cx2, cy2 = self._prefer_lower_face_crop_y(
+                                (cx1, cy1, cx2, cy2),
+                                c.get("face_box"),
+                                c.get("head_box"),
+                                (repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                str(c.get("crop_profile", "")),
                             )
+                            if float(cy1) > before_y1 + 1.0:
+                                self._status(
+                                    f"vertical crop settle dy={float(cy1) - before_y1:.1f} profile={c.get('crop_profile', 'n/a')} ratio={ratio_str}",
+                                    key="crop_vertical_settle",
+                                )
+                        except Exception:
+                            logger.exception(
+                                "Vertical crop settle failed idx=%s crop=%s face=%s",
+                                idx,
+                                (cx1, cy1, cx2, cy2),
+                                c.get("face_box"),
+                            )
+
+                    # Ratio-preserving smart placement. This is the only enabled
+                    # final placement pass: profile/ratio are already selected, and
+                    # this pass slides the crop inside bounds without changing them.
+                    try:
+                        if bool(getattr(cfg, "smart_crop_enable", True)):
+                            smart_profile = str(c.get("crop_profile") or crop_profile_for_guard or "").lower()
+                            if smart_profile in {"body", "wide_context"}:
+                                smart_protect = self._union_boxes_xyxy(
+                                    c.get("subject_box"),
+                                    c.get("head_box"),
+                                    c.get("face_box"),
+                                )
+                            else:
+                                smart_protect = self._union_boxes_xyxy(
+                                    c.get("head_box"),
+                                    c.get("face_box"),
+                                )
+                            before_smart = (int(cx1), int(cy1), int(cx2), int(cy2))
+                            cx1, cy1, cx2, cy2 = self._smart_crop_box(
+                                frame,
+                                before_smart,
+                                smart_protect,
+                                c.get("face_box"),
+                                ratio_str,
+                                cfg,
+                                bounds_xyxy=(repair_bx1, repair_by1, repair_bx2, repair_by2),
+                                profile=smart_profile,
+                            )
+                            after_smart = (int(cx1), int(cy1), int(cx2), int(cy2))
+                            if after_smart != before_smart:
+                                self._status(
+                                    f"smart crop refine {before_smart}->{after_smart} profile={smart_profile or 'n/a'} ratio={ratio_str}",
+                                    key="smart_crop_refine",
+                                    interval=2.0,
+                                )
                     except Exception:
                         logger.exception(
-                            "Vertical crop settle failed idx=%s crop=%s face=%s",
+                            "Smart crop refine failed idx=%s crop=%s face=%s",
                             idx,
                             (cx1, cy1, cx2, cy2),
                             c.get("face_box"),
@@ -7739,103 +7972,278 @@ class Processor(QtCore.QObject):
         self._status_last_text = {}
 
     # ---------- Smart crop helpers ----------
-    def _smart_crop_box(self, frame, box, face_box, ratio_str, cfg):
+    def _smart_crop_box(
+        self,
+        frame,
+        crop_xyxy,
+        protect_box,
+        face_box,
+        ratio_str,
+        cfg,
+        bounds_xyxy=None,
+        profile: Optional[str] = None,
+    ):
+        """Final ratio-preserving crop placement pass.
+
+        Smart crop is not a second crop selector.  The composition scorer chooses
+        the semantic profile and ratio first; this pass only slides/re-centers the
+        chosen crop inside the de-barred content bounds.  It preserves the selected
+        ratio and hard identity containment, then uses lightweight image saliency
+        as a tie-breaker so allowed ratios can use available screen context.
+        """
+        if frame is None or not bool(getattr(cfg, "smart_crop_enable", True)):
+            return tuple(int(round(v)) for v in crop_xyxy)
         H, W = frame.shape[:2]
-        x1, y1, x2, y2 = [int(v) for v in box]
-        x1 = max(0, x1); y1 = max(0, y1); x2 = min(W-1, x2); y2 = min(H-1, y2)
-        if x2 <= x1+2 or y2 <= y1+2:
-            return x1, y1, x2, y2
-        # parse ratio
+        if W <= 1 or H <= 1:
+            return tuple(int(round(v)) for v in crop_xyxy)
+
+        if bounds_xyxy is None:
+            bounds = (0, 0, int(W), int(H))
+        else:
+            try:
+                bx1, by1, bx2, by2 = [int(round(v)) for v in bounds_xyxy]
+                bx1 = max(0, min(int(W) - 1, bx1))
+                by1 = max(0, min(int(H) - 1, by1))
+                bx2 = max(bx1 + 1, min(int(W), bx2))
+                by2 = max(by1 + 1, min(int(H), by2))
+                bounds = (bx1, by1, bx2, by2)
+            except Exception:
+                bounds = (0, 0, int(W), int(H))
+        bx1, by1, bx2, by2 = bounds
+        bound_w = max(1.0, float(bx2 - bx1))
+        bound_h = max(1.0, float(by2 - by1))
+
+        seed = self._coerce_box_xyxy(crop_xyxy, bounds)
+        if seed is None:
+            return (bx1, by1, bx2, by2)
+        sx1, sy1, sx2, sy2 = [float(v) for v in seed]
+        original_crop = tuple(int(round(v)) for v in (sx1, sy1, sx2, sy2))
+        seed_w = max(2.0, sx2 - sx1)
+        seed_h = max(2.0, sy2 - sy1)
+        seed_cx = 0.5 * (sx1 + sx2)
+        seed_cy = 0.5 * (sy1 + sy2)
+
         try:
-            tw, th = parse_ratio(ratio_str)
-            target = float(tw) / float(th)
+            rw, rh = parse_ratio(ratio_str)
+            target_aspect = float(rw) / max(1e-6, float(rh))
         except Exception:
-            target = 2.0 / 3.0
-        w = x2 - x1; h = y2 - y1
-        # ensure exact ratio by adjusting height
-        h = int(round(max(2, w / max(1e-6, target))))
-        cy = (y1 + y2) // 2
-        y1 = max(0, min(H - h, cy - h // 2)); y2 = y1 + h
+            target_aspect = seed_w / max(1.0, seed_h)
+        target_aspect = max(0.05, min(20.0, target_aspect))
 
-        skip_side_search = False
+        # Preserve current crop area as much as possible while correcting aspect.
+        target_area = max(4.0, seed_w * seed_h)
+        crop_h = math.sqrt(target_area / target_aspect)
+        crop_w = crop_h * target_aspect
+        if crop_w > bound_w:
+            crop_w = bound_w
+            crop_h = crop_w / target_aspect
+        if crop_h > bound_h:
+            crop_h = bound_h
+            crop_w = crop_h * target_aspect
+        crop_w = max(2.0, min(bound_w, crop_w))
+        crop_h = max(2.0, min(bound_h, crop_h))
 
-        # Build a downscaled gradient saliency once (cheap)
-        if bool(getattr(cfg, "smart_crop_use_grad", True)):
-            small_w = min(384, W)
-            scale = (small_w / float(W)) if W > 0 else 1.0
-            small_h = max(8, int(round(H * scale)))
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-            small = cv2.resize(gray, (small_w, small_h), interpolation=interp)
-            gradx = cv2.Sobel(small, cv2.CV_32F, 1, 0, ksize=3)
-            grady = cv2.Sobel(small, cv2.CV_32F, 0, 1, ksize=3)
-            sal = cv2.magnitude(gradx, grady)
+        face = self._coerce_box_xyxy(face_box, bounds)
+        protect = self._coerce_box_xyxy(protect_box, bounds)
+        hard_box = self._union_boxes_xyxy(protect, face) or protect or face
+        hard_box = self._coerce_box_xyxy(hard_box, bounds)
+
+        if hard_box is not None:
+            hx1, hy1, hx2, hy2 = [float(v) for v in hard_box]
+            min_w = max(2.0, hx2 - hx1 + 2.0)
+            min_h = max(2.0, hy2 - hy1 + 2.0)
+            if face is not None:
+                fx1, fy1, fx2, fy2 = [float(v) for v in face]
+                fw = max(1.0, fx2 - fx1)
+                fh = max(1.0, fy2 - fy1)
+                side_pad = max(1.0, float(getattr(cfg, "crop_face_side_margin_frac", 0.30)) * fw)
+                min_w = max(min_w, fw + 2.0 * side_pad)
+                min_h = max(min_h, fh * 1.35)
+            scale = max(min_w / max(1.0, crop_w), min_h / max(1.0, crop_h), 1.0)
+            if scale > 1.0:
+                crop_w = min(bound_w, crop_w * scale)
+                crop_h = crop_w / target_aspect
+                if crop_h > bound_h:
+                    crop_h = bound_h
+                    crop_w = crop_h * target_aspect
+
+        crop_w_i = max(2, min(int(round(bound_w)), int(round(crop_w))))
+        crop_h_i = max(2, min(int(round(bound_h)), int(round(crop_h))))
+        # Final integer aspect correction. Prefer changing width first; if the
+        # content bounds cannot hold it, change height instead.
+        exact_w = int(round(crop_h_i * target_aspect))
+        if 2 <= exact_w <= int(round(bound_w)):
+            crop_w_i = exact_w
         else:
-            sal = None; scale = 1.0
+            exact_h = int(round(crop_w_i / target_aspect))
+            if 2 <= exact_h <= int(round(bound_h)):
+                crop_h_i = exact_h
 
-        # Dynamic scale so face ≤ max_frac depending on profile-ness
-        if face_box is not None:
-            fx1, fy1, fx2, fy2 = [int(v) for v in face_box]
-            fx1 = max(0, fx1); fy1 = max(0, fy1); fx2 = min(W-1, fx2); fy2 = min(H-1, fy2)
-            fw = max(1, fx2 - fx1)
-            # proxy for profile: face near crop side -> lower max_frac
-            rel = None
-            cw_left, cw_right = x1, x2
-            fcx = (fx1 + fx2) * 0.5
-            if cw_right > cw_left:
-                rel = (fcx - cw_left) / float(cw_right - cw_left)  # 0..1
-            profile = 2.0 * abs((rel if rel is not None else 0.5) - 0.5)  # 0=frontal, 1=profile
-            max_frac = 0.42 - 0.12 * profile  # 0.42 frontal → 0.30 profile
-            need_w = int(math.ceil(fw / max(1e-6, max_frac)))
-            # also ensure requested side margins around face
-            want_side = float(getattr(cfg, "crop_face_side_margin_frac", 0.30)) * fw
-            need_w = max(need_w, int(round(fw + 2.0 * want_side)))
-            if need_w > w:
-                w = min(W, need_w)
-                h = int(round(max(2, w / target)))
-            # center on face horizontally by default
-            cx = int(round(fcx))
-            x1 = max(0, min(W - w, cx - w // 2)); x2 = x1 + w
-            y1 = max(0, min(H - h, cy - h // 2)); y2 = y1 + h
-            # when a face is known, skip lateral saliency drift to avoid off-centering
-            sal = None
-            skip_side_search = True
-
-        # Lateral search to maximize saliency and keep face centered with margin
-        steps_cfg = int(getattr(cfg, "smart_crop_steps", 6))
-        sfrac = float(getattr(cfg, "smart_crop_side_search_frac", 0.35))
-        if skip_side_search:
-            steps = 0
-            max_shift = 0
-        else:
-            steps = max(0, steps_cfg)
-            max_shift = int(round(w * sfrac))
-        best = (x1, y1, x2, y2); best_score = -1e9
-        if steps <= 0 or max_shift <= 0:
-            dx_vals = (0.0,)
-        else:
-            dx_vals = np.linspace(-max_shift, max_shift, 2 * steps + 1)
-        for dx in dx_vals:
-            nx1 = int(max(0, min(W - w, x1 + dx))); nx2 = nx1 + w
-            # saliency score
-            if sal is not None:
-                sx1 = int(nx1 * scale); sx2 = int(nx2 * scale)
-                sy1 = int(y1 * scale);  sy2 = int(y2 * scale)
-                s_patch = sal[sy1:sy2, sx1:sx2]
-                s_val = float(np.mean(s_patch)) if s_patch.size else 0.0
+        prof = str(profile or "").lower()
+        if face is not None:
+            fx1, fy1, fx2, fy2 = [float(v) for v in face]
+            fcx = 0.5 * (fx1 + fx2)
+            fcy = 0.5 * (fy1 + fy2)
+            fh = max(1.0, fy2 - fy1)
+            if prof == "close":
+                anchor = (fcx, fcy + 0.55 * fh)
+                target_face_y = 0.36
+            elif prof == "portrait_close":
+                anchor = (fcx, fcy + 0.85 * fh)
+                target_face_y = 0.33
+            elif prof == "upper":
+                anchor = (fcx, fcy + 1.15 * fh)
+                target_face_y = 0.29
+            elif prof == "wide_context":
+                anchor = (fcx, fcy + 1.10 * fh)
+                target_face_y = 0.40
+            elif prof == "body":
+                anchor = (fcx, fcy + 1.50 * fh)
+                target_face_y = 0.42
             else:
-                s_val = 0.0
-            # margin score: prefer balanced headroom around face if available
-            m_val = 0.0
-            if face_box is not None:
-                fx1, _, fx2, _ = face_box
+                anchor = (fcx, fcy + 0.85 * fh)
+                target_face_y = 0.36
+        elif hard_box is not None:
+            hx1, hy1, hx2, hy2 = [float(v) for v in hard_box]
+            anchor = (0.5 * (hx1 + hx2), 0.5 * (hy1 + hy2))
+            target_face_y = 0.50
+        else:
+            anchor = (seed_cx, seed_cy)
+            target_face_y = 0.50
+
+        def _from_center(cx: float, cy: float):
+            x1 = int(round(cx - 0.5 * crop_w_i))
+            y1 = int(round(cy - 0.5 * crop_h_i))
+            x1 = max(bx1, min(bx2 - crop_w_i, x1))
+            y1 = max(by1, min(by2 - crop_h_i, y1))
+            return (x1, y1, x1 + crop_w_i, y1 + crop_h_i)
+
+        seed_crop = _from_center(seed_cx, seed_cy)
+        anchor_crop = _from_center(float(anchor[0]), float(anchor[1]))
+
+        sal = None
+        scale_x = scale_y = 1.0
+        if bool(getattr(cfg, "smart_crop_use_grad", True)):
+            try:
+                small_w = max(16, min(384, int(W)))
+                scale_x = small_w / float(W)
+                small_h = max(16, int(round(float(H) * scale_x)))
+                scale_y = small_h / float(H)
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                interp = cv2.INTER_AREA if small_w < W else cv2.INTER_LINEAR
+                small = cv2.resize(gray, (small_w, small_h), interpolation=interp)
+                gradx = cv2.Sobel(small, cv2.CV_32F, 1, 0, ksize=3)
+                grady = cv2.Sobel(small, cv2.CV_32F, 0, 1, ksize=3)
+                sal = cv2.magnitude(gradx, grady)
+                denom = float(np.percentile(sal, 95)) if sal.size else 1.0
+                if denom > 1e-6:
+                    sal = np.clip(sal / denom, 0.0, 1.0)
+            except Exception:
+                sal = None
+
+        steps = max(0, int(getattr(cfg, "smart_crop_steps", 6)))
+        sfrac = max(0.0, min(1.5, float(getattr(cfg, "smart_crop_side_search_frac", 0.35))))
+        max_dx = min(bound_w - crop_w_i, crop_w_i * sfrac)
+        # Vertical search is intentionally narrower. Vertical framing carries
+        # semantic meaning for face crops; saliency should not pull the crop off
+        # the chosen head/torso placement.
+        if prof in {"close", "portrait_close"}:
+            y_frac = 0.10
+        elif prof == "wide_context":
+            y_frac = 0.18
+        else:
+            y_frac = 0.14
+        max_dy = min(bound_h - crop_h_i, crop_h_i * min(sfrac, y_frac))
+        if steps <= 0:
+            offsets = [(0.0, 0.0)]
+        else:
+            dx_vals = np.linspace(-max_dx, max_dx, 2 * steps + 1) if max_dx > 0 else np.array([0.0])
+            dy_steps = max(1, min(steps, 3))
+            dy_vals = np.linspace(-max_dy, max_dy, 2 * dy_steps + 1) if max_dy > 0 else np.array([0.0])
+            offsets = [(float(dx), float(dy)) for dx in dx_vals for dy in dy_vals]
+
+        candidate_set = {seed_crop, anchor_crop}
+        ax1, ay1, ax2, ay2 = anchor_crop
+        acx = 0.5 * (ax1 + ax2)
+        acy = 0.5 * (ay1 + ay2)
+        for dx, dy in offsets:
+            candidate_set.add(_from_center(acx + dx, acy + dy))
+        # Always include a crop grown directly around the hard box if one exists.
+        if hard_box is not None:
+            try:
+                candidate_set.add(
+                    self._ratio_crop_containing_box(
+                        hard_box,
+                        ratio_str,
+                        bounds,
+                        anchor=anchor,
+                        min_size_xy=(crop_w_i, crop_h_i),
+                    )
+                )
+            except Exception:
+                pass
+
+        def _saliency(crop) -> float:
+            if sal is None:
+                return 0.0
+            x1, y1, x2, y2 = crop
+            sx1 = max(0, min(sal.shape[1] - 1, int(round(x1 * scale_x))))
+            sx2 = max(sx1 + 1, min(sal.shape[1], int(round(x2 * scale_x))))
+            sy1 = max(0, min(sal.shape[0] - 1, int(round(y1 * scale_y))))
+            sy2 = max(sy1 + 1, min(sal.shape[0], int(round(y2 * scale_y))))
+            patch = sal[sy1:sy2, sx1:sx2]
+            return float(np.mean(patch)) if patch.size else 0.0
+
+        best = original_crop
+        best_score = float("inf")
+        for cand in candidate_set:
+            x1, y1, x2, y2 = [float(v) for v in cand]
+            cw = max(1.0, x2 - x1)
+            ch = max(1.0, y2 - y1)
+            if hard_box is not None:
+                hard_def = self._containment_deficit_xyxy(cand, hard_box, margin_px=1.0)
+                if hard_def > 0.01:
+                    continue
+            else:
+                hard_def = 0.0
+            score = 100.0 * hard_def
+            if face is not None:
+                fx1, fy1, fx2, fy2 = [float(v) for v in face]
+                fw = max(1.0, fx2 - fx1)
+                fh = max(1.0, fy2 - fy1)
                 fcx = 0.5 * (fx1 + fx2)
-                left_m = max(0.0, fcx - nx1); right_m = max(0.0, nx2 - fcx)
-                m_val = min(left_m, right_m) / max(1.0, w)
-            score = s_val + 0.15 * m_val
-            if score > best_score:
-                best_score = score; best = (nx1, y1, nx2, y2)
-        return best
+                fcy = 0.5 * (fy1 + fy2)
+                rel_x = (fcx - x1) / cw
+                rel_y = (fcy - y1) / ch
+                score += 0.75 * abs(rel_x - 0.50)
+                score += 1.10 * abs(rel_y - target_face_y)
+                desired_side = float(getattr(cfg, "crop_face_side_margin_frac", 0.30)) * fw
+                left = max(0.0, fx1 - x1)
+                right = max(0.0, x2 - fx2)
+                if desired_side > 0:
+                    score += 0.40 * max(0.0, desired_side - min(left, right)) / desired_side
+                if prof == "wide_context":
+                    # Wide/context should actually use horizontal context.
+                    side_face_heights = min(left, right) / max(1.0, fh)
+                    score += 0.22 * max(0.0, 1.0 - side_face_heights)
+            elif hard_box is not None:
+                hx1, hy1, hx2, hy2 = [float(v) for v in hard_box]
+                hcx = 0.5 * (hx1 + hx2)
+                hcy = 0.5 * (hy1 + hy2)
+                score += 0.35 * abs(((hcx - x1) / cw) - 0.50)
+                score += 0.35 * abs(((hcy - y1) / ch) - 0.50)
+
+            # Mild inertia avoids jitter and prevents texture from dominating
+            # identity-aware placement.
+            cand_cx = 0.5 * (x1 + x2)
+            cand_cy = 0.5 * (y1 + y2)
+            score += 0.08 * (abs(cand_cx - seed_cx) / max(1.0, crop_w_i))
+            score += 0.08 * (abs(cand_cy - seed_cy) / max(1.0, crop_h_i))
+            score -= 0.05 * _saliency(cand)
+            if score < best_score:
+                best_score = score
+                best = tuple(int(round(v)) for v in cand)
+        return best if math.isfinite(best_score) else original_crop
 
     def _status(self, msg: str, key: str = None, interval: float = None):
         """
@@ -13750,6 +14158,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.compose_body_face_h_frac_spin = _mk_fspin(0.01, 1.0, 0.005, 3, "float: compose_body_face_h_frac")
         self.compose_body_face_h_frac_spin.setValue(float(self.cfg.compose_body_face_h_frac))
         self.compose_body_face_h_frac_spin.valueChanged.connect(self._on_ui_change)
+        self.compose_wide_context_enable_check = QtWidgets.QCheckBox()
+        self.compose_wide_context_enable_check.setChecked(bool(getattr(self.cfg, "compose_wide_context_enable", True)))
+        self.compose_wide_context_enable_check.setToolTip("bool: compose_wide_context_enable")
+        self.compose_wide_context_enable_check.stateChanged.connect(self._on_ui_change)
+        self.compose_wide_context_face_h_frac_spin = _mk_fspin(0.01, 1.0, 0.005, 3, "float: compose_wide_context_face_h_frac")
+        self.compose_wide_context_face_h_frac_spin.setValue(float(getattr(self.cfg, "compose_wide_context_face_h_frac", 0.16)))
+        self.compose_wide_context_face_h_frac_spin.valueChanged.connect(self._on_ui_change)
+        self.compose_wide_context_max_frame_face_frac_spin = _mk_fspin(0.01, 1.0, 0.005, 3, "float: compose_wide_context_max_frame_face_frac")
+        self.compose_wide_context_max_frame_face_frac_spin.setValue(float(getattr(self.cfg, "compose_wide_context_max_frame_face_frac", 0.18)))
+        self.compose_wide_context_max_frame_face_frac_spin.valueChanged.connect(self._on_ui_change)
+        self.compose_wide_context_min_side_face_heights_spin = _mk_fspin(0.0, 8.0, 0.05, 2, "float: compose_wide_context_min_side_face_heights")
+        self.compose_wide_context_min_side_face_heights_spin.setValue(float(getattr(self.cfg, "compose_wide_context_min_side_face_heights", 1.20)))
+        self.compose_wide_context_min_side_face_heights_spin.valueChanged.connect(self._on_ui_change)
+        self.compose_wide_context_prior_spin = _mk_fspin(-1.0, 3.0, 0.05, 2, "float: compose_wide_context_prior")
+        self.compose_wide_context_prior_spin.setValue(float(getattr(self.cfg, "compose_wide_context_prior", 0.18)))
+        self.compose_wide_context_prior_spin.valueChanged.connect(self._on_ui_change)
         self.compose_landscape_face_penalty_spin = _mk_fspin(0.0, 20.0, 0.1, 2, "float: compose_landscape_face_penalty")
         self.compose_landscape_face_penalty_spin.setValue(float(self.cfg.compose_landscape_face_penalty))
         self.compose_landscape_face_penalty_spin.valueChanged.connect(self._on_ui_change)
@@ -13930,6 +14354,11 @@ class MainWindow(QtWidgets.QMainWindow):
             ("compose_portrait_close_face_h_frac", self.compose_portrait_close_face_h_frac_spin),
             ("compose_upper_face_h_frac", self.compose_upper_face_h_frac_spin),
             ("compose_body_face_h_frac", self.compose_body_face_h_frac_spin),
+            ("compose_wide_context_enable", self.compose_wide_context_enable_check),
+            ("compose_wide_context_face_h_frac", self.compose_wide_context_face_h_frac_spin),
+            ("compose_wide_context_max_frame_face_frac", self.compose_wide_context_max_frame_face_frac_spin),
+            ("compose_wide_context_min_side_face_heights", self.compose_wide_context_min_side_face_heights_spin),
+            ("compose_wide_context_prior", self.compose_wide_context_prior_spin),
             ("compose_landscape_face_penalty", self.compose_landscape_face_penalty_spin),
             ("compose_body_every_n", self.compose_body_every_n_spin),
             ("compose_person_detect_cadence", self.compose_person_detect_cadence_spin),
@@ -15228,6 +15657,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "compose_portrait_close_face_h_frac",
             "compose_upper_face_h_frac",
             "compose_body_face_h_frac",
+            "compose_wide_context_enable",
+            "compose_wide_context_face_h_frac",
+            "compose_wide_context_max_frame_face_frac",
+            "compose_wide_context_min_side_face_heights",
+            "compose_wide_context_prior",
             "compose_landscape_face_penalty",
             "compose_body_every_n",
             "compose_person_detect_cadence",
@@ -15416,6 +15850,11 @@ class MainWindow(QtWidgets.QMainWindow):
             compose_portrait_close_face_h_frac=float(self.compose_portrait_close_face_h_frac_spin.value()) if hasattr(self, "compose_portrait_close_face_h_frac_spin") else float(getattr(self.cfg, "compose_portrait_close_face_h_frac", 0.43)),
             compose_upper_face_h_frac=float(self.compose_upper_face_h_frac_spin.value()) if hasattr(self, "compose_upper_face_h_frac_spin") else float(getattr(self.cfg, "compose_upper_face_h_frac", 0.22)),
             compose_body_face_h_frac=float(self.compose_body_face_h_frac_spin.value()) if hasattr(self, "compose_body_face_h_frac_spin") else float(getattr(self.cfg, "compose_body_face_h_frac", 0.085)),
+            compose_wide_context_enable=bool(self.compose_wide_context_enable_check.isChecked()) if hasattr(self, "compose_wide_context_enable_check") else bool(getattr(self.cfg, "compose_wide_context_enable", True)),
+            compose_wide_context_face_h_frac=float(self.compose_wide_context_face_h_frac_spin.value()) if hasattr(self, "compose_wide_context_face_h_frac_spin") else float(getattr(self.cfg, "compose_wide_context_face_h_frac", 0.16)),
+            compose_wide_context_max_frame_face_frac=float(self.compose_wide_context_max_frame_face_frac_spin.value()) if hasattr(self, "compose_wide_context_max_frame_face_frac_spin") else float(getattr(self.cfg, "compose_wide_context_max_frame_face_frac", 0.18)),
+            compose_wide_context_min_side_face_heights=float(self.compose_wide_context_min_side_face_heights_spin.value()) if hasattr(self, "compose_wide_context_min_side_face_heights_spin") else float(getattr(self.cfg, "compose_wide_context_min_side_face_heights", 1.20)),
+            compose_wide_context_prior=float(self.compose_wide_context_prior_spin.value()) if hasattr(self, "compose_wide_context_prior_spin") else float(getattr(self.cfg, "compose_wide_context_prior", 0.18)),
             compose_landscape_face_penalty=float(self.compose_landscape_face_penalty_spin.value()) if hasattr(self, "compose_landscape_face_penalty_spin") else float(getattr(self.cfg, "compose_landscape_face_penalty", 5.0)),
             compose_body_every_n=int(self.compose_body_every_n_spin.value()) if hasattr(self, "compose_body_every_n_spin") else int(getattr(self.cfg, "compose_body_every_n", 6)),
             compose_person_detect_cadence=int(self.compose_person_detect_cadence_spin.value()) if hasattr(self, "compose_person_detect_cadence_spin") else int(getattr(self.cfg, "compose_person_detect_cadence", 6)),
@@ -15816,6 +16255,23 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.compose_body_face_h_frac = float(getattr(cfg, "compose_body_face_h_frac", 0.085))
         except Exception:
             self.cfg.compose_body_face_h_frac = 0.085
+        self.cfg.compose_wide_context_enable = bool(getattr(cfg, "compose_wide_context_enable", True))
+        try:
+            self.cfg.compose_wide_context_face_h_frac = float(getattr(cfg, "compose_wide_context_face_h_frac", 0.16))
+        except Exception:
+            self.cfg.compose_wide_context_face_h_frac = 0.16
+        try:
+            self.cfg.compose_wide_context_max_frame_face_frac = float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18))
+        except Exception:
+            self.cfg.compose_wide_context_max_frame_face_frac = 0.18
+        try:
+            self.cfg.compose_wide_context_min_side_face_heights = float(getattr(cfg, "compose_wide_context_min_side_face_heights", 1.20))
+        except Exception:
+            self.cfg.compose_wide_context_min_side_face_heights = 1.20
+        try:
+            self.cfg.compose_wide_context_prior = float(getattr(cfg, "compose_wide_context_prior", 0.18))
+        except Exception:
+            self.cfg.compose_wide_context_prior = 0.18
         try:
             self.cfg.compose_landscape_face_penalty = float(getattr(cfg, "compose_landscape_face_penalty", 5.0))
         except Exception:
@@ -16269,6 +16725,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.compose_upper_face_h_frac_spin.setValue(float(cfg.compose_upper_face_h_frac))
         if hasattr(self, 'compose_body_face_h_frac_spin'):
             self.compose_body_face_h_frac_spin.setValue(float(cfg.compose_body_face_h_frac))
+        if hasattr(self, 'compose_wide_context_enable_check'):
+            self.compose_wide_context_enable_check.setChecked(bool(getattr(cfg, "compose_wide_context_enable", True)))
+        if hasattr(self, 'compose_wide_context_face_h_frac_spin'):
+            self.compose_wide_context_face_h_frac_spin.setValue(float(getattr(cfg, "compose_wide_context_face_h_frac", 0.16)))
+        if hasattr(self, 'compose_wide_context_max_frame_face_frac_spin'):
+            self.compose_wide_context_max_frame_face_frac_spin.setValue(float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18)))
+        if hasattr(self, 'compose_wide_context_min_side_face_heights_spin'):
+            self.compose_wide_context_min_side_face_heights_spin.setValue(float(getattr(cfg, "compose_wide_context_min_side_face_heights", 1.20)))
+        if hasattr(self, 'compose_wide_context_prior_spin'):
+            self.compose_wide_context_prior_spin.setValue(float(getattr(cfg, "compose_wide_context_prior", 0.18)))
         if hasattr(self, 'compose_landscape_face_penalty_spin'):
             self.compose_landscape_face_penalty_spin.setValue(float(cfg.compose_landscape_face_penalty))
         if hasattr(self, 'compose_body_every_n_spin'):
@@ -17605,6 +18071,35 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         except Exception:
             self.cfg.compose_body_face_h_frac = 0.085
+        self.cfg.compose_wide_context_enable = s.value(
+            "compose_wide_context_enable",
+            getattr(self.cfg, "compose_wide_context_enable", True),
+            type=bool,
+        )
+        try:
+            self.cfg.compose_wide_context_face_h_frac = float(
+                s.value("compose_wide_context_face_h_frac", getattr(self.cfg, "compose_wide_context_face_h_frac", 0.16))
+            )
+        except Exception:
+            self.cfg.compose_wide_context_face_h_frac = 0.16
+        try:
+            self.cfg.compose_wide_context_max_frame_face_frac = float(
+                s.value("compose_wide_context_max_frame_face_frac", getattr(self.cfg, "compose_wide_context_max_frame_face_frac", 0.18))
+            )
+        except Exception:
+            self.cfg.compose_wide_context_max_frame_face_frac = 0.18
+        try:
+            self.cfg.compose_wide_context_min_side_face_heights = float(
+                s.value("compose_wide_context_min_side_face_heights", getattr(self.cfg, "compose_wide_context_min_side_face_heights", 1.20))
+            )
+        except Exception:
+            self.cfg.compose_wide_context_min_side_face_heights = 1.20
+        try:
+            self.cfg.compose_wide_context_prior = float(
+                s.value("compose_wide_context_prior", getattr(self.cfg, "compose_wide_context_prior", 0.18))
+            )
+        except Exception:
+            self.cfg.compose_wide_context_prior = 0.18
         try:
             self.cfg.compose_landscape_face_penalty = float(
                 s.value(
@@ -17741,6 +18236,26 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'compose_body_face_h_frac_spin'):
             self.compose_body_face_h_frac_spin.setValue(
                 float(s.value("compose_body_face_h_frac", self.cfg.compose_body_face_h_frac))
+            )
+        if hasattr(self, 'compose_wide_context_enable_check'):
+            self.compose_wide_context_enable_check.setChecked(
+                s.value("compose_wide_context_enable", self.cfg.compose_wide_context_enable, type=bool)
+            )
+        if hasattr(self, 'compose_wide_context_face_h_frac_spin'):
+            self.compose_wide_context_face_h_frac_spin.setValue(
+                float(s.value("compose_wide_context_face_h_frac", self.cfg.compose_wide_context_face_h_frac))
+            )
+        if hasattr(self, 'compose_wide_context_max_frame_face_frac_spin'):
+            self.compose_wide_context_max_frame_face_frac_spin.setValue(
+                float(s.value("compose_wide_context_max_frame_face_frac", self.cfg.compose_wide_context_max_frame_face_frac))
+            )
+        if hasattr(self, 'compose_wide_context_min_side_face_heights_spin'):
+            self.compose_wide_context_min_side_face_heights_spin.setValue(
+                float(s.value("compose_wide_context_min_side_face_heights", self.cfg.compose_wide_context_min_side_face_heights))
+            )
+        if hasattr(self, 'compose_wide_context_prior_spin'):
+            self.compose_wide_context_prior_spin.setValue(
+                float(s.value("compose_wide_context_prior", self.cfg.compose_wide_context_prior))
             )
         if hasattr(self, 'compose_landscape_face_penalty_spin'):
             self.compose_landscape_face_penalty_spin.setValue(
