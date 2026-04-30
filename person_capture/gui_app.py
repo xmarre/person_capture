@@ -371,6 +371,10 @@ class SessionConfig:
     hdr_wic_yuv444_color_match_strength: float = 1.0
     hdr_wic_yuv444_color_match_luma_strength: float = 0.45
     hdr_wic_yuv444_color_match_chroma_strength: float = 0.85
+    # Preserve the clean yuv444 luma texture in very dark regions. The yuv420
+    # reference is useful for color response, but copying its luma distribution
+    # too strongly can crush/flatten shadow micro-detail. 0 disables this guard.
+    hdr_wic_yuv444_color_match_shadow_luma_protect: float = 0.85
     hdr_wic_yuv444_color_match_lowfreq: float = 0.0
     # Render only a reduced yuv420/full WIC reference for the color-match
     # statistics pass. The final output still comes from the full-resolution
@@ -5506,6 +5510,7 @@ class Processor(QtCore.QObject):
                             "hdr_wic_yuv444_color_match_strength",
                             "hdr_wic_yuv444_color_match_luma_strength",
                             "hdr_wic_yuv444_color_match_chroma_strength",
+                            "hdr_wic_yuv444_color_match_shadow_luma_protect",
                             "hdr_wic_yuv444_color_match_lowfreq",
                             "hdr_wic_yuv444_color_match_ref_max_side",
                             "hdr_wic_yuv444_color_match_gpu_mode",
@@ -9520,6 +9525,18 @@ class Processor(QtCore.QObject):
             min_value=0.0,
             max_value=1.0,
         )
+        try:
+            default_shadow_luma_protect = float(
+                getattr(self.cfg, "hdr_wic_yuv444_color_match_shadow_luma_protect", 0.85)
+            )
+        except Exception:
+            default_shadow_luma_protect = 0.85
+        shadow_luma_protect = self._float_env(
+            "PC_WIC_YUV444_COLOR_MATCH_SHADOW_LUMA_PROTECT",
+            default_shadow_luma_protect,
+            min_value=0.0,
+            max_value=1.0,
+        )
         if strength <= 0.0:
             return 0, ""
         try:
@@ -9708,6 +9725,7 @@ class Processor(QtCore.QObject):
                     luts,
                     channel_strengths,
                     diff_ref_bgr,
+                    shadow_luma_protect=shadow_luma_protect,
                 )
 
             if gpu_result is not None:
@@ -9719,7 +9737,21 @@ class Processor(QtCore.QObject):
                 for c, c_strength in enumerate(channel_strengths):
                     target = cv2.LUT(clean_ycc[:, :, c], luts[c]).astype(np.float32, copy=False)
                     src = clean_ycc[:, :, c].astype(np.float32, copy=False)
-                    mapped_f[:, :, c] = (src * (1.0 - c_strength)) + (target * c_strength)
+                    if c == 0 and shadow_luma_protect > 0.0 and c_strength > 0.0:
+                        # Keep the final texture source responsible for shadow
+                        # micro-detail. The yuv420/full WIC reference may have
+                        # the preferred global response, but its shadow luma
+                        # distribution is also where flattening/crush comes from.
+                        # Fade the luma match down only in the lower tail;
+                        # midtones/highlights keep the configured strength.
+                        shadow_keep = np.clip((128.0 - src) / 112.0, 0.0, 1.0)
+                        shadow_keep = np.power(shadow_keep, 1.15).astype(np.float32, copy=False)
+                        eff_strength = float(c_strength) * (
+                            1.0 - (0.88 * float(shadow_luma_protect) * shadow_keep)
+                        )
+                        mapped_f[:, :, c] = (src * (1.0 - eff_strength)) + (target * eff_strength)
+                    else:
+                        mapped_f[:, :, c] = (src * (1.0 - c_strength)) + (target * c_strength)
                 mapped_ycc = np.clip(np.rint(mapped_f), 0, 255).astype(np.uint8)
                 if lowfreq > 0.0:
                     if same_size:
@@ -9977,6 +10009,8 @@ class Processor(QtCore.QObject):
         luts: list[np.ndarray],
         channel_strengths: tuple[float, float, float],
         diff_ref_bgr: np.ndarray,
+        *,
+        shadow_luma_protect: float = 0.0,
     ) -> Optional[tuple[np.ndarray, int]]:
         """Run the full-resolution color-match pixel stage on CUDA.
 
@@ -10023,6 +10057,7 @@ class Processor(QtCore.QObject):
                 ycc_f = ycc_u8.to(torch.float32)
 
                 mapped_f = torch.empty_like(ycc_f)
+                shadow_luma_protect_f = max(0.0, min(1.0, float(shadow_luma_protect)))
                 for c, c_strength in enumerate(channel_strengths):
                     lut_np = np.asarray(luts[c], dtype=np.uint8)
                     if lut_np.shape[0] != 256:
@@ -10030,7 +10065,14 @@ class Processor(QtCore.QObject):
                     lut = torch.from_numpy(np.ascontiguousarray(lut_np)).to(device=device, non_blocking=True)
                     target = lut[ycc_u8[:, :, c].to(torch.long)].to(torch.float32)
                     s = float(c_strength)
-                    mapped_f[:, :, c] = (ycc_f[:, :, c] * (1.0 - s)) + (target * s)
+                    if c == 0 and shadow_luma_protect_f > 0.0 and s > 0.0:
+                        src_y = ycc_f[:, :, 0]
+                        shadow_keep = torch.clamp((128.0 - src_y) / 112.0, 0.0, 1.0)
+                        shadow_keep = torch.pow(shadow_keep, 1.15)
+                        eff_strength = s * (1.0 - (0.88 * shadow_luma_protect_f * shadow_keep))
+                        mapped_f[:, :, c] = (src_y * (1.0 - eff_strength)) + (target * eff_strength)
+                    else:
+                        mapped_f[:, :, c] = (ycc_f[:, :, c] * (1.0 - s)) + (target * s)
 
                 mapped_u8 = torch.clamp(torch.round(mapped_f), 0, 255).to(torch.uint8)
                 mapped = mapped_u8.to(torch.float32)
@@ -13764,6 +13806,19 @@ class MainWindow(QtWidgets.QMainWindow):
             float(getattr(self.cfg, "hdr_wic_yuv444_color_match_chroma_strength", 0.85))
         )
         self.hdr_wic_yuv444_color_match_chroma_strength_spin.valueChanged.connect(self._on_ui_change)
+        self.hdr_wic_yuv444_color_match_shadow_luma_protect_spin = _mk_fspin(
+            0.0,
+            1.0,
+            0.05,
+            2,
+            "float: hdr_wic_yuv444_color_match_shadow_luma_protect "
+            "(PC_WIC_YUV444_COLOR_MATCH_SHADOW_LUMA_PROTECT). Higher values preserve more "
+            "clean yuv444 shadow luma/detail instead of copying the yuv420 WIC shadow distribution."
+        )
+        self.hdr_wic_yuv444_color_match_shadow_luma_protect_spin.setValue(
+            float(getattr(self.cfg, "hdr_wic_yuv444_color_match_shadow_luma_protect", 0.85))
+        )
+        self.hdr_wic_yuv444_color_match_shadow_luma_protect_spin.valueChanged.connect(self._on_ui_change)
         self.hdr_wic_yuv444_color_match_lowfreq_spin = _mk_fspin(
             0.0,
             1.0,
@@ -14520,6 +14575,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("WIC yuv444 match overall", self.hdr_wic_yuv444_color_match_strength_spin),
             ("WIC yuv444 match luma", self.hdr_wic_yuv444_color_match_luma_strength_spin),
             ("WIC yuv444 match chroma", self.hdr_wic_yuv444_color_match_chroma_strength_spin),
+            ("WIC yuv444 shadow detail", self.hdr_wic_yuv444_color_match_shadow_luma_protect_spin),
             ("WIC yuv444 match lowfreq", self.hdr_wic_yuv444_color_match_lowfreq_spin),
             ("WIC yuv444 ref max side", self.hdr_wic_yuv444_color_match_ref_max_side_spin),
             ("WIC yuv444 preroll sec", self.hdr_wic_yuv444_color_match_preroll_sec_spin),
@@ -15935,6 +15991,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "hdr_wic_yuv444_color_match_strength",
             "hdr_wic_yuv444_color_match_luma_strength",
             "hdr_wic_yuv444_color_match_chroma_strength",
+            "hdr_wic_yuv444_color_match_shadow_luma_protect",
             "hdr_wic_yuv444_color_match_lowfreq",
             "hdr_wic_yuv444_color_match_ref_max_side",
             "hdr_wic_yuv444_color_match_gpu_mode",
@@ -16235,6 +16292,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 if hasattr(self, "hdr_wic_yuv444_color_match_chroma_strength_spin")
                 else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_chroma_strength", 0.85))
             ),
+            hdr_wic_yuv444_color_match_shadow_luma_protect=(
+                float(self.hdr_wic_yuv444_color_match_shadow_luma_protect_spin.value())
+                if hasattr(self, "hdr_wic_yuv444_color_match_shadow_luma_protect_spin")
+                else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_shadow_luma_protect", 0.85))
+            ),
             hdr_wic_yuv444_color_match_lowfreq=(
                 float(self.hdr_wic_yuv444_color_match_lowfreq_spin.value())
                 if hasattr(self, "hdr_wic_yuv444_color_match_lowfreq_spin")
@@ -16374,6 +16436,11 @@ class MainWindow(QtWidgets.QMainWindow):
             float(self.hdr_wic_yuv444_color_match_chroma_strength_spin.value())
             if hasattr(self, "hdr_wic_yuv444_color_match_chroma_strength_spin")
             else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_chroma_strength", 0.85))
+        )
+        cfg.hdr_wic_yuv444_color_match_shadow_luma_protect = (
+            float(self.hdr_wic_yuv444_color_match_shadow_luma_protect_spin.value())
+            if hasattr(self, "hdr_wic_yuv444_color_match_shadow_luma_protect_spin")
+            else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_shadow_luma_protect", 0.85))
         )
         cfg.hdr_wic_yuv444_color_match_lowfreq = (
             float(self.hdr_wic_yuv444_color_match_lowfreq_spin.value())
@@ -16526,6 +16593,12 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         except Exception:
             self.cfg.hdr_wic_yuv444_color_match_chroma_strength = 0.85
+        try:
+            self.cfg.hdr_wic_yuv444_color_match_shadow_luma_protect = min(
+                1.0, max(0.0, float(getattr(cfg, "hdr_wic_yuv444_color_match_shadow_luma_protect", 0.85)))
+            )
+        except Exception:
+            self.cfg.hdr_wic_yuv444_color_match_shadow_luma_protect = 0.85
         try:
             self.cfg.hdr_wic_yuv444_color_match_lowfreq = min(
                 1.0, max(0.0, float(getattr(cfg, "hdr_wic_yuv444_color_match_lowfreq", 0.0)))
@@ -16685,6 +16758,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.hdr_wic_yuv444_color_match_luma_strength_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_luma_strength)
         if hasattr(self, "hdr_wic_yuv444_color_match_chroma_strength_spin"):
             self.hdr_wic_yuv444_color_match_chroma_strength_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_chroma_strength)
+        if hasattr(self, "hdr_wic_yuv444_color_match_shadow_luma_protect_spin"):
+            self.hdr_wic_yuv444_color_match_shadow_luma_protect_spin.setValue(
+                self.cfg.hdr_wic_yuv444_color_match_shadow_luma_protect
+            )
         if hasattr(self, "hdr_wic_yuv444_color_match_lowfreq_spin"):
             self.hdr_wic_yuv444_color_match_lowfreq_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_lowfreq)
         if hasattr(self, "hdr_wic_yuv444_color_match_ref_max_side_spin"):
@@ -17936,6 +18013,21 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             self.cfg.hdr_wic_yuv444_color_match_chroma_strength = 0.85
         try:
+            self.cfg.hdr_wic_yuv444_color_match_shadow_luma_protect = min(
+                1.0,
+                max(
+                    0.0,
+                    float(
+                        s.value(
+                            "hdr_wic_yuv444_color_match_shadow_luma_protect",
+                            getattr(self.cfg, "hdr_wic_yuv444_color_match_shadow_luma_protect", 0.85),
+                        )
+                    ),
+                ),
+            )
+        except Exception:
+            self.cfg.hdr_wic_yuv444_color_match_shadow_luma_protect = 0.85
+        try:
             self.cfg.hdr_wic_yuv444_color_match_lowfreq = min(
                 1.0,
                 max(
@@ -17977,6 +18069,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.hdr_wic_yuv444_color_match_luma_strength_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_luma_strength)
         if hasattr(self, "hdr_wic_yuv444_color_match_chroma_strength_spin"):
             self.hdr_wic_yuv444_color_match_chroma_strength_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_chroma_strength)
+        if hasattr(self, "hdr_wic_yuv444_color_match_shadow_luma_protect_spin"):
+            self.hdr_wic_yuv444_color_match_shadow_luma_protect_spin.setValue(
+                self.cfg.hdr_wic_yuv444_color_match_shadow_luma_protect
+            )
         if hasattr(self, "hdr_wic_yuv444_color_match_lowfreq_spin"):
             self.hdr_wic_yuv444_color_match_lowfreq_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_lowfreq)
         if hasattr(self, "hdr_wic_yuv444_color_match_ref_max_side_spin"):
