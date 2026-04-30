@@ -358,6 +358,9 @@ class SessionConfig:
     # yuv420 display pixels as final shadow texture while preserving its color
     # response.
     hdr_wic_yuv444_color_match: bool = True
+    # Clean full-resolution yuv444 candidate range used by the color-match path.
+    # limited keeps current behavior; full enables direct A/B of WIC full-range.
+    hdr_wic_yuv444_color_match_clean_range: str = "limited"  # limited | full
     # Overall blend for the yuv444 color-match renderer.  Keep this separate
     # from the per-channel strengths below: luma is what crushed/darkened shadow
     # detail at high values, while chroma can usually be matched harder to regain
@@ -5247,6 +5250,7 @@ class Processor(QtCore.QObject):
                             "wic_shadow_deblob_strength",
                             "hdr_wic_experimental_primary",
                             "hdr_wic_yuv444_color_match",
+                            "hdr_wic_yuv444_color_match_clean_range",
                             "hdr_wic_yuv444_color_match_strength",
                             "hdr_wic_yuv444_color_match_luma_strength",
                             "hdr_wic_yuv444_color_match_chroma_strength",
@@ -9082,6 +9086,28 @@ class Processor(QtCore.QObject):
         return self._normalize_wic_yuv444_color_match_ref_max_side(raw, default=default_ref)
 
     @staticmethod
+    def _normalize_wic_yuv444_color_match_clean_range(value: object, default: str = "limited") -> str:
+        fallback = str(default if default is not None else "limited").strip().lower()
+        if fallback in {"full", "pc", "jpeg"}:
+            fallback = "full"
+        else:
+            fallback = "limited"
+        raw = str(value if value is not None else fallback).strip().lower()
+        if raw in {"full", "pc", "jpeg"}:
+            return "full"
+        if raw in {"limited", "tv", "mpeg"}:
+            return "limited"
+        return fallback
+
+    def _wic_yuv444_color_match_clean_range(self) -> str:
+        default_range = self._normalize_wic_yuv444_color_match_clean_range(
+            getattr(self.cfg, "hdr_wic_yuv444_color_match_clean_range", "limited"),
+            default="limited",
+        )
+        raw = os.getenv("PC_WIC_YUV444_COLOR_MATCH_CLEAN_RANGE", default_range)
+        return self._normalize_wic_yuv444_color_match_clean_range(raw, default=default_range)
+
+    @staticmethod
     def _scaled_even_dims_for_max_side(w: int, h: int, max_side: int) -> tuple[int, int]:
         w = max(2, int(w))
         h = max(2, int(h))
@@ -9314,6 +9340,7 @@ class Processor(QtCore.QObject):
         src_range = self._hdr_source_range()
         src_range_known = src_range in {"limited", "full"}
         src_range_setparams = src_range if src_range_known else "limited"
+        clean_range = self._wic_yuv444_color_match_clean_range()
         seek_sec: Optional[float] = None
         try:
             if frame_pts_sec is not None and math.isfinite(float(frame_pts_sec)):
@@ -9342,11 +9369,13 @@ class Processor(QtCore.QObject):
             "setparams=color_trc=smpte2084:color_primaries=bt2020:colorspace=bt2020nc:range=full",
         ])
         clean_filters: list[str] = []
-        if src_range == "full":
+        if clean_range == "limited" and src_range == "full":
             clean_filters.append("zscale=rangein=full:range=limited")
+        elif clean_range == "full" and src_range == "limited":
+            clean_filters.append("zscale=rangein=limited:range=full")
         clean_filters.extend([
             "format=yuv444p10le",
-            "setparams=color_trc=smpte2084:color_primaries=bt2020:colorspace=bt2020nc:range=limited",
+            f"setparams=color_trc=smpte2084:color_primaries=bt2020:colorspace=bt2020nc:range={clean_range}",
         ])
         filter_complex = (
             f"[0:v]{common};"
@@ -9413,7 +9442,7 @@ class Processor(QtCore.QObject):
             cmd.append(path)
 
         _append_avif_output("[refout]", "yuv420p10le", "2", ref_tmp)
-        _append_avif_output("[cleanout]", "yuv444p10le", "1", clean_tmp)
+        _append_avif_output("[cleanout]", "yuv444p10le", "2" if clean_range == "full" else "1", clean_tmp)
 
         timeout_sec = max(5, int(getattr(self.cfg, "hdr_archive_timeout_sec", getattr(self.cfg, "hdr_export_timeout_sec", 90)) or 90))
         try:
@@ -9485,6 +9514,7 @@ class Processor(QtCore.QObject):
             d_clean_wic = 0.0
             hdr_mode = "separate"
             wic_mode = "png"
+            clean_range = self._wic_yuv444_color_match_clean_range()
 
             pair_hdr_disabled = self._truthy_env("PC_DISABLE_WIC_YUV444_COLOR_MATCH_PAIR_HDR")
             ok_pair_hdr = False
@@ -9541,7 +9571,7 @@ class Processor(QtCore.QObject):
                     crop_xyxy,
                     clean_hdr,
                     pix_fmt="yuv444p10le",
-                    avif_range="limited",
+                    avif_range=clean_range,
                     avif_cpu_used=8,
                 )
                 if not ok_clean_hdr:
@@ -9748,7 +9778,7 @@ class Processor(QtCore.QObject):
                 crop_xyxy,
                 guide_hdr,
                 pix_fmt="yuv444p10le",
-                avif_range="limited",
+                avif_range=self._wic_yuv444_color_match_clean_range(),
             )
             if not ok_hdr:
                 self._status(
@@ -9989,7 +10019,7 @@ class Processor(QtCore.QObject):
                 crop_xyxy,
                 guide_hdr,
                 pix_fmt="yuv444p10le",
-                avif_range="limited",
+                avif_range=self._wic_yuv444_color_match_clean_range(),
             )
             if not ok_hdr:
                 self._status(
@@ -11394,6 +11424,7 @@ try {{
                 self._status(
                     "HDR WIC yuv444 color-match path active: "
                     f"fast_ref_max_side={self._wic_yuv444_color_match_ref_max_side()} "
+                    f"clean_range={self._wic_yuv444_color_match_clean_range()} "
                     f"gpu_mode={self._wic_yuv444_color_match_gpu_mode()} "
                     f"gpu_auto_min_pixels={self._wic_yuv444_color_match_gpu_auto_min_pixels()} "
                     f"out={Path(out_path).name}",
@@ -12306,11 +12337,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hdr_wic_yuv444_color_match_check = QtWidgets.QCheckBox()
         self.hdr_wic_yuv444_color_match_check.setChecked(bool(getattr(self.cfg, "hdr_wic_yuv444_color_match", True)))
         self.hdr_wic_yuv444_color_match_check.setToolTip(
-            "bool: hdr_wic_yuv444_color_match. Render limited-yuv444 through WIC, then histogram/color-match "
+            "bool: hdr_wic_yuv444_color_match. Render configurable yuv444 through WIC, then histogram/color-match "
             "it to the yuv420/full WIC PNG. This uses clean yuv444 pixels as final texture while preserving the "
             "accepted WIC/Paint color response. Kill switch: PC_DISABLE_WIC_YUV444_COLOR_MATCH."
         )
         self.hdr_wic_yuv444_color_match_check.stateChanged.connect(self._on_ui_change)
+        self.hdr_wic_yuv444_color_match_clean_range_combo = QtWidgets.QComboBox()
+        self.hdr_wic_yuv444_color_match_clean_range_combo.addItem("Limited range", "limited")
+        self.hdr_wic_yuv444_color_match_clean_range_combo.addItem("Full range", "full")
+        _clean_range = self._normalize_wic_color_match_clean_range_value(
+            getattr(self.cfg, "hdr_wic_yuv444_color_match_clean_range", "limited"),
+            default="limited",
+        )
+        _clean_range_idx = self.hdr_wic_yuv444_color_match_clean_range_combo.findData(_clean_range)
+        self.hdr_wic_yuv444_color_match_clean_range_combo.setCurrentIndex(
+            _clean_range_idx if _clean_range_idx >= 0 else 0
+        )
+        self.hdr_wic_yuv444_color_match_clean_range_combo.setToolTip(
+            "str: hdr_wic_yuv444_color_match_clean_range "
+            "(PC_WIC_YUV444_COLOR_MATCH_CLEAN_RANGE). Controls the clean full-resolution "
+            "yuv444 intermediate range used by WIC color-match and guide-cleanup paths."
+        )
+        self.hdr_wic_yuv444_color_match_clean_range_combo.currentIndexChanged.connect(self._on_ui_change)
         self.hdr_wic_yuv444_color_match_strength_spin = _mk_fspin(
             0.0,
             1.0,
@@ -13057,6 +13105,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("WIC intermediate AVIF range", self.hdr_wic_avif_range_combo),
             ("WIC experimental primary override", self.hdr_wic_experimental_primary_check),
             ("WIC yuv444 color match", self.hdr_wic_yuv444_color_match_check),
+            ("WIC yuv444 clean range", self.hdr_wic_yuv444_color_match_clean_range_combo),
             ("WIC yuv444 match overall", self.hdr_wic_yuv444_color_match_strength_spin),
             ("WIC yuv444 match luma", self.hdr_wic_yuv444_color_match_luma_strength_spin),
             ("WIC yuv444 match chroma", self.hdr_wic_yuv444_color_match_chroma_strength_spin),
@@ -14282,6 +14331,10 @@ class MainWindow(QtWidgets.QMainWindow):
         return Processor._normalize_wic_yuv444_color_match_ref_max_side(value, default=default)
 
     @staticmethod
+    def _normalize_wic_color_match_clean_range_value(value: object, default: str = "limited") -> str:
+        return Processor._normalize_wic_yuv444_color_match_clean_range(value, default=default)
+
+    @staticmethod
     def _normalize_wic_color_match_gpu_mode_value(value: object, default: str = "auto") -> str:
         return Processor._normalize_wic_yuv444_color_match_gpu_mode(value, default=default)
 
@@ -14706,6 +14759,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 if hasattr(self, "hdr_wic_yuv444_color_match_check")
                 else bool(getattr(self.cfg, "hdr_wic_yuv444_color_match", True))
             ),
+            hdr_wic_yuv444_color_match_clean_range=(
+                self._normalize_wic_color_match_clean_range_value(
+                    self.hdr_wic_yuv444_color_match_clean_range_combo.currentData() or "limited"
+                )
+                if hasattr(self, "hdr_wic_yuv444_color_match_clean_range_combo")
+                else self._normalize_wic_color_match_clean_range_value(
+                    getattr(self.cfg, "hdr_wic_yuv444_color_match_clean_range", "limited")
+                )
+            ),
             hdr_wic_yuv444_color_match_strength=(
                 float(self.hdr_wic_yuv444_color_match_strength_spin.value())
                 if hasattr(self, "hdr_wic_yuv444_color_match_strength_spin")
@@ -14827,6 +14889,15 @@ class MainWindow(QtWidgets.QMainWindow):
             bool(self.hdr_wic_yuv444_color_match_check.isChecked())
             if hasattr(self, "hdr_wic_yuv444_color_match_check")
             else bool(getattr(self.cfg, "hdr_wic_yuv444_color_match", True))
+        )
+        cfg.hdr_wic_yuv444_color_match_clean_range = (
+            self._normalize_wic_color_match_clean_range_value(
+                self.hdr_wic_yuv444_color_match_clean_range_combo.currentData() or "limited"
+            )
+            if hasattr(self, "hdr_wic_yuv444_color_match_clean_range_combo")
+            else self._normalize_wic_color_match_clean_range_value(
+                getattr(self.cfg, "hdr_wic_yuv444_color_match_clean_range", "limited")
+            )
         )
         cfg.hdr_wic_yuv444_color_match_strength = (
             float(self.hdr_wic_yuv444_color_match_strength_spin.value())
@@ -14961,6 +15032,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.hdr_wic_avif_range = "full"
         self.cfg.hdr_wic_experimental_primary = bool(getattr(cfg, "hdr_wic_experimental_primary", False))
         self.cfg.hdr_wic_yuv444_color_match = bool(getattr(cfg, "hdr_wic_yuv444_color_match", True))
+        self.cfg.hdr_wic_yuv444_color_match_clean_range = self._normalize_wic_color_match_clean_range_value(
+            getattr(cfg, "hdr_wic_yuv444_color_match_clean_range", "limited")
+        )
         try:
             self.cfg.hdr_wic_yuv444_color_match_strength = min(
                 1.0, max(0.0, float(getattr(cfg, "hdr_wic_yuv444_color_match_strength", 1.0)))
@@ -15089,6 +15163,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.hdr_wic_yuv444_color_match_strength = 1.0
         if hasattr(self, "hdr_wic_yuv444_color_match_check"):
             self.hdr_wic_yuv444_color_match_check.setChecked(self.cfg.hdr_wic_yuv444_color_match)
+        if hasattr(self, "hdr_wic_yuv444_color_match_clean_range_combo"):
+            idx = self.hdr_wic_yuv444_color_match_clean_range_combo.findData(
+                self._normalize_wic_color_match_clean_range_value(
+                    self.cfg.hdr_wic_yuv444_color_match_clean_range
+                )
+            )
+            self.hdr_wic_yuv444_color_match_clean_range_combo.setCurrentIndex(idx if idx >= 0 else 0)
         if hasattr(self, "hdr_wic_yuv444_color_match_strength_spin"):
             self.hdr_wic_yuv444_color_match_strength_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_strength)
         if hasattr(self, "hdr_wic_yuv444_color_match_luma_strength_spin"):
@@ -16252,6 +16333,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 type=bool,
             )
         )
+        self.cfg.hdr_wic_yuv444_color_match_clean_range = self._normalize_wic_color_match_clean_range_value(
+            s.value(
+                "hdr_wic_yuv444_color_match_clean_range",
+                getattr(self.cfg, "hdr_wic_yuv444_color_match_clean_range", "limited"),
+            )
+        )
         try:
             self.cfg.hdr_wic_yuv444_color_match_strength = min(
                 1.0,
@@ -16269,6 +16356,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.hdr_wic_yuv444_color_match_strength = 1.0
         if hasattr(self, "hdr_wic_yuv444_color_match_check"):
             self.hdr_wic_yuv444_color_match_check.setChecked(self.cfg.hdr_wic_yuv444_color_match)
+        if hasattr(self, "hdr_wic_yuv444_color_match_clean_range_combo"):
+            idx = self.hdr_wic_yuv444_color_match_clean_range_combo.findData(
+                self._normalize_wic_color_match_clean_range_value(
+                    self.cfg.hdr_wic_yuv444_color_match_clean_range
+                )
+            )
+            self.hdr_wic_yuv444_color_match_clean_range_combo.setCurrentIndex(idx if idx >= 0 else 0)
         if hasattr(self, "hdr_wic_yuv444_color_match_strength_spin"):
             self.hdr_wic_yuv444_color_match_strength_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_strength)
         try:
