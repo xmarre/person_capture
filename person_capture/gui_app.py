@@ -9278,9 +9278,20 @@ class Processor(QtCore.QObject):
         ffmpeg_bin = self._resolve_ffmpeg_bin()
         if not ffmpeg_bin:
             return False, "ffmpeg_unavailable"
-        x1, y1, x2, y2 = crop_xyxy
-        w = max(1, int(x2 - x1))
-        h = max(1, int(y2 - y1))
+        x1, y1, x2, y2 = [int(v) for v in crop_xyxy]
+        w = int(x2 - x1)
+        h = int(y2 - y1)
+        if w < 2 or h < 2:
+            return False, "invalid_crop"
+        # The paired path feeds a yuv420 reference branch, so the shared pre-split
+        # crop must itself be 4:2:0 legal (even origin and even extent).
+        if (x1 & 1) or (y1 & 1) or (w & 1) or (h & 1):
+            x1 &= ~1
+            y1 &= ~1
+            w &= ~1
+            h &= ~1
+            if w < 2 or h < 2:
+                return False, "invalid_crop_even"
         try:
             rw = max(2, int(ref_scale_to[0]))
             rh = max(2, int(ref_scale_to[1]))
