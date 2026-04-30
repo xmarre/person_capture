@@ -9212,9 +9212,11 @@ class Processor(QtCore.QObject):
                     255,
                 ).to(torch.uint8)
 
-                changed_t = torch.count_nonzero(
-                    torch.amax(torch.abs(out_bgr_u8.to(torch.int16) - ref_gpu.to(torch.int16)), dim=2) > 0
+                diff = torch.amax(
+                    torch.abs(out_bgr_u8.to(torch.int16) - ref_gpu.to(torch.int16)),
+                    dim=2,
                 )
+                changed_t = torch.count_nonzero(diff > 1)
                 changed = int(changed_t.item())
                 out_bgr = out_bgr_u8.cpu().numpy()
             return out_bgr, changed
