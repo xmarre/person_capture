@@ -6490,14 +6490,43 @@ class Processor(QtCore.QObject):
                                 force_portrait = was_landscape and (crop_profile_for_guard != "body" or prominent_face)
                                 room_below_hard_face = max(0.0, float(repair_by2) - float(hfy2))
                                 side_room_hard_face = min(float(hfx1 - repair_bx1), float(repair_bx2 - hfx2))
+                                portrait_ratios_available = True
+                                explicit_ratio_list: list[str] = []
+                                for rs in [str(r).strip() for r in (ratio_list or []) if str(r).strip()]:
+                                    try:
+                                        parse_ratio(rs)
+                                    except Exception:
+                                        continue
+                                    if rs not in explicit_ratio_list:
+                                        explicit_ratio_list.append(rs)
+                                if explicit_ratio_list:
+                                    portrait_ratios_available = any(rs in {"2:3", "3:4"} for rs in explicit_ratio_list)
+                                portrait_close_eligible_repair = (
+                                    0.14 <= frame_face_h_frac <= 0.56
+                                    and room_below_hard_face >= 0.35 * hfh
+                                )
+                                square_rescue_allowed_repair = True
+                                if (
+                                    ratio_str == "1:1"
+                                    and crop_profile_for_guard in {"close", "upper"}
+                                    and portrait_close_eligible_repair
+                                ):
+                                    if explicit_ratio_list and not portrait_ratios_available:
+                                        square_rescue_allowed_repair = True
+                                    else:
+                                        edge_constrained = side_room_hard_face < 0.24 * hfw
+                                        lower_context_weak = room_below_hard_face < 0.50 * hfh
+                                        very_tight_face = frame_face_h_frac >= 0.50
+                                        square_rescue_allowed_repair = bool(
+                                            edge_constrained or lower_context_weak or very_tight_face
+                                        )
                                 portrait_square_repair = (
                                     crop_profile_for_guard == "portrait_close"
                                     or (
                                         ratio_str == "1:1"
                                         and crop_profile_for_guard in {"close", "upper"}
-                                        and 0.14 <= frame_face_h_frac <= 0.56
-                                        and room_below_hard_face >= 0.50 * hfh
-                                        and side_room_hard_face >= 0.24 * hfw
+                                        and portrait_close_eligible_repair
+                                        and (not square_rescue_allowed_repair)
                                     )
                                 )
                                 if hard_def > 0.01 or force_portrait:
