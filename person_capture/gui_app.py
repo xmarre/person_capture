@@ -8871,8 +8871,16 @@ class Processor(QtCore.QObject):
                 diff_ref_bgr = clean_bgr
 
             base_ycc = cv2.cvtColor(base_bgr, cv2.COLOR_BGR2YCrCb)
-            clean_ycc = cv2.cvtColor(clean_bgr, cv2.COLOR_BGR2YCrCb)
-            clean_fit_ycc = clean_ycc if same_size else cv2.cvtColor(clean_fit_bgr, cv2.COLOR_BGR2YCrCb)
+            # Keep the full-resolution clean conversion out of the CPU path when
+            # CUDA is going to do the remap.  The reduced/reference-size fit image
+            # is still converted on CPU because percentile fitting is CPU-side and
+            # normally runs on the small fast-reference image.
+            clean_ycc: Optional[np.ndarray] = None
+            if same_size:
+                clean_ycc = cv2.cvtColor(clean_bgr, cv2.COLOR_BGR2YCrCb)
+                clean_fit_ycc = clean_ycc
+            else:
+                clean_fit_ycc = cv2.cvtColor(clean_fit_bgr, cv2.COLOR_BGR2YCrCb)
 
             by = base_ycc[:, :, 0]
             cy = clean_fit_ycc[:, :, 0]
@@ -8946,63 +8954,68 @@ class Processor(QtCore.QObject):
             except Exception:
                 lowfreq = 0.0
 
-            mapped_ycc = None
+            gpu_result = None
             if self._wic_yuv444_color_match_gpu_allowed(clean_w * clean_h, lowfreq=lowfreq):
-                mapped_ycc = self._apply_yuv444_color_match_luts_torch(
-                    clean_ycc,
+                gpu_result = self._apply_yuv444_color_match_torch(
+                    clean_bgr,
                     luts,
                     channel_strengths,
+                    diff_ref_bgr,
                 )
 
-            if mapped_ycc is None:
+            if gpu_result is not None:
+                out_bgr, changed = gpu_result
+            else:
+                if clean_ycc is None:
+                    clean_ycc = cv2.cvtColor(clean_bgr, cv2.COLOR_BGR2YCrCb)
                 mapped_f = clean_ycc.astype(np.float32, copy=False).copy()
                 for c, c_strength in enumerate(channel_strengths):
                     target = cv2.LUT(clean_ycc[:, :, c], luts[c]).astype(np.float32, copy=False)
                     src = clean_ycc[:, :, c].astype(np.float32, copy=False)
                     mapped_f[:, :, c] = (src * (1.0 - c_strength)) + (target * c_strength)
                 mapped_ycc = np.clip(np.rint(mapped_f), 0, 255).astype(np.uint8)
-            if lowfreq > 0.0:
-                if same_size:
-                    safe = fit_mask.astype(np.float32, copy=False)
-                    base_f = base_ycc.astype(np.float32, copy=False)
-                else:
-                    fit_mask_u8 = fit_mask.astype(np.uint8) * 255
-                    safe = (
-                        cv2.resize(
-                            fit_mask_u8,
+                if lowfreq > 0.0:
+                    if same_size:
+                        safe = fit_mask.astype(np.float32, copy=False)
+                        base_f = base_ycc.astype(np.float32, copy=False)
+                    else:
+                        fit_mask_u8 = fit_mask.astype(np.uint8) * 255
+                        safe = (
+                            cv2.resize(
+                                fit_mask_u8,
+                                (clean_w, clean_h),
+                                interpolation=cv2.INTER_NEAREST,
+                            ) > 0
+                        ).astype(np.float32, copy=False)
+                        base_f = cv2.resize(
+                            base_ycc,
                             (clean_w, clean_h),
-                            interpolation=cv2.INTER_NEAREST,
-                        ) > 0
-                    ).astype(np.float32, copy=False)
-                    base_f = cv2.resize(
-                        base_ycc,
-                        (clean_w, clean_h),
-                        interpolation=cv2.INTER_CUBIC,
-                    ).astype(np.float32, copy=False)
-                # Strong blur: intentional.  Smaller kernels reintroduce the blocky
-                # shadow texture this path is meant to avoid.
-                denom = cv2.GaussianBlur(safe, (0, 0), 48.0)
-                denom = np.maximum(denom, 1.0e-4)
-                mapped_f = mapped_ycc.astype(np.float32, copy=False)
-                # Apply the low-frequency residual to chroma only.  Luma residual is
-                # what made strong color-match settings crush/flatten dark detail.
-                for c in (1, 2):
-                    residual = (base_f[:, :, c] - mapped_f[:, :, c]) * safe
-                    residual_lp = cv2.GaussianBlur(residual, (0, 0), 48.0) / denom
-                    mapped_f[:, :, c] = np.clip(mapped_f[:, :, c] + residual_lp * float(lowfreq), 0.0, 255.0)
-                mapped_ycc = np.clip(np.rint(mapped_f), 0, 255).astype(np.uint8)
+                            interpolation=cv2.INTER_CUBIC,
+                        ).astype(np.float32, copy=False)
+                    # Strong blur: intentional.  Smaller kernels reintroduce the blocky
+                    # shadow texture this path is meant to avoid.
+                    denom = cv2.GaussianBlur(safe, (0, 0), 48.0)
+                    denom = np.maximum(denom, 1.0e-4)
+                    mapped_f = mapped_ycc.astype(np.float32, copy=False)
+                    # Apply the low-frequency residual to chroma only.  Luma residual is
+                    # what made strong color-match settings crush/flatten dark detail.
+                    for c in (1, 2):
+                        residual = (base_f[:, :, c] - mapped_f[:, :, c]) * safe
+                        residual_lp = cv2.GaussianBlur(residual, (0, 0), 48.0) / denom
+                        mapped_f[:, :, c] = np.clip(mapped_f[:, :, c] + residual_lp * float(lowfreq), 0.0, 255.0)
+                    mapped_ycc = np.clip(np.rint(mapped_f), 0, 255).astype(np.uint8)
 
-            out_bgr = cv2.cvtColor(mapped_ycc, cv2.COLOR_YCrCb2BGR)
+                out_bgr = cv2.cvtColor(mapped_ycc, cv2.COLOR_YCrCb2BGR)
+                diff = np.max(
+                    np.abs(
+                        out_bgr.astype(np.int16, copy=False)
+                        - diff_ref_bgr.astype(np.int16, copy=False)
+                    ),
+                    axis=2,
+                )
+                changed = int(np.count_nonzero(diff > 0))
 
             out[:, :, :3] = out_bgr
-            diff = np.max(
-                np.abs(
-                    out[:, :, :3].astype(np.int16, copy=False)
-                    - diff_ref_bgr.astype(np.int16, copy=False)
-                ),
-                axis=2,
-            )
-            changed = int(np.count_nonzero(diff > 0))
             if changed <= 0:
                 return 0, ""
             tmp_out = base_path + ".tmp_yuv444_color_match.png"
@@ -9106,9 +9119,10 @@ class Processor(QtCore.QObject):
     def _wic_yuv444_color_match_gpu_allowed(self, pixels: int, *, lowfreq: float) -> bool:
         """Return true when the LUT/blend stage should use Torch CUDA.
 
-        This accelerates only the full-resolution per-pixel LUT/blend operation.
-        It does not accelerate WIC, AVIF encoding, PNG decode/encode, percentile
-        fitting, or the final OpenCV YCrCb->BGR conversion.
+        This accelerates the full-resolution per-pixel color conversion, LUT/blend,
+        inverse color conversion, and change count.  It does not accelerate WIC,
+        AVIF encoding, PNG decode/encode, percentile fitting, or optional lowfreq
+        residual blur.
         """
         mode = self._wic_yuv444_color_match_gpu_mode()
         if mode == "off":
@@ -9122,55 +9136,90 @@ class Processor(QtCore.QObject):
                 return False
         return True
 
-    def _apply_yuv444_color_match_luts_torch(
+    def _apply_yuv444_color_match_torch(
         self,
-        clean_ycc: np.ndarray,
+        clean_bgr: np.ndarray,
         luts: list[np.ndarray],
         channel_strengths: tuple[float, float, float],
-    ) -> Optional[np.ndarray]:
-        """Apply 8-bit Y/Cr/Cb LUTs plus channel blend on CUDA.
+        diff_ref_bgr: np.ndarray,
+    ) -> Optional[tuple[np.ndarray, int]]:
+        """Run the full-resolution color-match pixel stage on CUDA.
 
-        Returns a uint8 YCrCb image on success, or None to use the CPU path.
+        Returns (uint8 BGR image, changed-pixel count) on success, or None to use
+        the CPU path.  The fitted LUTs intentionally stay CPU-side because the
+        fast-reference image is small and numpy percentile is stable there.
         """
         try:
-            if clean_ycc is None or clean_ycc.ndim != 3 or clean_ycc.shape[2] < 3:
+            if clean_bgr is None or clean_bgr.ndim != 3 or clean_bgr.shape[2] < 3:
+                return None
+            if diff_ref_bgr is None or diff_ref_bgr.ndim != 3 or diff_ref_bgr.shape[2] < 3:
+                return None
+            if clean_bgr.shape[:2] != diff_ref_bgr.shape[:2]:
                 return None
             if len(luts) != 3:
                 return None
+
             import torch
 
             if not torch.cuda.is_available():
                 return None
-            if clean_ycc.dtype != np.uint8:
-                clean_ycc_u8 = np.clip(np.rint(clean_ycc), 0, 255).astype(np.uint8)
-            else:
-                clean_ycc_u8 = np.ascontiguousarray(clean_ycc[:, :, :3])
 
+            clean_u8 = np.ascontiguousarray(clean_bgr[:, :, :3], dtype=np.uint8)
+            ref_u8 = np.ascontiguousarray(diff_ref_bgr[:, :, :3], dtype=np.uint8)
             device = torch.device("cuda")
-            src_u8 = torch.from_numpy(clean_ycc_u8).to(device=device, non_blocking=True)
-            src_f = src_u8.to(torch.float32)
-            out_f = torch.empty_like(src_f)
-            strengths = torch.tensor(
-                [
-                    float(channel_strengths[0]),
-                    float(channel_strengths[1]),
-                    float(channel_strengths[2]),
-                ],
-                dtype=torch.float32,
-                device=device,
-            )
-            for c in range(3):
-                lut_np = np.asarray(luts[c], dtype=np.uint8)
-                if lut_np.shape[0] != 256:
-                    return None
-                lut = torch.from_numpy(lut_np).to(device=device, non_blocking=True).to(torch.float32)
-                target = lut[src_u8[:, :, c].long()]
-                s = strengths[c]
-                out_f[:, :, c] = (src_f[:, :, c] * (1.0 - s)) + (target * s)
 
-            out_u8 = torch.clamp(torch.round(out_f), 0, 255).to(torch.uint8)
-            torch.cuda.synchronize()
-            return out_u8.cpu().numpy()
+            with torch.inference_mode():
+                src_u8 = torch.from_numpy(clean_u8).to(device=device, non_blocking=True)
+                ref_gpu = torch.from_numpy(ref_u8).to(device=device, non_blocking=True)
+                src = src_u8.to(torch.float32)
+
+                b = src[:, :, 0]
+                g = src[:, :, 1]
+                r = src[:, :, 2]
+
+                # OpenCV's uint8 BGR<->YCrCb uses JPEG YCrCb.  This float CUDA
+                # implementation follows the same display-referred transform;
+                # small +/-1 LSB differences versus OpenCV's integer kernels are
+                # acceptable and avoid the previous full-resolution CPU cvtColor.
+                y = (0.114 * b) + (0.587 * g) + (0.299 * r)
+                cr = ((r - y) * 0.713) + 128.0
+                cb = ((b - y) * 0.564) + 128.0
+                ycc_u8 = torch.clamp(torch.round(torch.stack((y, cr, cb), dim=2)), 0, 255).to(torch.uint8)
+                ycc_f = ycc_u8.to(torch.float32)
+
+                mapped_f = torch.empty_like(ycc_f)
+                for c, c_strength in enumerate(channel_strengths):
+                    lut_np = np.asarray(luts[c], dtype=np.uint8)
+                    if lut_np.shape[0] != 256:
+                        return None
+                    lut = torch.from_numpy(np.ascontiguousarray(lut_np)).to(device=device, non_blocking=True)
+                    target = lut[ycc_u8[:, :, c].to(torch.long)].to(torch.float32)
+                    s = float(c_strength)
+                    mapped_f[:, :, c] = (ycc_f[:, :, c] * (1.0 - s)) + (target * s)
+
+                mapped_u8 = torch.clamp(torch.round(mapped_f), 0, 255).to(torch.uint8)
+                mapped = mapped_u8.to(torch.float32)
+                out_y = mapped[:, :, 0]
+                out_cr = mapped[:, :, 1] - 128.0
+                out_cb = mapped[:, :, 2] - 128.0
+
+                out_r = out_y + (1.403 * out_cr)
+                out_g = out_y - (0.714 * out_cr) - (0.344 * out_cb)
+                out_b = out_y + (1.773 * out_cb)
+                out_bgr_u8 = torch.clamp(
+                    torch.round(torch.stack((out_b, out_g, out_r), dim=2)),
+                    0,
+                    255,
+                ).to(torch.uint8)
+
+                diff = torch.amax(
+                    torch.abs(out_bgr_u8.to(torch.int16) - ref_gpu.to(torch.int16)),
+                    dim=2,
+                )
+                changed_t = torch.count_nonzero(diff > 1)
+                changed = int(changed_t.item())
+                out_bgr = out_bgr_u8.cpu().numpy()
+            return out_bgr, changed
         except Exception as exc:
             try:
                 self._status(
@@ -11855,7 +11904,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hdr_wic_yuv444_color_match_gpu_mode_combo.setCurrentIndex(_gpu_mode_idx if _gpu_mode_idx >= 0 else 0)
         self.hdr_wic_yuv444_color_match_gpu_mode_combo.setToolTip(
             "str: hdr_wic_yuv444_color_match_gpu_mode (PC_WIC_YUV444_COLOR_MATCH_GPU). "
-            "Controls only the full-resolution LUT/blend remap stage. WIC/AVIF decode/render stays CPU-bound."
+            "Controls the full-resolution color conversion, LUT/blend remap, inverse conversion, and diff count. "
+            "WIC/AVIF/PNG I/O and percentile fitting stay CPU-bound."
         )
         self.hdr_wic_yuv444_color_match_gpu_mode_combo.currentIndexChanged.connect(self._on_ui_change)
         self.hdr_wic_yuv444_color_match_gpu_auto_min_pixels_spin = QtWidgets.QSpinBox()
