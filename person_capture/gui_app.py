@@ -2366,13 +2366,6 @@ class Processor(QtCore.QObject):
                     aspect = float(rw) / max(1e-6, float(rh))
                 except Exception:
                     return
-                if portrait_close_eligible and profile == "close" and rs == "1:1":
-                    # Medium-close portrait-eligible shots are exactly the case
-                    # where square close crops keep winning over portrait_close.
-                    # Treat this as an invariant, not a score preference; otherwise
-                    # close/1:1 can bypass the portrait_close hard gate entirely and
-                    # still log as profile=close ratio=1:1.
-                    return
                 if aspect > 1.05 and not allow_landscape:
                     return
                 if rs not in out:
@@ -2407,6 +2400,7 @@ class Processor(QtCore.QObject):
         profiles: list[tuple[str, Tuple[float, float, float, float], float, Tuple[float, float], Tuple[float, float]]] = []
         face_h = 0.0
         face_frame_frac = 0.0
+        room_below_face = 0.0
         portrait_close_eligible = False
         small_face_frame_frac = 0.12
         upper_small_face_profile_nudge = 0.10
@@ -2516,6 +2510,22 @@ class Processor(QtCore.QObject):
             b = base or (bx1, by1, bx2, by2)
             profiles.append(("base", b, 0.20, ((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5), (b[2] - b[0], b[3] - b[1])))
 
+        def _square_rescue_allowed() -> bool:
+            if not portrait_close_eligible or face is None:
+                return True
+            # Keep 1:1 available for genuinely tight/edge-constrained close-ups
+            # and for cases where the user did not make a portrait ratio available.
+            if validated_user_ratios and not any(rs in validated_user_ratios for rs in ("2:3", "3:4")):
+                return True
+            fx1, fy1, fx2, fy2 = face
+            fw_local = max(1.0, float(fx2 - fx1))
+            fh_local = max(1.0, float(fy2 - fy1))
+            side_room = min(float(fx1 - bx1), float(bx2 - fx2))
+            edge_constrained = side_room < 0.24 * fw_local
+            lower_context_weak = room_below_face < 0.50 * fh_local
+            very_tight_face = face_frame_frac >= 0.50
+            return bool(edge_constrained or lower_context_weak or very_tight_face)
+
         best: Optional[tuple[float, Tuple[int, int, int, int], str, str]] = None
         for profile, protect_raw, target_face_h_frac, anchor, min_size in profiles:
             protect = self._coerce_box_xyxy(protect_raw, bounds)
@@ -2586,11 +2596,13 @@ class Processor(QtCore.QObject):
                     profile_prior = 0.00
                     ratio_prior += 0.00 if rs == "1:1" else 0.08
                     if portrait_close_eligible:
-                        # _ratio_list_for_profile already removes close/1:1 here.
-                        # Keep only a mild profile nudge so close/2:3 or close/3:4
-                        # can still win when they genuinely compose better than
-                        # portrait_close, without allowing a square bypass.
-                        profile_prior += 0.26
+                        # Medium-close portrait-eligible frames are allowed to keep
+                        # square only when square is genuinely needed. Otherwise this
+                        # is a score demotion, not a hard removal, so real 1:1 closeups
+                        # and user square-only presets still work.
+                        profile_prior += 0.20
+                        if rs == "1:1" and not _square_rescue_allowed():
+                            ratio_prior += 0.42
                 elif profile == "portrait_close":
                     # Prefer medium-close faces with usable lower context.
                     if portrait_close_eligible:
@@ -2608,6 +2620,11 @@ class Processor(QtCore.QObject):
                 elif profile == "upper":
                     profile_prior = 0.12
                     ratio_prior += 0.00 if rs == "2:3" else 0.06
+                    if portrait_close_eligible and rs == "1:1" and not _square_rescue_allowed():
+                        # Same failure can surface as upper/1:1 when the upper
+                        # protect box has the cheapest containment score. Demote it
+                        # only when square is not needed; do not ban square globally.
+                        ratio_prior += 0.48
                     # Small/far faces need more surrounding context. This is a
                     # narrow score nudge, not a hard ratio override.
                     if face is not None and face_frame_frac < small_face_frame_frac:
@@ -6471,6 +6488,47 @@ class Processor(QtCore.QObject):
                                         or float(c.get("face_frac") or 0.0) >= 0.035
                                     )
                                 force_portrait = was_landscape and (crop_profile_for_guard != "body" or prominent_face)
+                                room_below_hard_face = max(0.0, float(repair_by2) - float(hfy2))
+                                side_room_hard_face = min(float(hfx1 - repair_bx1), float(repair_bx2 - hfx2))
+                                portrait_ratios_available = True
+                                explicit_ratio_list: list[str] = []
+                                for rs in [str(r).strip() for r in (ratio_list or []) if str(r).strip()]:
+                                    try:
+                                        parse_ratio(rs)
+                                    except Exception:
+                                        continue
+                                    if rs not in explicit_ratio_list:
+                                        explicit_ratio_list.append(rs)
+                                if explicit_ratio_list:
+                                    portrait_ratios_available = any(rs in {"2:3", "3:4"} for rs in explicit_ratio_list)
+                                portrait_close_eligible_repair = (
+                                    0.14 <= frame_face_h_frac <= 0.56
+                                    and room_below_hard_face >= 0.35 * hfh
+                                )
+                                square_rescue_allowed_repair = True
+                                if (
+                                    ratio_str == "1:1"
+                                    and crop_profile_for_guard in {"close", "upper"}
+                                    and portrait_close_eligible_repair
+                                ):
+                                    if explicit_ratio_list and not portrait_ratios_available:
+                                        square_rescue_allowed_repair = True
+                                    else:
+                                        edge_constrained = side_room_hard_face < 0.24 * hfw
+                                        lower_context_weak = room_below_hard_face < 0.50 * hfh
+                                        very_tight_face = frame_face_h_frac >= 0.50
+                                        square_rescue_allowed_repair = bool(
+                                            edge_constrained or lower_context_weak or very_tight_face
+                                        )
+                                portrait_square_repair = (
+                                    crop_profile_for_guard == "portrait_close"
+                                    or (
+                                        ratio_str == "1:1"
+                                        and crop_profile_for_guard in {"close", "upper"}
+                                        and portrait_close_eligible_repair
+                                        and (not square_rescue_allowed_repair)
+                                    )
+                                )
                                 if hard_def > 0.01 or force_portrait:
                                     if crop_profile_for_guard == "body" and not force_portrait:
                                         identity_guard = self._coerce_box_xyxy(
@@ -6509,14 +6567,12 @@ class Processor(QtCore.QObject):
                                         protect_box_clamped,
                                     ) or hard_face_padded
                                     best_fix = None
-                                    # Preserve portrait profile semantics during
-                                    # final containment repair. This repair used
-                                    # to be able to turn a good portrait_close
-                                    # candidate back into 1:1 because it evaluated
-                                    # square first and treated ratio as a soft
-                                    # score. Try true portrait ratios first;
-                                    # square is only a last-resort fallback.
-                                    fix_ratios = ("2:3", "3:4", "1:1") if crop_profile_for_guard == "portrait_close" else ("1:1", "2:3", "3:4")
+                                    # Preserve medium-close portrait semantics during
+                                    # final containment repair, but only for square crops
+                                    # that have enough lower/side context to make portrait
+                                    # framing viable. Square remains available as a rescue
+                                    # fallback when portrait ratios cannot satisfy guards.
+                                    fix_ratios = ("2:3", "3:4", "1:1") if portrait_square_repair else ("1:1", "2:3", "3:4")
                                     for fix_ratio in fix_ratios:
                                         try:
                                             fixed = self._ratio_crop_containing_box(
@@ -6532,14 +6588,14 @@ class Processor(QtCore.QObject):
                                             fw2 = max(1.0, float(fixed[2] - fixed[0]))
                                             fh2 = max(1.0, float(fixed[3] - fixed[1]))
                                             face_h_frac2 = hfh / fh2
-                                            if crop_profile_for_guard == "portrait_close":
+                                            if portrait_square_repair:
                                                 target_frac = 0.43
                                             elif fix_ratio == "1:1":
                                                 target_frac = 0.34
                                             else:
                                                 target_frac = 0.24
                                             score = abs(face_h_frac2 - target_frac)
-                                            if crop_profile_for_guard == "portrait_close":
+                                            if portrait_square_repair:
                                                 if fix_ratio == "2:3":
                                                     score -= 0.12
                                                 elif fix_ratio == "3:4":
@@ -6560,10 +6616,10 @@ class Processor(QtCore.QObject):
                                         cx1, cy1, cx2, cy2 = fixed
                                         ratio_str = fixed_ratio
                                         c["ratio"] = fixed_ratio
-                                        if crop_profile_for_guard == "portrait_close" and fixed_ratio == "1:1":
+                                        if portrait_square_repair and fixed_ratio == "1:1":
                                             self._status(
-                                                "portrait_close repair fell back to 1:1; 2:3/3:4 could not satisfy hard face guard",
-                                                key="crop_portrait_close_repair",
+                                                f"{crop_profile_for_guard} portrait repair fell back to 1:1; 2:3/3:4 could not satisfy hard face guard",
+                                                key="crop_portrait_square_repair",
                                                 interval=5.0,
                                             )
                                         if crop_profile_for_guard == "body" and was_landscape and fixed_ratio in {"1:1", "2:3", "3:4"}:
