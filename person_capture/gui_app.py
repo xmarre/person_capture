@@ -375,6 +375,10 @@ class SessionConfig:
     # reference is useful for color response, but copying its luma distribution
     # too strongly can crush/flatten shadow micro-detail. 0 disables this guard.
     hdr_wic_yuv444_color_match_shadow_luma_protect: float = 0.85
+    # Preserve near-neutral clean yuv444 chroma in dark regions. The yuv420 WIC
+    # reference is useful for broad color response, but its dark chroma statistics
+    # can still push neutral shadows/faces toward a frame-local red/green cast.
+    hdr_wic_yuv444_color_match_shadow_chroma_protect: float = 0.80
     hdr_wic_yuv444_color_match_lowfreq: float = 0.0
     # Render only a reduced yuv420/full WIC reference for the color-match
     # statistics pass. The final output still comes from the full-resolution
@@ -5511,6 +5515,7 @@ class Processor(QtCore.QObject):
                             "hdr_wic_yuv444_color_match_luma_strength",
                             "hdr_wic_yuv444_color_match_chroma_strength",
                             "hdr_wic_yuv444_color_match_shadow_luma_protect",
+                            "hdr_wic_yuv444_color_match_shadow_chroma_protect",
                             "hdr_wic_yuv444_color_match_lowfreq",
                             "hdr_wic_yuv444_color_match_ref_max_side",
                             "hdr_wic_yuv444_color_match_gpu_mode",
@@ -9537,6 +9542,18 @@ class Processor(QtCore.QObject):
             min_value=0.0,
             max_value=1.0,
         )
+        try:
+            default_shadow_chroma_protect = float(
+                getattr(self.cfg, "hdr_wic_yuv444_color_match_shadow_chroma_protect", 0.80)
+            )
+        except Exception:
+            default_shadow_chroma_protect = 0.80
+        shadow_chroma_protect = self._float_env(
+            "PC_WIC_YUV444_COLOR_MATCH_SHADOW_CHROMA_PROTECT",
+            default_shadow_chroma_protect,
+            min_value=0.0,
+            max_value=1.0,
+        )
         if strength <= 0.0:
             return 0, ""
         try:
@@ -9651,7 +9668,7 @@ class Processor(QtCore.QObject):
                     dst_p = float(np.percentile(dst_abs, 75.0))
                     if not math.isfinite(src_p) or not math.isfinite(dst_p) or src_p < 1.0:
                         return None
-                    return max(0.25, min(3.0, dst_p / src_p))
+                    return max(0.40, min(2.25, dst_p / src_p))
 
                 src_abs_all = np.abs(src_vals)
                 dst_abs_all = np.abs(dst_vals)
@@ -9659,7 +9676,7 @@ class Processor(QtCore.QObject):
                 dst_p_all = float(np.percentile(dst_abs_all, 75.0)) if dst_abs_all.size else 0.0
                 fallback_gain = 1.0
                 if math.isfinite(src_p_all) and math.isfinite(dst_p_all) and src_p_all >= 1.0:
-                    fallback_gain = max(0.25, min(3.0, dst_p_all / src_p_all))
+                    fallback_gain = max(0.40, min(2.25, dst_p_all / src_p_all))
 
                 pos_gain = _side_gain(src_vals, dst_vals, 1)
                 neg_gain = _side_gain(src_vals, dst_vals, -1)
@@ -9690,6 +9707,21 @@ class Processor(QtCore.QObject):
                     src_dev = np.abs(clean_fit_ycc[:, :, c].astype(np.int16, copy=False) - 128)
                     dst_dev = np.abs(base_ycc[:, :, c].astype(np.int16, copy=False) - 128)
                     chroma_mask = fit_mask & ((src_dev >= 2) | (dst_dev >= 2))
+                    # Do not let dark, almost-neutral chroma noise determine the
+                    # chroma gain. PR #373 pinned the neutral axis, which fixed
+                    # green translation drift, but dark neutral samples can still
+                    # over-fit one side of Cr/Cb and show up as an occasional red
+                    # or green shadow cast after gain scaling. Fit chroma from
+                    # pixels that contain usable chroma signal, then attenuate the
+                    # final blend in dark near-neutral pixels below.
+                    dark_neutral = (
+                        ((clean_fit_ycc[:, :, 0] < 36) | (base_ycc[:, :, 0] < 36))
+                        & (src_dev < 10)
+                        & (dst_dev < 10)
+                    )
+                    chroma_mask = chroma_mask & (~dark_neutral)
+                    if int(np.count_nonzero(chroma_mask)) < 1024:
+                        chroma_mask = fit_mask & (~dark_neutral)
                     if int(np.count_nonzero(chroma_mask)) < 1024:
                         chroma_mask = fit_mask
                     lut = _neutral_chroma_gain_lut(clean_fit_ycc[:, :, c], base_ycc[:, :, c], chroma_mask)
@@ -9726,6 +9758,7 @@ class Processor(QtCore.QObject):
                     channel_strengths,
                     diff_ref_bgr,
                     shadow_luma_protect=shadow_luma_protect,
+                    shadow_chroma_protect=shadow_chroma_protect,
                 )
 
             if gpu_result is not None:
@@ -9734,6 +9767,7 @@ class Processor(QtCore.QObject):
                 if clean_ycc is None:
                     clean_ycc = cv2.cvtColor(clean_bgr, cv2.COLOR_BGR2YCrCb)
                 mapped_f = clean_ycc.astype(np.float32, copy=False).copy()
+                shadow_chroma_tint_guard: Optional[np.ndarray] = None
                 for c, c_strength in enumerate(channel_strengths):
                     target = cv2.LUT(clean_ycc[:, :, c], luts[c]).astype(np.float32, copy=False)
                     src = clean_ycc[:, :, c].astype(np.float32, copy=False)
@@ -9748,6 +9782,27 @@ class Processor(QtCore.QObject):
                         shadow_keep = np.power(shadow_keep, 1.15).astype(np.float32, copy=False)
                         eff_strength = float(c_strength) * (
                             1.0 - (0.88 * float(shadow_luma_protect) * shadow_keep)
+                        )
+                        mapped_f[:, :, c] = (src * (1.0 - eff_strength)) + (target * eff_strength)
+                    elif c in (1, 2) and shadow_chroma_protect > 0.0 and c_strength > 0.0:
+                        # Chroma matching is allowed to restore the WIC/Paint
+                        # color response, but dark near-neutral pixels are where
+                        # frame-local Cr/Cb gain errors become visible as a red or
+                        # green tint. Reduce chroma remap strength there while
+                        # preserving the configured strength for midtones, bright
+                        # highlights, and strongly chromatic pixels.
+                        if shadow_chroma_tint_guard is None:
+                            src_y = clean_ycc[:, :, 0].astype(np.float32, copy=False)
+                            src_cr = clean_ycc[:, :, 1].astype(np.float32, copy=False) - 128.0
+                            src_cb = clean_ycc[:, :, 2].astype(np.float32, copy=False) - 128.0
+                            chroma_radius = np.sqrt((src_cr * src_cr) + (src_cb * src_cb))
+                            shadow_keep = np.clip((132.0 - src_y) / 116.0, 0.0, 1.0)
+                            shadow_keep = np.power(shadow_keep, 1.10).astype(np.float32, copy=False)
+                            neutral_keep = np.clip((24.0 - chroma_radius) / 22.0, 0.0, 1.0)
+                            neutral_keep = np.power(neutral_keep, 0.85).astype(np.float32, copy=False)
+                            shadow_chroma_tint_guard = shadow_keep * (0.35 + (0.65 * neutral_keep))
+                        eff_strength = float(c_strength) * (
+                            1.0 - (0.92 * float(shadow_chroma_protect) * shadow_chroma_tint_guard)
                         )
                         mapped_f[:, :, c] = (src * (1.0 - eff_strength)) + (target * eff_strength)
                     else:
@@ -10011,6 +10066,7 @@ class Processor(QtCore.QObject):
         diff_ref_bgr: np.ndarray,
         *,
         shadow_luma_protect: float = 0.0,
+        shadow_chroma_protect: float = 0.0,
     ) -> Optional[tuple[np.ndarray, int]]:
         """Run the full-resolution color-match pixel stage on CUDA.
 
@@ -10058,6 +10114,8 @@ class Processor(QtCore.QObject):
 
                 mapped_f = torch.empty_like(ycc_f)
                 shadow_luma_protect_f = max(0.0, min(1.0, float(shadow_luma_protect)))
+                shadow_chroma_protect_f = max(0.0, min(1.0, float(shadow_chroma_protect)))
+                chroma_radius = None
                 for c, c_strength in enumerate(channel_strengths):
                     lut_np = np.asarray(luts[c], dtype=np.uint8)
                     if lut_np.shape[0] != 256:
@@ -10071,6 +10129,20 @@ class Processor(QtCore.QObject):
                         shadow_keep = torch.pow(shadow_keep, 1.15)
                         eff_strength = s * (1.0 - (0.88 * shadow_luma_protect_f * shadow_keep))
                         mapped_f[:, :, c] = (src_y * (1.0 - eff_strength)) + (target * eff_strength)
+                    elif c in (1, 2) and shadow_chroma_protect_f > 0.0 and s > 0.0:
+                        src_y = ycc_f[:, :, 0]
+                        if chroma_radius is None:
+                            src_cr = ycc_f[:, :, 1] - 128.0
+                            src_cb = ycc_f[:, :, 2] - 128.0
+                            chroma_radius = torch.sqrt((src_cr * src_cr) + (src_cb * src_cb))
+                        shadow_keep = torch.clamp((132.0 - src_y) / 116.0, 0.0, 1.0)
+                        shadow_keep = torch.pow(shadow_keep, 1.10)
+                        neutral_keep = torch.clamp((24.0 - chroma_radius) / 22.0, 0.0, 1.0)
+                        neutral_keep = torch.pow(neutral_keep, 0.85)
+                        tint_guard = shadow_keep * (0.35 + (0.65 * neutral_keep))
+                        eff_strength = s * (1.0 - (0.92 * shadow_chroma_protect_f * tint_guard))
+                        src_ch = ycc_f[:, :, c]
+                        mapped_f[:, :, c] = (src_ch * (1.0 - eff_strength)) + (target * eff_strength)
                     else:
                         mapped_f[:, :, c] = (ycc_f[:, :, c] * (1.0 - s)) + (target * s)
 
@@ -13819,6 +13891,19 @@ class MainWindow(QtWidgets.QMainWindow):
             float(getattr(self.cfg, "hdr_wic_yuv444_color_match_shadow_luma_protect", 0.85))
         )
         self.hdr_wic_yuv444_color_match_shadow_luma_protect_spin.valueChanged.connect(self._on_ui_change)
+        self.hdr_wic_yuv444_color_match_shadow_chroma_protect_spin = _mk_fspin(
+            0.0,
+            1.0,
+            0.05,
+            2,
+            "float: hdr_wic_yuv444_color_match_shadow_chroma_protect "
+            "(PC_WIC_YUV444_COLOR_MATCH_SHADOW_CHROMA_PROTECT). Higher values preserve more "
+            "clean yuv444 chroma in dark near-neutral pixels to prevent red/green shadow casts."
+        )
+        self.hdr_wic_yuv444_color_match_shadow_chroma_protect_spin.setValue(
+            float(getattr(self.cfg, "hdr_wic_yuv444_color_match_shadow_chroma_protect", 0.80))
+        )
+        self.hdr_wic_yuv444_color_match_shadow_chroma_protect_spin.valueChanged.connect(self._on_ui_change)
         self.hdr_wic_yuv444_color_match_lowfreq_spin = _mk_fspin(
             0.0,
             1.0,
@@ -14576,6 +14661,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("WIC yuv444 match luma", self.hdr_wic_yuv444_color_match_luma_strength_spin),
             ("WIC yuv444 match chroma", self.hdr_wic_yuv444_color_match_chroma_strength_spin),
             ("WIC yuv444 shadow detail", self.hdr_wic_yuv444_color_match_shadow_luma_protect_spin),
+            ("WIC yuv444 shadow chroma", self.hdr_wic_yuv444_color_match_shadow_chroma_protect_spin),
             ("WIC yuv444 match lowfreq", self.hdr_wic_yuv444_color_match_lowfreq_spin),
             ("WIC yuv444 ref max side", self.hdr_wic_yuv444_color_match_ref_max_side_spin),
             ("WIC yuv444 preroll sec", self.hdr_wic_yuv444_color_match_preroll_sec_spin),
@@ -15992,6 +16078,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "hdr_wic_yuv444_color_match_luma_strength",
             "hdr_wic_yuv444_color_match_chroma_strength",
             "hdr_wic_yuv444_color_match_shadow_luma_protect",
+            "hdr_wic_yuv444_color_match_shadow_chroma_protect",
             "hdr_wic_yuv444_color_match_lowfreq",
             "hdr_wic_yuv444_color_match_ref_max_side",
             "hdr_wic_yuv444_color_match_gpu_mode",
@@ -16297,6 +16384,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 if hasattr(self, "hdr_wic_yuv444_color_match_shadow_luma_protect_spin")
                 else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_shadow_luma_protect", 0.85))
             ),
+            hdr_wic_yuv444_color_match_shadow_chroma_protect=(
+                float(self.hdr_wic_yuv444_color_match_shadow_chroma_protect_spin.value())
+                if hasattr(self, "hdr_wic_yuv444_color_match_shadow_chroma_protect_spin")
+                else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_shadow_chroma_protect", 0.80))
+            ),
             hdr_wic_yuv444_color_match_lowfreq=(
                 float(self.hdr_wic_yuv444_color_match_lowfreq_spin.value())
                 if hasattr(self, "hdr_wic_yuv444_color_match_lowfreq_spin")
@@ -16441,6 +16533,11 @@ class MainWindow(QtWidgets.QMainWindow):
             float(self.hdr_wic_yuv444_color_match_shadow_luma_protect_spin.value())
             if hasattr(self, "hdr_wic_yuv444_color_match_shadow_luma_protect_spin")
             else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_shadow_luma_protect", 0.85))
+        )
+        cfg.hdr_wic_yuv444_color_match_shadow_chroma_protect = (
+            float(self.hdr_wic_yuv444_color_match_shadow_chroma_protect_spin.value())
+            if hasattr(self, "hdr_wic_yuv444_color_match_shadow_chroma_protect_spin")
+            else float(getattr(self.cfg, "hdr_wic_yuv444_color_match_shadow_chroma_protect", 0.80))
         )
         cfg.hdr_wic_yuv444_color_match_lowfreq = (
             float(self.hdr_wic_yuv444_color_match_lowfreq_spin.value())
@@ -16599,6 +16696,12 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         except Exception:
             self.cfg.hdr_wic_yuv444_color_match_shadow_luma_protect = 0.85
+        try:
+            self.cfg.hdr_wic_yuv444_color_match_shadow_chroma_protect = min(
+                1.0, max(0.0, float(getattr(cfg, "hdr_wic_yuv444_color_match_shadow_chroma_protect", 0.80)))
+            )
+        except Exception:
+            self.cfg.hdr_wic_yuv444_color_match_shadow_chroma_protect = 0.80
         try:
             self.cfg.hdr_wic_yuv444_color_match_lowfreq = min(
                 1.0, max(0.0, float(getattr(cfg, "hdr_wic_yuv444_color_match_lowfreq", 0.0)))
@@ -16761,6 +16864,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "hdr_wic_yuv444_color_match_shadow_luma_protect_spin"):
             self.hdr_wic_yuv444_color_match_shadow_luma_protect_spin.setValue(
                 self.cfg.hdr_wic_yuv444_color_match_shadow_luma_protect
+            )
+        if hasattr(self, "hdr_wic_yuv444_color_match_shadow_chroma_protect_spin"):
+            self.hdr_wic_yuv444_color_match_shadow_chroma_protect_spin.setValue(
+                self.cfg.hdr_wic_yuv444_color_match_shadow_chroma_protect
             )
         if hasattr(self, "hdr_wic_yuv444_color_match_lowfreq_spin"):
             self.hdr_wic_yuv444_color_match_lowfreq_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_lowfreq)
@@ -18028,6 +18135,21 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             self.cfg.hdr_wic_yuv444_color_match_shadow_luma_protect = 0.85
         try:
+            self.cfg.hdr_wic_yuv444_color_match_shadow_chroma_protect = min(
+                1.0,
+                max(
+                    0.0,
+                    float(
+                        s.value(
+                            "hdr_wic_yuv444_color_match_shadow_chroma_protect",
+                            getattr(self.cfg, "hdr_wic_yuv444_color_match_shadow_chroma_protect", 0.80),
+                        )
+                    ),
+                ),
+            )
+        except Exception:
+            self.cfg.hdr_wic_yuv444_color_match_shadow_chroma_protect = 0.80
+        try:
             self.cfg.hdr_wic_yuv444_color_match_lowfreq = min(
                 1.0,
                 max(
@@ -18072,6 +18194,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "hdr_wic_yuv444_color_match_shadow_luma_protect_spin"):
             self.hdr_wic_yuv444_color_match_shadow_luma_protect_spin.setValue(
                 self.cfg.hdr_wic_yuv444_color_match_shadow_luma_protect
+            )
+        if hasattr(self, "hdr_wic_yuv444_color_match_shadow_chroma_protect_spin"):
+            self.hdr_wic_yuv444_color_match_shadow_chroma_protect_spin.setValue(
+                self.cfg.hdr_wic_yuv444_color_match_shadow_chroma_protect
             )
         if hasattr(self, "hdr_wic_yuv444_color_match_lowfreq_spin"):
             self.hdr_wic_yuv444_color_match_lowfreq_spin.setValue(self.cfg.hdr_wic_yuv444_color_match_lowfreq)
