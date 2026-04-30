@@ -9143,14 +9143,13 @@ class Processor(QtCore.QObject):
             getattr(self.cfg, "hdr_wic_block_corruption_guard_mode", "reject"),
             default="reject",
         )
+        # Legacy kill switch stays authoritative for backward compatibility.
+        if self._truthy_env("PC_DISABLE_WIC_BLOCK_CORRUPTION_GUARD"):
+            return "off"
         raw_env = str(os.getenv("PC_WIC_BLOCK_CORRUPTION_GUARD_MODE", "") or "").strip()
         if raw_env:
             return self._normalize_wic_block_corruption_guard_mode(raw_env, default=default_mode)
-        mode = default_mode
-        # Backward-compatible kill switch.
-        if mode != "off" and self._truthy_env("PC_DISABLE_WIC_BLOCK_CORRUPTION_GUARD"):
-            return "off"
-        return mode
+        return default_mode
 
     def _handle_wic_block_guard(self, stage: str, why: str) -> bool:
         mode = self._wic_block_guard_mode()
@@ -9668,6 +9667,7 @@ class Processor(QtCore.QObject):
             ref_raw_meta: tuple[int, int, int] | None = None
             clean_raw_meta: tuple[int, int, int] | None = None
             raw_failures: list[str] = []
+            guard_mode = self._wic_block_guard_mode()
 
             t_wic_start = time.perf_counter()
             if use_raw_wic:
@@ -9716,9 +9716,10 @@ class Processor(QtCore.QObject):
                     raw_mode = False
                     raw_failures.append("raw_read_failed")
                 else:
-                    block_bad, block_why = self._detect_wic_block_corruption_bgr(clean_bgr)
-                    if block_bad and self._handle_wic_block_guard("yuv444 clean raw render", block_why):
-                        return False, f"clean_wic_block_corrupt:{block_why}", 0
+                    if guard_mode != "off":
+                        block_bad, block_why = self._detect_wic_block_corruption_bgr(clean_bgr)
+                        if block_bad and self._handle_wic_block_guard("yuv444 clean raw render", block_why):
+                            return False, f"clean_wic_block_corrupt:{block_why}", 0
                     changed, repaired_tmp = self._repair_wic_yuv444_color_match_arrays(ref_bgr, clean_bgr, ref_raw)
             else:
                 changed = 0
@@ -9745,9 +9746,10 @@ class Processor(QtCore.QObject):
                     return False, f"clean_wic_failed:{why_clean_wic}", 0
                 t_clean_wic = time.perf_counter()
                 d_clean_wic = t_clean_wic - t_clean_wic_start
-                block_bad, block_why = self._detect_wic_block_corruption(clean_png)
-                if block_bad and self._handle_wic_block_guard("yuv444 clean render", block_why):
-                    return False, f"clean_wic_block_corrupt:{block_why}", 0
+                if guard_mode != "off":
+                    block_bad, block_why = self._detect_wic_block_corruption(clean_png)
+                    if block_bad and self._handle_wic_block_guard("yuv444 clean render", block_why):
+                        return False, f"clean_wic_block_corrupt:{block_why}", 0
                 changed, repaired_tmp = self._repair_wic_with_yuv444_color_match(ref_png, clean_png)
             t_match = time.perf_counter()
             d_match = t_match - (t_clean_wic if 't_clean_wic' in locals() else t_wic_start)
@@ -9759,9 +9761,10 @@ class Processor(QtCore.QObject):
             valid, invalid_why = self._validate_hdr_sdr_export_image(repaired_tmp, None)
             if not valid:
                 return False, f"color_match_invalid:{invalid_why}", 0
-            block_bad, block_why = self._detect_wic_block_corruption(repaired_tmp)
-            if block_bad and self._handle_wic_block_guard("yuv444 color-match output", block_why):
-                return False, f"color_match_block_corrupt:{block_why}", 0
+            if guard_mode != "off":
+                block_bad, block_why = self._detect_wic_block_corruption(repaired_tmp)
+                if block_bad and self._handle_wic_block_guard("yuv444 color-match output", block_why):
+                    return False, f"color_match_block_corrupt:{block_why}", 0
             os.replace(repaired_tmp, out_path)
             t_done = time.perf_counter()
             self._status(
@@ -9843,6 +9846,7 @@ class Processor(QtCore.QObject):
         except Exception:
             pass
         try:
+            guard_mode = self._wic_block_guard_mode()
             ok_hdr, why_hdr = self._save_hdr_wic_specific_intermediate_avif(
                 frame_idx,
                 frame_pts_sec,
@@ -9866,9 +9870,10 @@ class Processor(QtCore.QObject):
                     interval=10.0,
                 )
                 return 0
-            block_bad, block_why = self._detect_wic_block_corruption(guide_png)
-            if block_bad and self._handle_wic_block_guard("yuv444 color-match render", block_why):
-                return 0
+            if guard_mode != "off":
+                block_bad, block_why = self._detect_wic_block_corruption(guide_png)
+                if block_bad and self._handle_wic_block_guard("yuv444 color-match render", block_why):
+                    return 0
             changed, repaired_tmp = self._repair_wic_with_yuv444_color_match(out_path, guide_png)
             if changed <= 0:
                 self._status(
@@ -9892,9 +9897,10 @@ class Processor(QtCore.QObject):
                     interval=5.0,
                 )
                 return 0
-            block_bad, block_why = self._detect_wic_block_corruption(repaired_tmp)
-            if block_bad and self._handle_wic_block_guard("yuv444 color-match output", block_why):
-                return 0
+            if guard_mode != "off":
+                block_bad, block_why = self._detect_wic_block_corruption(repaired_tmp)
+                if block_bad and self._handle_wic_block_guard("yuv444 color-match output", block_why):
+                    return 0
             os.replace(repaired_tmp, out_path)
             repaired_tmp = ""
             return changed
