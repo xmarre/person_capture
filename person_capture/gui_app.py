@@ -10744,8 +10744,29 @@ class Processor(QtCore.QObject):
         if not clean_hdr_path or not os.path.exists(clean_hdr_path):
             return False, "windows_wic_unavailable:clean_hdr_source_missing", None, None
 
+        if not ref_out_path or not clean_out_path:
+            return False, "windows_wic_raw_pair_out_path_missing", None, None
         ref_tmp = ref_out_path + ".tmp.raw"
         clean_tmp = clean_out_path + ".tmp.raw"
+        ref_backup = ref_out_path + ".bak.rawpair"
+        clean_backup = clean_out_path + ".bak.rawpair"
+
+        path_roles = (
+            ("ref_out", ref_out_path),
+            ("clean_out", clean_out_path),
+            ("ref_tmp", ref_tmp),
+            ("clean_tmp", clean_tmp),
+            ("ref_backup", ref_backup),
+            ("clean_backup", clean_backup),
+        )
+        seen_paths: dict[str, str] = {}
+        for role, path in path_roles:
+            norm_path = os.path.normcase(os.path.abspath(path))
+            prev_role = seen_paths.get(norm_path)
+            if prev_role is not None:
+                return False, f"windows_wic_raw_pair_path_collision:{prev_role}:{role}:{norm_path}", None, None
+            seen_paths[norm_path] = role
+
         for out_path in (ref_out_path, clean_out_path):
             out_dir = os.path.dirname(out_path)
             if not out_dir:
@@ -10836,8 +10857,6 @@ Write-WicBgr32Raw $cleanSrc $cleanDst 'CLEAN'
                     return False, f"windows_wic_raw_pair_size_mismatch:{label}:got={got}:expected={expected}", None, None
 
             # Publish both outputs with rollback so we never leave a mixed pair.
-            ref_backup = ref_out_path + ".bak.rawpair"
-            clean_backup = clean_out_path + ".bak.rawpair"
             backed_up_ref = False
             backed_up_clean = False
             published_ref = False
