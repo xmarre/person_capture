@@ -9257,6 +9257,181 @@ class Processor(QtCore.QObject):
                 )
             return None
 
+
+    def _save_hdr_wic_color_match_pair_avifs(
+        self,
+        frame_idx: int,
+        frame_pts_sec: Optional[float],
+        crop_xyxy: tuple[int, int, int, int],
+        ref_out_path: str,
+        clean_out_path: str,
+        *,
+        ref_scale_to: tuple[int, int],
+        avif_cpu_used: int = 8,
+    ) -> tuple[bool, str]:
+        """Write the reduced reference and full yuv444 WIC HDR AVIFs in one FFmpeg decode.
+
+        The color-match fast path previously invoked FFmpeg twice for the same
+        timestamp/crop.  This helper keeps the exact same two intermediate shapes
+        but shares seek/decode/crop work across both AVIF encodes.
+        """
+        ffmpeg_bin = self._resolve_ffmpeg_bin()
+        if not ffmpeg_bin:
+            return False, "ffmpeg_unavailable"
+        x1, y1, x2, y2 = crop_xyxy
+        w = max(1, int(x2 - x1))
+        h = max(1, int(y2 - y1))
+        try:
+            rw = max(2, int(ref_scale_to[0]))
+            rh = max(2, int(ref_scale_to[1]))
+            rw -= rw % 2
+            rh -= rh % 2
+        except Exception:
+            return False, "invalid_ref_scale"
+        if rw <= 1 or rh <= 1:
+            return False, "invalid_ref_scale"
+        try:
+            cpu_used = max(0, min(8, int(avif_cpu_used)))
+        except Exception:
+            cpu_used = 8
+        try:
+            ensure_dir(os.path.dirname(ref_out_path))
+            ensure_dir(os.path.dirname(clean_out_path))
+        except Exception:
+            pass
+
+        src_range = self._hdr_source_range()
+        src_range_known = src_range in {"limited", "full"}
+        src_range_setparams = src_range if src_range_known else "limited"
+        seek_sec: Optional[float] = None
+        try:
+            if frame_pts_sec is not None and math.isfinite(float(frame_pts_sec)):
+                seek_sec = max(0.0, float(frame_pts_sec))
+        except Exception:
+            seek_sec = None
+        if seek_sec is None:
+            fps = float(getattr(self, "_fps", 0.0) or 0.0)
+            if fps > 0 and math.isfinite(fps):
+                seek_sec = max(0.0, float(frame_idx) / fps)
+
+        pre_seek_args, seek_filter = self._ffmpeg_still_seek_args_and_filter(seek_sec)
+        common = (
+            f"{seek_filter}"
+            "setparams=color_trc=smpte2084:color_primaries=bt2020:"
+            f"colorspace=bt2020nc:range={src_range_setparams},"
+            f"crop={w}:{h}:{int(x1)}:{int(y1)},split=2[refbase][cleanbase]"
+        )
+        ref_filters: list[str] = []
+        if src_range == "limited":
+            ref_filters.append("zscale=rangein=limited:range=full")
+        if rw != w or rh != h:
+            ref_filters.append(f"scale={rw}:{rh}:flags=lanczos")
+        ref_filters.extend([
+            "format=yuv420p10le",
+            "setparams=color_trc=smpte2084:color_primaries=bt2020:colorspace=bt2020nc:range=full",
+        ])
+        clean_filters: list[str] = []
+        if src_range == "full":
+            clean_filters.append("zscale=rangein=full:range=limited")
+        clean_filters.extend([
+            "format=yuv444p10le",
+            "setparams=color_trc=smpte2084:color_primaries=bt2020:colorspace=bt2020nc:range=limited",
+        ])
+        filter_complex = (
+            f"[0:v]{common};"
+            f"[refbase]{','.join(ref_filters)}[refout];"
+            f"[cleanbase]{','.join(clean_filters)}[cleanout]"
+        )
+
+        ref_tmp = ref_out_path + ".tmp.avif"
+        clean_tmp = clean_out_path + ".tmp.avif"
+        for pth in (ref_tmp, clean_tmp):
+            try:
+                if os.path.exists(pth):
+                    os.remove(pth)
+            except Exception:
+                pass
+        cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y"]
+        cmd += pre_seek_args
+        cmd += ["-i", self.cfg.video, "-filter_complex", filter_complex]
+
+        def _append_avif_output(label: str, pix_fmt: str, color_range: str, path: str) -> None:
+            cmd.extend([
+                "-map",
+                label,
+                "-frames:v",
+                "1",
+                "-an",
+                "-sn",
+                "-dn",
+                "-c:v",
+                "libaom-av1",
+                "-still-picture",
+                "1",
+                "-pix_fmt",
+                pix_fmt,
+                "-g",
+                "1",
+                "-tile-columns",
+                "0",
+                "-tile-rows",
+                "0",
+                "-row-mt",
+                "1",
+                "-cpu-used",
+                str(cpu_used),
+                "-lossless",
+                "1",
+                "-crf",
+                "0",
+                "-b:v",
+                "0",
+                "-aq-mode",
+                "0",
+                "-color_range",
+                color_range,
+                "-colorspace",
+                "bt2020nc",
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                "smpte2084",
+            ])
+            if pix_fmt == "yuv420p10le":
+                cmd.extend(["-chroma_sample_location", "left"])
+            cmd.append(path)
+
+        _append_avif_output("[refout]", "yuv420p10le", "2", ref_tmp)
+        _append_avif_output("[cleanout]", "yuv444p10le", "1", clean_tmp)
+
+        timeout_sec = max(5, int(getattr(self.cfg, "hdr_archive_timeout_sec", getattr(self.cfg, "hdr_export_timeout_sec", 90)) or 90))
+        try:
+            cp = subprocess.run(cmd, check=False, timeout=timeout_sec, capture_output=True, text=True)
+            if (
+                cp.returncode == 0
+                and os.path.exists(ref_tmp)
+                and os.path.getsize(ref_tmp) > 0
+                and os.path.exists(clean_tmp)
+                and os.path.getsize(clean_tmp) > 0
+            ):
+                os.replace(ref_tmp, ref_out_path)
+                os.replace(clean_tmp, clean_out_path)
+                return True, ""
+            tail = (cp.stderr or cp.stdout or "").splitlines()[-4:]
+            why = " | ".join(tail) if tail else f"ffmpeg_rc={cp.returncode}"
+            return False, why
+        except subprocess.TimeoutExpired as exc:
+            return False, f"timeout after {timeout_sec}s: {exc}"
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+        finally:
+            for pth in (ref_tmp, clean_tmp):
+                try:
+                    if os.path.exists(pth):
+                        os.remove(pth)
+                except Exception:
+                    pass
+
     def _try_save_wic_yuv444_color_matched_fast(
         self,
         frame_idx: int,
@@ -9293,19 +9468,75 @@ class Processor(QtCore.QObject):
                 self._dbg(f"fast yuv444 pre-clean failed for {pth}: {exc}")
         try:
             t0 = time.perf_counter()
-            ok_ref_hdr, why_ref_hdr = self._save_hdr_wic_specific_intermediate_avif(
-                frame_idx,
-                frame_pts_sec,
-                crop_xyxy,
-                ref_hdr,
-                pix_fmt="yuv420p10le",
-                avif_range="full",
-                scale_to=(ref_w, ref_h),
-            )
-            if not ok_ref_hdr:
-                return False, f"ref_hdr_failed:{why_ref_hdr}", 0
-            t_ref_hdr = time.perf_counter()
-            d_ref_hdr = t_ref_hdr - t0
+            d_ref_hdr = 0.0
+            d_clean_hdr = 0.0
+            d_ref_wic = 0.0
+            d_clean_wic = 0.0
+            hdr_mode = "separate"
+            wic_mode = "png"
+
+            pair_hdr_disabled = self._truthy_env("PC_DISABLE_WIC_YUV444_COLOR_MATCH_PAIR_HDR")
+            ok_pair_hdr = False
+            why_pair_hdr = "disabled"
+            if not pair_hdr_disabled:
+                t_hdr_pair = time.perf_counter()
+                ok_pair_hdr, why_pair_hdr = self._save_hdr_wic_color_match_pair_avifs(
+                    frame_idx,
+                    frame_pts_sec,
+                    crop_xyxy,
+                    ref_hdr,
+                    clean_hdr,
+                    ref_scale_to=(ref_w, ref_h),
+                    avif_cpu_used=8,
+                )
+                t_hdr_pair_done = time.perf_counter()
+                if ok_pair_hdr:
+                    hdr_mode = "pair"
+                    d_clean_hdr = t_hdr_pair_done - t_hdr_pair
+                else:
+                    for pth in (ref_hdr, clean_hdr):
+                        try:
+                            if os.path.exists(pth):
+                                os.remove(pth)
+                        except Exception:
+                            pass
+                    self._status(
+                        f"HDR WIC yuv444 paired HDR intermediate path fell back: {why_pair_hdr}",
+                        key="hdr_wic_yuv444_pair_hdr_fallback",
+                        interval=10.0,
+                    )
+
+            if not ok_pair_hdr:
+                t_ref_hdr_start = time.perf_counter()
+                ok_ref_hdr, why_ref_hdr = self._save_hdr_wic_specific_intermediate_avif(
+                    frame_idx,
+                    frame_pts_sec,
+                    crop_xyxy,
+                    ref_hdr,
+                    pix_fmt="yuv420p10le",
+                    avif_range="full",
+                    scale_to=(ref_w, ref_h),
+                    avif_cpu_used=8,
+                )
+                if not ok_ref_hdr:
+                    return False, f"ref_hdr_failed:{why_ref_hdr}", 0
+                t_ref_hdr = time.perf_counter()
+                d_ref_hdr = t_ref_hdr - t_ref_hdr_start
+
+                t_clean_hdr_start = time.perf_counter()
+                ok_clean_hdr, why_clean_hdr = self._save_hdr_wic_specific_intermediate_avif(
+                    frame_idx,
+                    frame_pts_sec,
+                    crop_xyxy,
+                    clean_hdr,
+                    pix_fmt="yuv444p10le",
+                    avif_range="limited",
+                    avif_cpu_used=8,
+                )
+                if not ok_clean_hdr:
+                    return False, f"clean_hdr_failed:{why_clean_hdr}", 0
+                t_clean_hdr = time.perf_counter()
+                d_clean_hdr = t_clean_hdr - t_clean_hdr_start
 
             use_raw_wic = not self._truthy_env("PC_DISABLE_WIC_YUV444_COLOR_MATCH_RAW")
             raw_mode = False
@@ -9313,44 +9544,44 @@ class Processor(QtCore.QObject):
             clean_raw_meta: tuple[int, int, int] | None = None
             raw_failures: list[str] = []
 
+            t_wic_start = time.perf_counter()
             if use_raw_wic:
+                ok_pair_wic, why_pair_wic, ref_pair_meta, clean_pair_meta = self._save_wic_bgra_raw_pair_from_hdr_images(
+                    ref_hdr,
+                    ref_raw,
+                    clean_hdr,
+                    clean_raw,
+                )
+                t_pair_wic = time.perf_counter()
+                if ok_pair_wic and ref_pair_meta is not None and clean_pair_meta is not None:
+                    ref_raw_meta = ref_pair_meta
+                    clean_raw_meta = clean_pair_meta
+                    raw_mode = True
+                    wic_mode = "raw_pair"
+                    t_clean_wic = t_pair_wic
+                    d_clean_wic = t_pair_wic - t_wic_start
+                else:
+                    raw_failures.append(f"raw_pair:{why_pair_wic}")
+
+            if use_raw_wic and not raw_mode:
+                t_ref_wic_start = time.perf_counter()
                 ok_ref_wic, why_ref_wic, rrw, rrh, rstride = self._save_wic_bgra_raw_from_hdr_image(ref_hdr, ref_raw)
+                t_ref_wic = time.perf_counter()
+                d_ref_wic = t_ref_wic - t_ref_wic_start
                 if ok_ref_wic:
                     ref_raw_meta = (rrw, rrh, rstride)
+                    t_clean_wic_start = time.perf_counter()
+                    ok_clean_wic, why_clean_wic, crw, crh, cstride = self._save_wic_bgra_raw_from_hdr_image(clean_hdr, clean_raw)
+                    t_clean_wic = time.perf_counter()
+                    d_clean_wic = t_clean_wic - t_clean_wic_start
+                    if ok_clean_wic:
+                        clean_raw_meta = (crw, crh, cstride)
+                        raw_mode = True
+                        wic_mode = "raw"
+                    else:
+                        raw_failures.append(f"clean_raw:{why_clean_wic}")
                 else:
                     raw_failures.append(f"ref_raw:{why_ref_wic}")
-            else:
-                ok_ref_wic = False
-                why_ref_wic = "raw_disabled"
-            t_ref_wic = time.perf_counter()
-            d_ref_wic = t_ref_wic - t_ref_hdr
-
-            t_clean_hdr_start = time.perf_counter()
-            ok_clean_hdr, why_clean_hdr = self._save_hdr_wic_specific_intermediate_avif(
-                frame_idx,
-                frame_pts_sec,
-                crop_xyxy,
-                clean_hdr,
-                pix_fmt="yuv444p10le",
-                avif_range="limited",
-            )
-            if not ok_clean_hdr:
-                return False, f"clean_hdr_failed:{why_clean_hdr}", 0
-            t_clean_hdr = time.perf_counter()
-            d_clean_hdr = t_clean_hdr - t_clean_hdr_start
-
-            if use_raw_wic and ok_ref_wic:
-                ok_clean_wic, why_clean_wic, crw, crh, cstride = self._save_wic_bgra_raw_from_hdr_image(clean_hdr, clean_raw)
-                if ok_clean_wic:
-                    clean_raw_meta = (crw, crh, cstride)
-                    raw_mode = True
-                else:
-                    raw_failures.append(f"clean_raw:{why_clean_wic}")
-            else:
-                ok_clean_wic = False
-                why_clean_wic = "raw_ref_failed"
-            t_clean_wic = time.perf_counter()
-            d_clean_wic = t_clean_wic - t_clean_hdr
 
             if raw_mode and ref_raw_meta is not None and clean_raw_meta is not None:
                 ref_bgr = self._read_wic_bgra_raw_image(ref_raw, *ref_raw_meta)
@@ -9372,6 +9603,7 @@ class Processor(QtCore.QObject):
                 changed = 0
 
             if not raw_mode:
+                wic_mode = "png"
                 if raw_failures:
                     self._status(
                         "HDR WIC yuv444 raw intermediate path fell back to PNG: " + " | ".join(raw_failures[-2:]),
@@ -9402,7 +9634,7 @@ class Processor(QtCore.QObject):
                     return False, f"clean_wic_block_corrupt:{block_why}", 0
                 changed, repaired_tmp = self._repair_wic_with_yuv444_color_match(ref_png, clean_png)
             t_match = time.perf_counter()
-            d_match = t_match - t_clean_wic
+            d_match = t_match - (t_clean_wic if 't_clean_wic' in locals() else t_wic_start)
 
             if changed <= 0:
                 return False, "color_match_noop:changed=0", 0
@@ -9424,6 +9656,8 @@ class Processor(QtCore.QObject):
             self._status(
                 "HDR WIC yuv444 fast timing: "
                 f"intermediate={'raw' if raw_mode else 'png'} "
+                f"hdr_mode={hdr_mode} "
+                f"wic_mode={wic_mode} "
                 f"ref_hdr={d_ref_hdr:.3f}s "
                 f"ref_wic={d_ref_wic:.3f}s "
                 f"clean_hdr={d_clean_hdr:.3f}s "
@@ -10330,6 +10564,7 @@ class Processor(QtCore.QObject):
         pix_fmt: str,
         avif_range: str,
         scale_to: Optional[tuple[int, int]] = None,
+        avif_cpu_used: Optional[int] = None,
     ) -> tuple[bool, str]:
         """Write a specific WIC diagnostic/guide HDR AVIF without env overrides."""
         pix_fmt = str(pix_fmt or "yuv420p10le").strip().lower()
@@ -10347,6 +10582,7 @@ class Processor(QtCore.QObject):
             avif_pix_fmt=pix_fmt,
             avif_range=avif_range,
             scale_to=scale_to,
+            avif_cpu_used=avif_cpu_used,
         )
 
     def _save_wic_display_avif_from_hdr_crop(
@@ -11308,6 +11544,7 @@ try {{
         avif_pix_fmt: str = "yuv420p10le",
         avif_range: str = "full",
         scale_to: Optional[tuple[int, int]] = None,
+        avif_cpu_used: Optional[int] = None,
     ) -> tuple[bool, str]:
         """Use ffmpeg directly to export an HDR crop from the original source."""
 
@@ -11368,6 +11605,11 @@ try {{
         avif_range = str(avif_range or "full").strip().lower()
         if avif_range not in {"full", "limited"}:
             avif_range = "full"
+        try:
+            avif_cpu = int(avif_cpu_used) if avif_cpu_used is not None else 5
+        except Exception:
+            avif_cpu = 5
+        avif_cpu = max(0, min(8, avif_cpu))
         avif_color_range = "2" if avif_range == "full" else "1"
         if is_avif:
             # Production AVIF exports keep the historical full-range handoff by
@@ -11417,7 +11659,7 @@ try {{
                 "-row-mt",
                 "1",
                 "-cpu-used",
-                "5",
+                str(avif_cpu),
                 # CRF 0 by itself is not a strict no-artifact guarantee for AV1.
                 # Force libaom's true lossless path so the HDR still used for
                 # WIC display rendering is not quantized in dark regions.  The
