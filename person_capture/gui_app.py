@@ -493,8 +493,10 @@ class SessionConfig:
     compose_wide_context_max_frame_face_frac: float = 0.18  # max face_h / content_h for landscape/context
     compose_wide_context_min_side_face_heights: float = 1.20  # require horizontal room around face for context
     compose_wide_context_prior: float = 0.18     # base score prior for landscape/context crops
+    compose_wide_context_every_n: int = 5        # deterministic widescreen/context cadence when viable; 0 disables
     compose_landscape_face_penalty: float = 5.0  # discourage landscape crops for prominent faces
     compose_body_every_n: int = 6                # deterministic body-shot bias cadence when viable
+    compose_person_assoc_max_face_frac: float = 0.30  # run person association up to this face_h/content_h; 0 disables scale gate
     compose_person_detect_cadence: int = 6        # only run YOLO person association for face hits on body-suited cadence
     border_threshold: int = 22                   # grayscale threshold for border trimming
     border_scan_frac: float = 0.25               # scan depth as fraction of min(w,h)
@@ -2444,6 +2446,8 @@ class Processor(QtCore.QObject):
         subj_h_frac = ((subj[3] - subj[1]) / bound_h) if subj is not None else 0.0
         body_period = max(0, int(getattr(cfg, "compose_body_every_n", 6)))
         body_cadence = body_period > 0 and frame_idx is not None and (int(frame_idx) % body_period == 0)
+        wide_period = max(0, int(getattr(cfg, "compose_wide_context_every_n", 5)))
+        wide_cadence = wide_period > 0 and frame_idx is not None and (int(frame_idx) % wide_period == 0)
         if face is not None:
             fx1, fy1, fx2, fy2 = face
             fw = max(1.0, fx2 - fx1)
@@ -2472,6 +2476,13 @@ class Processor(QtCore.QObject):
             wide_context_target = max(0.08, min(0.26, float(getattr(cfg, "compose_wide_context_face_h_frac", 0.16))))
             wide_context_max_frame_frac = max(0.08, min(0.32, float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18))))
             wide_context_min_side_face_heights = max(0.0, min(4.0, float(getattr(cfg, "compose_wide_context_min_side_face_heights", 1.20))))
+            # Cadence is a soft variety bias, not a hard ratio override. It only
+            # relaxes the context gate on frames that are already plausible
+            # landscape candidates, and the scorer can still reject the crop if
+            # it would cut identity/body evidence or over-enlarge the face.
+            effective_wide_context_max_frame_frac = wide_context_max_frame_frac + (0.035 if wide_cadence else 0.0)
+            effective_wide_context_max_frame_frac = max(0.08, min(0.34, effective_wide_context_max_frame_frac))
+            effective_wide_context_min_side_face_heights = wide_context_min_side_face_heights * (0.70 if wide_cadence else 1.0)
 
             close_protect = self._pad_box_xyxy(
                 (hx1, hy1, hx2, max(hy2, fy2 + 0.85 * face_h)),
@@ -2488,19 +2499,36 @@ class Processor(QtCore.QObject):
                 0.34,
                 min(0.48, float(cfg.compose_portrait_close_face_h_frac)),
             )
-            portrait_protect = self._pad_box_xyxy(
-                (hx1, hy1, hx2, max(hy2, fy2 + 1.45 * face_h)),
-                pad_x=0.18 * fw,
-                pad_y_top=0.00,
-                pad_y_bottom=0.35 * face_h,
-                bounds_xyxy=bounds,
-            ) or (hx1, hy1, hx2, max(hy2, fy2 + 1.45 * face_h))
+            if subj is not None:
+                sx1, sy1, sx2, sy2 = subj
+                sw = max(1.0, sx2 - sx1)
+                sh = max(1.0, sy2 - sy1)
+                torso_cx = 0.5 * (sx1 + sx2)
+                portrait_bottom = min(float(by2), max(fy2 + 1.70 * face_h, sy1 + 0.34 * sh))
+                portrait_half_w = max(1.05 * fw, 0.30 * sw)
+                portrait_top = min(hy1, sy1)
+                portrait_protect = (
+                    max(float(bx1), min(hx1, torso_cx - portrait_half_w)),
+                    max(float(by1), portrait_top),
+                    min(float(bx2), max(hx2, torso_cx + portrait_half_w)),
+                    portrait_bottom,
+                )
+                portrait_anchor = (torso_cx, 0.5 * (portrait_top + portrait_bottom))
+            else:
+                portrait_protect = self._pad_box_xyxy(
+                    (hx1, hy1, hx2, max(hy2, fy2 + 1.45 * face_h)),
+                    pad_x=0.18 * fw,
+                    pad_y_top=0.00,
+                    pad_y_bottom=0.35 * face_h,
+                    bounds_xyxy=bounds,
+                ) or (hx1, hy1, hx2, max(hy2, fy2 + 1.45 * face_h))
+                portrait_anchor = (fcx, fcy + 1.05 * face_h)
             profiles.append(
                 (
                     "portrait_close",
                     portrait_protect,
                     portrait_target,
-                    (fcx, fcy + 1.05 * face_h),
+                    portrait_anchor,
                     (fw * 2.05, face_h / portrait_target),
                 )
             )
@@ -2511,12 +2539,14 @@ class Processor(QtCore.QObject):
                 sh = max(1.0, sy2 - sy1)
                 upper_bottom = min(float(by2), max(fy2 + 3.6 * face_h, sy1 + 0.58 * sh))
                 upper_half_w = max(1.15 * fw, 0.48 * sw)
+                upper_top = min(hy1, sy1)
                 upper_protect = (
-                    max(float(bx1), min(hx1, fcx - upper_half_w)),
-                    max(float(by1), min(hy1, sy1)),
-                    min(float(bx2), max(hx2, fcx + upper_half_w)),
+                    max(float(bx1), min(hx1, 0.5 * (sx1 + sx2) - upper_half_w)),
+                    max(float(by1), upper_top),
+                    min(float(bx2), max(hx2, 0.5 * (sx1 + sx2) + upper_half_w)),
                     upper_bottom,
                 )
+                upper_anchor = (0.5 * (sx1 + sx2), 0.5 * (upper_top + upper_bottom))
             else:
                 upper_protect = self._pad_box_xyxy(
                     (hx1, hy1, hx2, max(hy2, fy2 + 2.6 * face_h)),
@@ -2525,12 +2555,13 @@ class Processor(QtCore.QObject):
                     pad_y_bottom=0.55 * face_h,
                     bounds_xyxy=bounds,
                 ) or (hx1, hy1, hx2, max(hy2, fy2 + 2.6 * face_h))
-            profiles.append(("upper", upper_protect, upper_target, (fcx, fcy + 1.45 * face_h), (fw * 2.8, face_h / upper_target)))
+                upper_anchor = (fcx, fcy + 1.45 * face_h)
+            profiles.append(("upper", upper_protect, upper_target, upper_anchor, (fw * 2.8, face_h / upper_target)))
 
             if (
                 wide_context_enabled
                 and _landscape_ratio_available()
-                and face_frame_frac <= wide_context_max_frame_frac
+                and face_frame_frac <= effective_wide_context_max_frame_frac
             ):
                 # Dedicated landscape/context framing. This is intentionally
                 # separate from the body profile: a strong widescreen still does
@@ -2540,22 +2571,25 @@ class Processor(QtCore.QObject):
                     max(0.0, float(fx1) - float(bx1)),
                     max(0.0, float(bx2) - float(fx2)),
                 ) / max(1.0, face_h)
-                if side_room_face_heights >= wide_context_min_side_face_heights:
+                if side_room_face_heights >= effective_wide_context_min_side_face_heights:
                     if subj is not None:
                         sx1, sy1, sx2, sy2 = subj
                         sw = max(1.0, sx2 - sx1)
                         sh = max(1.0, sy2 - sy1)
+                        subj_cx = 0.5 * (sx1 + sx2)
                         wide_bottom = min(float(by2), max(fy2 + 2.4 * face_h, sy1 + 0.70 * sh))
                         wide_half_w = max(2.2 * fw, 0.62 * sw)
                         wide_top = min(hy1, max(float(by1), sy1 - 0.05 * sh))
+                        wide_anchor = (subj_cx, 0.5 * (wide_top + wide_bottom))
                     else:
                         wide_bottom = min(float(by2), max(hy2, fy2 + 2.8 * face_h))
                         wide_half_w = max(2.4 * fw, 0.45 * float(bx2 - bx1))
                         wide_top = hy1
+                        wide_anchor = (fcx, fcy + 1.20 * face_h)
                     wide_protect = (
-                        max(float(bx1), min(hx1, fcx - wide_half_w)),
+                        max(float(bx1), min(hx1, float(wide_anchor[0]) - wide_half_w)),
                         max(float(by1), wide_top),
-                        min(float(bx2), max(hx2, fcx + wide_half_w)),
+                        min(float(bx2), max(hx2, float(wide_anchor[0]) + wide_half_w)),
                         wide_bottom,
                     )
                     profiles.append(
@@ -2563,7 +2597,7 @@ class Processor(QtCore.QObject):
                             "wide_context",
                             wide_protect,
                             wide_context_target,
-                            (fcx, fcy + 1.20 * face_h),
+                            wide_anchor,
                             (max(fw * 4.0, wide_half_w * 2.0), face_h / wide_context_target),
                         )
                     )
@@ -2682,7 +2716,7 @@ class Processor(QtCore.QObject):
                         continue
                     if face is None:
                         continue
-                    if face_frame_frac > wide_context_max_frame_frac:
+                    if face_frame_frac > effective_wide_context_max_frame_frac:
                         continue
 
                 crop = self._ratio_crop_containing_box(
@@ -2762,8 +2796,15 @@ class Processor(QtCore.QObject):
                     # The profile should win only for real context shots. Once
                     # the face becomes close/upper scale, portrait profiles should
                     # dominate even if a landscape ratio is allowed.
-                    over = max(0.0, face_frame_frac - wide_context_max_frame_frac)
+                    over = max(0.0, face_frame_frac - effective_wide_context_max_frame_frac)
                     ratio_prior += landscape_penalty * 4.0 * over
+                    if wide_cadence:
+                        # Deterministic oscillator: every Nth viable frame gets a
+                        # small landscape/context bias. This is deliberately softer
+                        # than containment/face-size penalties so it cannot force a
+                        # bad widescreen crop.
+                        profile_prior -= 0.32
+                        ratio_prior -= 0.10
                     actual_probe_face_frac = face_h / max(1.0, crop_h)
                     if actual_probe_face_frac > 0.30:
                         ratio_prior += landscape_penalty * (actual_probe_face_frac - 0.30)
@@ -2818,16 +2859,48 @@ class Processor(QtCore.QObject):
                     fcy = 0.5 * (face[1] + face[3])
                     rel_x = (fcx - cx1) / crop_w
                     rel_y = (fcy - cy1) / crop_h
-                    placement_penalty += 0.25 * abs(rel_x - 0.50)
+                    # Close stays face-driven. Once there is an associated person
+                    # box, looser portrait/context profiles should align around the
+                    # visible body region and leave the face high enough to recover
+                    # torso/body below.
+                    if subj is not None and profile in {"portrait_close", "upper", "wide_context"}:
+                        sx1, sy1, sx2, sy2 = subj
+                        scx = 0.5 * (sx1 + sx2)
+                        rel_sx = (scx - cx1) / crop_w
+                        placement_penalty += 0.18 * abs(rel_sx - 0.50)
+                        face_x_weight = 0.16
+                    else:
+                        face_x_weight = 0.25
+                    placement_penalty += face_x_weight * abs(rel_x - 0.50)
                     if profile == "close":
                         target_y = 0.36
                     elif profile == "portrait_close":
-                        target_y = 0.33
+                        target_y = 0.27 if subj is not None else 0.33
                     elif profile == "upper":
-                        target_y = 0.28
+                        target_y = 0.22 if subj is not None else 0.28
                     else:
-                        target_y = 0.38
+                        target_y = 0.32 if subj is not None else 0.38
                     placement_penalty += 0.35 * abs(rel_y - target_y)
+
+                if subj is not None and profile in {"upper", "body", "wide_context"}:
+                    sx1, sy1, sx2, sy2 = subj
+                    sh = max(1.0, sy2 - sy1)
+                    scx = 0.5 * (sx1 + sx2)
+                    if profile == "upper" and face is not None:
+                        # Center the visible upper-body region, not the full YOLO
+                        # person box. Full-body center would over-correct medium
+                        # portraits and can push the face too high.
+                        upper_bottom = min(float(by2), max(face[3] + 3.6 * face_h, sy1 + 0.58 * sh))
+                        body_cy = 0.5 * (min(sy1, face[1]) + upper_bottom)
+                        y_weight = 0.24
+                    elif profile == "wide_context" and face is not None:
+                        body_cy = 0.5 * (min(sy1, face[1]) + min(float(by2), max(face[3] + 2.4 * face_h, sy1 + 0.70 * sh)))
+                        y_weight = 0.16
+                    else:
+                        body_cy = 0.5 * (sy1 + sy2)
+                        y_weight = 0.20
+                    placement_penalty += 0.16 * abs(((scx - cx1) / crop_w) - 0.50)
+                    placement_penalty += y_weight * abs(((body_cy - cy1) / crop_h) - 0.50)
 
                 score = containment + profile_prior + ratio_prior + 2.2 * face_loss + area_penalty + placement_penalty
                 _maybe_update_portrait_alt(score, crop, rs, profile, actual_face_h_frac)
@@ -2885,14 +2958,14 @@ class Processor(QtCore.QObject):
                 if (
                     face is not None
                     and bool(getattr(cfg, "compose_wide_context_enable", True))
-                    and face_frame_frac <= max(0.08, min(0.32, float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18))))
+                    and face_frame_frac <= max(0.08, min(0.34, float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18)) + (0.035 if wide_cadence else 0.0)))
                 ):
                     fx1_f, fy1_f, fx2_f, fy2_f = [float(v) for v in face]
                     side_room_face_heights = min(
                         max(0.0, fx1_f - float(bx1)),
                         max(0.0, float(bx2) - fx2_f),
                     ) / max(1.0, fy2_f - fy1_f)
-                    wide_context_ok = side_room_face_heights >= max(0.0, min(4.0, float(getattr(cfg, "compose_wide_context_min_side_face_heights", 1.20))))
+                    wide_context_ok = side_room_face_heights >= (max(0.0, min(4.0, float(getattr(cfg, "compose_wide_context_min_side_face_heights", 1.20)))) * (0.70 if wide_cadence else 1.0))
                     if wide_context_ok:
                         fallback_profile = "wide_context"
                         fallback_protect = face_protect or face or base or (bx1, by1, bx2, by2)
@@ -2929,14 +3002,14 @@ class Processor(QtCore.QObject):
                 if (
                     face is not None
                     and bool(getattr(cfg, "compose_wide_context_enable", True))
-                    and face_frame_frac <= max(0.08, min(0.32, float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18))))
+                    and face_frame_frac <= max(0.08, min(0.34, float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18)) + (0.035 if wide_cadence else 0.0)))
                 ):
                     fx1_f, fy1_f, fx2_f, fy2_f = [float(v) for v in face]
                     side_room_face_heights = min(
                         max(0.0, fx1_f - float(bx1)),
                         max(0.0, float(bx2) - fx2_f),
                     ) / max(1.0, fy2_f - fy1_f)
-                    wide_context_ok = side_room_face_heights >= max(0.0, min(4.0, float(getattr(cfg, "compose_wide_context_min_side_face_heights", 1.20))))
+                    wide_context_ok = side_room_face_heights >= (max(0.0, min(4.0, float(getattr(cfg, "compose_wide_context_min_side_face_heights", 1.20)))) * (0.70 if wide_cadence else 1.0))
                     if wide_context_ok:
                         fallback_profile = "wide_context"
                         fallback_protect = face_protect or face or base or (bx1, by1, bx2, by2)
@@ -5411,8 +5484,10 @@ class Processor(QtCore.QObject):
                             "compose_wide_context_max_frame_face_frac",
                             "compose_wide_context_min_side_face_heights",
                             "compose_wide_context_prior",
+                            "compose_wide_context_every_n",
                             "compose_landscape_face_penalty",
                             "compose_body_every_n",
+                            "compose_person_assoc_max_face_frac",
                             "compose_person_detect_cadence",
                         }
                         rot_keys = {
@@ -5799,7 +5874,13 @@ class Processor(QtCore.QObject):
                                     except Exception:
                                         body_period = 6
                                     face_h_frac = (fy2 - fy1) / max(1.0, float(H2))
-                                    need_person_assoc = (face_h_frac < 0.11) or (body_period > 0 and int(idx) % body_period == 0)
+                                    # Body-aware composition needs an associated person box.
+                                    # The old gate only did this for tiny faces or cadence
+                                    # frames, so many medium portraits stayed face-centered.
+                                    # Keep true close-ups face-only, but associate person boxes
+                                    # for upper/portrait-scale faces where body anchoring matters.
+                                    assoc_max = max(0.0, min(0.60, float(getattr(cfg, "compose_person_assoc_max_face_frac", 0.30))))
+                                    need_person_assoc = (assoc_max > 0.0 and face_h_frac <= assoc_max) or (body_period > 0 and int(idx) % body_period == 0)
                                     if need_person_assoc:
                                         try:
                                             assoc_persons = det.detect(frame_for_det, conf=float(cfg.min_det_conf))
@@ -5990,7 +6071,13 @@ class Processor(QtCore.QObject):
                                     except Exception:
                                         body_period = 6
                                     face_h_frac = (fy2 - fy1) / max(1.0, float(H2))
-                                    need_person_assoc = (face_h_frac < 0.11) or (body_period > 0 and int(idx) % body_period == 0)
+                                    # Body-aware composition needs an associated person box.
+                                    # The old gate only did this for tiny faces or cadence
+                                    # frames, so many medium portraits stayed face-centered.
+                                    # Keep true close-ups face-only, but associate person boxes
+                                    # for upper/portrait-scale faces where body anchoring matters.
+                                    assoc_max = max(0.0, min(0.60, float(getattr(cfg, "compose_person_assoc_max_face_frac", 0.30))))
+                                    need_person_assoc = (assoc_max > 0.0 and face_h_frac <= assoc_max) or (body_period > 0 and int(idx) % body_period == 0)
                                     if need_person_assoc:
                                         try:
                                             assoc_persons = det.detect(frame_for_det, conf=float(cfg.min_det_conf))
@@ -7041,6 +7128,7 @@ class Processor(QtCore.QObject):
                                 cfg,
                                 bounds_xyxy=(repair_bx1, repair_by1, repair_bx2, repair_by2),
                                 profile=smart_profile,
+                                subject_box=c.get("subject_box"),
                             )
                             after_smart = (int(cx1), int(cy1), int(cx2), int(cy2))
                             if after_smart != before_smart:
@@ -7427,7 +7515,13 @@ class Processor(QtCore.QObject):
                                     except Exception:
                                         body_period = 6
                                     face_h_frac = (fy2 - fy1) / max(1.0, float(H2))
-                                    need_person_assoc = (face_h_frac < 0.11) or (body_period > 0 and int(idx) % body_period == 0)
+                                    # Body-aware composition needs an associated person box.
+                                    # The old gate only did this for tiny faces or cadence
+                                    # frames, so many medium portraits stayed face-centered.
+                                    # Keep true close-ups face-only, but associate person boxes
+                                    # for upper/portrait-scale faces where body anchoring matters.
+                                    assoc_max = max(0.0, min(0.60, float(getattr(cfg, "compose_person_assoc_max_face_frac", 0.30))))
+                                    need_person_assoc = (assoc_max > 0.0 and face_h_frac <= assoc_max) or (body_period > 0 and int(idx) % body_period == 0)
                                     if need_person_assoc:
                                         try:
                                             assoc_persons = persons or det.detect(frame_for_det, conf=float(cfg.min_det_conf))
@@ -7982,6 +8076,7 @@ class Processor(QtCore.QObject):
         cfg,
         bounds_xyxy=None,
         profile: Optional[str] = None,
+        subject_box: Optional[Tuple[float, float, float, float]] = None,
     ):
         """Final ratio-preserving crop placement pass.
 
@@ -8045,7 +8140,12 @@ class Processor(QtCore.QObject):
 
         face = self._coerce_box_xyxy(face_box, bounds)
         protect = self._coerce_box_xyxy(protect_box, bounds)
-        hard_box = self._union_boxes_xyxy(protect, face) or protect or face
+        subject = self._coerce_box_xyxy(subject_box, bounds)
+        prof = str(profile or "").lower()
+        if prof in {"body", "wide_context"}:
+            hard_box = self._union_boxes_xyxy(subject, protect, face) or subject or protect or face
+        else:
+            hard_box = self._union_boxes_xyxy(protect, face) or protect or face
         hard_box = self._coerce_box_xyxy(hard_box, bounds)
 
         if hard_box is not None:
@@ -8079,13 +8179,31 @@ class Processor(QtCore.QObject):
             if 2 <= exact_h <= int(round(bound_h)):
                 crop_h_i = exact_h
 
-        prof = str(profile or "").lower()
         if face is not None:
             fx1, fy1, fx2, fy2 = [float(v) for v in face]
             fcx = 0.5 * (fx1 + fx2)
             fcy = 0.5 * (fy1 + fy2)
             fh = max(1.0, fy2 - fy1)
-            if prof == "close":
+            if subject is not None and prof in {"portrait_close", "upper", "body", "wide_context"}:
+                sx1, sy1, sx2, sy2 = [float(v) for v in subject]
+                sh = max(1.0, sy2 - sy1)
+                scx = 0.5 * (sx1 + sx2)
+                if prof == "portrait_close":
+                    bottom = min(float(by2), max(fy2 + 1.70 * fh, sy1 + 0.34 * sh))
+                    anchor = (scx, 0.5 * (min(fy1, sy1) + bottom))
+                    target_face_y = 0.27
+                elif prof == "upper":
+                    bottom = min(float(by2), max(fy2 + 3.60 * fh, sy1 + 0.58 * sh))
+                    anchor = (scx, 0.5 * (min(fy1, sy1) + bottom))
+                    target_face_y = 0.22
+                elif prof == "wide_context":
+                    bottom = min(float(by2), max(fy2 + 2.40 * fh, sy1 + 0.70 * sh))
+                    anchor = (scx, 0.5 * (min(fy1, sy1) + bottom))
+                    target_face_y = 0.32
+                else:
+                    anchor = (scx, 0.5 * (sy1 + sy2))
+                    target_face_y = 0.24
+            elif prof == "close":
                 anchor = (fcx, fcy + 0.55 * fh)
                 target_face_y = 0.36
             elif prof == "portrait_close":
@@ -8233,7 +8351,28 @@ class Processor(QtCore.QObject):
                 fcy = 0.5 * (fy1 + fy2)
                 rel_x = (fcx - x1) / cw
                 rel_y = (fcy - y1) / ch
-                score += 0.75 * abs(rel_x - 0.50)
+                if subject is not None and prof in {"portrait_close", "upper", "body", "wide_context"}:
+                    sx1, sy1, sx2, sy2 = [float(v) for v in subject]
+                    sh = max(1.0, sy2 - sy1)
+                    scx = 0.5 * (sx1 + sx2)
+                    if prof == "portrait_close":
+                        body_bottom = min(float(by2), max(fy2 + 1.70 * fh, sy1 + 0.34 * sh))
+                        body_weight_y = 0.40
+                    elif prof == "upper":
+                        body_bottom = min(float(by2), max(fy2 + 3.60 * fh, sy1 + 0.58 * sh))
+                        body_weight_y = 0.55
+                    elif prof == "wide_context":
+                        body_bottom = min(float(by2), max(fy2 + 2.40 * fh, sy1 + 0.70 * sh))
+                        body_weight_y = 0.35
+                    else:
+                        body_bottom = sy2
+                        body_weight_y = 0.65
+                    body_cy = 0.5 * (min(fy1, sy1) + body_bottom)
+                    score += 0.40 * abs(((scx - x1) / cw) - 0.50)
+                    score += body_weight_y * abs(((body_cy - y1) / ch) - 0.50)
+                    score += 0.35 * abs(rel_x - 0.50)
+                else:
+                    score += 0.75 * abs(rel_x - 0.50)
                 score += 1.10 * abs(rel_y - target_face_y)
                 desired_side = float(getattr(cfg, "crop_face_side_margin_frac", 0.30)) * fw
                 left = max(0.0, fx1 - x1)
@@ -14228,6 +14367,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.compose_wide_context_prior_spin = _mk_fspin(-1.0, 3.0, 0.05, 2, "float: compose_wide_context_prior")
         self.compose_wide_context_prior_spin.setValue(float(getattr(self.cfg, "compose_wide_context_prior", 0.18)))
         self.compose_wide_context_prior_spin.valueChanged.connect(self._on_ui_change)
+        self.compose_wide_context_every_n_spin = QtWidgets.QSpinBox()
+        self.compose_wide_context_every_n_spin.setRange(0, 300)
+        self.compose_wide_context_every_n_spin.setValue(int(getattr(self.cfg, "compose_wide_context_every_n", 5)))
+        self.compose_wide_context_every_n_spin.setToolTip("int: compose_wide_context_every_n")
+        self.compose_wide_context_every_n_spin.valueChanged.connect(self._on_ui_change)
         self.compose_landscape_face_penalty_spin = _mk_fspin(0.0, 20.0, 0.1, 2, "float: compose_landscape_face_penalty")
         self.compose_landscape_face_penalty_spin.setValue(float(self.cfg.compose_landscape_face_penalty))
         self.compose_landscape_face_penalty_spin.valueChanged.connect(self._on_ui_change)
@@ -14236,6 +14380,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.compose_body_every_n_spin.setValue(int(self.cfg.compose_body_every_n))
         self.compose_body_every_n_spin.setToolTip("int: compose_body_every_n")
         self.compose_body_every_n_spin.valueChanged.connect(self._on_ui_change)
+        self.compose_person_assoc_max_face_frac_spin = _mk_fspin(0.0, 0.60, 0.005, 3, "float: compose_person_assoc_max_face_frac")
+        self.compose_person_assoc_max_face_frac_spin.setValue(float(getattr(self.cfg, "compose_person_assoc_max_face_frac", 0.30)))
+        self.compose_person_assoc_max_face_frac_spin.valueChanged.connect(self._on_ui_change)
         self.compose_person_detect_cadence_spin = QtWidgets.QSpinBox()
         self.compose_person_detect_cadence_spin.setRange(1, 300)
         self.compose_person_detect_cadence_spin.setValue(int(getattr(self.cfg, "compose_person_detect_cadence", 6)))
@@ -14413,8 +14560,10 @@ class MainWindow(QtWidgets.QMainWindow):
             ("compose_wide_context_max_frame_face_frac", self.compose_wide_context_max_frame_face_frac_spin),
             ("compose_wide_context_min_side_face_heights", self.compose_wide_context_min_side_face_heights_spin),
             ("compose_wide_context_prior", self.compose_wide_context_prior_spin),
+            ("compose_wide_context_every_n", self.compose_wide_context_every_n_spin),
             ("compose_landscape_face_penalty", self.compose_landscape_face_penalty_spin),
             ("compose_body_every_n", self.compose_body_every_n_spin),
+            ("compose_person_assoc_max_face_frac", self.compose_person_assoc_max_face_frac_spin),
             ("compose_person_detect_cadence", self.compose_person_detect_cadence_spin),
         ]
         for row, (lab, w) in enumerate(labels):
@@ -15716,8 +15865,10 @@ class MainWindow(QtWidgets.QMainWindow):
             "compose_wide_context_max_frame_face_frac",
             "compose_wide_context_min_side_face_heights",
             "compose_wide_context_prior",
+            "compose_wide_context_every_n",
             "compose_landscape_face_penalty",
             "compose_body_every_n",
+            "compose_person_assoc_max_face_frac",
             "compose_person_detect_cadence",
         }
         delta = {}
@@ -15909,8 +16060,10 @@ class MainWindow(QtWidgets.QMainWindow):
             compose_wide_context_max_frame_face_frac=float(self.compose_wide_context_max_frame_face_frac_spin.value()) if hasattr(self, "compose_wide_context_max_frame_face_frac_spin") else float(getattr(self.cfg, "compose_wide_context_max_frame_face_frac", 0.18)),
             compose_wide_context_min_side_face_heights=float(self.compose_wide_context_min_side_face_heights_spin.value()) if hasattr(self, "compose_wide_context_min_side_face_heights_spin") else float(getattr(self.cfg, "compose_wide_context_min_side_face_heights", 1.20)),
             compose_wide_context_prior=float(self.compose_wide_context_prior_spin.value()) if hasattr(self, "compose_wide_context_prior_spin") else float(getattr(self.cfg, "compose_wide_context_prior", 0.18)),
+            compose_wide_context_every_n=int(self.compose_wide_context_every_n_spin.value()) if hasattr(self, "compose_wide_context_every_n_spin") else int(getattr(self.cfg, "compose_wide_context_every_n", 5)),
             compose_landscape_face_penalty=float(self.compose_landscape_face_penalty_spin.value()) if hasattr(self, "compose_landscape_face_penalty_spin") else float(getattr(self.cfg, "compose_landscape_face_penalty", 5.0)),
             compose_body_every_n=int(self.compose_body_every_n_spin.value()) if hasattr(self, "compose_body_every_n_spin") else int(getattr(self.cfg, "compose_body_every_n", 6)),
+            compose_person_assoc_max_face_frac=float(self.compose_person_assoc_max_face_frac_spin.value()) if hasattr(self, "compose_person_assoc_max_face_frac_spin") else float(getattr(self.cfg, "compose_person_assoc_max_face_frac", 0.30)),
             compose_person_detect_cadence=int(self.compose_person_detect_cadence_spin.value()) if hasattr(self, "compose_person_detect_cadence_spin") else int(getattr(self.cfg, "compose_person_detect_cadence", 6)),
             hdr_wic_speckle_cleanup=(
                 bool(self.hdr_wic_speckle_cleanup_check.isChecked())
@@ -16327,6 +16480,10 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             self.cfg.compose_wide_context_prior = 0.18
         try:
+            self.cfg.compose_wide_context_every_n = int(getattr(cfg, "compose_wide_context_every_n", 5))
+        except Exception:
+            self.cfg.compose_wide_context_every_n = 5
+        try:
             self.cfg.compose_landscape_face_penalty = float(getattr(cfg, "compose_landscape_face_penalty", 5.0))
         except Exception:
             self.cfg.compose_landscape_face_penalty = 5.0
@@ -16334,6 +16491,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.compose_body_every_n = int(getattr(cfg, "compose_body_every_n", 6))
         except Exception:
             self.cfg.compose_body_every_n = 6
+        try:
+            self.cfg.compose_person_assoc_max_face_frac = float(getattr(cfg, "compose_person_assoc_max_face_frac", 0.30))
+        except Exception:
+            self.cfg.compose_person_assoc_max_face_frac = 0.30
         try:
             self.cfg.compose_person_detect_cadence = int(getattr(cfg, "compose_person_detect_cadence", 6))
         except Exception:
@@ -16789,10 +16950,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.compose_wide_context_min_side_face_heights_spin.setValue(float(getattr(cfg, "compose_wide_context_min_side_face_heights", 1.20)))
         if hasattr(self, 'compose_wide_context_prior_spin'):
             self.compose_wide_context_prior_spin.setValue(float(getattr(cfg, "compose_wide_context_prior", 0.18)))
+        if hasattr(self, 'compose_wide_context_every_n_spin'):
+            self.compose_wide_context_every_n_spin.setValue(int(getattr(cfg, "compose_wide_context_every_n", 5)))
         if hasattr(self, 'compose_landscape_face_penalty_spin'):
             self.compose_landscape_face_penalty_spin.setValue(float(cfg.compose_landscape_face_penalty))
         if hasattr(self, 'compose_body_every_n_spin'):
             self.compose_body_every_n_spin.setValue(int(cfg.compose_body_every_n))
+        if hasattr(self, 'compose_person_assoc_max_face_frac_spin'):
+            self.compose_person_assoc_max_face_frac_spin.setValue(float(getattr(cfg, "compose_person_assoc_max_face_frac", 0.30)))
         if hasattr(self, 'compose_person_detect_cadence_spin'):
             self.compose_person_detect_cadence_spin.setValue(int(getattr(cfg, "compose_person_detect_cadence", 6)))
 
@@ -18155,6 +18320,12 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             self.cfg.compose_wide_context_prior = 0.18
         try:
+            self.cfg.compose_wide_context_every_n = int(
+                s.value("compose_wide_context_every_n", getattr(self.cfg, "compose_wide_context_every_n", 5))
+            )
+        except Exception:
+            self.cfg.compose_wide_context_every_n = 5
+        try:
             self.cfg.compose_landscape_face_penalty = float(
                 s.value(
                     "compose_landscape_face_penalty",
@@ -18169,6 +18340,12 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         except Exception:
             self.cfg.compose_body_every_n = 6
+        try:
+            self.cfg.compose_person_assoc_max_face_frac = float(
+                s.value("compose_person_assoc_max_face_frac", getattr(self.cfg, "compose_person_assoc_max_face_frac", 0.30))
+            )
+        except Exception:
+            self.cfg.compose_person_assoc_max_face_frac = 0.30
         try:
             self.cfg.compose_person_detect_cadence = int(
                 s.value("compose_person_detect_cadence", getattr(self.cfg, "compose_person_detect_cadence", 6))
@@ -18311,6 +18488,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.compose_wide_context_prior_spin.setValue(
                 float(s.value("compose_wide_context_prior", self.cfg.compose_wide_context_prior))
             )
+        if hasattr(self, 'compose_wide_context_every_n_spin'):
+            self.compose_wide_context_every_n_spin.setValue(
+                int(s.value("compose_wide_context_every_n", getattr(self.cfg, "compose_wide_context_every_n", 5)))
+            )
         if hasattr(self, 'compose_landscape_face_penalty_spin'):
             self.compose_landscape_face_penalty_spin.setValue(
                 float(
@@ -18323,6 +18504,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'compose_body_every_n_spin'):
             self.compose_body_every_n_spin.setValue(
                 int(s.value("compose_body_every_n", self.cfg.compose_body_every_n))
+            )
+        if hasattr(self, 'compose_person_assoc_max_face_frac_spin'):
+            self.compose_person_assoc_max_face_frac_spin.setValue(
+                float(s.value("compose_person_assoc_max_face_frac", getattr(self.cfg, "compose_person_assoc_max_face_frac", 0.30)))
             )
         if hasattr(self, 'compose_person_detect_cadence_spin'):
             self.compose_person_detect_cadence_spin.setValue(
@@ -18498,6 +18683,10 @@ class MainWindow(QtWidgets.QMainWindow):
             s.setValue("w_cowboy", self.w_cowboy_spin.value())
         if hasattr(self, 'w_body_spin'):
             s.setValue("w_body", self.w_body_spin.value())
+        if hasattr(self, 'compose_wide_context_every_n_spin'):
+            s.setValue("compose_wide_context_every_n", int(self.compose_wide_context_every_n_spin.value()))
+        if hasattr(self, 'compose_person_assoc_max_face_frac_spin'):
+            s.setValue("compose_person_assoc_max_face_frac", float(self.compose_person_assoc_max_face_frac_spin.value()))
         s.sync()
 
 
