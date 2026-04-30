@@ -10837,16 +10837,23 @@ Write-WicBgr32Raw $cleanSrc $cleanDst 'CLEAN'
             clean_backup = clean_out_path + ".bak.rawpair"
             backed_up_ref = False
             backed_up_clean = False
+            published_ref = False
+            published_clean = False
             restored_ref = False
             restored_clean = False
             publish_succeeded = False
             try:
-                for bak in (ref_backup, clean_backup):
-                    try:
-                        if os.path.exists(bak):
-                            os.remove(bak)
-                    except Exception:
-                        pass
+                stale_backups: list[str] = []
+                if os.path.exists(ref_backup):
+                    stale_backups.append("ref")
+                if os.path.exists(clean_backup):
+                    stale_backups.append("clean")
+                if stale_backups:
+                    return False, (
+                        "windows_wic_raw_pair_recovery_required:"
+                        + ",".join(stale_backups)
+                        + "_backup_present"
+                    ), None, None
                 if os.path.exists(ref_out_path):
                     os.replace(ref_out_path, ref_backup)
                     backed_up_ref = True
@@ -10855,19 +10862,23 @@ Write-WicBgr32Raw $cleanSrc $cleanDst 'CLEAN'
                     backed_up_clean = True
 
                 os.replace(ref_tmp, ref_out_path)
+                published_ref = True
                 os.replace(clean_tmp, clean_out_path)
+                published_clean = True
                 publish_succeeded = True
             except Exception as exc:
-                try:
-                    if os.path.exists(ref_out_path):
-                        os.remove(ref_out_path)
-                except Exception:
-                    pass
-                try:
-                    if os.path.exists(clean_out_path):
-                        os.remove(clean_out_path)
-                except Exception:
-                    pass
+                if published_ref:
+                    try:
+                        if os.path.exists(ref_out_path):
+                            os.remove(ref_out_path)
+                    except Exception:
+                        pass
+                if published_clean:
+                    try:
+                        if os.path.exists(clean_out_path):
+                            os.remove(clean_out_path)
+                    except Exception:
+                        pass
                 if backed_up_ref and os.path.exists(ref_backup):
                     try:
                         os.replace(ref_backup, ref_out_path)
