@@ -2527,6 +2527,43 @@ class Processor(QtCore.QObject):
             return bool(edge_constrained or lower_context_weak or very_tight_face)
 
         best: Optional[tuple[float, Tuple[int, int, int, int], str, str]] = None
+        best_portrait_alt: Optional[tuple[float, Tuple[int, int, int, int], str, str, float, float, float]] = None
+        best_useful_portrait_alt: Optional[tuple[float, Tuple[int, int, int, int], str, str, float, float, float]] = None
+
+        def _portrait_candidate_is_useful(face_h_frac: float, side_margin: float, bottom_margin: float) -> bool:
+            return bool(
+                0.18 <= face_h_frac <= 0.50
+                and bottom_margin >= 0.28
+                and side_margin >= 0.10
+            )
+
+        def _maybe_update_portrait_alt(
+            score: float,
+            crop: Tuple[int, int, int, int],
+            rs: str,
+            profile: str,
+            actual_face_h_frac: float,
+        ) -> None:
+            nonlocal best_portrait_alt, best_useful_portrait_alt
+            if face is None:
+                return
+            if profile not in {"close", "portrait_close", "upper"}:
+                return
+            if rs not in {"2:3", "3:4"}:
+                return
+            cx1, _, cx2, cy2 = [float(v) for v in crop]
+            fx1, fy1, fx2, fy2 = [float(v) for v in face]
+            fw_local = max(1.0, fx2 - fx1)
+            fh_local = max(1.0, fy2 - fy1)
+            side_margin = min(max(0.0, fx1 - cx1), max(0.0, cx2 - fx2)) / fw_local
+            bottom_margin = max(0.0, cy2 - fy2) / fh_local
+            candidate = (score, crop, rs, profile, actual_face_h_frac, side_margin, bottom_margin)
+            if best_portrait_alt is None or candidate[0] < best_portrait_alt[0]:
+                best_portrait_alt = candidate
+            if _portrait_candidate_is_useful(actual_face_h_frac, side_margin, bottom_margin):
+                if best_useful_portrait_alt is None or candidate[0] < best_useful_portrait_alt[0]:
+                    best_useful_portrait_alt = candidate
+
         for profile, protect_raw, target_face_h_frac, anchor, min_size in profiles:
             protect = self._coerce_box_xyxy(protect_raw, bounds)
             if protect is None:
@@ -2665,6 +2702,7 @@ class Processor(QtCore.QObject):
                     if profile == "upper" and face_frame_frac < small_face_frame_frac:
                         profile_prior -= upper_small_face_face_loss_nudge
                 else:
+                    actual_face_h_frac = 0.0
                     face_loss = 0.0
 
                 area_penalty = 0.08 * (crop_area / bound_area)
@@ -2687,11 +2725,44 @@ class Processor(QtCore.QObject):
                     placement_penalty += 0.35 * abs(rel_y - target_y)
 
                 score = containment + profile_prior + ratio_prior + 2.2 * face_loss + area_penalty + placement_penalty
+                _maybe_update_portrait_alt(score, crop, rs, profile, actual_face_h_frac)
                 if best is None or score < best[0]:
                     best = (score, crop, rs, profile)
 
         if best is not None:
-            _, crop, rs, profile = best
+            best_score, crop, rs, profile = best
+            if (
+                face is not None
+                and rs == "1:1"
+                and profile in {"close", "portrait_close", "upper"}
+                and best_portrait_alt is not None
+            ):
+                fx1, fy1, fx2, fy2 = [float(v) for v in face]
+                fh_local = max(1.0, fy2 - fy1)
+                square_h = max(1.0, float(crop[3] - crop[1]))
+                square_face_h_frac = fh_local / square_h
+                portrait_candidate = best_useful_portrait_alt or best_portrait_alt
+                portrait_score, portrait_crop, portrait_rs, portrait_profile, portrait_face_h_frac, portrait_side_margin, portrait_bottom_margin = portrait_candidate
+                # Square remains valid for true tight close-ups and when the
+                # portrait candidate is objectively weak.  Otherwise, prefer the
+                # best feasible portrait candidate when it is close enough in the
+                # same scorer. This fixes medium-close frames that keep sneaking
+                # through as close/1:1 without banning useful square crops.
+                portrait_is_useful = _portrait_candidate_is_useful(
+                    portrait_face_h_frac,
+                    portrait_side_margin,
+                    portrait_bottom_margin,
+                )
+                square_is_legitimate = _square_rescue_allowed()
+                portrait_is_competitive = portrait_score <= best_score + 0.85
+                if portrait_is_useful and portrait_is_competitive and not square_is_legitimate:
+                    self._status(
+                        f"portrait crop override {profile}/1:1 -> {portrait_profile}/{portrait_rs} "
+                        f"sq_fh={square_face_h_frac:.3f} p_fh={portrait_face_h_frac:.3f}",
+                        key="crop_portrait_override",
+                        interval=2.0,
+                    )
+                    return portrait_crop, portrait_rs, portrait_profile
             return crop, rs, profile
 
         fallback_protect = face_hard_protect or subj or base or (bx1, by1, bx2, by2)
