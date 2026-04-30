@@ -2968,7 +2968,7 @@ class Processor(QtCore.QObject):
                     wide_context_ok = side_room_face_heights >= (max(0.0, min(4.0, float(getattr(cfg, "compose_wide_context_min_side_face_heights", 1.20)))) * (0.70 if wide_cadence else 1.0))
                     if wide_context_ok:
                         fallback_profile = "wide_context"
-                        fallback_protect = face_protect or face or base or (bx1, by1, bx2, by2)
+                        fallback_protect = subj or face_protect or face or base or (bx1, by1, bx2, by2)
                 if not wide_context_ok:
                     if subj is None:
                         continue
@@ -3012,7 +3012,7 @@ class Processor(QtCore.QObject):
                     wide_context_ok = side_room_face_heights >= (max(0.0, min(4.0, float(getattr(cfg, "compose_wide_context_min_side_face_heights", 1.20)))) * (0.70 if wide_cadence else 1.0))
                     if wide_context_ok:
                         fallback_profile = "wide_context"
-                        fallback_protect = face_protect or face or base or (bx1, by1, bx2, by2)
+                        fallback_protect = subj or face_protect or face or base or (bx1, by1, bx2, by2)
                 if (
                     not wide_context_ok
                     and subj is not None
@@ -8142,7 +8142,7 @@ class Processor(QtCore.QObject):
         protect = self._coerce_box_xyxy(protect_box, bounds)
         subject = self._coerce_box_xyxy(subject_box, bounds)
         prof = str(profile or "").lower()
-        if prof in {"body", "wide_context"}:
+        if prof in {"portrait_close", "upper", "body", "wide_context"}:
             hard_box = self._union_boxes_xyxy(subject, protect, face) or subject or protect or face
         else:
             hard_box = self._union_boxes_xyxy(protect, face) or protect or face
