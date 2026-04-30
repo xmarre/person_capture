@@ -2881,6 +2881,7 @@ class Processor(QtCore.QObject):
                 continue
             is_landscape = aspect > 1.05
             if is_landscape:
+                wide_context_ok = False
                 if (
                     face is not None
                     and bool(getattr(cfg, "compose_wide_context_enable", True))
@@ -2891,11 +2892,11 @@ class Processor(QtCore.QObject):
                         max(0.0, fx1_f - float(bx1)),
                         max(0.0, float(bx2) - fx2_f),
                     ) / max(1.0, fy2_f - fy1_f)
-                    if side_room_face_heights < max(0.0, min(4.0, float(getattr(cfg, "compose_wide_context_min_side_face_heights", 1.20)))):
-                        continue
-                    fallback_profile = "wide_context"
-                    fallback_protect = face_protect or face or base or (bx1, by1, bx2, by2)
-                else:
+                    wide_context_ok = side_room_face_heights >= max(0.0, min(4.0, float(getattr(cfg, "compose_wide_context_min_side_face_heights", 1.20))))
+                    if wide_context_ok:
+                        fallback_profile = "wide_context"
+                        fallback_protect = face_protect or face or base or (bx1, by1, bx2, by2)
+                if not wide_context_ok:
                     if subj is None:
                         continue
                     if face is not None and face_frame_frac >= small_face_frame_frac:
@@ -2924,6 +2925,7 @@ class Processor(QtCore.QObject):
             except Exception:
                 fallback_aspect = 1.0
             if fallback_aspect > 1.05:
+                wide_context_ok = False
                 if (
                     face is not None
                     and bool(getattr(cfg, "compose_wide_context_enable", True))
@@ -2934,10 +2936,16 @@ class Processor(QtCore.QObject):
                         max(0.0, fx1_f - float(bx1)),
                         max(0.0, float(bx2) - fx2_f),
                     ) / max(1.0, fy2_f - fy1_f)
-                    if side_room_face_heights >= max(0.0, min(4.0, float(getattr(cfg, "compose_wide_context_min_side_face_heights", 1.20)))):
+                    wide_context_ok = side_room_face_heights >= max(0.0, min(4.0, float(getattr(cfg, "compose_wide_context_min_side_face_heights", 1.20))))
+                    if wide_context_ok:
                         fallback_profile = "wide_context"
                         fallback_protect = face_protect or face or base or (bx1, by1, bx2, by2)
-                elif subj is not None and face_frame_frac < small_face_frame_frac and subj_h_frac >= 0.60:
+                if (
+                    not wide_context_ok
+                    and subj is not None
+                    and face_frame_frac < small_face_frame_frac
+                    and subj_h_frac >= 0.60
+                ):
                     fallback_profile = "body"
                     fallback_protect = subj or base or face_hard_protect or (bx1, by1, bx2, by2)
         crop = self._ratio_crop_containing_box(fallback_protect, fallback_ratio, bounds)
