@@ -358,6 +358,9 @@ class SessionConfig:
     # yuv420 display pixels as final shadow texture while preserving its color
     # response.
     hdr_wic_yuv444_color_match: bool = True
+    # How to handle detected WIC block-dropout corruption in yuv444 paths.
+    # reject = current fallback behavior, log = allow but report, off = disabled.
+    hdr_wic_block_corruption_guard_mode: str = "reject"  # reject | log | off
     # Clean full-resolution yuv444 candidate range used by the color-match path.
     # limited keeps current behavior; full enables direct A/B of WIC full-range.
     hdr_wic_yuv444_color_match_clean_range: str = "limited"  # limited | full
@@ -5257,6 +5260,7 @@ class Processor(QtCore.QObject):
                             "wic_shadow_deblob_strength",
                             "hdr_wic_experimental_primary",
                             "hdr_wic_yuv444_color_match",
+                            "hdr_wic_block_corruption_guard_mode",
                             "hdr_wic_yuv444_color_match_clean_range",
                             "hdr_wic_yuv444_color_match_strength",
                             "hdr_wic_yuv444_color_match_luma_strength",
@@ -9117,6 +9121,56 @@ class Processor(QtCore.QObject):
         return self._normalize_wic_yuv444_color_match_clean_range(raw, default=default_range)
 
     @staticmethod
+    def _normalize_wic_block_corruption_guard_mode(value: object, default: str = "reject") -> str:
+        fallback = str(default if default is not None else "reject").strip().lower()
+        if fallback in {"off", "disable", "disabled", "0", "false", "no"}:
+            fallback = "off"
+        elif fallback in {"log", "warn", "log_only", "warn_only"}:
+            fallback = "log"
+        else:
+            fallback = "reject"
+        raw = str(value if value is not None else fallback).strip().lower()
+        if raw in {"off", "disable", "disabled", "0", "false", "no"}:
+            return "off"
+        if raw in {"log", "warn", "log_only", "warn_only"}:
+            return "log"
+        if raw in {"reject", "on", "enabled", "1", "true", "yes"}:
+            return "reject"
+        return fallback
+
+    def _wic_block_guard_mode(self) -> str:
+        default_mode = self._normalize_wic_block_corruption_guard_mode(
+            getattr(self.cfg, "hdr_wic_block_corruption_guard_mode", "reject"),
+            default="reject",
+        )
+        # Legacy kill switch stays authoritative for backward compatibility.
+        if self._truthy_env("PC_DISABLE_WIC_BLOCK_CORRUPTION_GUARD"):
+            return "off"
+        raw_env = str(os.getenv("PC_WIC_BLOCK_CORRUPTION_GUARD_MODE", "") or "").strip()
+        if raw_env:
+            return self._normalize_wic_block_corruption_guard_mode(raw_env, default=default_mode)
+        return default_mode
+
+    def _handle_wic_block_guard(self, stage: str, why: str) -> bool:
+        mode = self._wic_block_guard_mode()
+        reason = str(why or "unknown")
+        if mode == "off":
+            return False
+        if mode == "log":
+            self._status(
+                f"HDR WIC {stage} block-guard hit but allowed: {reason}",
+                key="hdr_wic_yuv444_color_match",
+                interval=0.0,
+            )
+            return False
+        self._status(
+            f"HDR WIC {stage} rejected: {reason}",
+            key="hdr_wic_yuv444_color_match",
+            interval=0.0,
+        )
+        return True
+
+    @staticmethod
     def _scaled_even_dims_for_max_side(w: int, h: int, max_side: int) -> tuple[int, int]:
         w = max(2, int(w))
         h = max(2, int(h))
@@ -9613,6 +9667,7 @@ class Processor(QtCore.QObject):
             ref_raw_meta: tuple[int, int, int] | None = None
             clean_raw_meta: tuple[int, int, int] | None = None
             raw_failures: list[str] = []
+            guard_mode = self._wic_block_guard_mode()
 
             t_wic_start = time.perf_counter()
             if use_raw_wic:
@@ -9661,14 +9716,10 @@ class Processor(QtCore.QObject):
                     raw_mode = False
                     raw_failures.append("raw_read_failed")
                 else:
-                    block_bad, block_why = self._detect_wic_block_corruption_bgr(clean_bgr)
-                    if block_bad:
-                        self._status(
-                            f"HDR WIC yuv444 clean raw render rejected: {block_why}",
-                            key="hdr_wic_yuv444_color_match",
-                            interval=0.0,
-                        )
-                        return False, f"clean_wic_block_corrupt:{block_why}", 0
+                    if guard_mode != "off":
+                        block_bad, block_why = self._detect_wic_block_corruption_bgr(clean_bgr)
+                        if block_bad and self._handle_wic_block_guard("yuv444 clean raw render", block_why):
+                            return False, f"clean_wic_block_corrupt:{block_why}", 0
                     changed, repaired_tmp = self._repair_wic_yuv444_color_match_arrays(ref_bgr, clean_bgr, ref_raw)
             else:
                 changed = 0
@@ -9695,14 +9746,10 @@ class Processor(QtCore.QObject):
                     return False, f"clean_wic_failed:{why_clean_wic}", 0
                 t_clean_wic = time.perf_counter()
                 d_clean_wic = t_clean_wic - t_clean_wic_start
-                block_bad, block_why = self._detect_wic_block_corruption(clean_png)
-                if block_bad:
-                    self._status(
-                        f"HDR WIC yuv444 clean render rejected: {block_why}",
-                        key="hdr_wic_yuv444_color_match",
-                        interval=0.0,
-                    )
-                    return False, f"clean_wic_block_corrupt:{block_why}", 0
+                if guard_mode != "off":
+                    block_bad, block_why = self._detect_wic_block_corruption(clean_png)
+                    if block_bad and self._handle_wic_block_guard("yuv444 clean render", block_why):
+                        return False, f"clean_wic_block_corrupt:{block_why}", 0
                 changed, repaired_tmp = self._repair_wic_with_yuv444_color_match(ref_png, clean_png)
             t_match = time.perf_counter()
             d_match = t_match - (t_clean_wic if 't_clean_wic' in locals() else t_wic_start)
@@ -9714,14 +9761,10 @@ class Processor(QtCore.QObject):
             valid, invalid_why = self._validate_hdr_sdr_export_image(repaired_tmp, None)
             if not valid:
                 return False, f"color_match_invalid:{invalid_why}", 0
-            block_bad, block_why = self._detect_wic_block_corruption(repaired_tmp)
-            if block_bad:
-                self._status(
-                    f"HDR WIC yuv444 color-match output rejected: {block_why}",
-                    key="hdr_wic_yuv444_color_match",
-                    interval=0.0,
-                )
-                return False, f"color_match_block_corrupt:{block_why}", 0
+            if guard_mode != "off":
+                block_bad, block_why = self._detect_wic_block_corruption(repaired_tmp)
+                if block_bad and self._handle_wic_block_guard("yuv444 color-match output", block_why):
+                    return False, f"color_match_block_corrupt:{block_why}", 0
             os.replace(repaired_tmp, out_path)
             t_done = time.perf_counter()
             self._status(
@@ -9803,6 +9846,7 @@ class Processor(QtCore.QObject):
         except Exception:
             pass
         try:
+            guard_mode = self._wic_block_guard_mode()
             ok_hdr, why_hdr = self._save_hdr_wic_specific_intermediate_avif(
                 frame_idx,
                 frame_pts_sec,
@@ -9826,14 +9870,10 @@ class Processor(QtCore.QObject):
                     interval=10.0,
                 )
                 return 0
-            block_bad, block_why = self._detect_wic_block_corruption(guide_png)
-            if block_bad:
-                self._status(
-                    f"HDR WIC yuv444 color-match render rejected: {block_why}",
-                    key="hdr_wic_yuv444_color_match",
-                    interval=0.0,
-                )
-                return 0
+            if guard_mode != "off":
+                block_bad, block_why = self._detect_wic_block_corruption(guide_png)
+                if block_bad and self._handle_wic_block_guard("yuv444 color-match render", block_why):
+                    return 0
             changed, repaired_tmp = self._repair_wic_with_yuv444_color_match(out_path, guide_png)
             if changed <= 0:
                 self._status(
@@ -9857,14 +9897,10 @@ class Processor(QtCore.QObject):
                     interval=5.0,
                 )
                 return 0
-            block_bad, block_why = self._detect_wic_block_corruption(repaired_tmp)
-            if block_bad:
-                self._status(
-                    f"HDR WIC yuv444 color-match output rejected: {block_why}",
-                    key="hdr_wic_yuv444_color_match",
-                    interval=0.0,
-                )
-                return 0
+            if guard_mode != "off":
+                block_bad, block_why = self._detect_wic_block_corruption(repaired_tmp)
+                if block_bad and self._handle_wic_block_guard("yuv444 color-match output", block_why):
+                    return 0
             os.replace(repaired_tmp, out_path)
             repaired_tmp = ""
             return changed
@@ -11666,13 +11702,6 @@ try {{
     @staticmethod
     def _detect_wic_block_corruption_bgr(bgr: np.ndarray) -> tuple[bool, str]:
         """Detect WIC/AVIF block-dropout corruption from decoded BGR pixels."""
-        if str(os.getenv("PC_DISABLE_WIC_BLOCK_CORRUPTION_GUARD", "")).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }:
-            return False, ""
         try:
             if bgr is None or bgr.ndim != 3 or bgr.shape[2] < 3:
                 return False, ""
@@ -12959,6 +12988,22 @@ class MainWindow(QtWidgets.QMainWindow):
             "accepted WIC/Paint color response. Kill switch: PC_DISABLE_WIC_YUV444_COLOR_MATCH."
         )
         self.hdr_wic_yuv444_color_match_check.stateChanged.connect(self._on_ui_change)
+        self.hdr_wic_block_guard_mode_combo = QtWidgets.QComboBox()
+        self.hdr_wic_block_guard_mode_combo.addItem("Reject (fallback)", "reject")
+        self.hdr_wic_block_guard_mode_combo.addItem("Log only (allow)", "log")
+        self.hdr_wic_block_guard_mode_combo.addItem("Off (disabled)", "off")
+        _guard_mode = self._normalize_wic_block_guard_mode_value(
+            getattr(self.cfg, "hdr_wic_block_corruption_guard_mode", "reject"),
+            default="reject",
+        )
+        _guard_mode_idx = self.hdr_wic_block_guard_mode_combo.findData(_guard_mode)
+        self.hdr_wic_block_guard_mode_combo.setCurrentIndex(_guard_mode_idx if _guard_mode_idx >= 0 else 0)
+        self.hdr_wic_block_guard_mode_combo.setToolTip(
+            "str: hdr_wic_block_corruption_guard_mode "
+            "(PC_WIC_BLOCK_CORRUPTION_GUARD_MODE). "
+            "reject = current behavior, log = report but allow, off = disable rejection."
+        )
+        self.hdr_wic_block_guard_mode_combo.currentIndexChanged.connect(self._on_ui_change)
         self.hdr_wic_yuv444_color_match_clean_range_combo = QtWidgets.QComboBox()
         self.hdr_wic_yuv444_color_match_clean_range_combo.addItem("Limited range", "limited")
         self.hdr_wic_yuv444_color_match_clean_range_combo.addItem("Full range", "full")
@@ -13738,6 +13783,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("WIC intermediate AVIF range", self.hdr_wic_avif_range_combo),
             ("WIC experimental primary override", self.hdr_wic_experimental_primary_check),
             ("WIC yuv444 color match", self.hdr_wic_yuv444_color_match_check),
+            ("WIC block guard mode", self.hdr_wic_block_guard_mode_combo),
             ("WIC yuv444 clean range", self.hdr_wic_yuv444_color_match_clean_range_combo),
             ("WIC yuv444 match overall", self.hdr_wic_yuv444_color_match_strength_spin),
             ("WIC yuv444 match luma", self.hdr_wic_yuv444_color_match_luma_strength_spin),
@@ -14969,6 +15015,10 @@ class MainWindow(QtWidgets.QMainWindow):
         return Processor._normalize_wic_yuv444_color_match_clean_range(value, default=default)
 
     @staticmethod
+    def _normalize_wic_block_guard_mode_value(value: object, default: str = "reject") -> str:
+        return Processor._normalize_wic_block_corruption_guard_mode(value, default=default)
+
+    @staticmethod
     def _normalize_wic_color_match_gpu_mode_value(value: object, default: str = "auto") -> str:
         return Processor._normalize_wic_yuv444_color_match_gpu_mode(value, default=default)
 
@@ -15142,6 +15192,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "hdr_wic_avif_range",
             "hdr_wic_experimental_primary",
             "hdr_wic_yuv444_color_match",
+            "hdr_wic_block_corruption_guard_mode",
             "hdr_wic_yuv444_color_match_strength",
             "hdr_wic_yuv444_color_match_luma_strength",
             "hdr_wic_yuv444_color_match_chroma_strength",
@@ -15398,6 +15449,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 if hasattr(self, "hdr_wic_yuv444_color_match_check")
                 else bool(getattr(self.cfg, "hdr_wic_yuv444_color_match", True))
             ),
+            hdr_wic_block_corruption_guard_mode=(
+                self._normalize_wic_block_guard_mode_value(
+                    self.hdr_wic_block_guard_mode_combo.currentData() or "reject"
+                )
+                if hasattr(self, "hdr_wic_block_guard_mode_combo")
+                else self._normalize_wic_block_guard_mode_value(
+                    getattr(self.cfg, "hdr_wic_block_corruption_guard_mode", "reject")
+                )
+            ),
             hdr_wic_yuv444_color_match_clean_range=(
                 self._normalize_wic_color_match_clean_range_value(
                     self.hdr_wic_yuv444_color_match_clean_range_combo.currentData() or "limited"
@@ -15528,6 +15588,15 @@ class MainWindow(QtWidgets.QMainWindow):
             bool(self.hdr_wic_yuv444_color_match_check.isChecked())
             if hasattr(self, "hdr_wic_yuv444_color_match_check")
             else bool(getattr(self.cfg, "hdr_wic_yuv444_color_match", True))
+        )
+        cfg.hdr_wic_block_corruption_guard_mode = (
+            self._normalize_wic_block_guard_mode_value(
+                self.hdr_wic_block_guard_mode_combo.currentData() or "reject"
+            )
+            if hasattr(self, "hdr_wic_block_guard_mode_combo")
+            else self._normalize_wic_block_guard_mode_value(
+                getattr(self.cfg, "hdr_wic_block_corruption_guard_mode", "reject")
+            )
         )
         cfg.hdr_wic_yuv444_color_match_clean_range = (
             self._normalize_wic_color_match_clean_range_value(
@@ -15680,6 +15749,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.hdr_wic_avif_range = "full"
         self.cfg.hdr_wic_experimental_primary = bool(getattr(cfg, "hdr_wic_experimental_primary", False))
         self.cfg.hdr_wic_yuv444_color_match = bool(getattr(cfg, "hdr_wic_yuv444_color_match", True))
+        self.cfg.hdr_wic_block_corruption_guard_mode = self._normalize_wic_block_guard_mode_value(
+            getattr(cfg, "hdr_wic_block_corruption_guard_mode", "reject")
+        )
         self.cfg.hdr_wic_yuv444_color_match_clean_range = self._normalize_wic_color_match_clean_range_value(
             getattr(cfg, "hdr_wic_yuv444_color_match_clean_range", "limited")
         )
@@ -15806,6 +15878,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "hdr_wic_experimental_primary_check"):
             self.hdr_wic_experimental_primary_check.setChecked(self.cfg.hdr_wic_experimental_primary)
         self.cfg.hdr_wic_yuv444_color_match = bool(getattr(cfg, "hdr_wic_yuv444_color_match", True))
+        self.cfg.hdr_wic_block_corruption_guard_mode = self._normalize_wic_block_guard_mode_value(
+            getattr(cfg, "hdr_wic_block_corruption_guard_mode", "reject")
+        )
         try:
             self.cfg.hdr_wic_yuv444_color_match_strength = min(
                 1.0, max(0.0, float(getattr(cfg, "hdr_wic_yuv444_color_match_strength", 1.0)))
@@ -15814,6 +15889,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.hdr_wic_yuv444_color_match_strength = 1.0
         if hasattr(self, "hdr_wic_yuv444_color_match_check"):
             self.hdr_wic_yuv444_color_match_check.setChecked(self.cfg.hdr_wic_yuv444_color_match)
+        if hasattr(self, "hdr_wic_block_guard_mode_combo"):
+            idx = self.hdr_wic_block_guard_mode_combo.findData(
+                self._normalize_wic_block_guard_mode_value(self.cfg.hdr_wic_block_corruption_guard_mode)
+            )
+            self.hdr_wic_block_guard_mode_combo.setCurrentIndex(idx if idx >= 0 else 0)
         if hasattr(self, "hdr_wic_yuv444_color_match_clean_range_combo"):
             idx = self.hdr_wic_yuv444_color_match_clean_range_combo.findData(
                 self._normalize_wic_color_match_clean_range_value(
@@ -16990,6 +17070,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 type=bool,
             )
         )
+        self.cfg.hdr_wic_block_corruption_guard_mode = self._normalize_wic_block_guard_mode_value(
+            s.value(
+                "hdr_wic_block_corruption_guard_mode",
+                getattr(self.cfg, "hdr_wic_block_corruption_guard_mode", "reject"),
+            )
+        )
         self.cfg.hdr_wic_yuv444_color_match_clean_range = self._normalize_wic_color_match_clean_range_value(
             s.value(
                 "hdr_wic_yuv444_color_match_clean_range",
@@ -17013,6 +17099,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.cfg.hdr_wic_yuv444_color_match_strength = 1.0
         if hasattr(self, "hdr_wic_yuv444_color_match_check"):
             self.hdr_wic_yuv444_color_match_check.setChecked(self.cfg.hdr_wic_yuv444_color_match)
+        if hasattr(self, "hdr_wic_block_guard_mode_combo"):
+            idx = self.hdr_wic_block_guard_mode_combo.findData(
+                self._normalize_wic_block_guard_mode_value(self.cfg.hdr_wic_block_corruption_guard_mode)
+            )
+            self.hdr_wic_block_guard_mode_combo.setCurrentIndex(idx if idx >= 0 else 0)
         if hasattr(self, "hdr_wic_yuv444_color_match_clean_range_combo"):
             idx = self.hdr_wic_yuv444_color_match_clean_range_combo.findData(
                 self._normalize_wic_color_match_clean_range_value(
