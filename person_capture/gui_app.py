@@ -8179,8 +8179,8 @@ class Processor(QtCore.QObject):
                             prof,
                         )
                     )
-                except Exception:
-                    pass
+                except (TypeError, ValueError):
+                    continue
         ax1, ay1, ax2, ay2 = anchor_crop
         acx = 0.5 * (ax1 + ax2)
         acy = 0.5 * (ay1 + ay2)
