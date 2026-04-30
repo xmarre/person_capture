@@ -2528,6 +2528,14 @@ class Processor(QtCore.QObject):
 
         best: Optional[tuple[float, Tuple[int, int, int, int], str, str]] = None
         best_portrait_alt: Optional[tuple[float, Tuple[int, int, int, int], str, str, float, float, float]] = None
+        best_useful_portrait_alt: Optional[tuple[float, Tuple[int, int, int, int], str, str, float, float, float]] = None
+
+        def _portrait_candidate_is_useful(face_h_frac: float, side_margin: float, bottom_margin: float) -> bool:
+            return bool(
+                0.18 <= face_h_frac <= 0.50
+                and bottom_margin >= 0.28
+                and side_margin >= 0.10
+            )
 
         def _maybe_update_portrait_alt(
             score: float,
@@ -2536,14 +2544,14 @@ class Processor(QtCore.QObject):
             profile: str,
             actual_face_h_frac: float,
         ) -> None:
-            nonlocal best_portrait_alt
+            nonlocal best_portrait_alt, best_useful_portrait_alt
             if face is None:
                 return
             if profile not in {"close", "portrait_close", "upper"}:
                 return
             if rs not in {"2:3", "3:4"}:
                 return
-            cx1, cy1, cx2, cy2 = [float(v) for v in crop]
+            cx1, _, cx2, cy2 = [float(v) for v in crop]
             fx1, fy1, fx2, fy2 = [float(v) for v in face]
             fw_local = max(1.0, fx2 - fx1)
             fh_local = max(1.0, fy2 - fy1)
@@ -2552,6 +2560,9 @@ class Processor(QtCore.QObject):
             candidate = (score, crop, rs, profile, actual_face_h_frac, side_margin, bottom_margin)
             if best_portrait_alt is None or candidate[0] < best_portrait_alt[0]:
                 best_portrait_alt = candidate
+            if _portrait_candidate_is_useful(actual_face_h_frac, side_margin, bottom_margin):
+                if best_useful_portrait_alt is None or candidate[0] < best_useful_portrait_alt[0]:
+                    best_useful_portrait_alt = candidate
 
         for profile, protect_raw, target_face_h_frac, anchor, min_size in profiles:
             protect = self._coerce_box_xyxy(protect_raw, bounds)
@@ -2723,23 +2734,24 @@ class Processor(QtCore.QObject):
             if (
                 face is not None
                 and rs == "1:1"
-                and profile in {"close", "upper"}
+                and profile in {"close", "portrait_close", "upper"}
                 and best_portrait_alt is not None
             ):
                 fx1, fy1, fx2, fy2 = [float(v) for v in face]
                 fh_local = max(1.0, fy2 - fy1)
                 square_h = max(1.0, float(crop[3] - crop[1]))
                 square_face_h_frac = fh_local / square_h
-                portrait_score, portrait_crop, portrait_rs, portrait_profile, portrait_face_h_frac, portrait_side_margin, portrait_bottom_margin = best_portrait_alt
+                portrait_candidate = best_useful_portrait_alt or best_portrait_alt
+                portrait_score, portrait_crop, portrait_rs, portrait_profile, portrait_face_h_frac, portrait_side_margin, portrait_bottom_margin = portrait_candidate
                 # Square remains valid for true tight close-ups and when the
                 # portrait candidate is objectively weak.  Otherwise, prefer the
                 # best feasible portrait candidate when it is close enough in the
                 # same scorer. This fixes medium-close frames that keep sneaking
                 # through as close/1:1 without banning useful square crops.
-                portrait_is_useful = (
-                    0.18 <= portrait_face_h_frac <= 0.50
-                    and portrait_bottom_margin >= 0.28
-                    and portrait_side_margin >= 0.10
+                portrait_is_useful = _portrait_candidate_is_useful(
+                    portrait_face_h_frac,
+                    portrait_side_margin,
+                    portrait_bottom_margin,
                 )
                 square_is_true_tight_close = square_face_h_frac >= 0.54
                 portrait_is_competitive = portrait_score <= best_score + 0.85
