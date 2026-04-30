@@ -2448,6 +2448,15 @@ class Processor(QtCore.QObject):
         body_cadence = body_period > 0 and frame_idx is not None and (int(frame_idx) % body_period == 0)
         wide_period = max(0, int(getattr(cfg, "compose_wide_context_every_n", 5)))
         wide_cadence = wide_period > 0 and frame_idx is not None and (int(frame_idx) % wide_period == 0)
+        # Reuse the same deterministic variety oscillator for square too, but on
+        # an interleaved phase instead of the exact same frame. That keeps the
+        # existing widescreen cadence intact while occasionally tipping a nearby
+        # frame toward 1:1 when square is otherwise a valid composition.
+        square_cadence = (
+            wide_period > 1
+            and frame_idx is not None
+            and (int(frame_idx) % wide_period == max(1, wide_period // 2))
+        )
         if face is not None:
             fx1, fy1, fx2, fy2 = face
             fw = max(1.0, fx2 - fx1)
@@ -2793,6 +2802,12 @@ class Processor(QtCore.QObject):
                         profile_prior -= upper_small_face_profile_nudge
                         if rs == "1:1":
                             ratio_prior += upper_small_face_square_nudge
+                    if square_cadence and rs == "1:1" and not portrait_close_eligible:
+                        # Interleaved variety phase: occasionally let an upper-body
+                        # frame tip toward square when that crop still satisfies the
+                        # normal containment/body guards.
+                        profile_prior -= 0.10
+                        ratio_prior -= 0.16
                 elif profile == "wide_context":
                     landscape_penalty = max(0.0, min(20.0, float(getattr(cfg, "compose_landscape_face_penalty", 5.0))))
                     profile_prior = max(-0.25, min(1.50, float(getattr(cfg, "compose_wide_context_prior", 0.18))))
@@ -2834,6 +2849,12 @@ class Processor(QtCore.QObject):
                         ratio_prior += 0.08
                     elif rs == "1:1":
                         ratio_prior += 0.12
+                        if square_cadence:
+                            # Same oscillator, square phase: give full-subject/body
+                            # candidates a mild 1:1 boost without overpowering the
+                            # existing containment and face-size penalties.
+                            profile_prior -= 0.08
+                            ratio_prior -= 0.18
                     else:
                         ratio_prior += 0.30
                     if is_landscape and subj is not None:
@@ -2953,7 +2974,10 @@ class Processor(QtCore.QObject):
         fallback_protect = face_hard_protect or subj or base or (bx1, by1, bx2, by2)
         fallback_ratio = None
         fallback_profile = "fallback"
-        for rs in validated_user_ratios:
+        fallback_ratios = list(validated_user_ratios)
+        if square_cadence and "1:1" in fallback_ratios:
+            fallback_ratios = ["1:1"] + [rs for rs in fallback_ratios if rs != "1:1"]
+        for rs in fallback_ratios:
             try:
                 rw, rh = parse_ratio(rs)
                 aspect = float(rw) / max(1e-6, float(rh))
@@ -2990,6 +3014,8 @@ class Processor(QtCore.QObject):
         if fallback_ratio is None:
             if portrait_close_eligible:
                 preferred_fallbacks = ("2:3", "3:4", "1:1")
+            elif square_cadence and face_hard_protect is not None:
+                preferred_fallbacks = ("1:1", "2:3", "3:4")
             elif face_hard_protect is not None and face_frame_frac >= 0.16:
                 preferred_fallbacks = ("1:1", "2:3", "3:4")
             elif face_hard_protect is not None:
