@@ -10747,10 +10747,13 @@ class Processor(QtCore.QObject):
         ref_tmp = ref_out_path + ".tmp.raw"
         clean_tmp = clean_out_path + ".tmp.raw"
         for out_path in (ref_out_path, clean_out_path):
+            out_dir = os.path.dirname(out_path)
+            if not out_dir:
+                continue
             try:
-                ensure_dir(os.path.dirname(out_path))
-            except Exception:
-                pass
+                ensure_dir(out_dir)
+            except Exception as exc:
+                return False, f"windows_wic_raw_pair_out_dir_unwritable:{out_dir}:{type(exc).__name__}:{exc}", None, None
         for tmp in (ref_tmp, clean_tmp):
             try:
                 if os.path.exists(tmp):
@@ -10867,6 +10870,7 @@ Write-WicBgr32Raw $cleanSrc $cleanDst 'CLEAN'
                 published_clean = True
                 publish_succeeded = True
             except Exception as exc:
+                restore_notes: list[str] = []
                 if published_ref:
                     try:
                         if os.path.exists(ref_out_path):
@@ -10883,15 +10887,18 @@ Write-WicBgr32Raw $cleanSrc $cleanDst 'CLEAN'
                     try:
                         os.replace(ref_backup, ref_out_path)
                         restored_ref = True
-                    except Exception:
-                        pass
+                    except Exception as restore_exc:
+                        restore_notes.append(f"ref_restore_failed:{type(restore_exc).__name__}:{restore_exc}")
                 if backed_up_clean and os.path.exists(clean_backup):
                     try:
                         os.replace(clean_backup, clean_out_path)
                         restored_clean = True
-                    except Exception:
-                        pass
-                return False, f"windows_wic_raw_pair_publish_failed:{type(exc).__name__}:{exc}", None, None
+                    except Exception as restore_exc:
+                        restore_notes.append(f"clean_restore_failed:{type(restore_exc).__name__}:{restore_exc}")
+                reason = f"windows_wic_raw_pair_publish_failed:{type(exc).__name__}:{exc}"
+                if restore_notes:
+                    reason += "|" + "|".join(restore_notes)
+                return False, reason, None, None
             finally:
                 for bak, should_remove in (
                     (ref_backup, publish_succeeded or restored_ref),
