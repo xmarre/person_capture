@@ -2929,8 +2929,14 @@ class Processor(QtCore.QObject):
                     and bool(getattr(cfg, "compose_wide_context_enable", True))
                     and face_frame_frac <= max(0.08, min(0.32, float(getattr(cfg, "compose_wide_context_max_frame_face_frac", 0.18))))
                 ):
-                    fallback_profile = "wide_context"
-                    fallback_protect = face_protect or face or base or (bx1, by1, bx2, by2)
+                    fx1_f, fy1_f, fx2_f, fy2_f = [float(v) for v in face]
+                    side_room_face_heights = min(
+                        max(0.0, fx1_f - float(bx1)),
+                        max(0.0, float(bx2) - fx2_f),
+                    ) / max(1.0, fy2_f - fy1_f)
+                    if side_room_face_heights >= max(0.0, min(4.0, float(getattr(cfg, "compose_wide_context_min_side_face_heights", 1.20)))):
+                        fallback_profile = "wide_context"
+                        fallback_protect = face_protect or face or base or (bx1, by1, bx2, by2)
                 elif subj is not None and face_frame_frac < small_face_frame_frac and subj_h_frac >= 0.60:
                     fallback_profile = "body"
                     fallback_protect = subj or base or face_hard_protect or (bx1, by1, bx2, by2)
