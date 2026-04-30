@@ -10832,8 +10832,56 @@ Write-WicBgr32Raw $cleanSrc $cleanDst 'CLEAN'
                     got = os.path.getsize(tmp) if os.path.exists(tmp) else 0
                     return False, f"windows_wic_raw_pair_size_mismatch:{label}:got={got}:expected={expected}", None, None
 
-            os.replace(ref_tmp, ref_out_path)
-            os.replace(clean_tmp, clean_out_path)
+            # Publish both outputs with rollback so we never leave a mixed pair.
+            ref_backup = ref_out_path + ".bak.rawpair"
+            clean_backup = clean_out_path + ".bak.rawpair"
+            backed_up_ref = False
+            backed_up_clean = False
+            try:
+                for bak in (ref_backup, clean_backup):
+                    try:
+                        if os.path.exists(bak):
+                            os.remove(bak)
+                    except Exception:
+                        pass
+                if os.path.exists(ref_out_path):
+                    os.replace(ref_out_path, ref_backup)
+                    backed_up_ref = True
+                if os.path.exists(clean_out_path):
+                    os.replace(clean_out_path, clean_backup)
+                    backed_up_clean = True
+
+                os.replace(ref_tmp, ref_out_path)
+                os.replace(clean_tmp, clean_out_path)
+            except Exception as exc:
+                try:
+                    if os.path.exists(ref_out_path):
+                        os.remove(ref_out_path)
+                except Exception:
+                    pass
+                try:
+                    if os.path.exists(clean_out_path):
+                        os.remove(clean_out_path)
+                except Exception:
+                    pass
+                if backed_up_ref and os.path.exists(ref_backup):
+                    try:
+                        os.replace(ref_backup, ref_out_path)
+                    except Exception:
+                        pass
+                if backed_up_clean and os.path.exists(clean_backup):
+                    try:
+                        os.replace(clean_backup, clean_out_path)
+                    except Exception:
+                        pass
+                return False, f"windows_wic_raw_pair_publish_failed:{type(exc).__name__}:{exc}", None, None
+            finally:
+                for bak in (ref_backup, clean_backup):
+                    try:
+                        if os.path.exists(bak):
+                            os.remove(bak)
+                    except Exception:
+                        pass
             return True, "", ref_meta, clean_meta
         except subprocess.TimeoutExpired as exc:
             return False, f"windows_wic_raw_pair_timeout_{timeout_sec}s:{exc}", None, None
